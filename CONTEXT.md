@@ -20,8 +20,8 @@ _Avoid_: board (when meaning the Kanban board)
 The timeline representation of a Work Item's Start Date and Target Date.
 
 **Session**:
-The securely stored Entra work/school login that lets the app call Azure DevOps without signing in every launch.
-_Avoid_: personal Microsoft account, MSA, PAT as the primary login
+The securely stored login that lets the app call Azure DevOps without signing in every launch — Entra work/school SSO when a public-client ID is configured, otherwise a stored personal access token.
+_Avoid_: personal Microsoft account, MSA
 
 **Flavor**:
 A Catppuccin palette: Latte, Frappé, Macchiato, or Mocha.

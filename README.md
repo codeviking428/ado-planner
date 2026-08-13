@@ -6,7 +6,7 @@ Monday-lite Electron app: an Azure DevOps **Team** Work Item **Hierarchy** (Epic
 
 ```bash
 pnpm install
-cp .env.example .env   # set ENTRA_CLIENT_ID
+cp .env.example .env   # set ENTRA_CLIENT_ID, or leave empty for PAT fallback
 pnpm dev
 ```
 
@@ -38,6 +38,8 @@ Ship **one public-client ID**. Maintainers register it once; it is not a secret.
    - `vso.profile` — org listing
 7. Put the Application (client) ID in `ENTRA_CLIENT_ID` / `MAIN_VITE_ENTRA_CLIENT_ID`
 8. Do **not** add a client secret
+
+If those env vars are empty, the app asks for a personal access token at startup and stores it with Electron `safeStorage` (Linux `basic_text` is memory-only, same as Entra Session). Log out wipes it. This is a fallback until the Entra public client is registered.
 
 Authority is `https://login.microsoftonline.com/organizations`. Token scope is `499b84ac-1321-427f-aa17-267ca6975798/.default`.
 

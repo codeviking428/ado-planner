@@ -100,10 +100,13 @@ export type WorkItemFormModel = {
   values: Record<string, unknown>
 }
 
+export type AuthMode = 'entra' | 'pat'
+
 export type SessionInfo = {
   signedIn: boolean
   displayName: string | null
   username: string | null
+  authMode: AuthMode
 }
 
 export type Organization = { accountName: string }

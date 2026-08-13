@@ -32,6 +32,7 @@ import {
 } from '@shared/hierarchy'
 import { typeHasStartAndTarget } from '@shared/dates'
 import { flattenLayout, type FieldMetadata, type ProcessLayout } from '@shared/form-layout'
+import { adoAuthorizationHeader } from './ado-auth'
 import type { TokenProvider } from './session'
 
 function adoOrgUrl(org: string): string {
@@ -49,11 +50,16 @@ function vsspsUrl(): string {
   )
 }
 
-async function restJson(url: string, token: string, init?: RequestInit): Promise<unknown> {
+async function restJson(
+  url: string,
+  token: string,
+  scheme: 'bearer' | 'pat',
+  init?: RequestInit
+): Promise<unknown> {
   const response = await fetch(url, {
     ...init,
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: adoAuthorizationHeader(token, scheme),
       Accept: 'application/json',
       'Content-Type': 'application/json',
       ...(init?.headers ?? {})
@@ -74,7 +80,11 @@ export class AdoClient {
 
   private async connect(org: string): Promise<azdev.WebApi> {
     const token = await this.tokens.getAccessToken()
-    return new azdev.WebApi(adoOrgUrl(org), azdev.getBearerHandler(token))
+    const handler =
+      this.tokens.scheme === 'pat'
+        ? azdev.getPersonalAccessTokenHandler(token)
+        : azdev.getBearerHandler(token)
+    return new azdev.WebApi(adoOrgUrl(org), handler)
   }
 
   private async wit(org: string): Promise<IWorkItemTrackingApi> {
@@ -95,14 +105,17 @@ export class AdoClient {
 
   async listOrganizations(): Promise<Organization[]> {
     const token = await this.tokens.getAccessToken()
+    const scheme = this.tokens.scheme
     const profile = (await restJson(
       `${vsspsUrl()}/_apis/profile/profiles/me?api-version=7.1`,
-      token
+      token,
+      scheme
     )) as { id?: string }
     const memberQuery = profile.id ? `memberId=${profile.id}&` : ''
     const payload = (await restJson(
       `${vsspsUrl()}/_apis/accounts?${memberQuery}api-version=7.1`,
-      token
+      token,
+      scheme
     )) as
       | { value?: Array<{ accountName?: string }>; accountName?: string }
       | Array<{ accountName?: string }>
@@ -300,12 +313,14 @@ export class AdoClient {
 
   async searchIdentities(org: string, query: string): Promise<IdentityValue[]> {
     const token = await this.tokens.getAccessToken()
+    const scheme = this.tokens.scheme
     const url = `${adoOrgUrl(org).replace(`/${org}`, '')}/_apis/identities?searchFilter=General&filterValue=${encodeURIComponent(query)}&api-version=7.1`
     const vssps = `${process.env.ADO_PLANNER_ADO_BASE_URL ?? `https://vssps.dev.azure.com/${org}`}`
     const payload = (await restJson(
       `${vssps.replace(/\/$/, '')}/_apis/identities?searchFilter=General&filterValue=${encodeURIComponent(query)}&api-version=7.1`,
-      token
-    ).catch(() => restJson(url, token))) as {
+      token,
+      scheme
+    ).catch(() => restJson(url, token, scheme))) as {
       value?: Array<{ displayName?: string; uniqueName?: string; id?: string }>
     }
     return (payload.value ?? [])

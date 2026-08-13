@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import {
   Dialog,
   DialogContent,
@@ -61,20 +62,45 @@ function SignInShell({
   onLogin
 }: {
   session: SessionInfo | undefined
-  onLogin: () => void
+  onLogin: (pat?: string) => void
 }) {
+  const [pat, setPat] = useState('')
+  const patMode = session?.authMode === 'pat'
   return (
     <div
       className="flex h-svh flex-col items-center justify-center gap-4"
       data-testid="sign-in-shell"
     >
       <h1 className="text-xl font-medium">ADO Planner</h1>
-      <p className="text-muted-foreground max-w-md text-center text-sm">
-        Sign in with your work or school account to view a Team Work Item Hierarchy on a Gantt.
-      </p>
-      <Button onClick={onLogin} data-testid="sign-in">
-        Sign in
-      </Button>
+      {patMode ? (
+        <>
+          <p className="text-muted-foreground max-w-md text-center text-sm">
+            Entra app ID is not set. Paste an Azure DevOps personal access token to continue while
+            SSO is unavailable. Scopes: Work (read & write), Project, and Profile.
+          </p>
+          <Input
+            type="password"
+            autoComplete="off"
+            data-testid="pat-input"
+            placeholder="Personal access token"
+            value={pat}
+            onChange={(event) => setPat(event.target.value)}
+            className="max-w-sm"
+          />
+          <Button onClick={() => onLogin(pat)} disabled={!pat.trim()} data-testid="sign-in">
+            Continue
+          </Button>
+        </>
+      ) : (
+        <>
+          <p className="text-muted-foreground max-w-md text-center text-sm">
+            Sign in with your work or school account to view a Team Work Item Hierarchy on a Gantt.
+          </p>
+          <Button onClick={() => onLogin()} data-testid="sign-in">
+            Sign in
+          </Button>
+        </>
+      )}
       {session && !session.signedIn ? (
         <p className="text-muted-foreground text-xs">No Session yet.</p>
       ) : null}
@@ -102,7 +128,7 @@ function PlannerApp() {
   })
 
   const login = useMutation({
-    mutationFn: () => window.planner.session.login(),
+    mutationFn: (creds?: { pat?: string }) => window.planner.session.login(creds),
     onSuccess: (info) => {
       sessionQuery.refetch()
       if (!info.signedIn) {
@@ -222,8 +248,21 @@ function PlannerApp() {
     }
   }
 
-  if (!sessionQuery.data?.signedIn) {
-    return <SignInShell session={sessionQuery.data} onLogin={() => login.mutate()} />
+  if (sessionQuery.isPending || !sessionQuery.data) {
+    return (
+      <div className="flex h-svh items-center justify-center" data-testid="session-loading">
+        <p className="text-muted-foreground text-sm">Starting Session…</p>
+      </div>
+    )
+  }
+
+  if (!sessionQuery.data.signedIn) {
+    return (
+      <SignInShell
+        session={sessionQuery.data}
+        onLogin={(pat) => login.mutate(pat ? { pat } : undefined)}
+      />
+    )
   }
 
   return (
