@@ -43,8 +43,6 @@ Authority is `https://login.microsoftonline.com/organizations`. Token scope is `
 
 Sign-in uses MSAL Node `acquireTokenInteractive` (PKCE, loopback, `shell.openExternal`). Session is stored in main with Electron `safeStorage` wrapping an MSAL `ICachePlugin`. On Linux, if `safeStorage.getSelectedStorageBackend() === 'basic_text'`, the Session is memory-only.
 
-Details: [Electron SSO research](https://github.com/codeviking428/ado-planner/blob/research/electron-sso/docs/research/electron-sso.md), [Session store research](https://github.com/codeviking428/ado-planner/blob/research/session-store/docs/research/session-store.md).
-
 ## Packaging
 
 GitHub Releases: unsigned NSIS (Windows, per-user) + AppImage (Linux). `electron-updater` with `autoDownload: false`. Startup modal: Yes = download+install+restart; No snoozes until next launch. Not `npm i -g`. macOS is out of scope.
