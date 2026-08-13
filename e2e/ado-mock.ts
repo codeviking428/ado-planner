@@ -194,6 +194,11 @@ export function startAdoMock(port = 0) {
               name: 'Sprint 10',
               path: 'Shop\\FY26\\Sprint 10',
               attributes: { startDate: day('2026-07-13'), finishDate: day('2026-07-24') }
+            },
+            {
+              name: 'Sprint 12',
+              path: 'Shop\\FY26\\Sprint 12',
+              attributes: { startDate: day('2026-08-10'), finishDate: day('2026-08-21') }
             }
           ]
         })

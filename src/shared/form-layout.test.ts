@@ -1,5 +1,15 @@
 import { describe, expect, test } from 'vitest'
-import { buildFormPatch, flattenLayout, stripMnemonic } from './form-layout'
+import {
+  buildFormPatch,
+  draftFromFormValues,
+  flattenLayout,
+  formFieldName,
+  referenceNameFromFormField,
+  stripMnemonic,
+  workItemFormDefaults,
+  workItemFormSchema
+} from './form-layout'
+import type { FormControl } from './types'
 
 describe('flattenLayout', () => {
   test('keeps visible custom pages and skips history, links, attachments, contributions', () => {
@@ -127,5 +137,87 @@ describe('flattenLayout', () => {
       { op: 'test', path: '/rev', value: 9 },
       { op: 'add', path: '/fields/System.Title', value: 'New title' }
     ])
+  })
+})
+
+describe('TanStack Form field map', () => {
+  const title: FormControl = {
+    id: 'System.Title',
+    referenceName: 'System.Title',
+    label: 'Title',
+    kind: 'string',
+    required: true,
+    readOnly: false,
+    visible: true
+  }
+  const assigned: FormControl = {
+    id: 'System.AssignedTo',
+    referenceName: 'System.AssignedTo',
+    label: 'Assigned To',
+    kind: 'identity',
+    required: false,
+    readOnly: false,
+    visible: true
+  }
+
+  test('encodes dotted ADO reference names so TanStack Form does not nest them', () => {
+    expect(formFieldName('System.Title')).toBe('System::Title')
+    expect(referenceNameFromFormField('System::Title')).toBe('System.Title')
+    expect(formFieldName('Microsoft.VSTS.Scheduling.StartDate')).toBe(
+      'Microsoft::VSTS::Scheduling::StartDate'
+    )
+  })
+
+  test('default values and submitted draft round-trip ADO field names for PATCH', () => {
+    const defaults = workItemFormDefaults(
+      {
+        'System.Title': 'Persist cart',
+        'System.AssignedTo': { displayName: 'Ada', uniqueName: 'ada@contoso.com' }
+      },
+      [title, assigned]
+    )
+    expect(defaults).toEqual({
+      'System::Title': 'Persist cart',
+      'System::AssignedTo': { displayName: 'Ada', uniqueName: 'ada@contoso.com' }
+    })
+    const submitted = {
+      ...defaults,
+      'System::Title': 'Persist cart (saved)'
+    }
+    const draft = draftFromFormValues(submitted)
+    expect(draft['System.Title']).toBe('Persist cart (saved)')
+    expect(draft['System.AssignedTo']).toEqual({
+      displayName: 'Ada',
+      uniqueName: 'ada@contoso.com'
+    })
+    const document = buildFormPatch({
+      rev: 5,
+      original: {
+        'System.Title': 'Persist cart',
+        'System.AssignedTo': { displayName: 'Ada', uniqueName: 'ada@contoso.com' }
+      },
+      draft,
+      editable: [title, assigned]
+    })
+    expect(document).toEqual([
+      { op: 'test', path: '/rev', value: 5 },
+      { op: 'add', path: '/fields/System.Title', value: 'Persist cart (saved)' }
+    ])
+  })
+
+  test('zod schema requires always-required visible fields', () => {
+    const schema = workItemFormSchema([title, assigned])
+    expect(
+      schema.safeParse({
+        'System::Title': '',
+        'System::AssignedTo': null
+      }).success
+    ).toBe(false)
+    expect(
+      schema.safeParse({
+        'System::Title': 'Cart',
+        'System::AssignedTo': null
+      }).success
+    ).toBe(true)
   })
 })

@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
+import { useForm } from '@tanstack/react-form'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import {
@@ -22,7 +23,13 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { DescriptionEditor } from '@/components/description-editor'
 import { IdentityCombobox } from '@/components/identity-combobox'
-import { allEditableControls } from '@shared/form-layout'
+import {
+  allEditableControls,
+  draftFromFormValues,
+  formFieldName,
+  workItemFormDefaults,
+  workItemFormSchema
+} from '@shared/form-layout'
 import type { FormControl, IdentityValue, WorkItemFormModel } from '@shared/types'
 
 function asInputValue(value: unknown): string {
@@ -134,32 +141,53 @@ export function WorkItemFormDialog({
   onClose: () => void
   onSaved: (rev: number, values: Record<string, unknown>) => void
 }) {
-  const [draft, setDraft] = useState<Record<string, unknown>>(model.values)
-  const [saving, setSaving] = useState(false)
   const editable = useMemo(() => allEditableControls(model), [model])
+  const schema = useMemo(() => workItemFormSchema(editable), [editable])
+  const defaultValues = useMemo(
+    () => workItemFormDefaults(model.values, editable),
+    [editable, model.values]
+  )
   const pages =
     model.pages.length > 0 ? model.pages : [{ id: 'details', label: 'Details', groups: [] }]
 
-  const save = async () => {
-    setSaving(true)
-    try {
-      const result = await window.planner.ado.saveForm({
-        org,
-        project,
-        id: model.id,
-        rev: model.rev,
-        original: model.values,
-        draft,
-        editable
-      })
-      toast.success(`Saved Work Item #${model.id}`)
-      onSaved(result.rev, draft)
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Save failed')
-    } finally {
-      setSaving(false)
+  const form = useForm({
+    defaultValues,
+    validators: { onChange: schema },
+    onSubmit: async ({ value }) => {
+      const draft = draftFromFormValues(value)
+      try {
+        const result = await window.planner.ado.saveForm({
+          org,
+          project,
+          id: model.id,
+          rev: model.rev,
+          original: model.values,
+          draft,
+          editable
+        })
+        toast.success(`Saved Work Item #${model.id}`)
+        onSaved(result.rev, draft)
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Save failed')
+      }
     }
-  }
+  })
+
+  const renderControl = (control: FormControl) => (
+    <form.Field key={control.id} name={formFieldName(control.referenceName)}>
+      {(field) => (
+        <div className="grid gap-1.5">
+          <Label htmlFor={control.referenceName}>{control.label}</Label>
+          <FieldControl
+            control={control}
+            org={org}
+            value={field.state.value}
+            onChange={(value) => field.handleChange(value)}
+          />
+        </div>
+      )}
+    </form.Field>
+  )
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -175,69 +203,57 @@ export function WorkItemFormDialog({
             Layout pages as tabs. Groups are fieldsets on each page.
           </DialogDescription>
         </DialogHeader>
-        <Tabs defaultValue={pages[0]?.id} className="min-h-0 flex-1">
-          <TabsList variant="line" className="w-full justify-start">
+        <form
+          className="flex min-h-0 flex-1 flex-col"
+          onSubmit={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            void form.handleSubmit()
+          }}
+        >
+          <Tabs defaultValue={pages[0]?.id} className="min-h-0 flex-1">
+            <TabsList variant="line" className="w-full justify-start">
+              {pages.map((page) => (
+                <TabsTrigger key={page.id} value={page.id}>
+                  {page.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
             {pages.map((page) => (
-              <TabsTrigger key={page.id} value={page.id}>
-                {page.label}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-          {pages.map((page) => (
-            <TabsContent key={page.id} value={page.id} className="min-h-0 overflow-auto pt-3">
-              <ScrollArea className="max-h-[50vh] pr-2">
-                {model.systemControls
-                  .filter(() => page.id === pages[0]?.id)
-                  .map((control) => (
-                    <div key={control.id} className="mb-3 grid gap-1.5">
-                      <Label htmlFor={control.referenceName}>{control.label}</Label>
-                      <FieldControl
-                        control={control}
-                        org={org}
-                        value={draft[control.referenceName]}
-                        onChange={(value) =>
-                          setDraft((prev) => ({ ...prev, [control.referenceName]: value }))
-                        }
-                      />
-                    </div>
+              <TabsContent key={page.id} value={page.id} className="min-h-0 overflow-auto pt-3">
+                <ScrollArea className="max-h-[50vh] pr-2">
+                  {page.id === pages[0]?.id
+                    ? model.systemControls.map((control) => (
+                        <div key={control.id} className="mb-3">
+                          {renderControl(control)}
+                        </div>
+                      ))
+                    : null}
+                  {page.groups.map((group) => (
+                    <fieldset key={group.id} className="mb-4 grid gap-3">
+                      {group.label ? (
+                        <legend className="text-sm font-medium">{group.label}</legend>
+                      ) : null}
+                      {group.controls.map((control) => renderControl(control))}
+                    </fieldset>
                   ))}
-                {page.groups.map((group) => (
-                  <fieldset key={group.id} className="mb-4 grid gap-3">
-                    {group.label ? (
-                      <legend className="text-sm font-medium">{group.label}</legend>
-                    ) : null}
-                    {group.controls.map((control) => (
-                      <div key={control.id} className="grid gap-1.5">
-                        <Label htmlFor={control.referenceName}>{control.label}</Label>
-                        <FieldControl
-                          control={control}
-                          org={org}
-                          value={draft[control.referenceName]}
-                          onChange={(value) =>
-                            setDraft((prev) => ({ ...prev, [control.referenceName]: value }))
-                          }
-                        />
-                      </div>
-                    ))}
-                  </fieldset>
-                ))}
-              </ScrollArea>
-            </TabsContent>
-          ))}
-        </Tabs>
-        <DialogFooter>
-          <Button type="button" variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            disabled={saving}
-            onClick={() => void save()}
-            data-testid="save-work-item"
-          >
-            {saving ? 'Saving…' : 'Save'}
-          </Button>
-        </DialogFooter>
+                </ScrollArea>
+              </TabsContent>
+            ))}
+          </Tabs>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={onClose}>
+              Cancel
+            </Button>
+            <form.Subscribe selector={(state) => state.isSubmitting}>
+              {(saving) => (
+                <Button type="submit" disabled={saving} data-testid="save-work-item">
+                  {saving ? 'Saving…' : 'Save'}
+                </Button>
+              )}
+            </form.Subscribe>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   )

@@ -12,6 +12,10 @@ test('loads Hierarchy including an unparented root', async ({ window }) => {
   await expect(window.getByTestId('work-item-1001')).toBeVisible()
   await expect(window.getByTestId('work-item-1003')).toContainText('Persist cart')
   await expect(window.getByTestId('work-item-1012')).toContainText('Unparented spike')
+  await expect(window.getByTestId('dates-1012')).toHaveText(
+    'Unscheduled · iteration 2026-08-10–2026-08-21'
+  )
+  await expect(window.getByTestId('dates-1003')).toHaveText('2026-07-06 → 2026-07-20')
 })
 
 test('drag date PATCHes Start/Target and shows a success toast', async ({ window }) => {

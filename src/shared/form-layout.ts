@@ -1,3 +1,4 @@
+import { z } from 'zod'
 import type {
   FormControl,
   FormControlKind,
@@ -193,4 +194,47 @@ export function buildFormPatch(input: {
     })
   }
   return ops
+}
+
+/** TanStack Form treats `.` as a nested path. ADO reference names must stay flat. */
+export function formFieldName(referenceName: string): string {
+  return referenceName.replaceAll('.', '::')
+}
+
+export function referenceNameFromFormField(name: string): string {
+  return name.replaceAll('::', '.')
+}
+
+export function workItemFormDefaults(
+  values: Record<string, unknown>,
+  controls: FormControl[]
+): Record<string, unknown> {
+  const defaults: Record<string, unknown> = {}
+  for (const control of controls) {
+    defaults[formFieldName(control.referenceName)] = values[control.referenceName] ?? null
+  }
+  return defaults
+}
+
+export function draftFromFormValues(formValues: Record<string, unknown>): Record<string, unknown> {
+  const draft: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(formValues)) {
+    draft[referenceNameFromFormField(key)] = value
+  }
+  return draft
+}
+
+export function workItemFormSchema(controls: FormControl[]) {
+  const shape: Record<string, z.ZodType> = {}
+  for (const control of controls) {
+    const key = formFieldName(control.referenceName)
+    if (control.required && control.kind !== 'boolean' && control.kind !== 'identity') {
+      shape[key] = z.union([z.string().min(1), z.number()])
+    } else if (control.required && control.kind === 'boolean') {
+      shape[key] = z.boolean()
+    } else {
+      shape[key] = z.any().nullable()
+    }
+  }
+  return z.object(shape)
 }

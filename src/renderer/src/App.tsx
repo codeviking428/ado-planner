@@ -363,6 +363,7 @@ function PlannerApp() {
           <HierarchyGantt
             scope={scope}
             items={visible}
+            iterations={iterationsQuery.data ?? []}
             onItemsChange={setNodes}
             onOpen={(id) => void openForm(id)}
           />
