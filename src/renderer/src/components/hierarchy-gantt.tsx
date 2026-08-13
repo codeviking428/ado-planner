@@ -1,5 +1,4 @@
 import { useMemo, useRef } from 'react'
-import { format } from 'date-fns'
 import { toast } from 'sonner'
 import { Gantt, type GanttColumn } from '@/components/reui/gantt/gantt'
 import { GanttNav } from '@/components/reui/gantt/gantt-nav'
@@ -11,10 +10,12 @@ import type {
 import { GanttView } from '@/components/reui/gantt/gantt-view'
 import { colorForType } from '@shared/flavor'
 import {
+  datesColumnText,
   fromGanttExclusiveEnd,
-  isUnscheduled,
   isoDateOnly,
-  toGanttInclusiveTarget
+  iterationHintForPath,
+  toGanttInclusiveTarget,
+  type IterationHint
 } from '@shared/dates'
 import type { ScopeSelection, WorkItemNode } from '@shared/types'
 
@@ -51,11 +52,13 @@ function toEvents(items: WorkItemNode[]): GanttEvent[] {
 export function HierarchyGantt({
   scope,
   items,
+  iterations = [],
   onItemsChange,
   onOpen
 }: {
   scope: ScopeSelection
   items: WorkItemNode[]
+  iterations?: Array<{ path: string; startDate: string | null; finishDate: string | null }>
   onItemsChange: (items: WorkItemNode[]) => void
   onOpen: (id: number) => void
 }) {
@@ -76,23 +79,18 @@ export function HierarchyGantt({
       {
         id: 'dates',
         title: 'Start / Target',
-        width: 220,
+        width: 280,
         render: ({ resource }) => {
           const item = byId.get(Number(resource.id))
           if (!item) {
             return null
           }
-          if (!item.hasDateFields) {
-            return 'No Start/Target on type'
-          }
-          if (isUnscheduled(item)) {
-            return 'Unscheduled'
-          }
-          return `${format(new Date(item.startDate as string), 'yyyy-MM-dd')} → ${format(new Date(item.targetDate as string), 'yyyy-MM-dd')}`
+          const hint: IterationHint | null = iterationHintForPath(item.iterationPath, iterations)
+          return <span data-testid={`dates-${item.id}`}>{datesColumnText(item, items, hint)}</span>
         }
       }
     ],
-    [byId]
+    [byId, items, iterations]
   )
 
   const handleEventUpdate = (update: GanttProposedUpdate) => {

@@ -108,3 +108,44 @@ export function typeHasStartAndTarget(fieldReferenceNames: string[]): boolean {
     fieldReferenceNames.includes(TARGET_DATE_FIELD)
   )
 }
+
+function ymd(value: Date | string | null | undefined): string {
+  if (!value) {
+    return ''
+  }
+  const date = value instanceof Date ? value : parseIsoDate(value)
+  return date ? date.toISOString().slice(0, 10) : ''
+}
+
+/** Tree-column copy. Iteration/rollup hints are display-only — never PATCHed. */
+export function datesColumnText(
+  node: WorkItemNode,
+  nodes: WorkItemNode[],
+  iteration: IterationHint | null
+): string {
+  if (!node.hasDateFields) {
+    return 'No Start/Target on type'
+  }
+  if (!isUnscheduled(node)) {
+    return `${ymd(node.startDate)} → ${ymd(node.targetDate)}`
+  }
+  const rollup = clientRollup(nodes, node.id)
+  if (rollup) {
+    return `Unscheduled · rollup ${ymd(rollup.startDate)}–${ymd(rollup.targetDate)}`
+  }
+  if (iteration?.startDate && iteration.finishDate) {
+    return `Unscheduled · iteration ${ymd(iteration.startDate)}–${ymd(iteration.finishDate)}`
+  }
+  return 'Unscheduled'
+}
+
+export function iterationHintForPath(
+  path: string,
+  iterations: Array<{ path: string; startDate: string | null; finishDate: string | null }>
+): IterationHint | null {
+  const match = iterations.find((row) => row.path === path)
+  if (!match) {
+    return null
+  }
+  return { startDate: match.startDate, finishDate: match.finishDate }
+}
