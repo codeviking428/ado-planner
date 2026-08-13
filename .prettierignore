@@ -1,0 +1,10 @@
+out
+dist
+release
+node_modules
+pnpm-lock.yaml
+*.png
+*.ico
+*.icns
+.agents
+skills-lock.json

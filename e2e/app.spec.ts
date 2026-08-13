@@ -1,0 +1,40 @@
+import { expect, test } from './fixtures'
+
+test('seeded Session shows signed-in chrome and scope picker', async ({ window }) => {
+  await expect(window.getByTestId('signed-in-chrome')).toBeVisible()
+  await expect(window.getByTestId('session-name')).toHaveText('Ada Lovelace')
+  await expect(window.locator('#org')).toHaveValue('contoso')
+  await expect(window.locator('#project')).toHaveValue('Shop')
+  await expect(window.locator('#team')).toHaveValue('Platform')
+})
+
+test('loads Hierarchy including an unparented root', async ({ window }) => {
+  await expect(window.getByTestId('work-item-1001')).toBeVisible()
+  await expect(window.getByTestId('work-item-1003')).toContainText('Persist cart')
+  await expect(window.getByTestId('work-item-1012')).toContainText('Unparented spike')
+})
+
+test('drag date PATCHes Start/Target and shows a success toast', async ({ window }) => {
+  const bar = window.locator('[data-slot="gantt-bar"]').first()
+  await expect(bar).toBeVisible()
+  const box = await bar.boundingBox()
+  if (!box) {
+    throw new Error('missing bar')
+  }
+  await window.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await window.mouse.down()
+  await window.mouse.move(box.x + box.width / 2 + 80, box.y + box.height / 2, { steps: 8 })
+  await window.mouse.up()
+  await expect(window.locator('.cn-toast').first()).toContainText(
+    'Saved Start Date and Target Date'
+  )
+})
+
+test('open and save Work Item form with a success toast', async ({ window }) => {
+  await window.getByTestId('work-item-1003').dblclick()
+  await expect(window.getByText('#1003 User Story')).toBeVisible()
+  const title = window.locator('#System\\.Title')
+  await title.fill('Persist cart (saved)')
+  await window.getByTestId('save-work-item').click()
+  await expect(window.locator('.cn-toast').first()).toContainText('Saved Work Item #1003')
+})

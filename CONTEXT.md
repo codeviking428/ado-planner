@@ -25,3 +25,6 @@ _Avoid_: personal Microsoft account, MSA, PAT as the primary login
 
 **Flavor**:
 A Catppuccin palette: Latte, Frappé, Macchiato, or Mocha.
+
+**Unscheduled**:
+A Work Item whose Start Date and Target Date are empty. Iteration Path dates may be shown as a display hint; they are not a schedule until the user drags or edits dates.

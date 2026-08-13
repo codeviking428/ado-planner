@@ -1,0 +1,212 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+@import '@fontsource-variable/geist';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: 'Geist Variable', sans-serif;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Catppuccin Latte — only light Flavor. https://catppuccin.com/palette/ */
+:root,
+.light,
+[data-flavor='latte'] {
+  --background: hsl(220 23.08% 94.9%);
+  --foreground: hsl(234 16.02% 35.49%);
+  --card: hsl(220 23.08% 94.9%);
+  --card-foreground: hsl(234 16.02% 35.49%);
+  --popover: hsl(220 23.08% 94.9%);
+  --popover-foreground: hsl(234 16.02% 35.49%);
+  --primary: hsl(266 85.05% 58.04%);
+  --primary-foreground: hsl(220 23.08% 94.9%);
+  --secondary: hsl(223 15.91% 82.75%);
+  --secondary-foreground: hsl(234 16.02% 35.49%);
+  --muted: hsl(223 15.91% 82.75%);
+  --muted-foreground: hsl(233 12.8% 41.37%);
+  --accent: hsl(223 15.91% 82.75%);
+  --accent-foreground: hsl(234 16.02% 35.49%);
+  --destructive: hsl(347 86.67% 44.12%);
+  --border: hsl(225 13.56% 76.86%);
+  --input: hsl(225 13.56% 76.86%);
+  --ring: hsl(234 16.02% 35.49%);
+  --chart-1: hsl(345 57.65% 74.12%);
+  --chart-2: hsl(185 37.25% 70.59%);
+  --chart-3: hsl(219 81.96% 78.43%);
+  --chart-4: hsl(35 61.18% 76.86%);
+  --chart-5: hsl(113 32.94% 73.33%);
+  --radius: 0.625rem;
+  --sidebar: hsl(218 25.1% 93.73%);
+  --sidebar-foreground: hsl(234 16.02% 35.49%);
+  --sidebar-primary: hsl(266 85.05% 58.04%);
+  --sidebar-primary-foreground: hsl(220 23.08% 94.9%);
+  --sidebar-accent: hsl(220 23.08% 94.9%);
+  --sidebar-accent-foreground: hsl(234 16.02% 35.49%);
+  --sidebar-border: hsl(225 13.56% 76.86%);
+  --sidebar-ring: hsl(225 13.56% 76.86%);
+}
+
+/* Catppuccin Mocha */
+.dark,
+[data-flavor='mocha'] {
+  --background: hsl(240 21.05% 14.9%);
+  --foreground: hsl(226 63.93% 88.04%);
+  --card: hsl(240 21.05% 14.9%);
+  --card-foreground: hsl(226 63.93% 88.04%);
+  --popover: hsl(240 21.05% 14.9%);
+  --popover-foreground: hsl(226 63.93% 88.04%);
+  --primary: hsl(267 83.51% 80.98%);
+  --primary-foreground: hsl(240 21.05% 14.9%);
+  --secondary: hsl(237 16.24% 22.94%);
+  --secondary-foreground: hsl(226 63.93% 88.04%);
+  --muted: hsl(237 16.24% 22.94%);
+  --muted-foreground: hsl(227 35.29% 80%);
+  --accent: hsl(237 16.24% 22.94%);
+  --accent-foreground: hsl(226 63.93% 88.04%);
+  --destructive: hsl(343 81.25% 74.9%);
+  --border: hsl(234 13.21% 31.18%);
+  --input: hsl(234 13.21% 31.18%);
+  --ring: hsl(226 63.93% 88.04%);
+  --chart-1: hsl(329 21.57% 37.25%);
+  --chart-2: hsl(188 18.82% 37.25%);
+  --chart-3: hsl(221 27.45% 39.61%);
+  --chart-4: hsl(30 9.41% 42.35%);
+  --chart-5: hsl(139 12.94% 38.04%);
+  --sidebar: hsl(240 21.18% 14.12%);
+  --sidebar-foreground: hsl(226 63.93% 88.04%);
+  --sidebar-primary: hsl(267 83.51% 80.98%);
+  --sidebar-primary-foreground: hsl(240 21.05% 14.9%);
+  --sidebar-accent: hsl(240 21.05% 14.9%);
+  --sidebar-accent-foreground: hsl(226 63.93% 88.04%);
+  --sidebar-border: hsl(234 13.21% 31.18%);
+  --sidebar-ring: hsl(234 13.21% 31.18%);
+}
+
+/* Catppuccin Frappé is dark. */
+.dark[data-flavor='frappe'],
+[data-flavor='frappe'] {
+  --background: hsl(229 19% 23%);
+  --foreground: hsl(227 70% 87%);
+  --card: hsl(229 19% 23%);
+  --card-foreground: hsl(227 70% 87%);
+  --popover: hsl(229 19% 23%);
+  --popover-foreground: hsl(227 70% 87%);
+  --primary: hsl(277 59% 76%);
+  --primary-foreground: hsl(229 19% 23%);
+  --secondary: hsl(227 22% 32%);
+  --secondary-foreground: hsl(227 70% 87%);
+  --muted: hsl(227 22% 32%);
+  --muted-foreground: hsl(228 20% 65%);
+  --accent: hsl(227 22% 32%);
+  --accent-foreground: hsl(227 70% 87%);
+  --destructive: hsl(359 68% 71%);
+  --border: hsl(228 13% 36%);
+  --input: hsl(228 13% 36%);
+  --ring: hsl(227 70% 87%);
+  --chart-1: hsl(359 68% 71%);
+  --chart-2: hsl(172 23% 69%);
+  --chart-3: hsl(222 74% 74%);
+  --chart-4: hsl(40 70% 72%);
+  --chart-5: hsl(96 44% 68%);
+  --sidebar: hsl(231 19% 20%);
+  --sidebar-foreground: hsl(227 70% 87%);
+  --sidebar-primary: hsl(277 59% 76%);
+  --sidebar-primary-foreground: hsl(229 19% 23%);
+  --sidebar-accent: hsl(229 19% 23%);
+  --sidebar-accent-foreground: hsl(227 70% 87%);
+  --sidebar-border: hsl(228 13% 36%);
+  --sidebar-ring: hsl(228 13% 36%);
+}
+
+/* Catppuccin Macchiato is dark. */
+.dark[data-flavor='macchiato'],
+[data-flavor='macchiato'] {
+  --background: hsl(232 23% 18%);
+  --foreground: hsl(227 68% 88%);
+  --card: hsl(232 23% 18%);
+  --card-foreground: hsl(227 68% 88%);
+  --popover: hsl(232 23% 18%);
+  --popover-foreground: hsl(227 68% 88%);
+  --primary: hsl(267 83% 80%);
+  --primary-foreground: hsl(232 23% 18%);
+  --secondary: hsl(230 19% 26%);
+  --secondary-foreground: hsl(227 68% 88%);
+  --muted: hsl(230 19% 26%);
+  --muted-foreground: hsl(228 26% 72%);
+  --accent: hsl(230 19% 26%);
+  --accent-foreground: hsl(227 68% 88%);
+  --destructive: hsl(351 74% 73%);
+  --border: hsl(230 14% 29%);
+  --input: hsl(230 14% 29%);
+  --ring: hsl(227 68% 88%);
+  --chart-1: hsl(351 74% 73%);
+  --chart-2: hsl(171 40% 73%);
+  --chart-3: hsl(220 83% 75%);
+  --chart-4: hsl(40 70% 78%);
+  --chart-5: hsl(115 54% 72%);
+  --sidebar: hsl(233 23% 16%);
+  --sidebar-foreground: hsl(227 68% 88%);
+  --sidebar-primary: hsl(267 83% 80%);
+  --sidebar-primary-foreground: hsl(232 23% 18%);
+  --sidebar-accent: hsl(232 23% 18%);
+  --sidebar-accent-foreground: hsl(227 68% 88%);
+  --sidebar-border: hsl(230 14% 29%);
+  --sidebar-ring: hsl(230 14% 29%);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* Opaque lighter same-hue stroke on every Gantt bar (Latte contrast). */
+[data-slot='gantt-bar'] {
+  box-shadow: inset 0 0 0 2px color-mix(in oklch, var(--gantt-event-color) 58%, white);
+}
