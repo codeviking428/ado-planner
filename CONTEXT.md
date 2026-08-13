@@ -17,10 +17,11 @@ An Azure DevOps project team whose area paths bound the Hierarchy shown on the G
 _Avoid_: board (when meaning the Kanban board)
 
 **Gantt bar**:
-The timeline representation of a Work Item's start and end dates.
+The timeline representation of a Work Item's Start Date and Target Date.
 
 **Session**:
-The securely stored Entra login that lets the app call Azure DevOps without signing in every launch.
+The securely stored Entra work/school login that lets the app call Azure DevOps without signing in every launch.
+_Avoid_: personal Microsoft account, MSA, PAT as the primary login
 
 **Flavor**:
 A Catppuccin palette: Latte, Frappé, Macchiato, or Mocha.
