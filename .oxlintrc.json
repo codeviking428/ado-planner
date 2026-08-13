@@ -1,0 +1,3 @@
+{
+  "ignorePatterns": [".agents/**", "out/**", "release/**", "e2e/**"]
+}
