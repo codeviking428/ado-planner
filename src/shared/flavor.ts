@@ -30,6 +30,6 @@ export function isDarkFlavor(flavor: Flavor): boolean {
   return flavor !== 'latte'
 }
 
-export function defaultFlavor(prefersDark: boolean): Flavor {
-  return prefersDark ? 'mocha' : 'latte'
+export function defaultFlavor(): Flavor {
+  return 'mocha'
 }

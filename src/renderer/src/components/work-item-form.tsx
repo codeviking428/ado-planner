@@ -23,6 +23,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { DescriptionEditor } from '@/components/description-editor'
 import { IdentityCombobox } from '@/components/identity-combobox'
+import { showErrorToast } from '@/lib/error-toast'
 import {
   allEditableControls,
   draftFromFormValues,
@@ -168,7 +169,7 @@ export function WorkItemFormDialog({
         toast.success(`Saved Work Item #${model.id}`)
         onSaved(result.rev, draft)
       } catch (error) {
-        toast.error(error instanceof Error ? error.message : 'Save failed')
+        showErrorToast(error, 'Save failed')
       }
     }
   })

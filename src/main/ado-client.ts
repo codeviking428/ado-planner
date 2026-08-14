@@ -104,6 +104,14 @@ export class AdoClient {
   }
 
   async listOrganizations(): Promise<Organization[]> {
+    if (this.tokens.scheme === 'pat') {
+      const organization = await this.tokens.getOrganization()
+      if (!organization) {
+        throw new Error('No Azure DevOps organization is configured')
+      }
+      return [{ accountName: organization }]
+    }
+
     const token = await this.tokens.getAccessToken()
     const scheme = this.tokens.scheme
     const profile = (await restJson(
