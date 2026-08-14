@@ -20,6 +20,7 @@ import {
 } from '@shared/hierarchy'
 import { typeHasStartAndTarget } from '@shared/dates'
 import { flattenLayout, type FieldMetadata, type ProcessLayout } from '@shared/form-layout'
+import { adoAuthorizationHeader } from './ado-auth'
 import type { TokenProvider } from './session'
 
 function baseUrl(): string {
@@ -30,11 +31,16 @@ function vsspsUrl(): string {
   return (process.env.ADO_PLANNER_VSSPS_URL ?? baseUrl()).replace(/\/$/, '')
 }
 
-async function rest<T>(token: string, url: string, init?: RequestInit): Promise<T> {
+async function rest<T>(
+  token: string,
+  scheme: 'bearer' | 'pat',
+  url: string,
+  init?: RequestInit
+): Promise<T> {
   const response = await fetch(url, {
     ...init,
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: adoAuthorizationHeader(token, scheme),
       Accept: 'application/json',
       'Content-Type': 'application/json',
       ...(init?.headers ?? {})
@@ -59,19 +65,20 @@ export class RestAdoClient {
     return this.tokens.getAccessToken()
   }
 
+  private async request<T>(url: string, init?: RequestInit): Promise<T> {
+    return rest<T>(await this.token(), this.tokens.scheme, url, init)
+  }
+
   private orgUrl(org: string): string {
     return `${baseUrl()}/${org}`
   }
 
   async listOrganizations(): Promise<Organization[]> {
-    const token = await this.token()
-    const profile = await rest<{ id?: string }>(
-      token,
+    const profile = await this.request<{ id?: string }>(
       `${vsspsUrl()}/_apis/profile/profiles/me?api-version=7.1`
     )
     const qs = profile.id ? `memberId=${profile.id}&` : ''
-    const payload = await rest<Collection<{ accountName?: string }>>(
-      token,
+    const payload = await this.request<Collection<{ accountName?: string }>>(
       `${vsspsUrl()}/_apis/accounts?${qs}api-version=7.1`
     )
     return (payload.value ?? [])
@@ -81,8 +88,7 @@ export class RestAdoClient {
   }
 
   async listProjects(org: string): Promise<Project[]> {
-    const payload = await rest<Collection<{ id?: string; name?: string }>>(
-      await this.token(),
+    const payload = await this.request<Collection<{ id?: string; name?: string }>>(
       `${this.orgUrl(org)}/_apis/projects?api-version=7.1`
     )
     return (payload.value ?? []).map((row) => ({
@@ -92,8 +98,7 @@ export class RestAdoClient {
   }
 
   async listTeams(org: string, project: string): Promise<Team[]> {
-    const payload = await rest<Collection<{ id?: string; name?: string }>>(
-      await this.token(),
+    const payload = await this.request<Collection<{ id?: string; name?: string }>>(
       `${this.orgUrl(org)}/_apis/projects/${encodeURIComponent(project)}/teams?api-version=7.1`
     )
     return (payload.value ?? []).map((row) => ({
@@ -103,14 +108,13 @@ export class RestAdoClient {
   }
 
   async listIterations(org: string, project: string, team: string): Promise<IterationNode[]> {
-    const payload = await rest<
+    const payload = await this.request<
       Collection<{
         path?: string
         name?: string
         attributes?: { startDate?: string; finishDate?: string }
       }>
     >(
-      await this.token(),
       `${this.orgUrl(org)}/${encodeURIComponent(project)}/${encodeURIComponent(team)}/_apis/work/teamsettings/iterations?api-version=7.1`
     )
     return (payload.value ?? []).map((row) => ({
@@ -123,16 +127,13 @@ export class RestAdoClient {
   }
 
   async loadHierarchy(scope: ScopeSelection): Promise<HierarchyResult> {
-    const token = await this.token()
     const teamRoot = `${this.orgUrl(scope.org)}/${encodeURIComponent(scope.project)}/${encodeURIComponent(scope.team)}`
     const projectRoot = `${this.orgUrl(scope.org)}/${encodeURIComponent(scope.project)}`
     const [fieldValues, backlogs] = await Promise.all([
-      rest<{ values?: Array<{ value?: string; includeChildren?: boolean }> }>(
-        token,
+      this.request<{ values?: Array<{ value?: string; includeChildren?: boolean }> }>(
         `${teamRoot}/_apis/work/teamsettings/teamfieldvalues?api-version=7.1`
       ),
-      rest<Collection<{ workItemTypes?: Array<{ name?: string }> }>>(
-        token,
+      this.request<Collection<{ workItemTypes?: Array<{ name?: string }> }>>(
         `${teamRoot}/_apis/work/backlogs?api-version=7.1`
       )
     ])
@@ -147,8 +148,7 @@ export class RestAdoClient {
       value: value.value ?? '',
       includeChildren: value.includeChildren !== false
     }))
-    const wiql = await rest<{ workItems?: Array<{ id?: number }> }>(
-      token,
+    const wiql = await this.request<{ workItems?: Array<{ id?: number }> }>(
       `${projectRoot}/_apis/wit/wiql?api-version=7.1`,
       {
         method: 'POST',
@@ -162,8 +162,7 @@ export class RestAdoClient {
       .filter((id): id is number => id != null)
     const typeDateFields = new Set<string>()
     for (const type of types) {
-      const fields = await rest<Collection<{ referenceName?: string }>>(
-        token,
+      const fields = await this.request<Collection<{ referenceName?: string }>>(
         `${projectRoot}/_apis/wit/workitemtypes/${encodeURIComponent(type)}/fields?api-version=7.1`
       )
       const names = (fields.value ?? []).map((field) => field.referenceName ?? '')
@@ -173,9 +172,9 @@ export class RestAdoClient {
     }
     const nodes: import('@shared/types').WorkItemNode[] = []
     for (const chunk of chunkIds(ids, BATCH_SIZE)) {
-      const batch = await rest<
+      const batch = await this.request<
         Collection<{ id?: number; rev?: number; fields?: Record<string, unknown> }>
-      >(token, `${projectRoot}/_apis/wit/workitemsbatch?api-version=7.1`, {
+      >(`${projectRoot}/_apis/wit/workitemsbatch?api-version=7.1`, {
         method: 'POST',
         body: JSON.stringify({ ids: chunk, fields: HIERARCHY_FIELDS, errorPolicy: 'Omit' })
       })
@@ -196,8 +195,7 @@ export class RestAdoClient {
     id: number
     document: JsonPatchOp[]
   }): Promise<{ rev: number }> {
-    const updated = await rest<{ rev?: number }>(
-      await this.token(),
+    const updated = await this.request<{ rev?: number }>(
       `${this.orgUrl(input.org)}/${encodeURIComponent(input.project)}/_apis/wit/workitems/${input.id}?api-version=7.1`,
       { method: 'PATCH', body: JSON.stringify(input.document) }
     )
@@ -205,20 +203,17 @@ export class RestAdoClient {
   }
 
   async loadForm(org: string, project: string, id: number): Promise<WorkItemFormModel> {
-    const token = await this.token()
     const projectRoot = `${this.orgUrl(org)}/${encodeURIComponent(project)}`
-    const item = await rest<{
+    const item = await this.request<{
       id?: number
       rev?: number
       fields?: Record<string, unknown>
-    }>(token, `${projectRoot}/_apis/wit/workitems/${id}?api-version=7.1`)
+    }>(`${projectRoot}/_apis/wit/workitems/${id}?api-version=7.1`)
     const typeName = String(item.fields?.['System.WorkItemType'] ?? '')
-    const layout = await rest<ProcessLayout>(
-      token,
+    const layout = await this.request<ProcessLayout>(
       `${this.orgUrl(org)}/_apis/work/processes/agile/workItemTypes/${encodeURIComponent(typeName)}/layout?api-version=7.1`
     ).catch(() => ({ systemControls: [], pages: [] }))
-    const fields = await rest<Collection<FieldMetadata>>(
-      token,
+    const fields = await this.request<Collection<FieldMetadata>>(
       `${projectRoot}/_apis/wit/workitemtypes/${encodeURIComponent(typeName)}/fields?$expand=All&api-version=7.1`
     )
     const flattened = flattenLayout(layout, fields.value ?? [])
@@ -242,8 +237,7 @@ export class RestAdoClient {
   }
 
   async searchIdentities(org: string, query: string): Promise<IdentityValue[]> {
-    const payload = await rest<Collection<IdentityValue>>(
-      await this.token(),
+    const payload = await this.request<Collection<IdentityValue>>(
       `${this.orgUrl(org)}/_apis/identities?searchFilter=General&filterValue=${encodeURIComponent(query)}&api-version=7.1`
     )
     return payload.value ?? []

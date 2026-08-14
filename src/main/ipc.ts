@@ -2,6 +2,7 @@ import { ipcMain } from 'electron'
 import { buildFormPatch } from '@shared/form-layout'
 import { buildStartTargetPatch } from '@shared/dates'
 import {
+  loginCredsSchema,
   openFormSchema,
   patchDatesSchema,
   saveFormSchema,
@@ -18,7 +19,9 @@ export function registerIpc(tokens: TokenProvider, updater: UpdaterBridge): void
   const ado = useRestAdo() ? new RestAdoClient(tokens) : new AdoClient(tokens)
 
   ipcMain.handle('session:get', () => tokens.getSessionInfo())
-  ipcMain.handle('session:login', () => tokens.login())
+  ipcMain.handle('session:login', (_event, payload: unknown) =>
+    tokens.login(loginCredsSchema.parse(payload ?? undefined))
+  )
   ipcMain.handle('session:logout', () => tokens.logout())
 
   ipcMain.handle('ado:orgs', () => ado.listOrganizations())

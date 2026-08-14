@@ -7,6 +7,8 @@ files:
   - '!src/*'
   - '!e2e/*'
   - '!docs/*'
+  - '!scripts/*'
+  - '!.github/*'
   - '!electron.vite.config.{js,ts,mjs,cjs}'
   - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
@@ -35,3 +37,4 @@ publish:
   provider: github
   owner: codeviking428
   repo: ado-planner
+  releaseType: release

@@ -10,15 +10,22 @@ import {
 } from '@azure/msal-node'
 import { ADO_RESOURCE_SCOPE, ENTRA_AUTHORITY } from '@shared/types'
 import type { SessionInfo } from '@shared/types'
+import { entraClientIdFromEnv } from './auth-mode'
 import { createMsalCachePlugin, shouldPersistSession, type CacheStore } from './msal-cache'
+import { createPatTokenProvider } from './pat-session'
 
 const SCOPES = [ADO_RESOURCE_SCOPE]
 const SSO_PARTITION = 'persist:ado-planner-sso'
 
+export type LoginCreds = {
+  pat?: string
+}
+
 export type TokenProvider = {
+  scheme: 'bearer' | 'pat'
   getAccessToken(): Promise<string>
   getSessionInfo(): Promise<SessionInfo>
-  login(): Promise<SessionInfo>
+  login(creds?: LoginCreds): Promise<SessionInfo>
   logout(): Promise<void>
 }
 
@@ -30,14 +37,6 @@ type SafeStorageLike = {
 
 export function isE2e(): boolean {
   return process.env.ADO_PLANNER_E2E === '1'
-}
-
-function clientId(): string {
-  return (
-    process.env.ENTRA_CLIENT_ID ||
-    process.env.MAIN_VITE_ENTRA_CLIENT_ID ||
-    '00000000-0000-0000-0000-000000000000'
-  )
 }
 
 async function atomicWrite(filePath: string, data: Buffer): Promise<void> {
@@ -77,9 +76,11 @@ export function createE2eTokenProvider(): TokenProvider {
   const info: SessionInfo = {
     signedIn: true,
     displayName: process.env.ADO_PLANNER_E2E_DISPLAY_NAME ?? 'Ada Lovelace',
-    username: process.env.ADO_PLANNER_E2E_USERNAME ?? 'ada@contoso.com'
+    username: process.env.ADO_PLANNER_E2E_USERNAME ?? 'ada@contoso.com',
+    authMode: 'entra'
   }
   return {
+    scheme: 'bearer',
     async getAccessToken() {
       return 'e2e-token'
     },
@@ -102,7 +103,6 @@ export async function createSessionTokenProvider(): Promise<TokenProvider> {
     return createE2eTokenProvider()
   }
 
-  const cachePath = join(app.getPath('userData'), 'session', 'msal.bin')
   const backend =
     typeof safeStorage.getSelectedStorageBackend === 'function'
       ? safeStorage.getSelectedStorageBackend()
@@ -111,13 +111,22 @@ export async function createSessionTokenProvider(): Promise<TokenProvider> {
     platform: process.platform,
     storageBackend: backend
   })
+  const sessionDir = join(app.getPath('userData'), 'session')
+  const storeFor = (file: string): CacheStore =>
+    createSafeStorageStore(join(sessionDir, file), persistToDisk)
+
+  const clientId = entraClientIdFromEnv()
+  if (!clientId) {
+    return createPatTokenProvider({ store: storeFor('pat.bin') })
+  }
+
   const plugin: ICachePlugin & { wipe(): Promise<void> } = createMsalCachePlugin(
-    createSafeStorageStore(cachePath, persistToDisk)
+    storeFor('msal.bin')
   )
 
   const pca = new PublicClientApplication({
     auth: {
-      clientId: clientId(),
+      clientId,
       authority: ENTRA_AUTHORITY
     },
     cache: { cachePlugin: plugin }
@@ -155,6 +164,7 @@ export async function createSessionTokenProvider(): Promise<TokenProvider> {
   }
 
   return {
+    scheme: 'bearer',
     async getAccessToken() {
       const result = await silentOrInteractive()
       return result.accessToken
@@ -163,12 +173,13 @@ export async function createSessionTokenProvider(): Promise<TokenProvider> {
       const accounts = await pca.getTokenCache().getAllAccounts()
       const account = lastAccount ?? accounts[0]
       if (!account) {
-        return { signedIn: false, displayName: null, username: null }
+        return { signedIn: false, displayName: null, username: null, authMode: 'entra' }
       }
       return {
         signedIn: true,
         displayName: account.name ?? account.username,
-        username: account.username
+        username: account.username,
+        authMode: 'entra'
       }
     },
     async login() {
@@ -176,12 +187,13 @@ export async function createSessionTokenProvider(): Promise<TokenProvider> {
       const accounts = await pca.getTokenCache().getAllAccounts()
       const account = lastAccount ?? accounts[0]
       if (!account) {
-        return { signedIn: false, displayName: null, username: null }
+        return { signedIn: false, displayName: null, username: null, authMode: 'entra' }
       }
       return {
         signedIn: true,
         displayName: account.name ?? account.username,
-        username: account.username
+        username: account.username,
+        authMode: 'entra'
       }
     },
     async logout() {

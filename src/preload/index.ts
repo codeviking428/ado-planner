@@ -16,7 +16,7 @@ import type { OverlayFilter } from '@shared/types'
 export type PlannerApi = {
   session: {
     get(): Promise<SessionInfo>
-    login(): Promise<SessionInfo>
+    login(creds?: { pat?: string }): Promise<SessionInfo>
     logout(): Promise<void>
   }
   ado: {
@@ -57,7 +57,7 @@ export type PlannerApi = {
 const api: PlannerApi = {
   session: {
     get: () => ipcRenderer.invoke('session:get'),
-    login: () => ipcRenderer.invoke('session:login'),
+    login: (creds) => ipcRenderer.invoke('session:login', creds),
     logout: () => ipcRenderer.invoke('session:logout')
   },
   ado: {

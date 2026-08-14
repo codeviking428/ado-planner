@@ -3,12 +3,25 @@
   "version": "0.1.0",
   "description": "Monday-lite Azure DevOps Team Hierarchy Gantt",
   "main": "./out/main/index.js",
+  "bin": {
+    "ado-planner": "bin/ado-planner.cjs"
+  },
+  "files": [
+    "bin",
+    "out",
+    "resources",
+    "scripts"
+  ],
   "author": "ado-planner",
   "homepage": "https://github.com/codeviking428/ado-planner",
   "repository": {
     "type": "git",
     "url": "https://github.com/codeviking428/ado-planner.git"
   },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.30.3",
   "scripts": {
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -22,12 +35,12 @@
     "start": "electron-vite preview",
     "dev": "electron-vite dev",
     "build": "pnpm typecheck && electron-vite build",
-    "postinstall": "electron-builder install-app-deps",
+    "postinstall": "node scripts/postinstall.cjs",
     "build:unpack": "pnpm build && electron-builder --dir",
     "build:win": "pnpm build && electron-builder --win",
     "build:linux": "electron-vite build && electron-builder --linux",
     "e2e": "pnpm build && playwright test -c e2e/playwright.config.ts",
-    "prepare": "lefthook install"
+    "prepare": "node scripts/prepare.cjs"
   },
   "dependencies": {
     "@azure/msal-node": "^3.8.4",
@@ -46,6 +59,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
+    "electron": "^39.2.6",
     "electron-updater": "^6.7.3",
     "lucide-react": "^0.562.0",
     "react": "^19.2.1",
@@ -65,7 +79,6 @@
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
-    "electron": "^39.2.6",
     "electron-builder": "^26.0.12",
     "electron-vite": "^5.0.0",
     "lefthook": "^2.0.12",

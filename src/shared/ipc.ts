@@ -1,5 +1,11 @@
 import { z } from 'zod'
 
+export const loginCredsSchema = z
+  .object({
+    pat: z.string().optional()
+  })
+  .optional()
+
 export const scopeSchema = z.object({
   org: z.string().min(1),
   project: z.string().min(1),
