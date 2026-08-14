@@ -19,11 +19,13 @@ const SSO_PARTITION = 'persist:ado-planner-sso'
 
 export type LoginCreds = {
   pat?: string
+  organization?: string
 }
 
 export type TokenProvider = {
   scheme: 'bearer' | 'pat'
   getAccessToken(): Promise<string>
+  getOrganization(): Promise<string | null>
   getSessionInfo(): Promise<SessionInfo>
   login(creds?: LoginCreds): Promise<SessionInfo>
   logout(): Promise<void>
@@ -83,6 +85,9 @@ export function createE2eTokenProvider(): TokenProvider {
     scheme: 'bearer',
     async getAccessToken() {
       return 'e2e-token'
+    },
+    async getOrganization() {
+      return null
     },
     async getSessionInfo() {
       return info
@@ -168,6 +173,9 @@ export async function createSessionTokenProvider(): Promise<TokenProvider> {
     async getAccessToken() {
       const result = await silentOrInteractive()
       return result.accessToken
+    },
+    async getOrganization() {
+      return null
     },
     async getSessionInfo() {
       const accounts = await pca.getTokenCache().getAllAccounts()

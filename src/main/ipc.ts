@@ -19,9 +19,26 @@ export function registerIpc(tokens: TokenProvider, updater: UpdaterBridge): void
   const ado = useRestAdo() ? new RestAdoClient(tokens) : new AdoClient(tokens)
 
   ipcMain.handle('session:get', () => tokens.getSessionInfo())
-  ipcMain.handle('session:login', (_event, payload: unknown) =>
-    tokens.login(loginCredsSchema.parse(payload ?? undefined))
-  )
+  ipcMain.handle('session:login', async (_event, payload: unknown) => {
+    const info = await tokens.login(loginCredsSchema.parse(payload ?? undefined))
+    if (tokens.scheme !== 'pat' || !info.signedIn) {
+      return info
+    }
+
+    const organization = await tokens.getOrganization()
+    if (!organization) {
+      await tokens.logout()
+      throw new Error('No Azure DevOps organization is configured')
+    }
+    try {
+      await ado.listProjects(organization)
+      return info
+    } catch (error) {
+      await tokens.logout()
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      throw new Error(`Could not connect to Azure DevOps organization: ${message}`)
+    }
+  })
   ipcMain.handle('session:logout', () => tokens.logout())
 
   ipcMain.handle('ado:orgs', () => ado.listOrganizations())

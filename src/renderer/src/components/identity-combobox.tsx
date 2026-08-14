@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { showErrorToast } from '@/lib/error-toast'
 import type { IdentityValue } from '@shared/types'
 
 type IdentityComboboxProps = {
@@ -24,7 +25,10 @@ export function IdentityCombobox({ org, value, onChange, disabled }: IdentityCom
       void window.planner.ado
         .identities(org, query.trim())
         .then(setOptions)
-        .catch(() => setOptions([]))
+        .catch((error: unknown) => {
+          setOptions([])
+          showErrorToast(error, 'Could not search identities')
+        })
     }, 200)
     return () => window.clearTimeout(handle)
   }, [open, org, query])

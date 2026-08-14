@@ -74,6 +74,14 @@ export class RestAdoClient {
   }
 
   async listOrganizations(): Promise<Organization[]> {
+    if (this.tokens.scheme === 'pat') {
+      const organization = await this.tokens.getOrganization()
+      if (!organization) {
+        throw new Error('No Azure DevOps organization is configured')
+      }
+      return [{ accountName: organization }]
+    }
+
     const profile = await this.request<{ id?: string }>(
       `${vsspsUrl()}/_apis/profile/profiles/me?api-version=7.1`
     )

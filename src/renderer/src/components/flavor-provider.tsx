@@ -23,9 +23,7 @@ function applyFlavor(flavor: Flavor): void {
 
 export function FlavorProvider({ children }: { children: React.ReactNode }) {
   const [flavor, setFlavorState] = React.useState<Flavor>(() => {
-    return (
-      readStoredFlavor() ?? defaultFlavor(window.matchMedia('(prefers-color-scheme: dark)').matches)
-    )
+    return readStoredFlavor() ?? defaultFlavor()
   })
 
   const setFlavor = React.useCallback((next: Flavor) => {

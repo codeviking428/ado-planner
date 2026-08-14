@@ -8,6 +8,7 @@ import type {
   GanttResource
 } from '@/components/reui/gantt/gantt-types'
 import { GanttView } from '@/components/reui/gantt/gantt-view'
+import { showErrorToast } from '@/lib/error-toast'
 import { colorForType } from '@shared/flavor'
 import {
   datesColumnText,
@@ -53,12 +54,14 @@ export function HierarchyGantt({
   scope,
   items,
   iterations = [],
+  loading = false,
   onItemsChange,
   onOpen
 }: {
   scope: ScopeSelection
   items: WorkItemNode[]
   iterations?: Array<{ path: string; startDate: string | null; finishDate: string | null }>
+  loading?: boolean
   onItemsChange: (items: WorkItemNode[]) => void
   onOpen: (id: number) => void
 }) {
@@ -100,7 +103,7 @@ export function HierarchyGantt({
       return false
     }
     if (!item.hasDateFields) {
-      toast.error(`#${item.id} ${item.type} has no Start Date / Target Date`)
+      showErrorToast(`#${item.id} ${item.type} has no Start Date / Target Date`)
       return false
     }
     const previousStart = item.startDate
@@ -136,12 +139,12 @@ export function HierarchyGantt({
             row.id === id ? { ...row, startDate: previousStart, targetDate: previousTarget } : row
           )
         )
-        toast.error(error instanceof Error ? error.message : 'PATCH failed')
+        showErrorToast(error, 'PATCH failed')
       })
     return true
   }
 
-  if (items.length === 0) {
+  if (items.length === 0 && !loading) {
     return (
       <div
         className="text-muted-foreground flex h-full items-center justify-center text-sm"
@@ -156,6 +159,7 @@ export function HierarchyGantt({
     <Gantt
       events={events}
       resources={resources}
+      loading={loading}
       defaultScale="month"
       className="h-full text-xs"
       summaryBars

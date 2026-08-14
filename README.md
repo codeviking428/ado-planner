@@ -75,7 +75,8 @@ If no Entra app ID is configured (the default), ADO Planner asks for a PAT at st
 
 1. In Azure DevOps: **User settings → Personal access tokens → New Token**.
 2. Scopes: **Work Items (Read & Write)** and **Project and Team (Read)**. Full access is fine too.
-3. Paste the token into the sign-in screen and click **Continue**.
+3. Enter the organization URL, such as `https://dev.azure.com/contoso`.
+4. Paste the token into the sign-in screen and click **Continue**.
 
 The token is stored with Electron `safeStorage` on your machine. On Linux without a secret store it stays in memory only, so you'll paste it again next launch. **Log out** wipes it.
 

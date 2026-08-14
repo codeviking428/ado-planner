@@ -2,7 +2,8 @@ import { z } from 'zod'
 
 export const loginCredsSchema = z
   .object({
-    pat: z.string().optional()
+    pat: z.string().optional(),
+    organization: z.string().optional()
   })
   .optional()
 

@@ -7,6 +7,19 @@ export type WorkItemRecord = {
   fields: Record<string, unknown>
 }
 
+type PendingResponse = {
+  path: string
+  delayMs: number
+  failure?: { status: number; message: string }
+}
+
+export type AdoMock = {
+  url: string
+  delayNext: (path: string, delayMs: number) => void
+  failNext: (path: string, status: number, message: string) => void
+  close: () => Promise<void>
+}
+
 const TYPES_WITH_DATES = new Set(['Epic', 'Feature', 'User Story', 'Task'])
 
 function day(iso: string) {
@@ -153,6 +166,7 @@ const TYPE_FIELDS = [
 
 export function startAdoMock(port = 0) {
   const items = seedItems()
+  const pendingResponses: PendingResponse[] = []
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -160,17 +174,42 @@ export function startAdoMock(port = 0) {
     const method = req.method ?? 'GET'
 
     try {
+      const pendingIndex = pendingResponses.findIndex((pending) => path.includes(pending.path))
+      if (pendingIndex >= 0) {
+        const [pending] = pendingResponses.splice(pendingIndex, 1)
+        if (pending.delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, pending.delayMs))
+        }
+        if (pending.failure) {
+          return json(res, pending.failure.status, { message: pending.failure.message })
+        }
+      }
+
       if (path.endsWith('/_apis/profile/profiles/me')) {
         return json(res, 200, { id: 'user-1', displayName: 'Ada Lovelace' })
       }
       if (path.endsWith('/_apis/accounts')) {
-        return json(res, 200, { value: [{ accountName: 'contoso' }] })
+        return json(res, 200, {
+          value: [{ accountName: 'contoso' }, { accountName: 'fabrikam' }]
+        })
       }
       if (path.endsWith('/_apis/projects') && method === 'GET') {
-        return json(res, 200, { value: [{ id: 'p1', name: 'Shop' }] })
+        return json(
+          res,
+          200,
+          path.startsWith('/fabrikam/')
+            ? { value: [{ id: 'p2', name: 'Roadmap' }] }
+            : { value: [{ id: 'p1', name: 'Shop' }] }
+        )
       }
       if (path.includes('/_apis/projects/') && path.endsWith('/teams')) {
-        return json(res, 200, { value: [{ id: 't1', name: 'Platform' }] })
+        return json(
+          res,
+          200,
+          path.includes('/Roadmap/')
+            ? { value: [{ id: 't2', name: 'Delivery' }] }
+            : { value: [{ id: 't1', name: 'Platform' }] }
+        )
       }
       if (path.includes('/teamfieldvalues')) {
         return json(res, 200, {
@@ -262,12 +301,18 @@ export function startAdoMock(port = 0) {
     }
   })
 
-  return new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
+  return new Promise<AdoMock>((resolve) => {
     server.listen(port, '127.0.0.1', () => {
       const address = server.address()
       const bound = typeof address === 'object' && address ? address.port : port
       resolve({
         url: `http://127.0.0.1:${bound}`,
+        delayNext(path, delayMs) {
+          pendingResponses.push({ path, delayMs })
+        },
+        failNext(path, status, message) {
+          pendingResponses.push({ path, delayMs: 0, failure: { status, message } })
+        },
         close: () =>
           new Promise((done) => {
             server.close(() => done())

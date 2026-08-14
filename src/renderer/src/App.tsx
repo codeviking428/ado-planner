@@ -3,6 +3,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Spinner } from '@/components/ui/spinner'
 import {
   Dialog,
   DialogContent,
@@ -14,6 +15,7 @@ import {
 import { useFlavor } from '@/components/flavor-provider'
 import { HierarchyGantt } from '@/components/hierarchy-gantt'
 import { WorkItemFormDialog } from '@/components/work-item-form'
+import { showErrorToast } from '@/lib/error-toast'
 import { applyOverlays } from '@shared/overlays'
 import { FLAVORS } from '@shared/flavor'
 import type {
@@ -31,6 +33,7 @@ function NativeSelect({
   value,
   onChange,
   disabled,
+  loading,
   children,
   label
 }: {
@@ -38,14 +41,17 @@ function NativeSelect({
   value: string
   onChange: (value: string) => void
   disabled?: boolean
+  loading?: boolean
   children: ReactNode
   label: string
 }) {
   return (
     <label className="flex items-center gap-2 text-sm">
       <span className="text-muted-foreground">{label}</span>
+      {loading ? <Spinner className="size-3.5" data-testid={`${id}-loading`} /> : null}
       <select
         id={id}
+        aria-busy={loading}
         className="border-input bg-background h-8 rounded-md border px-2 text-sm"
         value={value}
         disabled={disabled}
@@ -57,14 +63,23 @@ function NativeSelect({
   )
 }
 
+function useQueryErrorToast(error: unknown, fallback: string): void {
+  useEffect(() => {
+    if (error) {
+      showErrorToast(error, fallback)
+    }
+  }, [error, fallback])
+}
+
 function SignInShell({
   session,
   onLogin
 }: {
   session: SessionInfo | undefined
-  onLogin: (pat?: string) => void
+  onLogin: (creds?: { pat?: string; organization?: string }) => void
 }) {
   const [pat, setPat] = useState('')
+  const [organization, setOrganization] = useState('')
   const patMode = session?.authMode === 'pat'
   return (
     <div
@@ -76,8 +91,19 @@ function SignInShell({
         <>
           <p className="text-muted-foreground max-w-md text-center text-sm">
             Entra app ID is not set. Paste an Azure DevOps personal access token to continue while
-            SSO is unavailable. Scopes: Work (read & write), Project, and Profile.
+            SSO is unavailable. Scopes: Work (read & write) and Project.
           </p>
+          <Input
+            type="url"
+            autoCapitalize="none"
+            autoComplete="url"
+            spellCheck={false}
+            data-testid="organization-input"
+            placeholder="https://dev.azure.com/your-organization"
+            value={organization}
+            onChange={(event) => setOrganization(event.target.value)}
+            className="max-w-sm"
+          />
           <Input
             type="password"
             autoComplete="off"
@@ -87,7 +113,11 @@ function SignInShell({
             onChange={(event) => setPat(event.target.value)}
             className="max-w-sm"
           />
-          <Button onClick={() => onLogin(pat)} disabled={!pat.trim()} data-testid="sign-in">
+          <Button
+            onClick={() => onLogin({ pat, organization })}
+            disabled={!pat.trim() || !organization.trim()}
+            data-testid="sign-in"
+          >
             Continue
           </Button>
         </>
@@ -128,14 +158,15 @@ function PlannerApp() {
   })
 
   const login = useMutation({
-    mutationFn: (creds?: { pat?: string }) => window.planner.session.login(creds),
+    mutationFn: (creds?: { pat?: string; organization?: string }) =>
+      window.planner.session.login(creds),
     onSuccess: (info) => {
       sessionQuery.refetch()
       if (!info.signedIn) {
-        toast.error('Sign-in did not create a Session')
+        showErrorToast('Sign-in did not create a Session')
       }
     },
-    onError: (error: Error) => toast.error(error.message)
+    onError: (error: Error) => showErrorToast(error, 'Sign-in failed')
   })
 
   const orgsQuery = useQuery({
@@ -170,6 +201,19 @@ function PlannerApp() {
     queryFn: () => window.planner.ado.hierarchy(scope as ScopeSelection),
     enabled: Boolean(scope)
   })
+  const scopeIsFetching =
+    orgsQuery.isFetching ||
+    projectsQuery.isFetching ||
+    teamsQuery.isFetching ||
+    iterationsQuery.isFetching ||
+    hierarchyQuery.isFetching
+
+  useQueryErrorToast(sessionQuery.error, 'Could not start Session')
+  useQueryErrorToast(orgsQuery.error, 'Could not load organizations')
+  useQueryErrorToast(projectsQuery.error, 'Could not load projects')
+  useQueryErrorToast(teamsQuery.error, 'Could not load Teams')
+  useQueryErrorToast(iterationsQuery.error, 'Could not load iterations')
+  useQueryErrorToast(hierarchyQuery.error, 'Could not load Hierarchy')
 
   useEffect(() => {
     if (hierarchyQuery.data) {
@@ -181,23 +225,18 @@ function PlannerApp() {
   }, [hierarchyQuery.data])
 
   useEffect(() => {
-    if (hierarchyQuery.error) {
-      toast.error(
-        hierarchyQuery.error instanceof Error
-          ? hierarchyQuery.error.message
-          : 'Could not load Hierarchy'
-      )
-    }
-  }, [hierarchyQuery.error])
-
-  useEffect(() => {
     const offAvailable = window.planner.updater.onAvailable(setUpdater)
-    const offError = window.planner.updater.onError((message) => toast.error(message))
-    void window.planner.updater.prompt().then((prompt) => {
-      if (prompt) {
-        setUpdater(prompt)
-      }
-    })
+    const offError = window.planner.updater.onError((message) =>
+      showErrorToast(message, 'Updater failed')
+    )
+    void window.planner.updater
+      .prompt()
+      .then((prompt) => {
+        if (prompt) {
+          setUpdater(prompt)
+        }
+      })
+      .catch((error: unknown) => showErrorToast(error, 'Could not check for updates'))
     return () => {
       offAvailable()
       offError()
@@ -244,25 +283,33 @@ function PlannerApp() {
       setOpenId(id)
       setForm(model)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Could not open Work Item')
+      showErrorToast(error, 'Could not open Work Item')
     }
   }
 
-  if (sessionQuery.isPending || !sessionQuery.data) {
+  if (sessionQuery.isPending) {
     return (
-      <div className="flex h-svh items-center justify-center" data-testid="session-loading">
+      <div
+        className="text-muted-foreground flex h-svh items-center justify-center gap-2 text-sm"
+        data-testid="session-loading"
+      >
+        <Spinner />
         <p className="text-muted-foreground text-sm">Starting Session…</p>
       </div>
     )
   }
 
-  if (!sessionQuery.data.signedIn) {
+  if (!sessionQuery.data) {
     return (
-      <SignInShell
-        session={sessionQuery.data}
-        onLogin={(pat) => login.mutate(pat ? { pat } : undefined)}
-      />
+      <div className="flex h-svh flex-col items-center justify-center gap-3">
+        <p className="text-muted-foreground text-sm">Could not start Session.</p>
+        <Button onClick={() => void sessionQuery.refetch()}>Retry</Button>
+      </div>
     )
+  }
+
+  if (!sessionQuery.data.signedIn) {
+    return <SignInShell session={sessionQuery.data} onLogin={(creds) => login.mutate(creds)} />
   }
 
   return (
@@ -285,7 +332,11 @@ function PlannerApp() {
             setOrg(value)
             setProject('')
             setTeam('')
+            setIterationPath('')
+            setNodes([])
           }}
+          disabled={scopeIsFetching}
+          loading={orgsQuery.isFetching}
         >
           <option value="">Select org</option>
           {(orgsQuery.data ?? []).map((row) => (
@@ -301,8 +352,11 @@ function PlannerApp() {
           onChange={(value) => {
             setProject(value)
             setTeam('')
+            setIterationPath('')
+            setNodes([])
           }}
-          disabled={!org}
+          disabled={!org || scopeIsFetching}
+          loading={projectsQuery.isFetching}
         >
           <option value="">Select project</option>
           {(projectsQuery.data ?? []).map((row) => (
@@ -311,7 +365,18 @@ function PlannerApp() {
             </option>
           ))}
         </NativeSelect>
-        <NativeSelect id="team" label="Team" value={team} onChange={setTeam} disabled={!project}>
+        <NativeSelect
+          id="team"
+          label="Team"
+          value={team}
+          onChange={(value) => {
+            setTeam(value)
+            setIterationPath('')
+            setNodes([])
+          }}
+          disabled={!project || scopeIsFetching}
+          loading={teamsQuery.isFetching || hierarchyQuery.isFetching}
+        >
           <option value="">Select Team</option>
           {(teamsQuery.data ?? []).map((row) => (
             <option key={row.id} value={row.name}>
@@ -324,7 +389,8 @@ function PlannerApp() {
           label="Iteration"
           value={iterationPath}
           onChange={setIterationPath}
-          disabled={!team}
+          disabled={!team || scopeIsFetching}
+          loading={iterationsQuery.isFetching}
         >
           <option value="">All</option>
           {(iterationsQuery.data ?? []).map((row) => (
@@ -359,7 +425,10 @@ function PlannerApp() {
           variant="outline"
           size="sm"
           onClick={() => {
-            void window.planner.session.logout().then(() => sessionQuery.refetch())
+            void window.planner.session
+              .logout()
+              .then(() => sessionQuery.refetch())
+              .catch((error: unknown) => showErrorToast(error, 'Could not log out'))
           }}
         >
           Log out
@@ -403,6 +472,7 @@ function PlannerApp() {
             scope={scope}
             items={visible}
             iterations={iterationsQuery.data ?? []}
+            loading={hierarchyQuery.isFetching}
             onItemsChange={setNodes}
             onOpen={(id) => void openForm(id)}
           />
@@ -453,15 +523,19 @@ function PlannerApp() {
               <Button
                 variant="outline"
                 onClick={() => {
-                  void window.planner.updater.snooze()
-                  setUpdater(null)
+                  void window.planner.updater
+                    .snooze()
+                    .then(() => setUpdater(null))
+                    .catch((error: unknown) => showErrorToast(error, 'Could not dismiss update'))
                 }}
               >
                 No
               </Button>
               <Button
                 onClick={() => {
-                  void window.planner.updater.apply()
+                  void window.planner.updater
+                    .apply()
+                    .catch((error: unknown) => showErrorToast(error, 'Could not apply update'))
                 }}
               >
                 Yes
