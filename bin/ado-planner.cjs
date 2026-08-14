@@ -5,7 +5,6 @@ const { spawn } = require('node:child_process')
 const { existsSync } = require('node:fs')
 const { join } = require('node:path')
 
-const electron = require('electron')
 const main = join(__dirname, '..', 'out', 'main', 'index.js')
 
 if (!existsSync(main)) {
@@ -16,20 +15,37 @@ if (!existsSync(main)) {
   process.exit(1)
 }
 
-const child = spawn(electron, [main, ...process.argv.slice(2)], {
-  stdio: 'inherit',
-  windowsHide: false
-})
-
-child.on('error', (error) => {
-  console.error(error)
-  process.exit(1)
-})
-
-child.on('exit', (code, signal) => {
-  if (signal) {
-    process.kill(process.pid, signal)
-    return
+function localElectron() {
+  try {
+    return require('electron')
+  } catch {
+    return null
   }
-  process.exit(code ?? 0)
-})
+}
+
+function run(command, args) {
+  const child = spawn(command, args, {
+    stdio: 'inherit',
+    windowsHide: false,
+    shell: process.platform === 'win32' && command === 'npx'
+  })
+  child.on('error', (error) => {
+    console.error(error)
+    process.exit(1)
+  })
+  child.on('exit', (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal)
+      return
+    }
+    process.exit(code ?? 0)
+  })
+}
+
+const electron = localElectron()
+if (electron) {
+  run(electron, [main, ...process.argv.slice(2)])
+} else {
+  const spec = require('../package.json').devDependencies.electron
+  run('npx', ['--yes', `electron@${spec}`, main, ...process.argv.slice(2)])
+}
