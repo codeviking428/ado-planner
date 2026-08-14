@@ -88,4 +88,14 @@ describe('applyOverlays', () => {
     })
     expect(visible.map((n) => n.id).sort()).toEqual([1, 2, 4])
   })
+
+  test('empty type overlay matches nothing', () => {
+    const visible = applyOverlays(forest, {
+      types: [],
+      states: null,
+      assignee: 'anyone',
+      iterationPath: null
+    })
+    expect(visible).toEqual([])
+  })
 })

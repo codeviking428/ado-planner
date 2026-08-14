@@ -86,6 +86,15 @@ describe('PAT Session', () => {
     await expect(provider.login({ pat: 'pat-secret-value' })).rejects.toThrow(/organization URL/)
   })
 
+  test('organization URLs with extra path are shortened to the org slug', async () => {
+    const provider = createPatTokenProvider({ store: memoryStore(false) })
+    await provider.login({
+      pat: 'pat-secret-value',
+      organization: 'https://dev.azure.com/contoso/Shop/_workitems/edit/123'
+    })
+    expect(await provider.getOrganization()).toBe('contoso')
+  })
+
   test('legacy visualstudio.com organization URLs are normalized', async () => {
     const provider = createPatTokenProvider({ store: memoryStore(false) })
     await provider.login({

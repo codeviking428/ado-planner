@@ -1,3 +1,4 @@
+import { shortenOrganizationUrl } from '@shared/organization-url'
 import type { SessionInfo } from '@shared/types'
 import type { CacheStore } from './msal-cache'
 import type { TokenProvider } from './session'
@@ -8,7 +9,7 @@ type PatCredentials = {
 }
 
 function normalizeOrganization(value: string): string {
-  const input = value.trim()
+  const input = shortenOrganizationUrl(value).trim()
   if (/^[a-z0-9][a-z0-9-]{0,49}$/i.test(input)) {
     return input
   }

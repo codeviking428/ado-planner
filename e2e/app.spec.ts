@@ -1,11 +1,20 @@
+import type { Page } from '@playwright/test'
 import { expect, test } from './fixtures'
+
+async function chooseScope(window: Page, id: string, option: string) {
+  await window.locator(`#${id}`).click()
+  await window.getByRole('option', { name: option, exact: true }).click()
+}
 
 test('seeded Session shows signed-in chrome and scope picker', async ({ window }) => {
   await expect(window.getByTestId('signed-in-chrome')).toBeVisible()
   await expect(window.getByTestId('session-name')).toHaveText('Ada Lovelace')
-  await expect(window.locator('#org')).toHaveValue('contoso')
-  await expect(window.locator('#project')).toHaveValue('Shop')
-  await expect(window.locator('#team')).toHaveValue('Platform')
+  await expect(window.locator('#org')).toContainText('contoso')
+  await expect(window.locator('#project')).toContainText('Shop')
+  await expect(window.locator('#team')).toContainText('Platform')
+  await expect(window.locator('#iteration')).toContainText('All')
+  await expect(window.locator('#assignee')).toContainText('Anyone')
+  await expect(window.locator('#iteration')).not.toContainText('__none__')
 })
 
 test('scope controls lock and show a spinner while switching organizations', async ({
@@ -15,7 +24,7 @@ test('scope controls lock and show a spinner while switching organizations', asy
   await expect(window.getByTestId('work-item-1001')).toBeVisible()
   adoMock.delayNext('/fabrikam/_apis/projects', 1_000)
 
-  await window.locator('#org').selectOption('fabrikam')
+  await chooseScope(window, 'org', 'fabrikam')
 
   await expect(window.getByTestId('project-loading')).toBeVisible()
   await expect(window.locator('#org')).toBeDisabled()
@@ -23,8 +32,8 @@ test('scope controls lock and show a spinner while switching organizations', asy
   await expect(window.locator('#team')).toBeDisabled()
   await expect(window.locator('#iteration')).toBeDisabled()
 
-  await expect(window.locator('#project')).toHaveValue('Roadmap')
-  await expect(window.locator('#team')).toHaveValue('Delivery')
+  await expect(window.locator('#project')).toContainText('Roadmap')
+  await expect(window.locator('#team')).toContainText('Delivery')
   await expect(window.locator('#org')).toBeEnabled()
   await expect(window.locator('#project')).toBeEnabled()
   await expect(window.locator('#team')).toBeEnabled()
@@ -49,7 +58,7 @@ test('scope errors show a toast whose message can be copied', async ({ adoMock, 
   })
   adoMock.failNext('/fabrikam/_apis/projects', 503, 'Projects unavailable')
 
-  await window.locator('#org').selectOption('fabrikam')
+  await chooseScope(window, 'org', 'fabrikam')
 
   const errorToast = window.locator('.cn-toast').filter({ hasText: 'Projects unavailable' }).first()
   await expect(errorToast).toBeVisible()
@@ -73,10 +82,48 @@ test('loads Hierarchy including an unparented root', async ({ window }) => {
   await expect(window.getByTestId('work-item-1001')).toBeVisible()
   await expect(window.getByTestId('work-item-1003')).toContainText('Persist cart')
   await expect(window.getByTestId('work-item-1012')).toContainText('Unparented spike')
-  await expect(window.getByTestId('dates-1012')).toHaveText(
-    'Unscheduled · iteration 2026-08-10–2026-08-21'
-  )
+  await expect(window.getByTestId('dates-1012')).toContainText('Unscheduled')
+  await expect(window.getByTestId('dates-1012')).toContainText('2026-08-10')
   await expect(window.getByTestId('dates-1003')).toHaveText('2026-07-06 → 2026-07-20')
+})
+
+test('type filter hides a leaf Work Item and can show it again', async ({ window }) => {
+  await expect(window.getByTestId('work-item-1012')).toBeVisible()
+  await window.getByTestId('type-filter').click()
+  await window.getByRole('menuitemcheckbox', { name: 'Task' }).click()
+  await expect(window.getByTestId('work-item-1012')).toBeHidden()
+  await expect(window.getByTestId('type-filter')).toContainText('1 hidden')
+  await window.getByRole('menuitemcheckbox', { name: 'Task' }).click()
+  await expect(window.getByTestId('work-item-1012')).toBeVisible()
+})
+
+test('type filter Hide all clears the Hierarchy', async ({ window }) => {
+  await expect(window.getByTestId('work-item-1001')).toBeVisible()
+  await window.getByTestId('type-filter').click()
+  await window.getByRole('menuitem', { name: 'Hide all' }).click()
+  await expect(window.getByTestId('empty-gantt')).toBeVisible()
+  await window.getByTestId('type-filter').click()
+  await window.getByRole('menuitem', { name: 'Show all' }).click()
+  await expect(window.getByTestId('work-item-1001')).toBeVisible()
+})
+
+test('Work Item titles and types are not clipped', async ({ window }) => {
+  await expect(window.getByTestId('work-item-1003')).toBeVisible()
+  const overflowing = await window.getByTestId('work-item-1003').evaluate((el) => {
+    const title = el.querySelector('span.truncate') ?? el
+    return title.scrollWidth > title.clientWidth + 1
+  })
+  expect(overflowing).toBe(false)
+  await expect(window.getByText('User Story', { exact: true }).first()).toBeVisible()
+  await window.screenshot({
+    path: 'test-results/planner-board.png',
+    fullPage: true
+  })
+  await window.getByTestId('type-filter').click()
+  await expect(window.getByRole('menuitemcheckbox', { name: 'Epic' })).toBeVisible()
+  await window.screenshot({
+    path: 'test-results/planner-filters.png'
+  })
 })
 
 test('drag date PATCHes Start/Target and shows a success toast', async ({ window }) => {

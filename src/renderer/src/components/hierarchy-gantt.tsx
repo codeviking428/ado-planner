@@ -1,4 +1,4 @@
-import { useMemo, useRef } from 'react'
+import { useMemo, useRef, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { Gantt, type GanttColumn } from '@/components/reui/gantt/gantt'
 import { GanttNav } from '@/components/reui/gantt/gantt-nav'
@@ -19,6 +19,39 @@ import {
   type IterationHint
 } from '@shared/dates'
 import type { ScopeSelection, WorkItemNode } from '@shared/types'
+
+function TypeBadge({ type }: { type: string }) {
+  const color = colorForType(type)
+  return (
+    <span
+      className="inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-0.5"
+      style={{ backgroundColor: `color-mix(in oklch, ${color} 18%, transparent)` }}
+      title={type}
+    >
+      <span className="size-1.5 shrink-0 rounded-full" style={{ backgroundColor: color }} />
+      <span className="truncate text-[12px] font-medium" style={{ color }}>
+        {type}
+      </span>
+    </span>
+  )
+}
+
+function DatesCell({ text }: { text: string }): ReactNode {
+  if (text.startsWith('Unscheduled')) {
+    const hint = text.replace(/^Unscheduled(?: · )?(?:iteration |rollup )?/, '')
+    return (
+      <span className="flex min-w-0 flex-col gap-0.5 leading-tight" title={text}>
+        <span className="text-muted-foreground">Unscheduled</span>
+        {hint ? <span className="truncate tabular-nums">{hint}</span> : null}
+      </span>
+    )
+  }
+  return (
+    <span className="truncate tabular-nums" title={text}>
+      {text}
+    </span>
+  )
+}
 
 function toResources(items: WorkItemNode[]): GanttResource[] {
   const byParent = new Map<number | null, WorkItemNode[]>()
@@ -76,20 +109,29 @@ export function HierarchyGantt({
       {
         id: 'type',
         title: 'Type',
-        width: 88,
-        render: ({ resource }) => byId.get(Number(resource.id))?.type ?? ''
+        width: 156,
+        className: 'min-w-0',
+        render: ({ resource }) => {
+          const type = byId.get(Number(resource.id))?.type
+          return type ? <TypeBadge type={type} /> : null
+        }
       },
       {
         id: 'dates',
         title: 'Start / Target',
-        width: 280,
+        width: 176,
+        className: 'min-w-0',
         render: ({ resource }) => {
           const item = byId.get(Number(resource.id))
           if (!item) {
             return null
           }
           const hint: IterationHint | null = iterationHintForPath(item.iterationPath, iterations)
-          return <span data-testid={`dates-${item.id}`}>{datesColumnText(item, items, hint)}</span>
+          return (
+            <span data-testid={`dates-${item.id}`} className="min-w-0">
+              <DatesCell text={datesColumnText(item, items, hint)} />
+            </span>
+          )
         }
       }
     ],
@@ -150,7 +192,7 @@ export function HierarchyGantt({
         className="text-muted-foreground flex h-full items-center justify-center text-sm"
         data-testid="empty-gantt"
       >
-        No Work Items in this Team.
+        No Work Items match this Team and the current filters.
       </div>
     )
   }
@@ -161,15 +203,16 @@ export function HierarchyGantt({
       resources={resources}
       loading={loading}
       defaultScale="month"
-      className="h-full text-xs"
+      className="h-full text-[13px]"
       summaryBars
       parentScheduling={false}
       rowCheckboxes={false}
       dragCreate={false}
       displayScheduleHint={false}
+      metrics={{ minRowHeight: 2.75, laneHeight: 1.4, rowPadding: 0.6 }}
       interactions={{ drag: true, resize: true, selectSlot: false }}
       columns={columns}
-      treePanel={{ width: 420, nameColumnWidth: 200 }}
+      treePanel={{ width: 592, nameColumnWidth: 248, minWidth: 360, maxWidth: 760 }}
       i18n={{ labels: { resources: 'Work Items' } }}
       canDropEvent={(update) => {
         const id = Number(update.event.resourceId ?? update.event.id)
@@ -186,14 +229,17 @@ export function HierarchyGantt({
           <span
             className="flex min-w-0 items-baseline gap-1.5"
             data-testid={`work-item-${resource.id}`}
+            title={item?.title ?? resource.title}
           >
-            <span className="text-muted-foreground font-mono">#{resource.id}</span>
-            <span className="truncate">{item?.title ?? resource.title}</span>
+            <span className="text-muted-foreground shrink-0 font-mono text-[12px]">
+              #{resource.id}
+            </span>
+            <span className="truncate font-medium">{item?.title ?? resource.title}</span>
           </span>
         )
       }}
     >
-      <GanttNav />
+      <GanttNav className="px-4 py-2.5" />
       <GanttView />
     </Gantt>
   )

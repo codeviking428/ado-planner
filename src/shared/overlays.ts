@@ -28,10 +28,10 @@ export function applyOverlays(nodes: WorkItemNode[], filter: OverlayFilter): Wor
 }
 
 function matchesOverlay(node: WorkItemNode, filter: OverlayFilter): boolean {
-  if (filter.types && filter.types.length > 0 && !filter.types.includes(node.type)) {
+  if (filter.types !== null && !filter.types.includes(node.type)) {
     return false
   }
-  if (filter.states && filter.states.length > 0 && !filter.states.includes(node.state)) {
+  if (filter.states !== null && !filter.states.includes(node.state)) {
     return false
   }
   if (filter.iterationPath && node.iterationPath !== filter.iterationPath) {
