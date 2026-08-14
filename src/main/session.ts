@@ -108,13 +108,13 @@ export async function createSessionTokenProvider(): Promise<TokenProvider> {
     return createE2eTokenProvider()
   }
 
-  const backend =
-    typeof safeStorage.getSelectedStorageBackend === 'function'
-      ? safeStorage.getSelectedStorageBackend()
-      : 'unknown'
   const persistToDisk = shouldPersistSession({
     platform: process.platform,
-    storageBackend: backend
+    encryptionAvailable: safeStorage.isEncryptionAvailable(),
+    storageBackend:
+      process.platform === 'linux' && typeof safeStorage.getSelectedStorageBackend === 'function'
+        ? safeStorage.getSelectedStorageBackend()
+        : undefined
   })
   const sessionDir = join(app.getPath('userData'), 'session')
   const storeFor = (file: string): CacheStore =>

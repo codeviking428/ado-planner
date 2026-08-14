@@ -2,12 +2,46 @@ import { describe, expect, test } from 'vitest'
 import { createMsalCachePlugin, shouldPersistSession } from './msal-cache'
 
 describe('Session cache policy', () => {
-  test('Linux basic_text is memory-only', () => {
-    expect(shouldPersistSession({ platform: 'linux', storageBackend: 'basic_text' })).toBe(false)
+  test('Windows persists when encryption is available without a storage backend', () => {
+    expect(shouldPersistSession({ platform: 'win32', encryptionAvailable: true })).toBe(true)
   })
 
-  test('Windows DPAPI persists to disk', () => {
-    expect(shouldPersistSession({ platform: 'win32', storageBackend: 'dpapi' })).toBe(true)
+  test('macOS persists when encryption is available without a storage backend', () => {
+    expect(shouldPersistSession({ platform: 'darwin', encryptionAvailable: true })).toBe(true)
+  })
+
+  test('Windows is memory-only when encryption is unavailable', () => {
+    expect(shouldPersistSession({ platform: 'win32', encryptionAvailable: false })).toBe(false)
+  })
+
+  test('Linux gnome_libsecret persists when encryption is available', () => {
+    expect(
+      shouldPersistSession({
+        platform: 'linux',
+        encryptionAvailable: true,
+        storageBackend: 'gnome_libsecret'
+      })
+    ).toBe(true)
+  })
+
+  test('Linux basic_text is memory-only', () => {
+    expect(
+      shouldPersistSession({
+        platform: 'linux',
+        encryptionAvailable: true,
+        storageBackend: 'basic_text'
+      })
+    ).toBe(false)
+  })
+
+  test('Linux unknown backend is memory-only', () => {
+    expect(
+      shouldPersistSession({
+        platform: 'linux',
+        encryptionAvailable: true,
+        storageBackend: 'unknown'
+      })
+    ).toBe(false)
   })
 
   test('plugin writes only when persistToDisk and cache changed', async () => {

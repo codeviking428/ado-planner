@@ -38,9 +38,17 @@ export function createMsalCachePlugin(store: CacheStore): ICachePlugin & {
   }
 }
 
-export function shouldPersistSession(input: { platform: string; storageBackend: string }): boolean {
-  if (input.platform === 'linux' && input.storageBackend === 'basic_text') {
+export function shouldPersistSession(input: {
+  platform: string
+  encryptionAvailable: boolean
+  storageBackend?: string
+}): boolean {
+  if (!input.encryptionAvailable) {
     return false
   }
-  return input.storageBackend !== 'unknown' && input.storageBackend !== 'basic_text'
+  if (input.platform === 'linux') {
+    const backend = input.storageBackend ?? 'unknown'
+    return backend !== 'basic_text' && backend !== 'unknown'
+  }
+  return true
 }
