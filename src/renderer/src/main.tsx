@@ -9,7 +9,12 @@ import './assets/index.css'
 
 const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { retry: false, refetchOnWindowFocus: false }
+    queries: {
+      retry: false,
+      refetchOnWindowFocus: false,
+      staleTime: 5 * 60 * 1000,
+      gcTime: 30 * 60 * 1000
+    }
   }
 })
 

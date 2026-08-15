@@ -33,7 +33,14 @@ export type HierarchyResult = {
   truncated: boolean
 }
 
-export type AssigneeFilter = 'anyone' | 'me' | 'unassigned'
+export const ASSIGNEE_SPECIALS = ['anyone', 'me', 'unassigned'] as const
+export type AssigneeSpecial = (typeof ASSIGNEE_SPECIALS)[number]
+/** `anyone` / `me` / `unassigned`, or a Team member `uniqueName`. */
+export type AssigneeFilter = AssigneeSpecial | (string & {})
+
+export function isAssigneeSpecial(value: string): value is AssigneeSpecial {
+  return (ASSIGNEE_SPECIALS as readonly string[]).includes(value)
+}
 
 export type OverlayFilter = {
   types: string[] | null

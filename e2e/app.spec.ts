@@ -87,6 +87,47 @@ test('loads Hierarchy including an unparented root', async ({ window }) => {
   await expect(window.getByTestId('dates-1003')).toHaveText('2026-07-06 → 2026-07-20')
 })
 
+test('assignee menu lists Team members and filters the Hierarchy', async ({ window }) => {
+  await expect(window.getByTestId('work-item-1003')).toBeVisible()
+  await window.locator('#assignee').click()
+  await expect(window.getByRole('option', { name: 'Ada Lovelace' })).toBeVisible()
+  await expect(window.getByRole('option', { name: 'Grace Hopper' })).toBeVisible()
+  await window.getByRole('option', { name: 'Grace Hopper' }).click()
+  await expect(window.getByTestId('work-item-1003')).toBeHidden()
+  await chooseScope(window, 'assignee', 'Anyone')
+  await expect(window.getByTestId('work-item-1003')).toBeVisible()
+})
+
+test('scope Team search filters options', async ({ window }) => {
+  await window.locator('#team').click()
+  await window.getByTestId('team-search').fill('Plat')
+  await expect(window.getByRole('option', { name: 'Platform' })).toBeVisible()
+  await expect(window.getByRole('option', { name: 'Select Team' })).toBeHidden()
+})
+
+test('scope and filters persist across reload', async ({ window }) => {
+  await expect(window.getByTestId('work-item-1001')).toBeVisible()
+  await chooseScope(window, 'org', 'fabrikam')
+  await expect(window.locator('#project')).toContainText('Roadmap')
+  await expect(window.locator('#team')).toContainText('Delivery')
+  await window.getByTestId('type-filter').click()
+  await window.getByRole('menuitemcheckbox', { name: 'Task' }).click()
+  await expect(window.getByTestId('type-filter')).toContainText('1 hidden')
+  await window.reload()
+  await expect(window.getByTestId('signed-in-chrome')).toBeVisible()
+  await expect(window.locator('#org')).toContainText('fabrikam')
+  await expect(window.locator('#project')).toContainText('Roadmap')
+  await expect(window.locator('#team')).toContainText('Delivery')
+  await expect(window.getByTestId('type-filter')).toContainText('1 hidden')
+})
+
+test('type filter search narrows the list', async ({ window }) => {
+  await window.getByTestId('type-filter').click()
+  await window.getByTestId('type-filter-search').fill('Task')
+  await expect(window.getByRole('menuitemcheckbox', { name: 'Task' })).toBeVisible()
+  await expect(window.getByRole('menuitemcheckbox', { name: 'Epic' })).toBeHidden()
+})
+
 test('type filter hides a leaf Work Item and can show it again', async ({ window }) => {
   await expect(window.getByTestId('work-item-1012')).toBeVisible()
   await window.getByTestId('type-filter').click()

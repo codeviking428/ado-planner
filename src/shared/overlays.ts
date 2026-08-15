@@ -37,14 +37,18 @@ function matchesOverlay(node: WorkItemNode, filter: OverlayFilter): boolean {
   if (filter.iterationPath && node.iterationPath !== filter.iterationPath) {
     return false
   }
-  if (filter.assignee === 'unassigned' && node.assignedTo) {
-    return false
+  if (filter.assignee === 'anyone') {
+    return true
   }
-  if (filter.assignee === 'me') {
-    const me = filter.currentUserUniqueName?.toLowerCase()
-    if (!me || node.assignedTo?.uniqueName.toLowerCase() !== me) {
-      return false
-    }
+  if (filter.assignee === 'unassigned') {
+    return !node.assignedTo
+  }
+  const wanted =
+    filter.assignee === 'me'
+      ? filter.currentUserUniqueName?.toLowerCase()
+      : filter.assignee.toLowerCase()
+  if (!wanted || node.assignedTo?.uniqueName.toLowerCase() !== wanted) {
+    return false
   }
   return true
 }

@@ -17,7 +17,7 @@ export const scopeSchema = z.object({
 export const overlaySchema = z.object({
   types: z.array(z.string()).nullable(),
   states: z.array(z.string()).nullable(),
-  assignee: z.enum(['anyone', 'me', 'unassigned']),
+  assignee: z.string().min(1),
   iterationPath: z.string().nullable(),
   currentUserUniqueName: z.string().nullable().optional()
 })
@@ -61,4 +61,10 @@ export const saveFormSchema = z.object({
 export const searchIdentitiesSchema = z.object({
   org: z.string().min(1),
   query: z.string().min(1)
+})
+
+export const teamMembersSchema = z.object({
+  org: z.string().min(1),
+  project: z.string().min(1),
+  team: z.string().min(1)
 })

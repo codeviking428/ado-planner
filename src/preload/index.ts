@@ -23,6 +23,7 @@ export type PlannerApi = {
     orgs(): Promise<Organization[]>
     projects(org: string): Promise<Project[]>
     teams(org: string, project: string): Promise<Team[]>
+    teamMembers(org: string, project: string, team: string): Promise<IdentityValue[]>
     iterations(org: string, project: string, team: string): Promise<IterationNode[]>
     hierarchy(scope: ScopeSelection): Promise<HierarchyResult>
     patchDates(input: {
@@ -64,6 +65,8 @@ const api: PlannerApi = {
     orgs: () => ipcRenderer.invoke('ado:orgs'),
     projects: (org) => ipcRenderer.invoke('ado:projects', org),
     teams: (org, project) => ipcRenderer.invoke('ado:teams', { org, project }),
+    teamMembers: (org, project, team) =>
+      ipcRenderer.invoke('ado:team-members', { org, project, team }),
     iterations: (org, project, team) =>
       ipcRenderer.invoke('ado:iterations', { org, project, team }),
     hierarchy: (scope) => ipcRenderer.invoke('ado:hierarchy', scope),
