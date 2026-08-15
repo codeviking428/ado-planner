@@ -39,6 +39,7 @@
     "build:unpack": "pnpm build && electron-builder --dir",
     "build:win": "pnpm build && electron-builder --win",
     "build:linux": "electron-vite build && electron-builder --linux",
+    "build:mac": "pnpm build && electron-builder --mac",
     "e2e": "pnpm build && playwright test -c e2e/playwright.config.ts",
     "prepare": "node scripts/prepare.cjs"
   },
