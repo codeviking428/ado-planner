@@ -7,7 +7,8 @@ import {
   patchDatesSchema,
   saveFormSchema,
   scopeSchema,
-  searchIdentitiesSchema
+  searchIdentitiesSchema,
+  teamMembersSchema
 } from '@shared/ipc'
 import type { FormControl } from '@shared/types'
 import { AdoClient } from './ado-client'
@@ -46,6 +47,10 @@ export function registerIpc(tokens: TokenProvider, updater: UpdaterBridge): void
   ipcMain.handle('ado:teams', (_event, payload: { org: string; project: string }) =>
     ado.listTeams(payload.org, payload.project)
   )
+  ipcMain.handle('ado:team-members', (_event, payload: unknown) => {
+    const input = teamMembersSchema.parse(payload)
+    return ado.listTeamMembers(input.org, input.project, input.team)
+  })
   ipcMain.handle(
     'ado:iterations',
     (_event, payload: { org: string; project: string; team: string }) =>

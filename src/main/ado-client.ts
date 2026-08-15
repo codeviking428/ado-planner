@@ -32,6 +32,7 @@ import {
 } from '@shared/hierarchy'
 import { typeHasStartAndTarget } from '@shared/dates'
 import { flattenLayout, type FieldMetadata, type ProcessLayout } from '@shared/form-layout'
+import { mapTeamMemberIdentities, type TeamMemberIdentityRow } from '@shared/team-members'
 import { adoAuthorizationHeader } from './ado-auth'
 import type { TokenProvider } from './session'
 
@@ -150,6 +151,16 @@ export class AdoClient {
       id: team.id ?? team.name ?? '',
       name: team.name ?? ''
     }))
+  }
+
+  async listTeamMembers(org: string, project: string, team: string): Promise<IdentityValue[]> {
+    const token = await this.tokens.getAccessToken()
+    const payload = (await restJson(
+      `${adoOrgUrl(org)}/_apis/projects/${encodeURIComponent(project)}/teams/${encodeURIComponent(team)}/members?$top=1000&api-version=7.1`,
+      token,
+      this.tokens.scheme
+    )) as { value?: TeamMemberIdentityRow[] }
+    return mapTeamMemberIdentities(payload.value ?? [])
   }
 
   async listIterations(org: string, project: string, team: string): Promise<IterationNode[]> {

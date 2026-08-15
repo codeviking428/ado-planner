@@ -89,6 +89,16 @@ describe('applyOverlays', () => {
     expect(visible.map((n) => n.id).sort()).toEqual([1, 2, 4])
   })
 
+  test('assignee uniqueName keeps that identity and ancestors', () => {
+    const visible = applyOverlays(forest, {
+      types: null,
+      states: null,
+      assignee: 'ada@contoso',
+      iterationPath: null
+    })
+    expect(visible.map((n) => n.id).sort()).toEqual([1, 2, 3])
+  })
+
   test('empty type overlay matches nothing', () => {
     const visible = applyOverlays(forest, {
       types: [],

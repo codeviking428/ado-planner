@@ -202,6 +202,42 @@ export function startAdoMock(port = 0) {
             : { value: [{ id: 'p1', name: 'Shop' }] }
         )
       }
+      if (path.includes('/teams/') && path.endsWith('/members')) {
+        return json(
+          res,
+          200,
+          path.includes('/Delivery/') || path.includes('/Roadmap/')
+            ? {
+                value: [
+                  {
+                    identity: {
+                      displayName: 'Grace Hopper',
+                      uniqueName: 'grace@contoso.com',
+                      id: 'g1'
+                    }
+                  }
+                ]
+              }
+            : {
+                value: [
+                  {
+                    identity: {
+                      displayName: 'Ada Lovelace',
+                      uniqueName: 'ada@contoso.com',
+                      id: 'a1'
+                    }
+                  },
+                  {
+                    identity: {
+                      displayName: 'Grace Hopper',
+                      uniqueName: 'grace@contoso.com',
+                      id: 'g1'
+                    }
+                  }
+                ]
+              }
+        )
+      }
       if (path.includes('/_apis/projects/') && path.endsWith('/teams')) {
         return json(
           res,
