@@ -1,27 +1,103 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: Semver to publish (no v prefix), e.g. 0.2.0
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
+  prepare:
+    name: Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Require master
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/master" ]; then
+            echo "Cut releases from master only (this run is ${GITHUB_REF})."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and tag
+        id: meta
+        env:
+          RAW: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${RAW#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid semver: $RAW"
+            exit 1
+          fi
+          TAG="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Bump package.json, commit, and tag
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          CURRENT="$(node -p "require('./package.json').version")"
+          if [ "$CURRENT" != "$VERSION" ]; then
+            node -e "
+              const fs = require('fs')
+              const path = 'package.json'
+              const pkg = JSON.parse(fs.readFileSync(path, 'utf8'))
+              pkg.version = process.env.VERSION
+              fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n')
+            "
+            git add package.json
+            git commit -m "chore(release): ${VERSION}"
+          fi
+          git tag -a "$TAG" -m "ADO Planner ${VERSION}"
+          git push origin HEAD:master
+          git push origin "$TAG"
+
   release:
+    name: ${{ matrix.name }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - name: Windows
+            os: windows-latest
             args: --win nsis
-          - os: ubuntu-latest
+          - name: Linux
+            os: ubuntu-latest
             args: --linux AppImage
+          - name: macOS
+            os: macos-latest
+            args: --mac
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - uses: pnpm/action-setup@v4
         with:
@@ -43,3 +119,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
