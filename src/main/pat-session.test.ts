@@ -29,22 +29,30 @@ function memoryStore(
   }
 }
 
+function createSession(
+  store = memoryStore(true),
+  resolveIdentity: () => Promise<{ displayName: string; username: string } | null> = async () =>
+    null
+) {
+  return createPatTokenProvider({ store, resolveIdentity })
+}
+
 describe('PAT Session', () => {
   test('login with a PAT and organization signs in and returns both', async () => {
-    const provider = createPatTokenProvider({ store: memoryStore(true) })
-    const info = await provider.login({
+    const tokens = createSession()
+    const info = await tokens.login({
       pat: 'pat-secret-value',
       organization: 'https://dev.azure.com/contoso/'
     })
     expect(info.signedIn).toBe(true)
     expect(info.authMode).toBe('pat')
-    expect(await provider.getAccessToken()).toBe('pat-secret-value')
-    expect(await provider.getOrganization()).toBe('contoso')
+    expect(await tokens.getAccessToken()).toBe('pat-secret-value')
+    expect(await tokens.getOrganization()).toBe('contoso')
   })
 
   test('login without a PAT is rejected', async () => {
-    const provider = createPatTokenProvider({ store: memoryStore(true) })
-    await expect(provider.login()).rejects.toThrow(/PAT/)
+    const tokens = createSession()
+    await expect(tokens.login()).rejects.toThrow(/PAT/)
   })
 
   test('stored credentials restore Session without asking again', async () => {
@@ -52,60 +60,70 @@ describe('PAT Session', () => {
       true,
       JSON.stringify({ pat: 'pat-secret-value', organization: 'contoso' })
     )
-    const provider = createPatTokenProvider({ store })
-    const info = await provider.getSessionInfo()
+    const tokens = createSession(store)
+    const info = await tokens.getSessionInfo()
     expect(info.signedIn).toBe(true)
-    expect(await provider.getAccessToken()).toBe('pat-secret-value')
-    expect(await provider.getOrganization()).toBe('contoso')
+    expect(await tokens.getAccessToken()).toBe('pat-secret-value')
+    expect(await tokens.getOrganization()).toBe('contoso')
   })
 
   test('logout wipes the stored PAT', async () => {
     const store = memoryStore(true)
-    const provider = createPatTokenProvider({ store })
-    await provider.login({ pat: 'pat-secret-value', organization: 'contoso' })
-    await provider.logout()
+    const tokens = createSession(store)
+    await tokens.login({ pat: 'pat-secret-value', organization: 'contoso' })
+    await tokens.logout()
     expect(store.unlinked).toBe(true)
-    expect((await provider.getSessionInfo()).signedIn).toBe(false)
+    expect((await tokens.getSessionInfo()).signedIn).toBe(false)
   })
 
   test('memory-only store never writes the PAT', async () => {
     const store = memoryStore(false)
-    const provider = createPatTokenProvider({ store })
-    await provider.login({ pat: 'pat-secret-value', organization: 'contoso' })
+    const tokens = createSession(store)
+    await tokens.login({ pat: 'pat-secret-value', organization: 'contoso' })
     expect(store.writes).toEqual([])
-    expect(await provider.getAccessToken()).toBe('pat-secret-value')
+    expect(await tokens.getAccessToken()).toBe('pat-secret-value')
   })
 
   test('blank PAT is rejected', async () => {
-    const provider = createPatTokenProvider({ store: memoryStore(true) })
-    await expect(provider.login({ pat: '   ', organization: 'contoso' })).rejects.toThrow(/PAT/)
+    const tokens = createSession()
+    await expect(tokens.login({ pat: '   ', organization: 'contoso' })).rejects.toThrow(/PAT/)
   })
 
   test('missing organization is rejected', async () => {
-    const provider = createPatTokenProvider({ store: memoryStore(true) })
-    await expect(provider.login({ pat: 'pat-secret-value' })).rejects.toThrow(/organization URL/)
+    const tokens = createSession()
+    await expect(tokens.login({ pat: 'pat-secret-value' })).rejects.toThrow(/organization URL/)
   })
 
   test('organization URLs with extra path are shortened to the org slug', async () => {
-    const provider = createPatTokenProvider({ store: memoryStore(false) })
-    await provider.login({
+    const tokens = createSession(memoryStore(false))
+    await tokens.login({
       pat: 'pat-secret-value',
       organization: 'https://dev.azure.com/contoso/Shop/_workitems/edit/123'
     })
-    expect(await provider.getOrganization()).toBe('contoso')
+    expect(await tokens.getOrganization()).toBe('contoso')
   })
 
   test('legacy visualstudio.com organization URLs are normalized', async () => {
-    const provider = createPatTokenProvider({ store: memoryStore(false) })
-    await provider.login({
+    const tokens = createSession(memoryStore(false))
+    await tokens.login({
       pat: 'pat-secret-value',
       organization: 'https://contoso.visualstudio.com/'
     })
-    expect(await provider.getOrganization()).toBe('contoso')
+    expect(await tokens.getOrganization()).toBe('contoso')
   })
 
   test('legacy PAT-only storage does not create an incomplete Session', async () => {
-    const provider = createPatTokenProvider({ store: memoryStore(true, 'pat-secret-value') })
-    expect((await provider.getSessionInfo()).signedIn).toBe(false)
+    const tokens = createSession(memoryStore(true, 'pat-secret-value'))
+    expect((await tokens.getSessionInfo()).signedIn).toBe(false)
+  })
+
+  test('resolved identity fills displayName and username', async () => {
+    const tokens = createSession(memoryStore(false), async () => ({
+      displayName: 'Ada Lovelace',
+      username: 'ada@contoso.com'
+    }))
+    const info = await tokens.login({ pat: 'pat-secret-value', organization: 'contoso' })
+    expect(info.displayName).toBe('Ada Lovelace')
+    expect(info.username).toBe('ada@contoso.com')
   })
 })

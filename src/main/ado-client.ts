@@ -30,6 +30,7 @@ import {
   HIERARCHY_FIELDS,
   mapBatchWorkItem
 } from '@shared/hierarchy'
+import { topBacklogTypesFromLevels } from '@shared/root-types'
 import { typeHasStartAndTarget } from '@shared/dates'
 import { flattenLayout, type FieldMetadata, type ProcessLayout } from '@shared/form-layout'
 import { mapTeamMemberIdentities, type TeamMemberIdentityRow } from '@shared/team-members'
@@ -196,6 +197,7 @@ export class AdoClient {
         )
       )
     ] as string[]
+    const topBacklogTypes = topBacklogTypesFromLevels(backlogs ?? [])
 
     const areas = (fieldValues.values ?? []).map((value) => ({
       value: value.value ?? '',
@@ -244,6 +246,7 @@ export class AdoClient {
     return {
       nodes: assembleForest(nodes),
       types,
+      topBacklogTypes,
       truncated
     }
   }

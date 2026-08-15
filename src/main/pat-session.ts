@@ -1,6 +1,7 @@
 import { shortenOrganizationUrl } from '@shared/organization-url'
 import type { SessionInfo } from '@shared/types'
 import type { CacheStore } from './msal-cache'
+import { fetchPatIdentity, type PatIdentity } from './pat-identity'
 import type { TokenProvider } from './session'
 
 type PatCredentials = {
@@ -57,9 +58,14 @@ function deserializeCredentials(serialized: string | null): PatCredentials | nul
   }
 }
 
-export function createPatTokenProvider(input: { store: CacheStore }): TokenProvider {
+export function createPatTokenProvider(input: {
+  store: CacheStore
+  resolveIdentity?: (org: string, pat: string) => Promise<PatIdentity | null>
+}): TokenProvider {
   let memory: PatCredentials | null = null
   let loaded = false
+  let identity: PatIdentity | null | undefined
+  const resolveIdentity = input.resolveIdentity ?? fetchPatIdentity
 
   const load = async (): Promise<PatCredentials | null> => {
     if (!loaded) {
@@ -76,7 +82,19 @@ export function createPatTokenProvider(input: { store: CacheStore }): TokenProvi
     if (!pat) {
       return { signedIn: false, displayName: null, username: null, authMode: 'pat' }
     }
-    return { signedIn: true, displayName: 'PAT', username: null, authMode: 'pat' }
+    if (identity === undefined) {
+      try {
+        identity = await resolveIdentity(pat.organization, pat.pat)
+      } catch {
+        identity = null
+      }
+    }
+    return {
+      signedIn: true,
+      displayName: identity?.displayName ?? 'PAT',
+      username: identity?.username ?? null,
+      authMode: 'pat'
+    }
   }
 
   return {
@@ -99,6 +117,7 @@ export function createPatTokenProvider(input: { store: CacheStore }): TokenProvi
       }
       const organization = normalizeOrganization(creds?.organization ?? '')
       memory = { pat, organization }
+      identity = undefined
       loaded = true
       if (input.store.persistToDisk) {
         await input.store.write(JSON.stringify(memory))
@@ -107,6 +126,7 @@ export function createPatTokenProvider(input: { store: CacheStore }): TokenProvi
     },
     async logout() {
       memory = null
+      identity = undefined
       loaded = true
       await input.store.unlink()
     }

@@ -18,6 +18,7 @@ import {
   HIERARCHY_FIELDS,
   mapBatchWorkItem
 } from '@shared/hierarchy'
+import { topBacklogTypesFromLevels } from '@shared/root-types'
 import { typeHasStartAndTarget } from '@shared/dates'
 import { flattenLayout, type FieldMetadata, type ProcessLayout } from '@shared/form-layout'
 import { mapTeamMemberIdentities, type TeamMemberIdentityRow } from '@shared/team-members'
@@ -149,7 +150,7 @@ export class RestAdoClient {
       this.request<{ values?: Array<{ value?: string; includeChildren?: boolean }> }>(
         `${teamRoot}/_apis/work/teamsettings/teamfieldvalues?api-version=7.1`
       ),
-      this.request<Collection<{ workItemTypes?: Array<{ name?: string }> }>>(
+      this.request<Collection<{ rank?: number; workItemTypes?: Array<{ name?: string }> }>>(
         `${teamRoot}/_apis/work/backlogs?api-version=7.1`
       )
     ])
@@ -160,6 +161,7 @@ export class RestAdoClient {
         )
       )
     ] as string[]
+    const topBacklogTypes = topBacklogTypesFromLevels(backlogs.value ?? [])
     const areas = (fieldValues.values ?? []).map((value) => ({
       value: value.value ?? '',
       includeChildren: value.includeChildren !== false
@@ -202,7 +204,12 @@ export class RestAdoClient {
         }
       }
     }
-    return { nodes: assembleForest(nodes), types, truncated: ids.length >= WIQL_RESULT_CAP }
+    return {
+      nodes: assembleForest(nodes),
+      types,
+      topBacklogTypes,
+      truncated: ids.length >= WIQL_RESULT_CAP
+    }
   }
 
   async patchDates(input: {

@@ -1,10 +1,11 @@
 import type { OverlayFilter, WorkItemNode } from './types'
 
 export function applyOverlays(nodes: WorkItemNode[], filter: OverlayFilter): WorkItemNode[] {
+  const byId = new Map(nodes.map((node) => [node.id, node]))
   const matching = new Set<number>()
 
   for (const node of nodes) {
-    if (matchesOverlay(node, filter)) {
+    if (matchesOverlay(node, filter, byId)) {
       matching.add(node.id)
     }
   }
@@ -13,21 +14,52 @@ export function applyOverlays(nodes: WorkItemNode[], filter: OverlayFilter): Wor
     return []
   }
 
-  const byId = new Map(nodes.map((node) => [node.id, node]))
   const visible = new Set(matching)
+  const roots = filter.rootTypes
 
   for (const id of matching) {
     let current = byId.get(id)
     while (current?.parentId) {
+      if (roots && roots.length > 0 && roots.includes(current.type)) {
+        break
+      }
       visible.add(current.parentId)
       current = byId.get(current.parentId)
     }
   }
 
-  return nodes.filter((node) => visible.has(node.id))
+  return nodes
+    .filter((node) => visible.has(node.id))
+    .map((node) =>
+      node.parentId != null && !visible.has(node.parentId) ? { ...node, parentId: null } : node
+    )
 }
 
-function matchesOverlay(node: WorkItemNode, filter: OverlayFilter): boolean {
+function isUnderRootType(
+  node: WorkItemNode,
+  byId: Map<number, WorkItemNode>,
+  rootTypes: string[]
+): boolean {
+  let current: WorkItemNode | undefined = node
+  while (current) {
+    if (rootTypes.includes(current.type)) {
+      return true
+    }
+    current = current.parentId == null ? undefined : byId.get(current.parentId)
+  }
+  return false
+}
+
+function matchesOverlay(
+  node: WorkItemNode,
+  filter: OverlayFilter,
+  byId: Map<number, WorkItemNode>
+): boolean {
+  if (filter.rootTypes !== undefined && filter.rootTypes !== null) {
+    if (filter.rootTypes.length === 0 || !isUnderRootType(node, byId, filter.rootTypes)) {
+      return false
+    }
+  }
   if (filter.types !== null && !filter.types.includes(node.type)) {
     return false
   }

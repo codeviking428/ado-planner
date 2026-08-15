@@ -185,8 +185,20 @@ export function startAdoMock(port = 0) {
         }
       }
 
+      if (path.endsWith('/_apis/connectionData')) {
+        return json(res, 200, {
+          authenticatedUser: {
+            uniqueName: 'ada@contoso.com',
+            providerDisplayName: 'Ada Lovelace'
+          }
+        })
+      }
       if (path.endsWith('/_apis/profile/profiles/me')) {
-        return json(res, 200, { id: 'user-1', displayName: 'Ada Lovelace' })
+        return json(res, 200, {
+          id: 'user-1',
+          displayName: 'Ada Lovelace',
+          emailAddress: 'ada@contoso.com'
+        })
       }
       if (path.endsWith('/_apis/accounts')) {
         return json(res, 200, {
@@ -255,10 +267,10 @@ export function startAdoMock(port = 0) {
       if (path.endsWith('/backlogs')) {
         return json(res, 200, {
           value: [
-            { workItemTypes: [{ name: 'Epic' }] },
-            { workItemTypes: [{ name: 'Feature' }] },
-            { workItemTypes: [{ name: 'User Story' }] },
-            { workItemTypes: [{ name: 'Task' }] }
+            { rank: 30, workItemTypes: [{ name: 'Epic' }] },
+            { rank: 20, workItemTypes: [{ name: 'Feature' }] },
+            { rank: 10, workItemTypes: [{ name: 'User Story' }] },
+            { rank: 5, workItemTypes: [{ name: 'Task' }] }
           ]
         })
       }

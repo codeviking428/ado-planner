@@ -30,6 +30,7 @@ export type WorkItemNode = {
 export type HierarchyResult = {
   nodes: WorkItemNode[]
   types: string[]
+  topBacklogTypes: string[]
   truncated: boolean
 }
 
@@ -45,6 +46,8 @@ export function isAssigneeSpecial(value: string): value is AssigneeSpecial {
 export type OverlayFilter = {
   types: string[] | null
   states: string[] | null
+  /** `null` = every type is a Root type. `[]` = none. */
+  rootTypes?: string[] | null
   assignee: AssigneeFilter
   iterationPath: string | null
   currentUserUniqueName?: string | null

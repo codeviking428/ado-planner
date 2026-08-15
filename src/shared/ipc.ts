@@ -18,6 +18,7 @@ export const overlaySchema = z.object({
   types: z.array(z.string()).nullable(),
   states: z.array(z.string()).nullable(),
   assignee: z.string().min(1),
+  rootTypes: z.array(z.string()).nullable().optional(),
   iterationPath: z.string().nullable(),
   currentUserUniqueName: z.string().nullable().optional()
 })

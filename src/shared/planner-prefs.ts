@@ -8,6 +8,8 @@ export type PlannerPrefs = {
   assignee: AssigneeFilter
   hiddenTypes: string[]
   hiddenStates: string[]
+  /** `undefined` = never set; `null` = Show all; `[]` = Hide all. */
+  rootTypes?: string[] | null
 }
 
 function asString(value: unknown): string {
@@ -28,6 +30,14 @@ export function parsePlannerPrefs(raw: string | null): PlannerPrefs | null {
       typeof value.assignee === 'string' && value.assignee.trim()
         ? (value.assignee.trim() as AssigneeFilter)
         : 'anyone'
+    const rootTypes =
+      value.rootTypes === undefined
+        ? undefined
+        : value.rootTypes === null
+          ? null
+          : Array.isArray(value.rootTypes)
+            ? asStringArray(value.rootTypes)
+            : undefined
     return {
       org: asString(value.org),
       project: asString(value.project),
@@ -35,7 +45,8 @@ export function parsePlannerPrefs(raw: string | null): PlannerPrefs | null {
       iterationPath: asString(value.iterationPath),
       assignee,
       hiddenTypes: asStringArray(value.hiddenTypes),
-      hiddenStates: asStringArray(value.hiddenStates)
+      hiddenStates: asStringArray(value.hiddenStates),
+      rootTypes
     }
   } catch {
     return null

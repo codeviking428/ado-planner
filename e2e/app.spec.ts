@@ -81,10 +81,21 @@ test('scope errors show a toast whose message can be copied', async ({ adoMock, 
 test('loads Hierarchy including an unparented root', async ({ window }) => {
   await expect(window.getByTestId('work-item-1001')).toBeVisible()
   await expect(window.getByTestId('work-item-1003')).toContainText('Persist cart')
+  await expect(window.getByTestId('work-item-1012')).toBeHidden()
+  await expect(window.getByTestId('dates-1003')).toHaveText('2026-07-06 → 2026-07-20')
+})
+
+test('Roots hide unparented Work Items that are not a Root type', async ({ window }) => {
+  await expect(window.getByTestId('work-item-1001')).toBeVisible()
+  await expect(window.getByTestId('work-item-1012')).toBeHidden()
+  await expect(window.getByTestId('root-filter')).toContainText('3 hidden')
+  await window.getByTestId('root-filter').click()
+  await window.getByRole('menuitem', { name: 'Show all' }).click()
   await expect(window.getByTestId('work-item-1012')).toContainText('Unparented spike')
   await expect(window.getByTestId('dates-1012')).toContainText('Unscheduled')
-  await expect(window.getByTestId('dates-1012')).toContainText('2026-08-10')
-  await expect(window.getByTestId('dates-1003')).toHaveText('2026-07-06 → 2026-07-20')
+  await window.getByTestId('root-filter').click()
+  await window.getByRole('menuitem', { name: 'Hide all' }).click()
+  await expect(window.getByTestId('empty-gantt')).toBeVisible()
 })
 
 test('assignee menu lists Team members and filters the Hierarchy', async ({ window }) => {
@@ -129,13 +140,13 @@ test('type filter search narrows the list', async ({ window }) => {
 })
 
 test('type filter hides a leaf Work Item and can show it again', async ({ window }) => {
-  await expect(window.getByTestId('work-item-1012')).toBeVisible()
+  await expect(window.getByTestId('work-item-1005')).toBeVisible()
   await window.getByTestId('type-filter').click()
   await window.getByRole('menuitemcheckbox', { name: 'Task' }).click()
-  await expect(window.getByTestId('work-item-1012')).toBeHidden()
+  await expect(window.getByTestId('work-item-1005')).toBeHidden()
   await expect(window.getByTestId('type-filter')).toContainText('1 hidden')
   await window.getByRole('menuitemcheckbox', { name: 'Task' }).click()
-  await expect(window.getByTestId('work-item-1012')).toBeVisible()
+  await expect(window.getByTestId('work-item-1005')).toBeVisible()
 })
 
 test('type filter Hide all clears the Hierarchy', async ({ window }) => {

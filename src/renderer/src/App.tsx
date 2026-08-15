@@ -32,6 +32,7 @@ import { showErrorToast } from '@/lib/error-toast'
 import { loadPlannerPrefs, savePlannerPrefs } from '@/lib/planner-prefs'
 import { applyOverlays } from '@shared/overlays'
 import { chooseAvailable } from '@shared/planner-prefs'
+import { resolveRootTypes } from '@shared/root-types'
 import { FLAVORS, type Flavor } from '@shared/flavor'
 import { shortenOrganizationUrl } from '@shared/organization-url'
 import {
@@ -162,6 +163,7 @@ function PlannerApp() {
   const [assignee, setAssignee] = useState<AssigneeFilter>(stored?.assignee ?? 'anyone')
   const [hiddenTypes, setHiddenTypes] = useState<string[]>(stored?.hiddenTypes ?? [])
   const [hiddenStates, setHiddenStates] = useState<string[]>(stored?.hiddenStates ?? [])
+  const [rootTypesPref, setRootTypesPref] = useState<string[] | null | undefined>(stored?.rootTypes)
   const [nodes, setNodes] = useState<WorkItemNode[]>([])
   const [openId, setOpenId] = useState<number | null>(null)
   const [form, setForm] = useState<WorkItemFormModel | null>(null)
@@ -332,6 +334,10 @@ function PlannerApp() {
   }, [iterationPath, iterationsQuery.data])
 
   useEffect(() => {
+    if (assignee === 'me' && sessionQuery.isSuccess && !sessionQuery.data.username) {
+      setAssignee('anyone')
+      return
+    }
     if (isAssigneeSpecial(assignee)) {
       return
     }
@@ -346,7 +352,14 @@ function PlannerApp() {
     if (!names.has(assignee.toLowerCase())) {
       setAssignee('anyone')
     }
-  }, [assignee, team, membersQuery.isSuccess, membersQuery.data])
+  }, [
+    assignee,
+    team,
+    membersQuery.isSuccess,
+    membersQuery.data,
+    sessionQuery.isSuccess,
+    sessionQuery.data
+  ])
 
   useEffect(() => {
     savePlannerPrefs({
@@ -356,16 +369,23 @@ function PlannerApp() {
       iterationPath,
       assignee,
       hiddenTypes,
-      hiddenStates
+      hiddenStates,
+      rootTypes: rootTypesPref
     })
-  }, [org, project, team, iterationPath, assignee, hiddenTypes, hiddenStates])
+  }, [org, project, team, iterationPath, assignee, hiddenTypes, hiddenStates, rootTypesPref])
 
   const types = hierarchyQuery.data?.types ?? [...new Set(nodes.map((node) => node.type))]
   const states = [...new Set(nodes.map((node) => node.state))].sort()
+  const resolvedRoots = resolveRootTypes({
+    stored: rootTypesPref,
+    loadedTypes: types,
+    topBacklogTypes: hierarchyQuery.data?.topBacklogTypes ?? []
+  })
 
   const overlay: OverlayFilter = {
     types: hiddenTypes.length ? types.filter((type) => !hiddenTypes.includes(type)) : null,
     states: hiddenStates.length ? states.filter((state) => !hiddenStates.includes(state)) : null,
+    rootTypes: hierarchyQuery.data ? resolvedRoots : undefined,
     assignee,
     iterationPath: iterationPath || null,
     currentUserUniqueName: sessionQuery.data?.username
@@ -511,7 +531,7 @@ function PlannerApp() {
             onChange={(value) => setAssignee((value || 'anyone') as AssigneeFilter)}
             options={[
               { value: 'anyone', label: 'Anyone' },
-              { value: 'me', label: 'Me' },
+              ...(sessionQuery.data.username ? [{ value: 'me', label: 'Me' }] : []),
               { value: 'unassigned', label: 'Unassigned' },
               ...(membersQuery.data ?? []).map((row) => ({
                 value: row.uniqueName,
@@ -526,6 +546,30 @@ function PlannerApp() {
               Filters
             </span>
             <div className="flex items-center gap-2">
+              <FilterMenu
+                id="root-filter"
+                label="Roots"
+                items={types}
+                hidden={
+                  resolvedRoots === null
+                    ? []
+                    : types.filter((type) => !resolvedRoots.includes(type))
+                }
+                onChange={(hidden) => {
+                  if (types.length === 0) {
+                    return
+                  }
+                  if (hidden.length === 0) {
+                    setRootTypesPref(null)
+                    return
+                  }
+                  if (hidden.length === types.length) {
+                    setRootTypesPref([])
+                    return
+                  }
+                  setRootTypesPref(types.filter((type) => !hidden.includes(type)))
+                }}
+              />
               <FilterMenu
                 id="type-filter"
                 label="Types"

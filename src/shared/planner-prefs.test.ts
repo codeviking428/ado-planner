@@ -10,9 +10,22 @@ describe('planner prefs', () => {
       iterationPath: 'MatterWorx\\Sprint 12',
       assignee: 'me' as const,
       hiddenTypes: ['Task'],
-      hiddenStates: ['Done']
+      hiddenStates: ['Done'],
+      rootTypes: ['Epic', 'Feature'] as string[] | null
     }
     expect(parsePlannerPrefs(serializePlannerPrefs(prefs))).toEqual(prefs)
+  })
+
+  test('missing rootTypes stays unset', () => {
+    expect(parsePlannerPrefs(JSON.stringify({ org: 'amergis' }))?.rootTypes).toBeUndefined()
+  })
+
+  test('null rootTypes is Show all', () => {
+    expect(parsePlannerPrefs(JSON.stringify({ rootTypes: null }))?.rootTypes).toBeNull()
+  })
+
+  test('empty rootTypes is Hide all', () => {
+    expect(parsePlannerPrefs(JSON.stringify({ rootTypes: [] }))?.rootTypes).toEqual([])
   })
 
   test('junk or empty storage is ignored', () => {
