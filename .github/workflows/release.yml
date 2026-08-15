@@ -90,9 +90,8 @@ jobs:
           - name: Linux
             os: ubuntu-latest
             args: --linux AppImage
-          - name: macOS
-            os: macos-latest
-            args: --mac
+          # macOS is off until we have an Apple Developer Program account and
+          # a Developer ID Application cert. See README → Publishing for Mac.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -119,8 +118,3 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
