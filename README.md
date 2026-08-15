@@ -16,11 +16,11 @@
   <a href="https://github.com/codeviking428/ado-planner/releases/latest"><img src="https://img.shields.io/github/v/release/codeviking428/ado-planner?label=Download&style=flat-square" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Windows-installer-0f4c81?style=flat-square" alt="Windows">
   <img src="https://img.shields.io/badge/Linux-AppImage-2ea44f?style=flat-square" alt="Linux">
-  <img src="https://img.shields.io/badge/macOS-DMG-999999?style=flat-square" alt="macOS">
+  <img src="https://img.shields.io/badge/macOS-not%20published-lightgrey?style=flat-square" alt="macOS not published">
 </p>
 
 <p align="center">
-  <a href="https://github.com/codeviking428/ado-planner/releases/latest"><strong>Download for Windows, macOS, or Linux</strong></a>
+  <a href="https://github.com/codeviking428/ado-planner/releases/latest"><strong>Download for Windows or Linux</strong></a>
   ·
   <a href="#install-with-npm">Install with npm</a>
   ·
@@ -42,14 +42,15 @@ No browser tabs, no CSV round-trips, no second tool that drifts out of date.
 
 ## Install
 
-### Windows, macOS & Linux (the usual way)
+### Windows & Linux (the usual way)
 
 1. Open the <a href="https://github.com/codeviking428/ado-planner/releases/latest">latest release</a>.
 2. **Windows:** download `ado-planner-*-setup.exe` and run it. It installs per-user — no admin prompt. You'll get a Start Menu and desktop shortcut.
-3. **macOS:** download `ado-planner-*.dmg`, open it, and drag ADO Planner into Applications. Until an Apple Developer ID is configured in CI, Gatekeeper will warn — right-click the app and choose **Open**.
-4. **Linux:** download `ado-planner-*.AppImage`, mark it executable (`chmod +x ado-planner-*.AppImage`), and run it.
+3. **Linux:** download `ado-planner-*.AppImage`, mark it executable (`chmod +x ado-planner-*.AppImage`), and run it.
 
 The installed app checks for updates on launch. Yes downloads, installs, and restarts; No snoozes until next time.
+
+macOS is not published yet. See [Publishing for Mac](#publishing-for-mac).
 
 ### Install with npm
 
@@ -141,15 +142,29 @@ pnpm lint
 pnpm format
 pnpm e2e           # Playwright `_electron` against a loopback ADO mock
 pnpm build:win     # NSIS installer (per-user)
-pnpm build:mac     # universal DMG + zip (must run on macOS)
 pnpm build:linux   # AppImage
 ```
 
 Linux e2e without a desktop session: `xvfb-run -a pnpm e2e`.
 
-Releases are **manual**. When `master` is stable: **Actions → Release → Run workflow**, leave the branch on `master`, and enter the next semver (e.g. `0.2.0`). That tags `v*`, builds Windows NSIS, macOS universal DMG/zip, and Linux AppImage, and publishes them. Packaged builds auto-update from that feed (`electron-updater`, `autoDownload: false`).
+Releases are **manual**. When `master` is stable: **Actions → Release → Run workflow**, leave the branch on `master`, and enter the next semver (e.g. `0.2.0`). That tags `v*`, builds Windows NSIS and Linux AppImage, and publishes them. Packaged builds auto-update from that feed (`electron-updater`, `autoDownload: false`).
 
-Optional Apple signing/notarization (otherwise the DMG is unsigned): repo secrets `CSC_LINK`, `CSC_KEY_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`.
+### Publishing for Mac
+
+Off for now. An unsigned `.dmg` is not a product we want to ship — Gatekeeper blocks it, and `electron-updater` on macOS expects a signed build. When we turn it back on:
+
+1. Enroll in the [Apple Developer Program](https://developer.apple.com/programs/) (~$99/year).
+2. Create a **Developer ID Application** certificate (not Apple Development / Mac App Store).
+3. Export the cert + private key as a `.p12` and add repo secrets:
+   - `CSC_LINK` — base64 of the `.p12` (or a URL electron-builder accepts)
+   - `CSC_KEY_PASSWORD` — password for that `.p12`
+   - `APPLE_ID` — Apple ID used for notarization
+   - `APPLE_APP_SPECIFIC_PASSWORD` — [app-specific password](https://support.apple.com/en-us/102654)
+   - `APPLE_TEAM_ID` — 10-character Team ID
+4. Re-add the `macos-latest` / `--mac` matrix entry in `.github/workflows/release.yml` (config for a universal DMG + zip is already in `electron-builder.yml`).
+5. No personal Mac is required to _build_ — GitHub’s `macos-latest` runner is enough. The Apple account is required to _sign and notarize_.
+
+[electron-builder code signing](https://www.electron.build/code-signing) · [notarization](https://www.electron.build/code-signing#notarization)
 
 ## Spec
 
