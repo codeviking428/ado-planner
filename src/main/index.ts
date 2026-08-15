@@ -16,6 +16,10 @@ function applyUserDataOverride(): void {
 
 applyUserDataOverride()
 
+if (!app.isPackaged) {
+  app.commandLine.appendSwitch('remote-allow-origins', '*')
+}
+
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 1400,

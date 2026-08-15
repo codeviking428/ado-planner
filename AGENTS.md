@@ -12,6 +12,10 @@ Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `
 
 Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
+### Dev session
+
+CDP / HMR / mocks: probe `127.0.0.1:9222` and attach to the user's `pnpm dev` window to see what they see; use Playwright e2e with mocks for scripted iteration. See `docs/agents/dev-session.md`.
+
 ## Git
 
 ### Commits
