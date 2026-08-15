@@ -147,6 +147,8 @@ pnpm build:linux   # AppImage
 
 Linux e2e without a desktop session: `xvfb-run -a pnpm e2e`.
 
+Every PR (and every push to `master`) runs lint, typecheck, Vitest, `electron-vite` build, and Playwright `_electron` e2e under Xvfb. Those e2e tests drive the packaged Electron app against a loopback ADO mock — they do not need Playwright’s Chromium/Chrome browsers.
+
 Releases are **manual**. When `master` is stable: **Actions → Release → Run workflow**, leave the branch on `master`, and enter the next semver (e.g. `0.2.0`). That tags `v*`, builds Windows NSIS and Linux AppImage, and publishes them. Packaged builds auto-update from that feed (`electron-updater`, `autoDownload: false`).
 
 ### Publishing for Mac
