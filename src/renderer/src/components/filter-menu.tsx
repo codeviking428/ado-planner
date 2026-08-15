@@ -1,5 +1,7 @@
+import { useState } from 'react'
 import { ChevronDownIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -10,6 +12,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
+
+function matchesQuery(label: string, query: string): boolean {
+  const needle = query.trim().toLowerCase()
+  return needle.length === 0 || label.toLowerCase().includes(needle)
+}
 
 export function FilterMenu({
   id,
@@ -24,9 +31,18 @@ export function FilterMenu({
   hidden: string[]
   onChange: (hidden: string[]) => void
 }) {
+  const [query, setQuery] = useState('')
   const hiddenCount = hidden.length
+  const filtered = items.filter((item) => matchesQuery(item, query))
+
   return (
-    <DropdownMenu>
+    <DropdownMenu
+      onOpenChange={(open) => {
+        if (!open) {
+          setQuery('')
+        }
+      }}
+    >
       <DropdownMenuTrigger
         render={
           <Button
@@ -45,9 +61,20 @@ export function FilterMenu({
         <ChevronDownIcon className="size-3.5 opacity-60" aria-hidden />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-64">
+        <div className="bg-popover sticky top-0 z-10 p-1">
+          <Input
+            autoFocus
+            data-testid={`${id}-search`}
+            placeholder={`Search ${label.toLowerCase()}`}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+          />
+        </div>
         <DropdownMenuGroup>
           <DropdownMenuLabel>Show {label.toLowerCase()}</DropdownMenuLabel>
-          {items.map((item) => {
+          {filtered.map((item) => {
             const visible = !hidden.includes(item)
             return (
               <DropdownMenuCheckboxItem
@@ -61,6 +88,9 @@ export function FilterMenu({
               </DropdownMenuCheckboxItem>
             )
           })}
+          {filtered.length === 0 ? (
+            <p className="text-muted-foreground px-2 py-1.5 text-sm">No matches</p>
+          ) : null}
         </DropdownMenuGroup>
         {items.length > 0 ? (
           <>

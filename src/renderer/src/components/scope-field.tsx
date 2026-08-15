@@ -1,3 +1,5 @@
+import { useState } from 'react'
+import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
 import {
   Select,
@@ -8,6 +10,11 @@ import {
 } from '@/components/ui/select'
 
 const NONE = '__none__'
+
+function matchesQuery(label: string, query: string): boolean {
+  const needle = query.trim().toLowerCase()
+  return needle.length === 0 || label.toLowerCase().includes(needle)
+}
 
 export function ScopeField({
   id,
@@ -30,7 +37,10 @@ export function ScopeField({
   options: Array<{ value: string; label: string }>
   allowEmpty?: boolean
 }) {
+  const [query, setQuery] = useState('')
   const selected = allowEmpty ? value || NONE : value
+  const filtered = options.filter((option) => matchesQuery(option.label, query))
+  const showEmpty = allowEmpty && matchesQuery(placeholder, query)
   const labelFor = (next: string | null) => {
     if (!next || next === NONE) {
       return placeholder
@@ -49,6 +59,11 @@ export function ScopeField({
           value={selected}
           disabled={disabled}
           onValueChange={(next) => onChange(!next || next === NONE ? '' : next)}
+          onOpenChange={(next) => {
+            if (!next) {
+              setQuery('')
+            }
+          }}
         >
           <SelectTrigger
             id={id}
@@ -59,13 +74,27 @@ export function ScopeField({
           >
             <SelectValue placeholder={placeholder}>{labelFor}</SelectValue>
           </SelectTrigger>
-          <SelectContent alignItemWithTrigger={false} align="start" className="min-w-44">
-            {allowEmpty ? <SelectItem value={NONE}>{placeholder}</SelectItem> : null}
-            {options.map((option) => (
+          <SelectContent alignItemWithTrigger={false} align="start" className="min-w-52">
+            <div className="bg-popover sticky top-0 z-10 p-1">
+              <Input
+                autoFocus
+                data-testid={`${id}-search`}
+                placeholder={`Search ${label.toLowerCase()}`}
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+              />
+            </div>
+            {showEmpty ? <SelectItem value={NONE}>{placeholder}</SelectItem> : null}
+            {filtered.map((option) => (
               <SelectItem key={option.value} value={option.value}>
                 {option.label}
               </SelectItem>
             ))}
+            {filtered.length === 0 && !showEmpty ? (
+              <p className="text-muted-foreground px-2 py-1.5 text-sm">No matches</p>
+            ) : null}
           </SelectContent>
         </Select>
       </span>

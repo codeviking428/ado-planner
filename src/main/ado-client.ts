@@ -30,8 +30,10 @@ import {
   HIERARCHY_FIELDS,
   mapBatchWorkItem
 } from '@shared/hierarchy'
+import { topBacklogTypesFromLevels } from '@shared/root-types'
 import { typeHasStartAndTarget } from '@shared/dates'
 import { flattenLayout, type FieldMetadata, type ProcessLayout } from '@shared/form-layout'
+import { mapTeamMemberIdentities, type TeamMemberIdentityRow } from '@shared/team-members'
 import { adoAuthorizationHeader } from './ado-auth'
 import type { TokenProvider } from './session'
 
@@ -152,6 +154,16 @@ export class AdoClient {
     }))
   }
 
+  async listTeamMembers(org: string, project: string, team: string): Promise<IdentityValue[]> {
+    const token = await this.tokens.getAccessToken()
+    const payload = (await restJson(
+      `${adoOrgUrl(org)}/_apis/projects/${encodeURIComponent(project)}/teams/${encodeURIComponent(team)}/members?$top=1000&api-version=7.1`,
+      token,
+      this.tokens.scheme
+    )) as { value?: TeamMemberIdentityRow[] }
+    return mapTeamMemberIdentities(payload.value ?? [])
+  }
+
   async listIterations(org: string, project: string, team: string): Promise<IterationNode[]> {
     const work = await this.work(org)
     const iterations = await work.getTeamIterations({ project, team })
@@ -185,6 +197,7 @@ export class AdoClient {
         )
       )
     ] as string[]
+    const topBacklogTypes = topBacklogTypesFromLevels(backlogs ?? [])
 
     const areas = (fieldValues.values ?? []).map((value) => ({
       value: value.value ?? '',
@@ -233,6 +246,7 @@ export class AdoClient {
     return {
       nodes: assembleForest(nodes),
       types,
+      topBacklogTypes,
       truncated
     }
   }

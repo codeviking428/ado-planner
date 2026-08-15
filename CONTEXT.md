@@ -12,6 +12,10 @@ _Avoid_: ticket, card, item (bare)
 The parent/child tree of Work Items from Epic down to Task inside a Team's area paths.
 _Avoid_: board columns, backlog level as the view
 
+**Root type**:
+A Work Item type that may appear at the top of the Hierarchy. Descendants of any type still nest under those roots. A Work Item with no ancestor of a Root type is not shown.
+_Avoid_: top-level ticket, backlog level, sidebar root, Unparented bucket
+
 **Team**:
 An Azure DevOps project team whose area paths bound the Hierarchy shown on the Gantt.
 _Avoid_: board (when meaning the Kanban board)

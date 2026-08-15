@@ -1,5 +1,6 @@
 pre-commit:
-  parallel: true
+  # Sequential: prettier and oxfmt both write staged files; parallel races on Windows.
+  parallel: false
   commands:
     oxlint:
       glob: '*.{js,ts,tsx}'

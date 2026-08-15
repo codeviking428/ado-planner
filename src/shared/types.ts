@@ -30,14 +30,24 @@ export type WorkItemNode = {
 export type HierarchyResult = {
   nodes: WorkItemNode[]
   types: string[]
+  topBacklogTypes: string[]
   truncated: boolean
 }
 
-export type AssigneeFilter = 'anyone' | 'me' | 'unassigned'
+export const ASSIGNEE_SPECIALS = ['anyone', 'me', 'unassigned'] as const
+export type AssigneeSpecial = (typeof ASSIGNEE_SPECIALS)[number]
+/** `anyone` / `me` / `unassigned`, or a Team member `uniqueName`. */
+export type AssigneeFilter = AssigneeSpecial | (string & {})
+
+export function isAssigneeSpecial(value: string): value is AssigneeSpecial {
+  return (ASSIGNEE_SPECIALS as readonly string[]).includes(value)
+}
 
 export type OverlayFilter = {
   types: string[] | null
   states: string[] | null
+  /** `null` = every type is a Root type. `[]` = none. */
+  rootTypes?: string[] | null
   assignee: AssigneeFilter
   iterationPath: string | null
   currentUserUniqueName?: string | null

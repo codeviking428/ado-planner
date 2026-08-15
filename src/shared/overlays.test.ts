@@ -89,6 +89,52 @@ describe('applyOverlays', () => {
     expect(visible.map((n) => n.id).sort()).toEqual([1, 2, 4])
   })
 
+  test('assignee uniqueName keeps that identity and ancestors', () => {
+    const visible = applyOverlays(forest, {
+      types: null,
+      states: null,
+      assignee: 'ada@contoso',
+      iterationPath: null
+    })
+    expect(visible.map((n) => n.id).sort()).toEqual([1, 2, 3])
+  })
+
+  test('Root types keep descendants and hide Work Items with no Root-type ancestor', () => {
+    const visible = applyOverlays(forest, {
+      types: null,
+      states: null,
+      assignee: 'anyone',
+      iterationPath: null,
+      rootTypes: ['Epic']
+    })
+    expect(visible.map((n) => n.id).sort()).toEqual([1, 2, 3])
+  })
+
+  test('Root type sits at the top when its parent is not a Root type', () => {
+    const visible = applyOverlays(forest, {
+      types: null,
+      states: null,
+      assignee: 'anyone',
+      iterationPath: null,
+      rootTypes: ['Feature']
+    })
+    expect(visible.map((n) => ({ id: n.id, parentId: n.parentId }))).toEqual([
+      { id: 2, parentId: null },
+      { id: 3, parentId: 2 }
+    ])
+  })
+
+  test('empty Root types overlay matches nothing', () => {
+    const visible = applyOverlays(forest, {
+      types: null,
+      states: null,
+      assignee: 'anyone',
+      iterationPath: null,
+      rootTypes: []
+    })
+    expect(visible).toEqual([])
+  })
+
   test('empty type overlay matches nothing', () => {
     const visible = applyOverlays(forest, {
       types: [],

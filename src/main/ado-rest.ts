@@ -18,8 +18,10 @@ import {
   HIERARCHY_FIELDS,
   mapBatchWorkItem
 } from '@shared/hierarchy'
+import { topBacklogTypesFromLevels } from '@shared/root-types'
 import { typeHasStartAndTarget } from '@shared/dates'
 import { flattenLayout, type FieldMetadata, type ProcessLayout } from '@shared/form-layout'
+import { mapTeamMemberIdentities, type TeamMemberIdentityRow } from '@shared/team-members'
 import { adoAuthorizationHeader } from './ado-auth'
 import type { TokenProvider } from './session'
 
@@ -115,6 +117,13 @@ export class RestAdoClient {
     }))
   }
 
+  async listTeamMembers(org: string, project: string, team: string): Promise<IdentityValue[]> {
+    const payload = await this.request<Collection<TeamMemberIdentityRow>>(
+      `${this.orgUrl(org)}/_apis/projects/${encodeURIComponent(project)}/teams/${encodeURIComponent(team)}/members?$top=1000&api-version=7.1`
+    )
+    return mapTeamMemberIdentities(payload.value ?? [])
+  }
+
   async listIterations(org: string, project: string, team: string): Promise<IterationNode[]> {
     const payload = await this.request<
       Collection<{
@@ -141,7 +150,7 @@ export class RestAdoClient {
       this.request<{ values?: Array<{ value?: string; includeChildren?: boolean }> }>(
         `${teamRoot}/_apis/work/teamsettings/teamfieldvalues?api-version=7.1`
       ),
-      this.request<Collection<{ workItemTypes?: Array<{ name?: string }> }>>(
+      this.request<Collection<{ rank?: number; workItemTypes?: Array<{ name?: string }> }>>(
         `${teamRoot}/_apis/work/backlogs?api-version=7.1`
       )
     ])
@@ -152,6 +161,7 @@ export class RestAdoClient {
         )
       )
     ] as string[]
+    const topBacklogTypes = topBacklogTypesFromLevels(backlogs.value ?? [])
     const areas = (fieldValues.values ?? []).map((value) => ({
       value: value.value ?? '',
       includeChildren: value.includeChildren !== false
@@ -194,7 +204,12 @@ export class RestAdoClient {
         }
       }
     }
-    return { nodes: assembleForest(nodes), types, truncated: ids.length >= WIQL_RESULT_CAP }
+    return {
+      nodes: assembleForest(nodes),
+      types,
+      topBacklogTypes,
+      truncated: ids.length >= WIQL_RESULT_CAP
+    }
   }
 
   async patchDates(input: {

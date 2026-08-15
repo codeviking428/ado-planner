@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { PaletteIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -29,17 +29,22 @@ import { HierarchyGantt } from '@/components/hierarchy-gantt'
 import { ScopeField } from '@/components/scope-field'
 import { WorkItemFormDialog } from '@/components/work-item-form'
 import { showErrorToast } from '@/lib/error-toast'
+import { loadPlannerPrefs, savePlannerPrefs } from '@/lib/planner-prefs'
 import { applyOverlays } from '@shared/overlays'
+import { chooseAvailable } from '@shared/planner-prefs'
+import { resolveRootTypes } from '@shared/root-types'
 import { FLAVORS, type Flavor } from '@shared/flavor'
 import { shortenOrganizationUrl } from '@shared/organization-url'
-import type {
-  AssigneeFilter,
-  OverlayFilter,
-  ScopeSelection,
-  SessionInfo,
-  UpdaterPrompt,
-  WorkItemFormModel,
-  WorkItemNode
+import {
+  isAssigneeSpecial,
+  type AssigneeFilter,
+  type HierarchyResult,
+  type OverlayFilter,
+  type ScopeSelection,
+  type SessionInfo,
+  type UpdaterPrompt,
+  type WorkItemFormModel,
+  type WorkItemNode
 } from '@shared/types'
 
 const FLAVOR_LABELS: Record<Flavor, string> = {
@@ -150,22 +155,26 @@ function SignInShell({
 
 function PlannerApp() {
   const { flavor, setFlavor } = useFlavor()
-  const [org, setOrg] = useState('')
-  const [project, setProject] = useState('')
-  const [team, setTeam] = useState('')
-  const [iterationPath, setIterationPath] = useState('')
-  const [assignee, setAssignee] = useState<AssigneeFilter>('anyone')
-  const [hiddenTypes, setHiddenTypes] = useState<string[]>([])
-  const [hiddenStates, setHiddenStates] = useState<string[]>([])
+  const [stored] = useState(loadPlannerPrefs)
+  const [org, setOrg] = useState(stored?.org ?? '')
+  const [project, setProject] = useState(stored?.project ?? '')
+  const [team, setTeam] = useState(stored?.team ?? '')
+  const [iterationPath, setIterationPath] = useState(stored?.iterationPath ?? '')
+  const [assignee, setAssignee] = useState<AssigneeFilter>(stored?.assignee ?? 'anyone')
+  const [hiddenTypes, setHiddenTypes] = useState<string[]>(stored?.hiddenTypes ?? [])
+  const [hiddenStates, setHiddenStates] = useState<string[]>(stored?.hiddenStates ?? [])
+  const [rootTypesPref, setRootTypesPref] = useState<string[] | null | undefined>(stored?.rootTypes)
   const [nodes, setNodes] = useState<WorkItemNode[]>([])
   const [openId, setOpenId] = useState<number | null>(null)
   const [form, setForm] = useState<WorkItemFormModel | null>(null)
   const [updater, setUpdater] = useState<UpdaterPrompt | null>(null)
+  const queryClient = useQueryClient()
 
   const sessionQuery = useQuery({
     queryKey: ['session'],
     queryFn: () => window.planner.session.get()
   })
+  const signedIn = sessionQuery.data?.signedIn === true
 
   const login = useMutation({
     mutationFn: (creds?: { pat?: string; organization?: string }) =>
@@ -182,35 +191,50 @@ function PlannerApp() {
   const orgsQuery = useQuery({
     queryKey: ['orgs'],
     queryFn: () => window.planner.ado.orgs(),
-    enabled: sessionQuery.data?.signedIn === true
+    enabled: signedIn
   })
 
   const projectsQuery = useQuery({
     queryKey: ['projects', org],
     queryFn: () => window.planner.ado.projects(org),
-    enabled: Boolean(org)
+    enabled: signedIn && Boolean(org)
   })
 
   const teamsQuery = useQuery({
     queryKey: ['teams', org, project],
     queryFn: () => window.planner.ado.teams(org, project),
-    enabled: Boolean(org && project)
+    enabled: signedIn && Boolean(org && project)
   })
 
   const iterationsQuery = useQuery({
     queryKey: ['iterations', org, project, team],
     queryFn: () => window.planner.ado.iterations(org, project, team),
-    enabled: Boolean(org && project && team)
+    enabled: signedIn && Boolean(org && project && team)
+  })
+
+  const membersQuery = useQuery({
+    queryKey: ['team-members', org, project, team],
+    queryFn: () => window.planner.ado.teamMembers(org, project, team),
+    enabled: signedIn && Boolean(org && project && team)
   })
 
   const scope: ScopeSelection | null =
     org && project && team ? { org, project, team, iterationPath: iterationPath || null } : null
+  const hierarchyKey = ['hierarchy', org, project, team] as const
 
   const hierarchyQuery = useQuery({
-    queryKey: ['hierarchy', org, project, team],
+    queryKey: hierarchyKey,
     queryFn: () => window.planner.ado.hierarchy(scope as ScopeSelection),
-    enabled: Boolean(scope)
+    enabled: signedIn && Boolean(scope),
+    placeholderData: keepPreviousData
   })
+
+  const writeNodes = (next: WorkItemNode[]) => {
+    setNodes(next)
+    queryClient.setQueryData<HierarchyResult>(hierarchyKey, (prev) =>
+      prev ? { ...prev, nodes: next } : prev
+    )
+  }
   const scopeIsFetching =
     orgsQuery.isFetching ||
     projectsQuery.isFetching ||
@@ -223,6 +247,7 @@ function PlannerApp() {
   useQueryErrorToast(projectsQuery.error, 'Could not load projects')
   useQueryErrorToast(teamsQuery.error, 'Could not load Teams')
   useQueryErrorToast(iterationsQuery.error, 'Could not load iterations')
+  useQueryErrorToast(membersQuery.error, 'Could not load Team members')
   useQueryErrorToast(hierarchyQuery.error, 'Could not load Hierarchy')
 
   useEffect(() => {
@@ -254,29 +279,113 @@ function PlannerApp() {
   }, [])
 
   useEffect(() => {
-    if (!org && orgsQuery.data?.[0]) {
-      setOrg(orgsQuery.data[0].accountName)
+    if (!orgsQuery.data) {
+      return
+    }
+    const next = chooseAvailable(
+      org,
+      orgsQuery.data.map((row) => row.accountName)
+    )
+    if (next !== org) {
+      setOrg(next)
+      setProject('')
+      setTeam('')
+      setIterationPath('')
     }
   }, [org, orgsQuery.data])
 
   useEffect(() => {
-    if (!project && projectsQuery.data?.[0]) {
-      setProject(projectsQuery.data[0].name)
+    if (!projectsQuery.data) {
+      return
+    }
+    const next = chooseAvailable(
+      project,
+      projectsQuery.data.map((row) => row.name)
+    )
+    if (next !== project) {
+      setProject(next)
+      setTeam('')
+      setIterationPath('')
     }
   }, [project, projectsQuery.data])
 
   useEffect(() => {
-    if (!team && teamsQuery.data?.[0]) {
-      setTeam(teamsQuery.data[0].name)
+    if (!teamsQuery.data) {
+      return
+    }
+    const next = chooseAvailable(
+      team,
+      teamsQuery.data.map((row) => row.name)
+    )
+    if (next !== team) {
+      setTeam(next)
+      setIterationPath('')
     }
   }, [team, teamsQuery.data])
 
+  useEffect(() => {
+    if (!iterationsQuery.data || !iterationPath) {
+      return
+    }
+    const paths = iterationsQuery.data.map((row) => row.path)
+    if (!paths.includes(iterationPath)) {
+      setIterationPath('')
+    }
+  }, [iterationPath, iterationsQuery.data])
+
+  useEffect(() => {
+    if (assignee === 'me' && sessionQuery.isSuccess && !sessionQuery.data.username) {
+      setAssignee('anyone')
+      return
+    }
+    if (isAssigneeSpecial(assignee)) {
+      return
+    }
+    if (!team) {
+      setAssignee('anyone')
+      return
+    }
+    if (!membersQuery.isSuccess) {
+      return
+    }
+    const names = new Set(membersQuery.data.map((row) => row.uniqueName.toLowerCase()))
+    if (!names.has(assignee.toLowerCase())) {
+      setAssignee('anyone')
+    }
+  }, [
+    assignee,
+    team,
+    membersQuery.isSuccess,
+    membersQuery.data,
+    sessionQuery.isSuccess,
+    sessionQuery.data
+  ])
+
+  useEffect(() => {
+    savePlannerPrefs({
+      org,
+      project,
+      team,
+      iterationPath,
+      assignee,
+      hiddenTypes,
+      hiddenStates,
+      rootTypes: rootTypesPref
+    })
+  }, [org, project, team, iterationPath, assignee, hiddenTypes, hiddenStates, rootTypesPref])
+
   const types = hierarchyQuery.data?.types ?? [...new Set(nodes.map((node) => node.type))]
   const states = [...new Set(nodes.map((node) => node.state))].sort()
+  const resolvedRoots = resolveRootTypes({
+    stored: rootTypesPref,
+    loadedTypes: types,
+    topBacklogTypes: hierarchyQuery.data?.topBacklogTypes ?? []
+  })
 
   const overlay: OverlayFilter = {
     types: hiddenTypes.length ? types.filter((type) => !hiddenTypes.includes(type)) : null,
     states: hiddenStates.length ? states.filter((state) => !hiddenStates.includes(state)) : null,
+    rootTypes: hierarchyQuery.data ? resolvedRoots : undefined,
     assignee,
     iterationPath: iterationPath || null,
     currentUserUniqueName: sessionQuery.data?.username
@@ -359,7 +468,6 @@ function PlannerApp() {
               setProject('')
               setTeam('')
               setIterationPath('')
-              setNodes([])
             }}
             options={(orgsQuery.data ?? []).map((row) => ({
               value: row.accountName,
@@ -377,7 +485,6 @@ function PlannerApp() {
               setProject(value)
               setTeam('')
               setIterationPath('')
-              setNodes([])
             }}
             options={(projectsQuery.data ?? []).map((row) => ({
               value: row.name,
@@ -394,7 +501,6 @@ function PlannerApp() {
             onChange={(value) => {
               setTeam(value)
               setIterationPath('')
-              setNodes([])
             }}
             options={(teamsQuery.data ?? []).map((row) => ({
               value: row.name,
@@ -420,11 +526,17 @@ function PlannerApp() {
             value={assignee}
             placeholder="Anyone"
             allowEmpty={false}
+            disabled={!team}
+            loading={membersQuery.isFetching}
             onChange={(value) => setAssignee((value || 'anyone') as AssigneeFilter)}
             options={[
               { value: 'anyone', label: 'Anyone' },
-              { value: 'me', label: 'Me' },
-              { value: 'unassigned', label: 'Unassigned' }
+              ...(sessionQuery.data.username ? [{ value: 'me', label: 'Me' }] : []),
+              { value: 'unassigned', label: 'Unassigned' },
+              ...(membersQuery.data ?? []).map((row) => ({
+                value: row.uniqueName,
+                label: row.displayName
+              }))
             ]}
           />
         </div>
@@ -434,6 +546,30 @@ function PlannerApp() {
               Filters
             </span>
             <div className="flex items-center gap-2">
+              <FilterMenu
+                id="root-filter"
+                label="Roots"
+                items={types}
+                hidden={
+                  resolvedRoots === null
+                    ? []
+                    : types.filter((type) => !resolvedRoots.includes(type))
+                }
+                onChange={(hidden) => {
+                  if (types.length === 0) {
+                    return
+                  }
+                  if (hidden.length === 0) {
+                    setRootTypesPref(null)
+                    return
+                  }
+                  if (hidden.length === types.length) {
+                    setRootTypesPref([])
+                    return
+                  }
+                  setRootTypesPref(types.filter((type) => !hidden.includes(type)))
+                }}
+              />
               <FilterMenu
                 id="type-filter"
                 label="Types"
@@ -493,7 +629,7 @@ function PlannerApp() {
               items={visible}
               iterations={iterationsQuery.data ?? []}
               loading={hierarchyQuery.isFetching}
-              onItemsChange={setNodes}
+              onItemsChange={writeNodes}
               onOpen={(id) => void openForm(id)}
             />
           </div>
@@ -514,8 +650,8 @@ function PlannerApp() {
             setOpenId(null)
           }}
           onSaved={(rev, values) => {
-            setNodes((prev) =>
-              prev.map((row) =>
+            writeNodes(
+              nodes.map((row) =>
                 row.id === openId
                   ? {
                       ...row,
