@@ -23,6 +23,22 @@ _Avoid_: board (when meaning the Kanban board)
 **Gantt bar**:
 The timeline representation of a Work Item's Start Date and Target Date.
 
+**Dependency**:
+A Predecessor/Successor link between two Work Items that constrains schedule. Finish-to-start only.
+_Avoid_: Hierarchy, parent/child, related (bare)
+
+**Date cascade**:
+Moving a Work Item's Start Date and Target Date because a Dependency requires it.
+_Avoid_: auto-shift, ripple
+
+**Cascade mode**:
+How Date cascade behaves: Flexible, Strict, or No-action. A local planner preference; default Flexible.
+_Avoid_: dependency mode
+
+**Critical path**:
+The longest Dependency chain by dates. A derived highlight, not a stored field.
+_Avoid_: critical-path field
+
 **Session**:
 The securely stored login that lets the app call Azure DevOps without signing in every launch — Entra work/school SSO when a public-client ID is configured, otherwise a stored personal access token.
 _Avoid_: personal Microsoft account, MSA

@@ -34,6 +34,7 @@
     "test:watch": "vitest",
     "start": "electron-vite preview",
     "dev": "electron-vite dev --watch --remoteDebuggingPort=9222",
+    "prototype:deps": "electron-vite dev --watch --remoteDebuggingPort=9222",
     "build": "pnpm typecheck && electron-vite build",
     "postinstall": "node scripts/postinstall.cjs",
     "build:unpack": "pnpm build && electron-builder --dir",
