@@ -8,6 +8,7 @@ import type {
   GanttResource
 } from '@/components/reui/gantt/gantt-types'
 import { GanttView } from '@/components/reui/gantt/gantt-view'
+import { useDependencyPrototype } from '@/components/dependency-prototype'
 import { showErrorToast } from '@/lib/error-toast'
 import { colorForType } from '@shared/flavor'
 import {
@@ -104,6 +105,8 @@ export function HierarchyGantt({
   const resources = useMemo(() => toResources(items), [items])
   const events = useMemo(() => toEvents(items), [items])
 
+  const proto = useDependencyPrototype(items)
+
   const columns: GanttColumn[] = useMemo(
     () => [
       {
@@ -198,49 +201,57 @@ export function HierarchyGantt({
   }
 
   return (
-    <Gantt
-      events={events}
-      resources={resources}
-      loading={loading}
-      defaultScale="month"
-      className="h-full text-[13px]"
-      summaryBars
-      parentScheduling={false}
-      rowCheckboxes={false}
-      dragCreate={false}
-      displayScheduleHint={false}
-      metrics={{ minRowHeight: 2.75, laneHeight: 1.4, rowPadding: 0.6 }}
-      interactions={{ drag: true, resize: true, selectSlot: false }}
-      columns={columns}
-      treePanel={{ width: 592, nameColumnWidth: 248, minWidth: 360, maxWidth: 760 }}
-      i18n={{ labels: { resources: 'Work Items' } }}
-      canDropEvent={(update) => {
-        const id = Number(update.event.resourceId ?? update.event.id)
-        return itemsRef.current.find((row) => row.id === id)?.hasDateFields === true
-      }}
-      onEventUpdate={handleEventUpdate}
-      onEventDoubleClick={(occurrence) =>
-        onOpen(Number(occurrence.event.resourceId ?? occurrence.event.id))
-      }
-      onResourceDoubleClick={({ resource }) => onOpen(Number(resource.id))}
-      renderResourceLabel={({ resource }) => {
-        const item = byId.get(Number(resource.id))
-        return (
-          <span
-            className="flex min-w-0 items-baseline gap-1.5"
-            data-testid={`work-item-${resource.id}`}
-            title={item?.title ?? resource.title}
-          >
-            <span className="text-muted-foreground shrink-0 font-mono text-[12px]">
-              #{resource.id}
+    <div className="relative h-full">
+      <Gantt
+        events={events}
+        resources={resources}
+        loading={loading}
+        defaultScale="month"
+        className="h-full text-[13px]"
+        summaryBars
+        parentScheduling={false}
+        rowCheckboxes={false}
+        dragCreate={false}
+        displayScheduleHint={false}
+        metrics={{ minRowHeight: 2.75, laneHeight: 1.4, rowPadding: 0.6 }}
+        interactions={{ drag: true, resize: true, selectSlot: false }}
+        columns={[...columns, ...proto.extraColumns]}
+        treePanel={{
+          width: 592 + proto.extraColumns.reduce((sum, column) => sum + (column.width ?? 0), 0),
+          nameColumnWidth: 248,
+          minWidth: 360,
+          maxWidth: 920
+        }}
+        i18n={{ labels: { resources: 'Work Items' } }}
+        canDropEvent={(update) => {
+          const id = Number(update.event.resourceId ?? update.event.id)
+          return itemsRef.current.find((row) => row.id === id)?.hasDateFields === true
+        }}
+        onEventUpdate={handleEventUpdate}
+        onEventDoubleClick={(occurrence) =>
+          onOpen(Number(occurrence.event.resourceId ?? occurrence.event.id))
+        }
+        onResourceDoubleClick={({ resource }) => onOpen(Number(resource.id))}
+        renderResourceLabel={({ resource }) => {
+          const item = byId.get(Number(resource.id))
+          return (
+            <span
+              className="flex min-w-0 items-baseline gap-1.5"
+              data-testid={`work-item-${resource.id}`}
+              title={item?.title ?? resource.title}
+            >
+              <span className="text-muted-foreground shrink-0 font-mono text-[12px]">
+                #{resource.id}
+              </span>
+              <span className="truncate font-medium">{item?.title ?? resource.title}</span>
             </span>
-            <span className="truncate font-medium">{item?.title ?? resource.title}</span>
-          </span>
-        )
-      }}
-    >
-      <GanttNav className="px-4 py-2.5" />
-      <GanttView />
-    </Gantt>
+          )
+        }}
+      >
+        <GanttNav className="px-4 py-2.5" />
+        <GanttView />
+      </Gantt>
+      {proto.chrome}
+    </div>
   )
 }
