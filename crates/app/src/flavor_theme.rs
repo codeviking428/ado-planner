@@ -123,6 +123,8 @@ pub fn theme_color(flavor: Flavor) -> ThemeColor {
     colors.title_bar_border = border;
     colors.window_border = border;
     colors.list = bg;
+    colors.list_hover = muted;
+    colors.list_active = pal.color(pal.secondary);
     colors.tab = bg;
     colors.tab_active = muted;
     colors.tab_foreground = fg;

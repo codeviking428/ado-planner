@@ -13,7 +13,8 @@ pub const MIN_TREE_WIDTH: f32 = 240.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
-pub const TIMELINE_HEADER_H: f32 = 28.0;
+pub const TIMELINE_HEADER_H: f32 = 44.0;
+pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GanttScale {
@@ -67,16 +68,54 @@ impl GanttScale {
 
     pub fn range_title(self, origin: Date) -> String {
         match self {
-            Self::Day => origin.to_string(),
-            Self::Week => format!("Week of {origin}"),
-            Self::Month => format!("{}-{:02}", origin.year(), origin.month()),
+            Self::Day => format!("{} {}", month_abbrev(origin), origin.day()),
+            Self::Week => format!("Week of {} {}", month_abbrev(origin), origin.day()),
+            Self::Month => format!("{} {}", month_abbrev(origin), origin.year()),
             Self::Quarter => {
-                let q = ((origin.month() as u32 - 1) / 3) + 1;
+                let q = ((origin.month() as i32 - 1) / 3) + 1;
                 format!("{} Q{q}", origin.year())
             }
             Self::Year => origin.year().to_string(),
         }
     }
+
+    pub fn tick_label(self, date: Date) -> String {
+        match self {
+            Self::Day => date.day().to_string(),
+            Self::Week => format!("{} {}", month_abbrev(date), date.day()),
+            Self::Month => month_abbrev(date).to_string(),
+            Self::Quarter => {
+                let q = ((date.month() as i32 - 1) / 3) + 1;
+                format!("Q{q}")
+            }
+            Self::Year => date.year().to_string(),
+        }
+    }
+
+    pub fn major_label(self, date: Date) -> String {
+        match self {
+            Self::Day | Self::Week => format!("{} {}", month_abbrev(date), date.year()),
+            Self::Month | Self::Quarter | Self::Year => date.year().to_string(),
+        }
+    }
+
+    pub fn shows_weekend_bands(self) -> bool {
+        matches!(self, Self::Day)
+    }
+}
+
+fn month_abbrev(date: Date) -> &'static str {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MONTHS[(date.month() as u8).saturating_sub(1).min(11) as usize]
+}
+
+fn is_weekend(date: Date) -> bool {
+    matches!(
+        date.weekday(),
+        jiff::civil::Weekday::Saturday | jiff::civil::Weekday::Sunday
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +155,15 @@ pub struct VisibleRow {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TimelineTick {
+    pub x: f32,
+    pub label: String,
+    pub major_label: String,
+    pub major: bool,
+    pub weekend: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct BarLayout {
     pub id: i64,
     pub kind: GanttBarKind,
@@ -124,6 +172,8 @@ pub struct BarLayout {
     pub y: f32,
     pub summary: bool,
     pub label: String,
+    pub title: String,
+    pub color: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -136,11 +186,14 @@ pub struct GanttView {
     pub tree_width: f32,
     pub viewport_h: f32,
     pub timeline_origin_x: f32,
+    pub timeline_width: f32,
     pub selected_id: Option<i64>,
+    pub hovered_id: Option<i64>,
     pub collapsed: HashSet<i64>,
     pub gesture: Option<Gesture>,
     pub pending_nudge: Option<PendingNudge>,
     pub context_menu: Option<ContextTarget>,
+    pub splitter_drag: Option<(f32, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,11 +213,14 @@ impl Default for GanttView {
             tree_width: DEFAULT_TREE_WIDTH,
             viewport_h: 720.0,
             timeline_origin_x: 0.0,
+            timeline_width: 800.0,
             selected_id: None,
+            hovered_id: None,
             collapsed: HashSet::new(),
             gesture: None,
             pending_nudge: None,
             context_menu: None,
+            splitter_drag: None,
         }
     }
 }
@@ -182,6 +238,20 @@ impl GanttView {
         let count = ((viewport_h / ROW_HEIGHT).ceil() as usize).saturating_add(2);
         let end = (start + count).min(rows.len());
         &rows[start..end]
+    }
+
+    pub fn row_scroll_remainder(&self) -> f32 {
+        self.scroll_y.rem_euclid(ROW_HEIGHT)
+    }
+
+    pub fn row_y(&self, window_offset: usize) -> f32 {
+        window_offset as f32 * ROW_HEIGHT - self.row_scroll_remainder()
+    }
+
+    pub fn clamp_scroll(&mut self, row_count: usize, viewport_h: f32) {
+        let content_h = (viewport_h - TIMELINE_HEADER_H).max(0.0);
+        let max_y = (row_count as f32 * ROW_HEIGHT - content_h).max(0.0);
+        self.scroll_y = self.scroll_y.clamp(0.0, max_y);
     }
 
     pub fn toggle_expand(&mut self, id: i64) {
@@ -299,11 +369,6 @@ impl GanttView {
         viewport_h: f32,
     ) -> Vec<BarLayout> {
         let window = self.visible_window(rows, viewport_h);
-        let start_index = if rows.is_empty() {
-            0
-        } else {
-            ((self.scroll_y / ROW_HEIGHT).floor() as usize).min(rows.len())
-        };
         let by_id: HashMap<i64, &WorkItemNode> = nodes.iter().map(|node| (node.id, node)).collect();
         window
             .iter()
@@ -324,9 +389,11 @@ impl GanttView {
                     kind: display.kind,
                     x,
                     width,
-                    y: (start_index + offset) as f32 * ROW_HEIGHT - self.scroll_y,
+                    y: self.row_y(offset),
                     summary,
                     label: dates_column_text(node, nodes, hint.as_ref()),
+                    title: node.title.clone(),
+                    color: parse_type_color(ado_core::color_for_type(&node.work_item_type)),
                 })
             })
             .collect()
@@ -403,7 +470,7 @@ impl GanttView {
         Some((gesture.id, gesture.live_start, gesture.live_target))
     }
 
-    pub fn timeline_ticks(&self, width: f32) -> Vec<(f32, String)> {
+    pub fn timeline_ticks(&self, width: f32) -> Vec<TimelineTick> {
         let ppd = self.scale.pixels_per_day(self.zoom);
         if ppd <= 0.0 || width <= 0.0 {
             return Vec::new();
@@ -413,13 +480,99 @@ impl GanttView {
         let step = self.scale.step_days().max(1);
         let mut day = (start_days / step) * step;
         let mut ticks = Vec::new();
+        let mut last_major = String::new();
         while day <= end_days {
             let date = self.origin.saturating_add(day.days());
             let x = day as f32 * ppd - self.scroll_x;
-            ticks.push((x, self.scale.range_title(date)));
+            let major_label = self.scale.major_label(date);
+            let major = major_label != last_major;
+            if major {
+                last_major = major_label.clone();
+            }
+            ticks.push(TimelineTick {
+                x,
+                label: self.scale.tick_label(date),
+                major_label,
+                major,
+                weekend: is_weekend(date),
+            });
             day += step;
         }
         ticks
+    }
+
+    pub fn today_x(&self, today: Date) -> f32 {
+        self.x_for_date(today)
+    }
+
+    /// Two-level header majors, with at most one sticky label at x = 0 so
+    /// scrolled-past months/years do not stack on top of each other.
+    pub fn header_major_labels(&self, width: f32) -> Vec<(f32, String)> {
+        const STICKY_MIN: f32 = 88.0;
+        let mut sticky: Option<String> = None;
+        let mut out = Vec::new();
+        for tick in self
+            .timeline_ticks(width)
+            .into_iter()
+            .filter(|tick| tick.major)
+        {
+            if tick.x <= 0.0 {
+                sticky = Some(tick.major_label);
+            } else {
+                out.push((tick.x, tick.major_label));
+            }
+        }
+        if let Some(label) = sticky {
+            let overlaps = out.first().is_some_and(|(x, _)| *x < STICKY_MIN);
+            if !overlaps {
+                out.insert(0, (0.0, label));
+            }
+        }
+        out
+    }
+
+    /// Fit every laid-out bar into `width` pixels, matching monday.com Auto Fit.
+    pub fn auto_fit(&mut self, nodes: &[WorkItemNode], iterations: &[IterationNode], width: f32) {
+        let mut earliest: Option<Date> = None;
+        let mut latest: Option<Date> = None;
+        for node in nodes {
+            let hint = iteration_hint_for_path(&node.iteration_path, iterations);
+            let display = gantt_bar_display(node, nodes, hint.as_ref());
+            if let Some(start) = display.start {
+                earliest = Some(match earliest {
+                    Some(current) if start < current => start,
+                    Some(current) => current,
+                    None => start,
+                });
+            }
+            if let Some(end) = display.end {
+                latest = Some(match latest {
+                    Some(current) if end > current => end,
+                    Some(current) => current,
+                    None => end,
+                });
+            }
+        }
+        let Some(start) = earliest else {
+            return;
+        };
+        let end = latest.unwrap_or(start);
+        self.origin = start;
+        self.scroll_x = 0.0;
+        let days = end
+            .since((Unit::Day, start))
+            .map(|span| span.get_days())
+            .unwrap_or(1)
+            .max(7) as f32;
+        let target_ppd = ((width * 0.88) / days).clamp(0.4, 96.0);
+        let base = match self.scale {
+            GanttScale::Day => 48.0,
+            GanttScale::Week => 24.0,
+            GanttScale::Month => 12.0,
+            GanttScale::Quarter => 4.0,
+            GanttScale::Year => 1.5,
+        };
+        self.zoom = (target_ppd / base).clamp(0.4, 4.0);
     }
 
     pub fn apply_nudge(
@@ -488,6 +641,10 @@ impl GanttView {
         };
         Some((bar, kind))
     }
+}
+
+fn parse_type_color(hex: &str) -> u32 {
+    u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0x89b4fa)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,6 +781,8 @@ mod tests {
             y: 0.0,
             summary: false,
             label: "bar".into(),
+            title: "bar".into(),
+            color: 0x89b4fa,
         };
         let bars = [bar];
         assert_eq!(
@@ -681,7 +840,28 @@ mod tests {
         };
         let ticks = gantt.timeline_ticks(400.0);
         assert!(ticks.len() >= 2);
-        assert!(ticks.iter().any(|(_, label)| label.contains("2026")));
+        assert!(ticks.iter().any(|tick| tick.major));
+        assert!(ticks.iter().any(|tick| {
+            tick.label.contains("2026") || tick.label.contains("Jul") || tick.label.contains("7")
+        }));
+    }
+
+    #[test]
+    fn auto_fit_puts_scheduled_bars_on_screen() {
+        let nodes = vec![node(1, None)];
+        let mut gantt = GanttView {
+            origin: Date::new(2025, 1, 1).unwrap(),
+            zoom: 0.4,
+            ..Default::default()
+        };
+        gantt.auto_fit(&nodes, &[], 800.0);
+        assert_eq!(gantt.origin, Date::new(2026, 7, 6).unwrap());
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert!(!bars.is_empty());
+        assert!(bars[0].x >= -1.0);
+        assert!(bars[0].x + bars[0].width <= 800.0 + 1.0);
+        assert!(!bars[0].title.is_empty());
     }
 
     #[test]
@@ -719,6 +899,79 @@ mod tests {
         let bars = gantt.layout_bars(&[item], &rows, &iterations, 720.0);
         assert_eq!(bars.len(), 1);
         assert!(bars[0].summary);
+    }
+
+    #[test]
+    fn header_major_labels_do_not_stack_at_the_origin() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 1, 1).unwrap(),
+            scale: GanttScale::Month,
+            scroll_x: 12.0 * 30.0 * 8.0,
+            ..Default::default()
+        };
+        let labels = gantt.header_major_labels(800.0);
+        let at_zero = labels.iter().filter(|(x, _)| *x == 0.0).count();
+        assert!(at_zero <= 1, "sticky majors must not stack: {labels:?}");
+        assert!(
+            labels.iter().any(|(_, label)| label.contains("2026")),
+            "year label should remain visible: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn weekend_bands_are_day_scale_only() {
+        assert!(GanttScale::Day.shows_weekend_bands());
+        assert!(!GanttScale::Month.shows_weekend_bands());
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 4).unwrap(),
+            scale: GanttScale::Day,
+            ..Default::default()
+        };
+        let ticks = gantt.timeline_ticks(400.0);
+        assert!(ticks.iter().any(|tick| tick.weekend && tick.label == "4"));
+    }
+
+    #[test]
+    fn row_y_keeps_bars_aligned_with_fractional_scroll() {
+        let nodes = vec![node(1, None), node(2, None), node(3, None)];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scroll_y: 50.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert!(!bars.is_empty());
+        assert!((bars[0].y - gantt.row_y(0)).abs() < f32::EPSILON);
+        assert!(gantt.row_scroll_remainder() > 0.0);
+    }
+
+    #[test]
+    fn short_bars_keep_a_title_for_an_outside_label() {
+        let nodes = vec![node(1, None)];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert_eq!(bars.len(), 1);
+        assert!(bars[0].width < BAR_LABEL_INSIDE_MIN);
+        assert_eq!(bars[0].title, "WI 1");
+    }
+
+    #[test]
+    fn clamp_scroll_stops_at_the_last_row() {
+        let mut gantt = GanttView {
+            viewport_h: 80.0,
+            scroll_y: 10_000.0,
+            ..Default::default()
+        };
+        gantt.clamp_scroll(3, 80.0);
+        assert!(gantt.scroll_y < 200.0);
+        assert!(gantt.scroll_y >= 0.0);
     }
 
     #[test]

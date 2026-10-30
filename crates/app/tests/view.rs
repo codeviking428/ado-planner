@@ -65,8 +65,53 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
         "timeline scale header should be painted"
     );
     assert!(
+        cx.debug_bounds("gantt-tree-header")
+            .is_some_and(|bounds| bounds.size.height > gpui_kit::px(0.)),
+        "tree header should align with the timeline header"
+    );
+    assert!(
+        cx.debug_bounds("gantt-today").is_some(),
+        "today marker should be painted"
+    );
+    assert!(
         cx.debug_bounds("gantt-bar").is_some(),
         "at least one Gantt bar should be painted"
+    );
+}
+
+#[gpui_kit::test]
+fn rendered_unscheduled_chip_and_form_header(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.first_mut() {
+        node.start_date = None;
+        node.target_date = None;
+        node.has_date_fields = true;
+    }
+    let mut values = serde_json::Map::new();
+    values.insert(
+        "System.Title".into(),
+        serde_json::Value::String("Persist cart".into()),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: Vec::new(),
+        pages: Vec::new(),
+        values,
+    }));
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("unscheduled-chip").is_some(),
+        "unscheduled dates should render as a chip, not a clipped string"
+    );
+    assert!(
+        cx.debug_bounds("work-item-form-header")
+            .is_some_and(|bounds| bounds.size.height > gpui_kit::px(24.)),
+        "item panel should paint a crisp header"
     );
 }
 

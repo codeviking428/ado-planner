@@ -28,7 +28,8 @@ use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
-    GanttScale, GestureKind, HANDLE_WIDTH, NUDGE_IDLE_MS, NudgeAxis, ROW_HEIGHT, TIMELINE_HEADER_H,
+    BAR_LABEL_INSIDE_MIN, GanttScale, GestureKind, HANDLE_WIDTH, MIN_TREE_WIDTH, NUDGE_IDLE_MS,
+    NudgeAxis, ROW_HEIGHT, TIMELINE_HEADER_H,
 };
 use crate::paths::AppPaths;
 use crate::state::PlannerState;
@@ -324,18 +325,21 @@ impl PlannerView {
 
     fn apply_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         let mods = event.modifiers;
+        let delta = event.delta.pixel_delta(px(16.));
         if mods.control || mods.platform {
-            let factor = if event.delta.pixel_delta(px(12.)).y > px(0.) {
-                1.1
-            } else {
-                0.9
-            };
-            self.state.gantt.zoom_at(factor, 0.0, 0.0);
+            let factor = if f32::from(delta.y) < 0.0 { 1.12 } else { 0.9 };
+            let pointer = self.state.gantt.timeline_width * 0.5;
+            self.state.gantt.zoom_at(factor, pointer, 0.0);
+        } else if mods.shift {
+            self.state.gantt.scroll_x += f32::from(delta.y) + f32::from(delta.x);
         } else {
-            self.state.gantt.scroll_x += f32::from(event.delta.pixel_delta(px(12.)).x);
-            self.state.gantt.scroll_y += f32::from(event.delta.pixel_delta(px(12.)).y);
-            self.state.gantt.scroll_y = self.state.gantt.scroll_y.max(0.0);
+            self.state.gantt.scroll_x += f32::from(delta.x);
+            self.state.gantt.scroll_y += f32::from(delta.y);
         }
+        let rows = self.state.visible_rows().len();
+        self.state
+            .gantt
+            .clamp_scroll(rows, self.state.gantt.viewport_h);
         cx.notify();
     }
 
@@ -670,25 +674,26 @@ impl PlannerView {
             "state-filter" => self.state.prefs.planner.hidden_states.clone(),
             _ => self.state.hidden_roots(),
         };
-        let trigger =
-            Button::new(id)
-                .label(caption)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_scope = None;
-                    this.state.gantt.context_menu = None;
-                    this.open_filter = if this.open_filter == Some(id) {
-                        None
-                    } else {
-                        Some(id)
-                    };
-                    this.filter_query.update(cx, |input, cx| {
-                        input.set_value("", window, cx);
-                    });
-                    if this.open_filter == Some(id) {
-                        Self::focus_input(&this.filter_query, window, cx);
-                    }
-                    cx.notify();
-                }));
+        let trigger = Button::new(id)
+            .label(caption)
+            .selected(open || hidden > 0)
+            .when(open || hidden > 0, |btn| btn.primary())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_scope = None;
+                this.state.gantt.context_menu = None;
+                this.open_filter = if this.open_filter == Some(id) {
+                    None
+                } else {
+                    Some(id)
+                };
+                this.filter_query.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                if this.open_filter == Some(id) {
+                    Self::focus_input(&this.filter_query, window, cx);
+                }
+                cx.notify();
+            }));
         let mut popup = Popup::new(format!("{id}-popup"), trigger).offset(px(4.));
         if open {
             popup = popup.content(self.filter_menu(id, items, hidden_set, cx));
@@ -753,6 +758,8 @@ impl PlannerView {
                     .gap_2()
                     .px_1()
                     .py_1()
+                    .rounded_md()
+                    .hover(|el| el.bg(cx.theme().list_hover))
                     .child(
                         Checkbox::new(SharedString::from(format!("cb-{item}")))
                             .checked(checked)
@@ -779,6 +786,7 @@ impl PlannerView {
                 Button::new(flavor.as_str())
                     .label(flavor.label())
                     .selected(selected)
+                    .when(selected, |btn| btn.primary())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.state.set_flavor(flavor);
                         apply_flavor(cx, flavor);
@@ -816,27 +824,21 @@ impl PlannerView {
         }
         let rows = self.state.gantt.flatten(&visible);
         let viewport_h = self.state.gantt.viewport_h.max(120.0);
-        let window = self.state.gantt.visible_window(&rows, viewport_h).to_vec();
-        let bars =
-            self.state
-                .gantt
-                .layout_bars(&visible, &rows, &self.state.iterations, viewport_h);
+        let content_h = (viewport_h - TIMELINE_HEADER_H).max(80.0);
+        let window = self.state.gantt.visible_window(&rows, content_h).to_vec();
+        let bars = self
+            .state
+            .gantt
+            .layout_bars(&visible, &rows, &self.state.iterations, content_h);
         v_flex()
             .id("gantt")
             .size_full()
             .track_focus(&self.form_focus)
-            .overflow_scroll()
-            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
-                this.apply_scroll(event, cx);
-            }))
             .child(self.render_gantt_nav(cx))
             .child(
                 h_flex()
                     .id("gantt-body")
                     .flex_1()
-                    .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
-                        this.apply_scroll(event, cx);
-                    }))
                     .child(self.render_tree(&visible, &window, cx))
                     .child(
                         div()
@@ -845,17 +847,23 @@ impl PlannerView {
                             .h_full()
                             .bg(cx.theme().border)
                             .cursor_col_resize()
+                            .hover(|el| el.bg(cx.theme().primary))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
                                     if event.click_count >= 2 {
                                         this.state.gantt.reset_tree_width();
+                                        this.state.gantt.splitter_drag = None;
+                                    } else {
+                                        let x: f32 = event.position.x.into();
+                                        this.state.gantt.splitter_drag =
+                                            Some((x, this.state.gantt.tree_width));
                                     }
                                     cx.notify();
                                 }),
                             ),
                     )
-                    .child(self.render_timeline(&bars, cx)),
+                    .child(self.render_timeline(&window, &bars, cx)),
             )
             .when(self.state.hierarchy_loading, |el| {
                 el.child(
@@ -873,8 +881,12 @@ impl PlannerView {
     fn render_gantt_nav(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .id("gantt-nav")
+            .items_center()
             .gap_2()
-            .p_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
             .child(
                 Button::new("today")
                     .label("Today")
@@ -903,13 +915,16 @@ impl PlannerView {
                 div()
                     .w(px(168.))
                     .flex_shrink_0()
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child(self.state.gantt.scale.range_title(self.state.gantt.origin)),
             )
             .children(GanttScale::ALL.iter().map(|scale| {
                 let scale = *scale;
+                let selected = self.state.gantt.scale == scale;
                 Button::new(scale.label())
                     .label(scale.label())
-                    .selected(self.state.gantt.scale == scale)
+                    .selected(selected)
+                    .when(selected, |btn| btn.primary())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.dismiss_overlays();
                         this.state.gantt.scale = scale;
@@ -920,7 +935,8 @@ impl PlannerView {
                 Button::new("zoom-out")
                     .label("−")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.gantt.zoom_at(0.8, 0.0, 0.0);
+                        let pointer = this.state.gantt.timeline_width * 0.5;
+                        this.state.gantt.zoom_at(0.8, pointer, 0.0);
                         cx.notify();
                     })),
             )
@@ -928,7 +944,20 @@ impl PlannerView {
                 Button::new("zoom-in")
                     .label("+")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.gantt.zoom_at(1.25, 0.0, 0.0);
+                        let pointer = this.state.gantt.timeline_width * 0.5;
+                        this.state.gantt.zoom_at(1.25, pointer, 0.0);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("auto-fit")
+                    .label("Auto Fit")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let nodes = this.state.visible_nodes();
+                        let width = this.state.gantt.timeline_width.max(200.0);
+                        this.state
+                            .gantt
+                            .auto_fit(&nodes, &this.state.iterations, width);
                         cx.notify();
                     })),
             )
@@ -942,6 +971,9 @@ impl PlannerView {
     ) -> impl IntoElement {
         let by_id: std::collections::HashMap<_, _> =
             nodes.iter().map(|n| (n.id, n.clone())).collect();
+        let header_fg = cx.theme().muted_foreground;
+        let hover_bg = cx.theme().list_hover;
+        let remainder = self.state.gantt.row_scroll_remainder();
         v_flex()
             .id("gantt-tree")
             .w(px(self.state.gantt.tree_width))
@@ -950,123 +982,197 @@ impl PlannerView {
             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                 this.apply_scroll(event, cx);
             }))
-            .children(window.iter().map(|row| {
-                let node = by_id.get(&row.id).cloned();
-                let Some(node) = node else {
-                    return div().into_any_element();
-                };
-                let id = node.id;
-                let selected = self.state.gantt.selected_id == Some(id);
-                let hint = crate::gantt::iteration_for(&node, &self.state.iterations);
-                let dates = dates_column_text(&node, nodes, hint.as_ref());
-                let depth = row.depth;
-                let expanded = row.expanded;
-                let has_children = row.has_children;
+            .child(
                 h_flex()
-                    .id(("work-item", id as u64))
-                    .role(Role::Row)
-                    .aria_label(format!("#{id} {}", node.title))
-                    .h(px(ROW_HEIGHT))
+                    .id("gantt-tree-header")
+                    .debug_selector(|| "gantt-tree-header".into())
+                    .h(px(TIMELINE_HEADER_H))
                     .px_2()
-                    .gap_2()
-                    .ml(px(depth as f32 * 16.))
-                    .bg(if selected {
-                        cx.theme().list_active
-                    } else {
-                        cx.theme().background
-                    })
-                    .child(
-                        Button::new(("expand", id as u64))
-                            .label(if !has_children {
-                                " "
-                            } else if expanded {
-                                "▾"
-                            } else {
-                                "▸"
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.gantt.toggle_expand(id);
-                                cx.notify();
-                            })),
-                    )
-                    .child(div().child(format!("#{id}")))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(48.))
-                            .overflow_hidden()
-                            .child(node.title.clone()),
+                            .text_xs()
+                            .text_color(header_fg)
+                            .child("Work item"),
                     )
-                    .child(self.type_badge(&node.work_item_type))
                     .child(
                         div()
-                            .id(("dates", id as u64))
+                            .w(px(148.))
                             .flex_shrink_0()
-                            .min_w(px(148.))
-                            .overflow_hidden()
                             .text_xs()
-                            .child(dates),
-                    )
-                    .on_click(
-                        cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
-                            this.dismiss_overlays();
-                            if this
-                                .state
-                                .gantt
-                                .pending_nudge
-                                .as_ref()
-                                .is_some_and(|pending| pending.id != id)
-                            {
-                                this.state.discard_nudge();
-                            }
-                            this.state.gantt.selected_id = Some(id);
-                            window.focus(&this.form_focus, cx);
-                            if event.click_count() >= 2 {
-                                this.open_form(id, cx);
-                            }
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, _, _, cx| {
-                            this.state.gantt.context_menu = Some(crate::gantt::ContextTarget {
-                                id,
-                                from_bar: false,
-                            });
-                            cx.notify();
-                        }),
-                    )
-                    .into_any_element()
-            }))
+                            .text_color(header_fg)
+                            .child("Dates"),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .mt(px(-remainder))
+                    .children(window.iter().map(|row| {
+                        let node = by_id.get(&row.id).cloned();
+                        let Some(node) = node else {
+                            return div().into_any_element();
+                        };
+                        let id = node.id;
+                        let selected = self.state.gantt.selected_id == Some(id);
+                        let hovered = self.state.gantt.hovered_id == Some(id);
+                        let hint = crate::gantt::iteration_for(&node, &self.state.iterations);
+                        let dates = dates_column_text(&node, nodes, hint.as_ref());
+                        let depth = row.depth;
+                        let expanded = row.expanded;
+                        let has_children = row.has_children;
+                        h_flex()
+                            .id(("work-item", id as u64))
+                            .role(Role::Row)
+                            .aria_label(format!("#{id} {}", node.title))
+                            .h(px(ROW_HEIGHT))
+                            .px_2()
+                            .gap_2()
+                            .ml(px(depth as f32 * 16.))
+                            .bg(if selected {
+                                cx.theme().list_active
+                            } else if hovered {
+                                hover_bg
+                            } else {
+                                cx.theme().background
+                            })
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                this.state.gantt.hovered_id =
+                                    if *hovered { Some(id) } else { None };
+                                cx.notify();
+                            }))
+                            .child(
+                                Button::new(("expand", id as u64))
+                                    .label(if !has_children {
+                                        " "
+                                    } else if expanded {
+                                        "▾"
+                                    } else {
+                                        "▸"
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.state.gantt.toggle_expand(id);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(div().child(format!("#{id}")))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(48.))
+                                    .overflow_hidden()
+                                    .child(node.title.clone()),
+                            )
+                            .child(self.type_badge(&node.work_item_type, cx))
+                            .child(self.dates_cell(id, dates, cx))
+                            .on_click(cx.listener(
+                                move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                                    this.dismiss_overlays();
+                                    if this
+                                        .state
+                                        .gantt
+                                        .pending_nudge
+                                        .as_ref()
+                                        .is_some_and(|pending| pending.id != id)
+                                    {
+                                        this.state.discard_nudge();
+                                    }
+                                    this.state.gantt.selected_id = Some(id);
+                                    window.focus(&this.form_focus, cx);
+                                    if event.click_count() >= 2 {
+                                        this.open_form(id, cx);
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.state.gantt.context_menu =
+                                        Some(crate::gantt::ContextTarget {
+                                            id,
+                                            from_bar: false,
+                                        });
+                                    cx.notify();
+                                }),
+                            )
+                            .into_any_element()
+                    })),
+            )
     }
 
-    fn type_badge(&self, ty: &str) -> impl IntoElement {
+    fn type_badge(&self, ty: &str, cx: &Context<Self>) -> impl IntoElement {
         let color = color_for_type(ty);
         let parsed = u32::from_str_radix(color.trim_start_matches('#'), 16).unwrap_or(0x89b4fa);
         h_flex()
             .gap_1()
             .px_1()
             .rounded_md()
+            .bg(cx.theme().muted)
             .child(div().size(px(8.)).rounded_full().bg(rgb(parsed)))
-            .child(div().text_xs().child(ty.to_string()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(parsed))
+                    .child(ty.to_string()),
+            )
+    }
+
+    fn dates_cell(&self, id: i64, text: String, cx: &Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        if let Some(rest) = text.strip_prefix("Unscheduled") {
+            let hint = rest.trim_start_matches([' ', '·']).trim().to_string();
+            v_flex()
+                .id(("dates", id as u64))
+                .debug_selector(|| "unscheduled-chip".into())
+                .flex_shrink_0()
+                .w(px(148.))
+                .overflow_hidden()
+                .child(div().text_xs().text_color(muted).child("Unscheduled"))
+                .when(!hint.is_empty(), |el| {
+                    el.child(div().text_xs().overflow_hidden().child(hint))
+                })
+        } else {
+            div()
+                .id(("dates", id as u64))
+                .flex_shrink_0()
+                .w(px(148.))
+                .overflow_hidden()
+                .text_xs()
+                .child(text)
+        }
     }
 
     fn render_timeline(
         &mut self,
+        window: &[crate::gantt::VisibleRow],
         bars: &[crate::gantt::BarLayout],
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let ticks = self.state.gantt.timeline_ticks(2400.0);
+        let width = self.state.gantt.timeline_width.max(400.0);
+        let ticks = self.state.gantt.timeline_ticks(width);
+        let today_x = self.state.gantt.today_x(jiff::Zoned::now().date());
         let header_fg = cx.theme().muted_foreground;
-        let bar_fg = cx.theme().primary_foreground;
         let muted_fg = cx.theme().foreground;
+        let bar_label_fg = gpui_kit::hsla(240. / 360., 0.21, 0.12, 1.);
+        let grid = cx.theme().border;
+        let weekend = cx.theme().muted;
+        let hover_bg = cx.theme().list_hover;
+        let selected_bg = cx.theme().list_active;
+        let today_color = cx.theme().primary;
+        let selected_id = self.state.gantt.selected_id;
+        let hovered_id = self.state.gantt.hovered_id;
+        let show_weekends = self.state.gantt.scale.shows_weekend_bands();
+        let weekend_w = self.state.gantt.scale.pixels_per_day(self.state.gantt.zoom);
+        let major_labels = self.state.gantt.header_major_labels(width);
         div()
             .id("gantt-timeline")
             .flex_1()
             .h_full()
             .relative()
-            .overflow_scroll()
+            .overflow_hidden()
             .bg(cx.theme().background)
             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                 this.apply_scroll(event, cx);
@@ -1080,6 +1186,64 @@ impl PlannerView {
                     }
                 }),
             )
+            .children(
+                ticks
+                    .iter()
+                    .filter(|tick| show_weekends && tick.weekend)
+                    .map(|tick| {
+                        div()
+                            .absolute()
+                            .left(px(tick.x))
+                            .top(px(TIMELINE_HEADER_H))
+                            .bottom_0()
+                            .w(px(weekend_w))
+                            .bg(weekend)
+                    }),
+            )
+            .children(ticks.iter().map(|tick| {
+                div()
+                    .absolute()
+                    .left(px(tick.x))
+                    .top(px(TIMELINE_HEADER_H))
+                    .bottom_0()
+                    .w(px(1.))
+                    .bg(grid)
+            }))
+            .children(window.iter().enumerate().map(|(offset, row)| {
+                let y = self.state.gantt.row_y(offset);
+                let selected = selected_id == Some(row.id);
+                let hovered = hovered_id == Some(row.id);
+                let id = row.id;
+                div()
+                    .id(("gantt-row-band", id as u64))
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(y + TIMELINE_HEADER_H))
+                    .h(px(ROW_HEIGHT))
+                    .bg(if selected {
+                        selected_bg
+                    } else if hovered {
+                        hover_bg
+                    } else {
+                        gpui_kit::hsla(0., 0., 0., 0.)
+                    })
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.state.gantt.hovered_id = if *hovered { Some(id) } else { None };
+                        cx.notify();
+                    }))
+            }))
+            .child(
+                div()
+                    .id("gantt-today")
+                    .debug_selector(|| "gantt-today".into())
+                    .absolute()
+                    .left(px(today_x))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(today_color),
+            )
             .child(
                 div()
                     .id("gantt-scale-header")
@@ -1092,77 +1256,139 @@ impl PlannerView {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
-                    .children(ticks.into_iter().map(|(x, label)| {
+                    .children(major_labels.into_iter().map(|(x, label)| {
                         div()
                             .absolute()
                             .left(px(x))
-                            .top(px(4.))
+                            .top(px(2.))
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(muted_fg)
+                            .child(label)
+                    }))
+                    .children(ticks.iter().map(|tick| {
+                        div()
+                            .absolute()
+                            .left(px(tick.x))
+                            .top(px(22.))
                             .text_xs()
                             .text_color(header_fg)
-                            .child(label)
+                            .child(tick.label.clone())
                     })),
             )
-            .children(bars.iter().map(|bar| {
+            .children(bars.iter().flat_map(|bar| {
                 let id = bar.id;
                 let bar_x = bar.x;
                 let bar_width = bar.width;
                 let summary = bar.summary;
-                div()
-                    .id(("gantt-bar", id as u64))
-                    .debug_selector(|| "gantt-bar".into())
-                    .role(Role::Button)
-                    .aria_label(format!("Gantt bar #{id}"))
-                    .absolute()
-                    .left(px(bar.x.max(0.0)))
-                    .top(px(bar.y + TIMELINE_HEADER_H))
-                    .w(px(bar.width.max(8.0)))
-                    .h(px(ROW_HEIGHT - 8.0))
-                    .mt(px(4.))
-                    .rounded_md()
-                    .bg(if bar.summary {
-                        cx.theme().muted
-                    } else {
-                        cx.theme().primary
-                    })
-                    .text_color(if bar.summary { muted_fg } else { bar_fg })
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .overflow_hidden()
-                    .child(div().px_1().text_xs().child(bar.label.clone()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            if event.click_count >= 2 {
-                                this.open_form(id, cx);
-                                return;
-                            }
-                            if summary {
-                                this.state.gantt.selected_id = Some(id);
+                let inside = bar.width >= BAR_LABEL_INSIDE_MIN;
+                let selected = selected_id == Some(id);
+                let hovered = hovered_id == Some(id);
+                let show_handles = !summary && (selected || hovered);
+                let mut items = vec![
+                    div()
+                        .id(("gantt-bar", id as u64))
+                        .debug_selector(|| "gantt-bar".into())
+                        .role(Role::Button)
+                        .aria_label(format!("Gantt bar #{id} {}", bar.title))
+                        .absolute()
+                        .left(px(bar.x))
+                        .top(px(bar.y + TIMELINE_HEADER_H))
+                        .w(px(bar.width.max(8.0)))
+                        .h(px(ROW_HEIGHT - 10.0))
+                        .mt(px(5.))
+                        .rounded_md()
+                        .relative()
+                        .when(summary, |el| el.bg(cx.theme().muted))
+                        .when(!summary, |el| el.bg(rgb(bar.color)))
+                        .text_color(if summary { muted_fg } else { bar_label_fg })
+                        .border_1()
+                        .border_color(if selected {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().border
+                        })
+                        .overflow_hidden()
+                        .child(div().px_1().text_xs().child(if inside {
+                            bar.title.clone()
+                        } else {
+                            String::new()
+                        }))
+                        .when(show_handles, |el| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .h_full()
+                                    .w(px(HANDLE_WIDTH))
+                                    .bg(cx.theme().primary),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right_0()
+                                    .top_0()
+                                    .h_full()
+                                    .w(px(HANDLE_WIDTH))
+                                    .bg(cx.theme().primary),
+                            )
+                        })
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            this.state.gantt.hovered_id = if *hovered { Some(id) } else { None };
+                            cx.notify();
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                if event.click_count >= 2 {
+                                    this.open_form(id, cx);
+                                    return;
+                                }
+                                if summary {
+                                    this.state.gantt.selected_id = Some(id);
+                                    cx.notify();
+                                    return;
+                                }
+                                let x: f32 = event.position.x.into();
+                                let local_x = x - this.state.gantt.timeline_origin_x;
+                                let kind = if local_x <= bar_x + HANDLE_WIDTH {
+                                    GestureKind::ResizeStart
+                                } else if local_x >= bar_x + bar_width - HANDLE_WIDTH {
+                                    GestureKind::ResizeEnd
+                                } else {
+                                    GestureKind::Move
+                                };
+                                this.dismiss_overlays();
+                                let _ = this.state.begin_bar_gesture(id, kind, local_x);
                                 cx.notify();
-                                return;
-                            }
-                            let x: f32 = event.position.x.into();
-                            let local_x = x - this.state.gantt.timeline_origin_x;
-                            let kind = if local_x <= bar_x + HANDLE_WIDTH {
-                                GestureKind::ResizeStart
-                            } else if local_x >= bar_x + bar_width - HANDLE_WIDTH {
-                                GestureKind::ResizeEnd
-                            } else {
-                                GestureKind::Move
-                            };
-                            this.dismiss_overlays();
-                            let _ = this.state.begin_bar_gesture(id, kind, local_x);
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, _, _, cx| {
-                            this.state.gantt.context_menu =
-                                Some(crate::gantt::ContextTarget { id, from_bar: true });
-                            cx.notify();
-                        }),
-                    )
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, _, _, cx| {
+                                this.state.gantt.context_menu =
+                                    Some(crate::gantt::ContextTarget { id, from_bar: true });
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                ];
+                if !inside {
+                    items.push(
+                        div()
+                            .id(("gantt-bar-label", id as u64))
+                            .debug_selector(|| "gantt-bar-label".into())
+                            .absolute()
+                            .left(px(bar.x + bar.width + 6.0))
+                            .top(px(bar.y + TIMELINE_HEADER_H + 8.0))
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(bar.title.clone())
+                            .into_any_element(),
+                    );
+                }
+                items
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.state.gantt.gesture.is_some() {
@@ -1282,6 +1508,8 @@ impl PlannerView {
             return div().into_any_element();
         };
         let title = form.title();
+        let heading = form.item_title();
+        let work_item_type = form.model.work_item_type.clone();
         let pages = form.model.pages.clone();
         let system = form.model.system_controls.clone();
         let active = form.active_page;
@@ -1311,20 +1539,63 @@ impl PlannerView {
                     .bg(cx.theme().popover)
                     .text_color(cx.theme().popover_foreground)
                     .rounded_xl()
-                    .p_6()
-                    .gap_3()
+                    .shadow_md()
+                    .gap_0()
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
-                    .child(div().text_lg().child(title))
                     .child(
                         h_flex()
+                            .id("work-item-form-header")
+                            .debug_selector(|| "work-item-form-header".into())
+                            .w_full()
+                            .items_start()
+                            .px_6()
+                            .py_4()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(self.type_badge(&work_item_type, cx))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(title),
+                                            ),
+                                    )
+                                    .child(div().text_lg().child(if heading.is_empty() {
+                                        "Untitled".to_string()
+                                    } else {
+                                        heading
+                                    })),
+                            )
+                            .child(
+                                Button::new("close-form")
+                                    .label("Close")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.close_form();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .px_6()
+                            .pt_3()
                             .gap_2()
                             .children(pages.iter().enumerate().map(|(i, page)| {
                                 Button::new(("page", i as u32))
                                     .label(page.label.clone())
                                     .selected(i == active)
+                                    .when(i == active, |btn| btn.primary())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(form) = this.state.form.as_mut() {
                                             form.active_page = i;
@@ -1338,15 +1609,24 @@ impl PlannerView {
                             .id("work-item-form-body")
                             .flex_1()
                             .min_h(px(120.))
+                            .px_6()
+                            .py_3()
                             .overflow_y_scrollbar()
-                            .gap_2()
+                            .gap_3()
                             .children(system.iter().map(|control| self.render_field(control, cx)))
                             .when(active < pages.len(), |el| {
                                 el.child(v_flex().gap_3().children(
                                     pages[active].groups.iter().map(|group| {
                                         v_flex()
                                             .gap_2()
-                                            .child(Label::new(group.label.clone()))
+                                            .p_3()
+                                            .rounded_md()
+                                            .bg(cx.theme().muted)
+                                            .child(
+                                                Label::new(group.label.clone())
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground),
+                                            )
                                             .children(
                                                 group
                                                     .controls
@@ -1359,7 +1639,11 @@ impl PlannerView {
                     )
                     .child(
                         h_flex()
+                            .px_6()
+                            .py_3()
                             .gap_2()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
                             .child(
                                 Button::new("save-work-item")
                                     .primary()
@@ -1390,7 +1674,11 @@ impl PlannerView {
         let id = control.reference_name.clone();
         v_flex()
             .gap_1()
-            .child(Label::new(label))
+            .child(
+                Label::new(label)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground),
+            )
             .child(match control.kind {
                 FormControlKind::Html if !form.is_plain_html(&id) => {
                     let url = self
@@ -1508,6 +1796,7 @@ impl PlannerView {
                     let selected = value.as_str().unwrap_or("").to_string();
                     h_flex()
                         .gap_1()
+                        .flex_wrap()
                         .children(options.into_iter().map(|opt| {
                             let field = id.clone();
                             let value = opt.clone();
@@ -1869,8 +2158,11 @@ impl Focusable for PlannerView {
 impl Render for PlannerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport_h = f32::from(window.viewport_size().height);
+        let viewport_w = f32::from(window.viewport_size().width);
         self.state.gantt.viewport_h = (viewport_h - 140.0).max(120.0);
         self.state.gantt.timeline_origin_x = self.state.gantt.tree_width + 6.0;
+        self.state.gantt.timeline_width =
+            (viewport_w - self.state.gantt.tree_width - 6.0).max(200.0);
         self.state.toasts.expire();
         self.ensure_form_inputs(window, cx);
         self.schedule_toast_expiry(cx);
@@ -1883,10 +2175,18 @@ impl Render for PlannerView {
                 if this.state.gantt.gesture.is_some() {
                     this.commit_gesture(cx);
                 }
+                if this.state.gantt.splitter_drag.take().is_some() {
+                    cx.notify();
+                }
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                let x: f32 = event.position.x.into();
+                if let Some((origin_x, origin_w)) = this.state.gantt.splitter_drag {
+                    this.state.gantt.tree_width = (origin_w + x - origin_x).max(MIN_TREE_WIDTH);
+                    cx.notify();
+                    return;
+                }
                 if this.state.gantt.gesture.is_some() {
-                    let x: f32 = event.position.x.into();
                     this.state
                         .update_bar_gesture(x - this.state.gantt.timeline_origin_x);
                     cx.notify();

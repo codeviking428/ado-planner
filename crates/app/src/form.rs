@@ -57,6 +57,15 @@ impl FormDraft {
         format!("#{} {}", self.model.id, self.model.work_item_type)
     }
 
+    pub fn item_title(&self) -> String {
+        self.values
+            .get("System.Title")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    }
+
     pub fn set_string(&mut self, reference: &str, value: String) {
         self.values
             .insert(reference.to_string(), Value::String(value));
@@ -255,6 +264,8 @@ mod tests {
             }],
         });
         let draft = FormDraft::from_model(model);
+        assert_eq!(draft.item_title(), "Hello");
+        assert!(draft.title().contains("#1"));
         assert!(draft.is_plain_html("System.Description"));
         assert!(
             draft
