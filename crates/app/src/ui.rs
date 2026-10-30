@@ -25,7 +25,7 @@ use gpui_kit::{
 
 use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
-use crate::form::ado_edit_url;
+use crate::form::ado_edit_url_on;
 use crate::gantt::{GanttScale, GestureKind, HANDLE_WIDTH, NUDGE_IDLE_MS, NudgeAxis, ROW_HEIGHT};
 use crate::paths::AppPaths;
 use crate::state::PlannerState;
@@ -1178,7 +1178,14 @@ impl PlannerView {
                     let url = self
                         .state
                         .scope()
-                        .map(|scope| ado_edit_url(&scope.org, &scope.project, form.model.id))
+                        .map(|scope| {
+                            ado_edit_url_on(
+                                self.state.client.ado_base(),
+                                &scope.org,
+                                &scope.project,
+                                form.model.id,
+                            )
+                        })
                         .unwrap_or_default();
                     v_flex()
                         .gap_1()
