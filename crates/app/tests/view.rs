@@ -2,12 +2,12 @@
 
 use ado_core::SessionInfo;
 use ado_planner::form::FormDraft;
-use ado_planner::gantt::{ContextTarget, GanttView};
+use ado_planner::gantt::{ContextTarget, GanttView, MIN_TIMELINE_WIDTH, ROW_HEIGHT};
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::ui::PlannerView;
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
-use gpui_kit::{KeyDownEvent, Keystroke, VisualTestContext};
+use gpui_kit::{KeyDownEvent, Keystroke, VisualTestContext, px};
 use jiff::civil::Date;
 
 fn idle_state(dir: &tempfile::TempDir) -> PlannerState {
@@ -74,8 +74,81 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
         "today marker should be painted"
     );
     assert!(
-        cx.debug_bounds("gantt-bar").is_some(),
+        cx.debug_bounds("gantt-bar-1").is_some(),
         "at least one Gantt bar should be painted"
+    );
+}
+
+#[gpui_kit::test]
+fn painted_tree_rows_and_bars_share_row_height(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let row1 = cx
+        .debug_bounds("gantt-tree-row-1")
+        .expect("first tree row should paint");
+    let row2 = cx
+        .debug_bounds("gantt-tree-row-2")
+        .expect("second tree row should paint");
+    let bar1 = cx
+        .debug_bounds("gantt-bar-1")
+        .expect("first bar should paint");
+    let bar2 = cx
+        .debug_bounds("gantt-bar-2")
+        .expect("second bar should paint");
+    let tree_stride = f32::from(row2.origin.y) - f32::from(row1.origin.y);
+    let bar_stride = f32::from(bar2.origin.y) - f32::from(bar1.origin.y);
+    assert!(
+        (f32::from(row1.size.height) - ROW_HEIGHT).abs() < 2.0,
+        "tree row height {} should be ROW_HEIGHT {ROW_HEIGHT}",
+        f32::from(row1.size.height)
+    );
+    assert!(
+        (tree_stride - ROW_HEIGHT).abs() < 2.0,
+        "tree row stride {tree_stride} should be ROW_HEIGHT {ROW_HEIGHT}"
+    );
+    assert!(
+        (bar_stride - ROW_HEIGHT).abs() < 2.0,
+        "bar stride {bar_stride} should be ROW_HEIGHT {ROW_HEIGHT}, not the 24/44 mismatch"
+    );
+    let bar_mid = f32::from(bar1.origin.y) + f32::from(bar1.size.height) / 2.0;
+    let row_mid = f32::from(row1.origin.y) + f32::from(row1.size.height) / 2.0;
+    assert!(
+        (bar_mid - row_mid).abs() < 8.0,
+        "bar for row 1 sits at {bar_mid}, tree row at {row_mid}"
+    );
+}
+
+#[gpui_kit::test]
+fn painted_splitter_keeps_a_minimum_timeline(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1024.),
+        height: px(720.),
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.state.gantt.set_tree_width_for_pane(10_000.0, 1024.0);
+        cx.notify();
+    });
+    draw(cx);
+    let tree = cx.debug_bounds("gantt-tree").expect("tree");
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    assert!(
+        f32::from(timeline.size.width) >= MIN_TIMELINE_WIDTH - 1.0,
+        "timeline painted {}px while tree painted {}px; MIN_TIMELINE_WIDTH is {MIN_TIMELINE_WIDTH}",
+        f32::from(timeline.size.width),
+        f32::from(tree.size.width)
+    );
+    assert!(
+        f32::from(tree.size.width) <= 1024.0 - MIN_TIMELINE_WIDTH + 8.0,
+        "tree painted {}px and ate the timeline",
+        f32::from(tree.size.width)
     );
 }
 
@@ -315,4 +388,200 @@ fn sign_in_shell_still_renders(cx: &mut gpui_kit::TestAppContext) {
     state.session_loading = false;
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
+}
+
+#[gpui_kit::test]
+fn escape_closes_a_freshly_opened_form_without_a_focused_field(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: Vec::new(),
+        pages: Vec::new(),
+        values: serde_json::Map::new(),
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(cx.debug_bounds("work-item-form").is_some());
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.form.is_none(),
+            "Escape on a freshly opened form with no field focused should close it"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn inline_title_editor_is_wide_enough_to_show_the_title(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_title(1, window, cx);
+        });
+    });
+    draw(cx);
+    let editor = cx
+        .debug_bounds("gantt-inline-title")
+        .expect("inline title editor should paint");
+    assert!(
+        f32::from(editor.size.width) >= 160.0,
+        "inline editor was only {}px wide",
+        f32::from(editor.size.width)
+    );
+}
+
+#[gpui_kit::test]
+fn form_uses_date_picker_avatar_chip_and_checkbox(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-07-06T00:00:00Z"),
+    );
+    values.insert(
+        "Microsoft.VSTS.Scheduling.StoryPoints".into(),
+        serde_json::json!(13.0),
+    );
+    values.insert(
+        "System.AssignedTo".into(),
+        serde_json::json!({"displayName": "Ada Lovelace", "uniqueName": "ada@contoso.com"}),
+    );
+    values.insert("Custom.Blocked".into(), serde_json::json!(true));
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: vec![
+            ado_core::FormControl {
+                id: "System.Title".into(),
+                reference_name: "System.Title".into(),
+                label: "Title".into(),
+                kind: ado_core::FormControlKind::String,
+                required: true,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+            ado_core::FormControl {
+                id: ado_core::START_DATE_FIELD.into(),
+                reference_name: ado_core::START_DATE_FIELD.into(),
+                label: "Start Date".into(),
+                kind: ado_core::FormControlKind::DateTime,
+                required: false,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+            ado_core::FormControl {
+                id: "Microsoft.VSTS.Scheduling.StoryPoints".into(),
+                reference_name: "Microsoft.VSTS.Scheduling.StoryPoints".into(),
+                label: "Story Points".into(),
+                kind: ado_core::FormControlKind::Integer,
+                required: false,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+            ado_core::FormControl {
+                id: "System.AssignedTo".into(),
+                reference_name: "System.AssignedTo".into(),
+                label: "Assigned To".into(),
+                kind: ado_core::FormControlKind::Identity,
+                required: false,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+            ado_core::FormControl {
+                id: "Custom.Blocked".into(),
+                reference_name: "Custom.Blocked".into(),
+                label: "Blocked".into(),
+                kind: ado_core::FormControlKind::Boolean,
+                required: false,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+        ],
+        pages: Vec::new(),
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-date-picker").is_some(),
+        "date fields should render a date picker, not a raw ISO string"
+    );
+    assert!(
+        cx.debug_bounds("form-assignee-chip").is_some(),
+        "Assigned To should render as an avatar chip"
+    );
+    assert!(
+        cx.debug_bounds("form-boolean").is_some(),
+        "booleans should render as a labeled checkbox, not a flat control"
+    );
+    view.update(cx, |view, cx| {
+        let points = view
+            .form_input_value("Microsoft.VSTS.Scheduling.StoryPoints", cx)
+            .unwrap_or_default();
+        assert_eq!(
+            points, "13",
+            "integers must not render as 13.0, got {points}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn narrow_window_toolbar_wraps_instead_of_clipping(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(700.),
+        height: px(500.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("header-log-out").is_some(),
+        "Log out should remain painted in a 700px window"
+    );
+    assert!(
+        cx.debug_bounds("gantt-nav")
+            .is_some_and(|bounds| bounds.size.width > px(0.)),
+        "gantt toolbar should wrap rather than vanish"
+    );
+}
+
+#[gpui_kit::test]
+fn lighter_toasts_and_today_label_paint(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.toasts.push(
+        ado_planner::toasts::ToastKind::Success,
+        "Copied work item ID",
+    );
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("planner-toast").is_some(),
+        "toasts should paint"
+    );
+    assert!(
+        cx.debug_bounds("gantt-today").is_some(),
+        "today marker should paint"
+    );
 }

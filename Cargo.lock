@@ -154,6 +154,7 @@ dependencies = [
  "ado-session",
  "async-trait",
  "cargo-packager-updater",
+ "chrono",
  "dirs 6.0.0",
  "gpui-kit",
  "jiff",

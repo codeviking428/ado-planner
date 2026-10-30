@@ -208,10 +208,63 @@ pub fn identity_json(value: &IdentityValue) -> Value {
     })
 }
 
+/// Display text for a form control, so integers are not shown as `13.0` and
+/// date-times are not dumped as raw ISO instants.
+pub fn format_form_value(kind: FormControlKind, value: &Value) -> String {
+    match (kind, value) {
+        (FormControlKind::Integer, Value::Number(n)) => n
+            .as_i64()
+            .map(|v| v.to_string())
+            .or_else(|| {
+                n.as_f64().map(|v| {
+                    if v.fract() == 0.0 {
+                        format!("{}", v as i64)
+                    } else {
+                        v.to_string()
+                    }
+                })
+            })
+            .unwrap_or_else(|| n.to_string()),
+        (FormControlKind::Double, Value::Number(n)) => n
+            .as_f64()
+            .map(|v| {
+                if v.fract() == 0.0 {
+                    format!("{}", v as i64)
+                } else {
+                    v.to_string()
+                }
+            })
+            .unwrap_or_else(|| n.to_string()),
+        (FormControlKind::DateTime, Value::String(text)) => ado_core::parse_iso_date(Some(text))
+            .map(|date| date.to_string())
+            .unwrap_or_else(|| text.clone()),
+        (_, Value::String(text)) => text.clone(),
+        (_, Value::Number(n)) => n.to_string(),
+        (_, Value::Bool(flag)) => flag.to_string(),
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ado_core::FormControlKind;
+
+    #[test]
+    fn format_form_value_drops_integer_fraction_and_iso_time() {
+        assert_eq!(
+            format_form_value(FormControlKind::Integer, &json!(13.0)),
+            "13"
+        );
+        assert_eq!(
+            format_form_value(FormControlKind::Integer, &json!(13)),
+            "13"
+        );
+        assert_eq!(
+            format_form_value(FormControlKind::DateTime, &json!("2026-07-06T00:00:00Z")),
+            "2026-07-06"
+        );
+    }
 
     #[test]
     fn apply_saved_clears_empty_or_null_dates() {

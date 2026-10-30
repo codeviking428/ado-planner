@@ -175,6 +175,7 @@ pub struct BarLayout {
     pub label: String,
     pub title: String,
     pub color: u32,
+    pub progress: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +340,14 @@ impl GanttView {
 
     pub fn set_tree_width(&mut self, width: f32) {
         self.tree_width = width.clamp(MIN_TREE_WIDTH, self.max_tree_width());
+        self.timeline_width = (self.viewport_w - self.tree_width - 6.0).max(MIN_TIMELINE_WIDTH);
+    }
+
+    /// Clamp against the live pane width so a stale `viewport_w` cannot let the
+    /// tree eat the timeline.
+    pub fn set_tree_width_for_pane(&mut self, width: f32, pane_w: f32) {
+        self.viewport_w = pane_w.max(MIN_TREE_WIDTH + MIN_TIMELINE_WIDTH + 6.0);
+        self.set_tree_width(width);
     }
 
     pub fn clamp_tree_width(&mut self) {
@@ -424,6 +433,7 @@ impl GanttView {
                     label: dates_column_text(node, nodes, hint.as_ref()),
                     title: node.title.clone(),
                     color: parse_type_color(ado_core::color_for_type(&node.work_item_type)),
+                    progress: child_completion(nodes, node.id),
                 })
             })
             .collect()
@@ -583,12 +593,18 @@ impl GanttView {
                 });
             }
         }
+        let today = jiff::Zoned::now().date();
         let Some(start) = earliest else {
-            self.go_today(jiff::Zoned::now().date());
+            self.go_today(today);
             self.zoom = 1.0;
             return;
         };
-        let end = latest.unwrap_or(start);
+        let start = if today < start { today } else { start };
+        let end = match latest {
+            Some(current) if today > current => today,
+            Some(current) => current,
+            None => today,
+        };
         self.origin = start;
         self.scroll_x = 0.0;
         let days = end
@@ -684,6 +700,29 @@ pub enum NudgeAxis {
     Both,
     Start,
     Target,
+}
+
+pub fn is_completed_state(state: &str) -> bool {
+    matches!(
+        state.to_ascii_lowercase().as_str(),
+        "done" | "closed" | "resolved" | "completed" | "removed"
+    )
+}
+
+/// Fraction of direct children in a completed state, for monday-style bar fill.
+pub fn child_completion(nodes: &[WorkItemNode], id: i64) -> Option<f32> {
+    let children: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.parent_id == Some(id))
+        .collect();
+    if children.is_empty() {
+        return None;
+    }
+    let done = children
+        .iter()
+        .filter(|node| is_completed_state(&node.state))
+        .count();
+    Some(done as f32 / children.len() as f32)
 }
 
 pub fn flatten_visible(nodes: &[WorkItemNode], collapsed: &HashSet<i64>) -> Vec<VisibleRow> {
@@ -815,6 +854,7 @@ mod tests {
             label: "bar".into(),
             title: "bar".into(),
             color: 0x89b4fa,
+            progress: None,
         };
         let bars = [bar];
         assert_eq!(
@@ -1040,10 +1080,56 @@ mod tests {
         };
         gantt.set_tree_width(10_000.0);
         assert!((gantt.tree_width - (800.0 - 6.0 - MIN_TIMELINE_WIDTH)).abs() < f32::EPSILON);
+        assert!(gantt.timeline_width >= MIN_TIMELINE_WIDTH);
         gantt.nudge_tree_width(500.0);
         assert!(gantt.tree_width <= gantt.max_tree_width());
         gantt.set_tree_width(0.0);
         assert!((gantt.tree_width - MIN_TREE_WIDTH).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn set_tree_width_for_pane_uses_the_live_width_not_a_stale_viewport() {
+        let mut gantt = GanttView {
+            viewport_w: 1280.0,
+            tree_width: DEFAULT_TREE_WIDTH,
+            ..Default::default()
+        };
+        gantt.set_tree_width_for_pane(10_000.0, 1024.0);
+        assert!(
+            (gantt.tree_width - (1024.0 - 6.0 - MIN_TIMELINE_WIDTH)).abs() < 0.5,
+            "tree_width {} should clamp against the 1024px pane, not the stale 1280",
+            gantt.tree_width
+        );
+        assert!(gantt.timeline_width >= MIN_TIMELINE_WIDTH - 0.5);
+    }
+
+    #[test]
+    fn layout_bars_share_row_height_stride() {
+        let nodes = crate::state::fake_hierarchy(8);
+        let gantt = GanttView::default();
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert!(bars.len() >= 2);
+        let stride = bars[1].y - bars[0].y;
+        assert!(
+            (stride - ROW_HEIGHT).abs() < f32::EPSILON,
+            "bar stride {stride} should equal ROW_HEIGHT {ROW_HEIGHT}"
+        );
+        assert!(
+            (bars[0].y).abs() < f32::EPSILON,
+            "first bar y should be 0, not TIMELINE_HEADER_H"
+        );
+    }
+
+    #[test]
+    fn parent_bars_report_child_completion() {
+        let mut nodes = crate::state::fake_hierarchy(3);
+        nodes[1].parent_id = Some(1);
+        nodes[2].parent_id = Some(1);
+        nodes[1].state = "Closed".into();
+        nodes[2].state = "New".into();
+        assert_eq!(child_completion(&nodes, 1), Some(0.5));
+        assert_eq!(child_completion(&nodes, 2), None);
     }
 
     #[test]
