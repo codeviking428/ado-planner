@@ -2,13 +2,16 @@
 
 use ado_core::SessionInfo;
 use ado_planner::form::FormDraft;
-use ado_planner::gantt::{ContextTarget, GanttView, MIN_TIMELINE_WIDTH, ROW_HEIGHT};
+use ado_planner::gantt::{ContextTarget, GanttView, GestureKind, MIN_TIMELINE_WIDTH, ROW_HEIGHT};
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::ui::PlannerView;
 use ado_planner::ui::looks_like_pat;
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
-use gpui_kit::{KeyDownEvent, Keystroke, VisualTestContext, px};
+use gpui_kit::{
+    KeyDownEvent, Keystroke, Modifiers, MouseButton, ScrollDelta, ScrollEvent, VisualTestContext,
+    point, px,
+};
 use jiff::civil::Date;
 
 fn idle_state(dir: &tempfile::TempDir) -> PlannerState {
@@ -796,5 +799,292 @@ fn lighter_toasts_and_today_label_paint(cx: &mut gpui_kit::TestAppContext) {
     assert!(
         cx.debug_bounds("gantt-today").is_some(),
         "today marker should paint"
+    );
+}
+
+#[gpui_kit::test]
+fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today_btn = cx.debug_bounds("gantt-today-btn").expect("Today button");
+    cx.simulate_click(today_btn.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let today = jiff::Zoned::now().date();
+        let month_start = Date::new(today.year(), today.month(), 1).unwrap();
+        let today_x = view.state.gantt.today_x(today);
+        let month_x = view.state.gantt.x_for_date(month_start);
+        assert!(
+            (today_x - month_x).abs() > 20.0,
+            "Today at {today_x} must not sit on the {month_start} gridline at {month_x}"
+        );
+        let labels: Vec<String> = view
+            .state
+            .gantt
+            .header_tick_labels(view.state.gantt.timeline_width.max(400.0))
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        for pair in labels.windows(2) {
+            assert_ne!(
+                pair[0], pair[1],
+                "month header labels must not repeat after Today: {labels:?}"
+            );
+        }
+        assert!(
+            labels.iter().any(|label| label == "Oct" || label == "Nov"),
+            "October/November must appear after jumping to today, got {labels:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn horizontal_scroll_left_reveals_earlier_month_labels(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 8, 1).unwrap();
+    state.gantt.scroll_x = 0.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let before = view.update(cx, |view, _| {
+        view.state.gantt.x_for_date(Date::new(2026, 8, 1).unwrap())
+    });
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    cx.simulate_event(ScrollEvent {
+        position: timeline.center(),
+        delta: ScrollDelta::Pixels(point(px(120.), px(0.))),
+        ..Default::default()
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let after = view
+            .state
+            .gantt
+            .x_for_date(Date::new(2026, 8, 1).unwrap());
+        assert!(
+            after > before,
+            "scroll-left (positive GPUI delta.x) must move Aug 1 right, revealing earlier months: {before} -> {after}"
+        );
+        let labels: Vec<_> = view
+            .state
+            .gantt
+            .header_tick_labels(view.state.gantt.timeline_width.max(400.0))
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "Jul" || label == "Aug"),
+            "header labels after a left scroll should be calendar months, got {labels:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn dragging_a_link_dot_starts_a_link_not_a_resize(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    state.gantt.hovered_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1-link-end")
+        .expect("selected bar must show a link dot outside the bar");
+    let bar = cx.debug_bounds("gantt-bar-1").expect("bar");
+    assert!(
+        f32::from(handle.origin.x) + 1.0 >= f32::from(bar.origin.x) + f32::from(bar.size.width),
+        "link dot must sit outside the bar end so a drag is not a resize"
+    );
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.as_ref().expect("link gesture");
+        assert_eq!(gesture.kind, GestureKind::Link);
+        assert_eq!(gesture.id, 1);
+    });
+    let other = cx.debug_bounds("gantt-bar-2").expect("successor bar");
+    cx.simulate_mouse_move(
+        other.center(),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.as_ref().expect("still linking");
+        assert_eq!(gesture.kind, GestureKind::Link);
+        let start = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .and_then(|node| node.start_date.clone());
+        assert_eq!(
+            start.as_deref(),
+            Some("2026-07-06T00:00:00Z"),
+            "link drag must not rewrite dates"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn dragging_a_start_only_bar_moves_its_start_date(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.target_date = None;
+        node.title = "Cart UI".into();
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-2")
+        .expect("start-only bar should paint");
+    let start = bar.center();
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.as_ref().expect("move");
+        assert_eq!(gesture.kind, GestureKind::Move);
+        assert!(gesture.had_start);
+        assert!(!gesture.had_target);
+    });
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(start.x + px(ppd * 4.0), start.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.clone().expect("live move");
+        let (start_date, target_date) = GanttView::gesture_patch_dates(&gesture);
+        assert_eq!(
+            start_date,
+            Some(Date::new(2026, 7, 10).unwrap()),
+            "dragging 4 days from Jul 6 must land on Jul 10, got {start_date:?}"
+        );
+        assert!(
+            target_date.is_none(),
+            "start-only drag must not invent a target, got {target_date:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn first_click_on_dates_opens_the_calendar(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let cell = cx.debug_bounds("gantt-dates-cell").expect("dates cell");
+    cx.simulate_mouse_down(cell.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-dates").is_some(),
+        "the first click must open the calendar, not convert the cell to a closed input"
+    );
+}
+
+#[gpui_kit::test]
+fn form_range_field_is_labelled_dates(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-07-06T00:00:00Z"),
+    );
+    values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-07-20T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![
+                    ado_core::FormControl {
+                        id: ado_core::START_DATE_FIELD.into(),
+                        reference_name: ado_core::START_DATE_FIELD.into(),
+                        label: "Start Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                    ado_core::FormControl {
+                        id: ado_core::TARGET_DATE_FIELD.into(),
+                        reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                        label: "Target Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                    ado_core::FormControl {
+                        id: "Custom.NeedsReview".into(),
+                        reference_name: "Custom.NeedsReview".into(),
+                        label: "Needs Review".into(),
+                        kind: ado_core::FormControlKind::Boolean,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                ],
+            }],
+        }],
+        values,
+    }));
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-dates-label").is_some(),
+        "the form range field must be labelled Dates, not only Start Date"
+    );
+    assert!(
+        cx.debug_bounds("form-boolean").is_some(),
+        "boolean should paint as Yes/No without a checkbox focus ring"
     );
 }

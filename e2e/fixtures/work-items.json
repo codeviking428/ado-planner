@@ -57,7 +57,8 @@
       "System.State": "New",
       "System.Parent": 1003,
       "System.AreaPath": "Shop\\Platform",
-      "System.IterationPath": "Shop\\FY26\\Sprint 12"
+      "System.IterationPath": "Shop\\FY26\\Sprint 12",
+      "Microsoft.VSTS.Scheduling.StartDate": "2026-07-21T00:00:00Z"
     }
   },
   {
@@ -78,5 +79,51 @@
         "url": "https://dev.azure.com/contoso/Shop/_apis/wit/workItems/1003"
       }
     ]
+  },
+  {
+    "id": 1013,
+    "rev": 1,
+    "fields": {
+      "System.Title": "Go-live milestone",
+      "System.WorkItemType": "Feature",
+      "System.State": "New",
+      "System.Parent": 1001,
+      "System.AssignedTo": {
+        "displayName": "Alan Turing",
+        "uniqueName": "alan@contoso.com"
+      },
+      "System.AreaPath": "Shop\\Platform",
+      "System.IterationPath": "Shop\\FY26",
+      "Microsoft.VSTS.Scheduling.TargetDate": "2026-08-15T00:00:00Z"
+    }
+  },
+  {
+    "id": 1014,
+    "rev": 1,
+    "fields": {
+      "System.Title": "Backlog grooming",
+      "System.WorkItemType": "Task",
+      "System.State": "New",
+      "System.Parent": 1002,
+      "System.AreaPath": "Shop\\Platform",
+      "System.IterationPath": "Shop\\FY26\\Sprint 12"
+    }
+  },
+  {
+    "id": 1020,
+    "rev": 3,
+    "fields": {
+      "System.Title": "Growth experiments",
+      "System.WorkItemType": "Epic",
+      "System.State": "Active",
+      "System.AssignedTo": {
+        "displayName": "Katherine Johnson",
+        "uniqueName": "katherine@contoso.com"
+      },
+      "System.AreaPath": "Shop\\Growth",
+      "System.IterationPath": "Shop\\FY26",
+      "Microsoft.VSTS.Scheduling.StartDate": "2026-08-01T00:00:00Z",
+      "Microsoft.VSTS.Scheduling.TargetDate": "2026-09-15T00:00:00Z"
+    }
   }
 ]

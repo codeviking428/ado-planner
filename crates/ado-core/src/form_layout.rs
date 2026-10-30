@@ -269,9 +269,53 @@ fn patch_value(kind: FormControlKind, next: Option<&Value>) -> Value {
 fn json_equal(next: Option<&Value>, prev: Option<&Value>) -> bool {
     match (next, prev) {
         (None, None) => true,
-        (Some(a), Some(b)) => a == b,
         (None, Some(Value::Null)) | (Some(Value::Null), None) => true,
+        (Some(a), Some(b)) => values_equal(a, b),
         _ => false,
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Some(left), Some(right)) = (as_f64(a), as_f64(b)) {
+        return (left - right).abs() < f64::EPSILON;
+    }
+    if let (Some(left), Some(right)) = (date_prefix(a), date_prefix(b)) {
+        return left == right;
+    }
+    if let (Some(left), Some(right)) = (identity_key(a), identity_key(b)) {
+        return left.eq_ignore_ascii_case(&right);
+    }
+    false
+}
+
+fn as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn date_prefix(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|text| text.len() >= 10 && text.as_bytes()[4] == b'-' && text.as_bytes()[7] == b'-')
+        .map(|text| &text[..10])
+}
+
+fn identity_key(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Object(map) => map
+            .get("uniqueName")
+            .and_then(Value::as_str)
+            .or_else(|| map.get("displayName").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned),
+        _ => None,
     }
 }
 
@@ -529,6 +573,59 @@ mod tests {
     fn strips_ado_mnemonics() {
         assert_eq!(strip_mnemonic("Stat&e"), "State");
         assert_eq!(strip_mnemonic("R&&D Notes"), "R&D Notes");
+    }
+
+    #[test]
+    fn save_patch_ignores_numeric_and_date_equivalents() {
+        let mut original = serde_json::Map::new();
+        original.insert("Microsoft.VSTS.Scheduling.StoryPoints".into(), json!(5));
+        original.insert(
+            "Microsoft.VSTS.Scheduling.StartDate".into(),
+            json!("2026-07-06T00:00:00Z"),
+        );
+        let mut draft = original.clone();
+        draft.insert("Microsoft.VSTS.Scheduling.StoryPoints".into(), json!(5.0));
+        draft.insert(
+            "Microsoft.VSTS.Scheduling.StartDate".into(),
+            json!("2026-07-06T00:00:00Z"),
+        );
+        draft.insert("System.Title".into(), json!("New title"));
+        original.insert("System.Title".into(), json!("Old"));
+        let document = build_form_patch(
+            3,
+            &original,
+            &draft,
+            &[
+                title_control(),
+                FormControl {
+                    id: "Microsoft.VSTS.Scheduling.StoryPoints".into(),
+                    reference_name: "Microsoft.VSTS.Scheduling.StoryPoints".into(),
+                    label: "Story Points".into(),
+                    kind: FormControlKind::Double,
+                    required: false,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                },
+                FormControl {
+                    id: "Microsoft.VSTS.Scheduling.StartDate".into(),
+                    reference_name: "Microsoft.VSTS.Scheduling.StartDate".into(),
+                    label: "Start Date".into(),
+                    kind: FormControlKind::DateTime,
+                    required: false,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                },
+            ],
+        );
+        assert_eq!(
+            document
+                .iter()
+                .filter_map(|op| op.path.strip_prefix("/fields/"))
+                .collect::<Vec<_>>(),
+            vec!["System.Title"]
+        );
     }
 
     #[test]

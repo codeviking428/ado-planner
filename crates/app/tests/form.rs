@@ -41,6 +41,39 @@ async fn open_and_save_work_item_form() {
 }
 
 #[tokio::test]
+async fn save_toast_uses_display_names_and_skips_unchanged_fields() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.open_form(1003).await.expect("open");
+    state.save_form().await.expect("save with no edits");
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        !message.to_lowercase().contains("storypoints"),
+        "unchanged Story Points must not appear as a raw key: {message}"
+    );
+    assert!(
+        !message.to_lowercase().contains("remainingwork"),
+        "unchanged Remaining Work must not appear as a raw key: {message}"
+    );
+    let form_open = {
+        state.open_form(1003).await.expect("open again");
+        true
+    };
+    assert!(form_open);
+    let form = state.form.as_mut().expect("form");
+    form.set_string("System.Title", "Persist cart (named)".into());
+    state.save_form().await.expect("save title");
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.to_lowercase().contains("title"),
+        "toast should use the display name, got {message}"
+    );
+    assert!(
+        !message.to_lowercase().contains("storypoints"),
+        "unchanged fields must stay out of the toast: {message}"
+    );
+}
+
+#[tokio::test]
 async fn non_plain_html_field_is_read_only() {
     let html = r#"<p>Hello <span style="color:red">Ada</span></p>"#;
     assert!(!ado_core::is_plain_html_field(html));

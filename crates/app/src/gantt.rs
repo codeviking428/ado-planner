@@ -115,6 +115,41 @@ impl GanttScale {
     pub fn shows_weekend_bands(self) -> bool {
         matches!(self, Self::Day)
     }
+
+    /// Align `date` to the start of this scale's calendar period.
+    pub fn floor_date(self, date: Date) -> Date {
+        match self {
+            Self::Day => date,
+            Self::Week => {
+                let offset = match date.weekday() {
+                    jiff::civil::Weekday::Monday => 0,
+                    jiff::civil::Weekday::Tuesday => 1,
+                    jiff::civil::Weekday::Wednesday => 2,
+                    jiff::civil::Weekday::Thursday => 3,
+                    jiff::civil::Weekday::Friday => 4,
+                    jiff::civil::Weekday::Saturday => 5,
+                    jiff::civil::Weekday::Sunday => 6,
+                };
+                date.saturating_sub(offset.days())
+            }
+            Self::Month => Date::new(date.year(), date.month(), 1).unwrap_or(date),
+            Self::Quarter => {
+                let month = ((((date.month() as i32) - 1) / 3) * 3 + 1) as i8;
+                Date::new(date.year(), month, 1).unwrap_or(date)
+            }
+            Self::Year => Date::new(date.year(), 1, 1).unwrap_or(date),
+        }
+    }
+
+    pub fn next_date(self, date: Date) -> Date {
+        match self {
+            Self::Day => date.saturating_add(1.day()),
+            Self::Week => date.saturating_add(7.days()),
+            Self::Month => date.saturating_add(1.month()),
+            Self::Quarter => date.saturating_add(3.months()),
+            Self::Year => date.saturating_add(1.year()),
+        }
+    }
 }
 
 fn month_abbrev(date: Date) -> &'static str {
@@ -148,6 +183,7 @@ pub struct Gesture {
     pub target: Date,
     pub live_start: Date,
     pub live_target: Date,
+    pub live_x: f32,
     pub had_start: bool,
     pub had_target: bool,
 }
@@ -322,8 +358,28 @@ impl GanttView {
     }
 
     pub fn step_period(&mut self, direction: i32) {
-        let days = self.scale.step_days() * direction;
-        self.origin = self.origin.saturating_add(days.days());
+        if direction == 0 {
+            return;
+        }
+        let span = match self.scale {
+            GanttScale::Day => direction.days(),
+            GanttScale::Week => (direction * 7).days(),
+            GanttScale::Month => direction.months(),
+            GanttScale::Quarter => (direction * 3).months(),
+            GanttScale::Year => direction.years(),
+        };
+        self.origin = self.origin.saturating_add(span);
+    }
+
+    /// Apply a wheel/trackpad delta whose signs already match content direction
+    /// (positive X reveals later dates, positive Y reveals later rows).
+    pub fn apply_wheel(&mut self, dx: f32, dy: f32, shift: bool) {
+        if shift {
+            self.scroll_x += dy + dx;
+        } else {
+            self.scroll_x += dx;
+            self.scroll_y += dy;
+        }
     }
 
     pub fn go_today(&mut self, today: Date) {
@@ -517,13 +573,11 @@ impl GanttView {
                 target: today,
                 live_start: today,
                 live_target: today,
+                live_x: origin_x,
                 had_start: false,
                 had_target: false,
             });
             return Ok(());
-        }
-        if bar.kind != GanttBarKind::Scheduled {
-            return Err("This Work Item has no Start Date and Target Date fields.");
         }
         if bar.milestone && kind != GestureKind::Move {
             return Err("Milestones can be moved, not resized.");
@@ -535,12 +589,19 @@ impl GanttView {
         if !node.has_date_fields {
             return Err("This Work Item has no Start Date and Target Date fields.");
         }
+        if bar.kind == GanttBarKind::NoFields {
+            return Err("This Work Item has no Start Date and Target Date fields.");
+        }
         let had_start = parse_iso_date(node.start_date.as_deref()).is_some();
         let had_target = parse_iso_date(node.target_date.as_deref()).is_some();
-        let hint = None;
-        let display = gantt_bar_display(node, nodes, hint);
-        let start = display.start.ok_or("Unscheduled")?;
-        let target = display.end.ok_or("Unscheduled")?;
+        let display = gantt_bar_display(node, nodes, None);
+        let start = display.start.unwrap_or(self.origin);
+        let target = display
+            .end
+            .unwrap_or_else(|| start.saturating_add((ado_core::DEFAULT_BAR_DAYS - 1).days()));
+        if bar.kind == GanttBarKind::Unscheduled && kind != GestureKind::Move {
+            return Err("Unscheduled bars can be moved to set dates.");
+        }
         self.selected_id = Some(bar.id);
         self.gesture = Some(Gesture {
             kind,
@@ -550,6 +611,7 @@ impl GanttView {
             target,
             live_start: start,
             live_target: target,
+            live_x: origin_x,
             had_start,
             had_target,
         });
@@ -561,6 +623,7 @@ impl GanttView {
             return;
         };
         if gesture.kind == GestureKind::Link {
+            gesture.live_x = x;
             return;
         }
         let delta_days =
@@ -570,7 +633,9 @@ impl GanttView {
                 gesture.live_start = gesture.start.saturating_add(delta_days.days());
                 gesture.live_target = gesture.target.saturating_add(delta_days.days());
             }
-            GestureKind::Link => {}
+            GestureKind::Link => {
+                gesture.live_x = x;
+            }
             GestureKind::ResizeStart => {
                 let next = gesture.start.saturating_add(delta_days.days());
                 if next <= gesture.target {
@@ -613,6 +678,9 @@ impl GanttView {
     }
 
     pub fn gesture_patch_dates(gesture: &Gesture) -> (Option<Date>, Option<Date>) {
+        if !gesture.had_start && !gesture.had_target && gesture.kind == GestureKind::Move {
+            return (Some(gesture.live_start), Some(gesture.live_target));
+        }
         let start = (gesture.had_start || gesture.kind == GestureKind::ResizeStart)
             .then_some(gesture.live_start);
         let target = (gesture.had_target || gesture.kind == GestureKind::ResizeEnd)
@@ -625,15 +693,14 @@ impl GanttView {
         if ppd <= 0.0 || width <= 0.0 {
             return Vec::new();
         }
-        let start_days = (self.scroll_x / ppd).floor() as i32;
-        let end_days = ((self.scroll_x + width) / ppd).ceil() as i32 + self.scale.step_days();
-        let step = self.scale.step_days().max(1);
-        let mut day = (start_days / step) * step;
+        let left = self.date_for_x(-ppd);
+        let right = self.date_for_x(width + ppd);
+        let mut date = self.scale.floor_date(left);
         let mut ticks = Vec::new();
         let mut last_major = String::new();
-        while day <= end_days {
-            let date = self.origin.saturating_add(day.days());
-            let x = day as f32 * ppd - self.scroll_x;
+        let mut guard = 0;
+        while date <= right && guard < 512 {
+            let x = self.x_for_date(date);
             let major_label = self.scale.major_label(date);
             let major = major_label != last_major;
             if major {
@@ -646,7 +713,12 @@ impl GanttView {
                 major,
                 weekend: is_weekend(date),
             });
-            day += step;
+            let next = self.scale.next_date(date);
+            if next <= date {
+                break;
+            }
+            date = next;
+            guard += 1;
         }
         ticks
     }
@@ -658,18 +730,33 @@ impl GanttView {
     /// Two-level header majors, with at most one sticky label at x = 0 so
     /// scrolled-past months/years do not stack on top of each other.
     pub fn header_major_labels(&self, width: f32) -> Vec<(f32, String)> {
-        const STICKY_MIN: f32 = 88.0;
+        Self::sticky_header_labels(
+            self.timeline_ticks(width)
+                .into_iter()
+                .filter(|tick| tick.major)
+                .map(|tick| (tick.x, tick.major_label)),
+        )
+    }
+
+    /// Month (or day/week) tick labels, with the in-view period stuck at x = 0
+    /// when its gridline has scrolled off the left edge.
+    pub fn header_tick_labels(&self, width: f32) -> Vec<(f32, String)> {
+        Self::sticky_header_labels(
+            self.timeline_ticks(width)
+                .into_iter()
+                .map(|tick| (tick.x, tick.label)),
+        )
+    }
+
+    fn sticky_header_labels(ticks: impl IntoIterator<Item = (f32, String)>) -> Vec<(f32, String)> {
+        const STICKY_MIN: f32 = 72.0;
         let mut sticky: Option<String> = None;
         let mut out = Vec::new();
-        for tick in self
-            .timeline_ticks(width)
-            .into_iter()
-            .filter(|tick| tick.major)
-        {
-            if tick.x <= 0.0 {
-                sticky = Some(tick.major_label);
+        for (x, label) in ticks {
+            if x <= 0.0 {
+                sticky = Some(label);
             } else {
-                out.push((tick.x, tick.major_label));
+                out.push((x, label));
             }
         }
         if let Some(label) = sticky {
@@ -933,6 +1020,7 @@ pub fn iteration_for(node: &WorkItemNode, iterations: &[IterationNode]) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::ToSpan;
 
     fn node(id: i64, parent: Option<i64>) -> WorkItemNode {
         WorkItemNode {
@@ -1152,6 +1240,35 @@ mod tests {
         assert!(ticks.iter().any(|tick| {
             tick.label.contains("2026") || tick.label.contains("Jul") || tick.label.contains("7")
         }));
+    }
+
+    #[test]
+    fn month_tick_labels_are_calendar_months_not_thirty_day_steps() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let labels: Vec<String> = gantt
+            .timeline_ticks(800.0)
+            .into_iter()
+            .filter(|tick| tick.x >= -1.0 && tick.x <= 800.0)
+            .map(|tick| tick.label)
+            .collect();
+        assert!(
+            labels.len() >= 3,
+            "expected several month ticks, got {labels:?}"
+        );
+        assert_eq!(
+            &labels[..3],
+            ["Jul", "Aug", "Sep"],
+            "30-day steps produced Jul|Jul|Aug; calendar months must be Jul|Aug|Sep"
+        );
+        for pair in labels.windows(2) {
+            assert_ne!(
+                pair[0], pair[1],
+                "a month must not repeat in consecutive tick labels: {labels:?}"
+            );
+        }
     }
 
     #[test]
@@ -1409,6 +1526,114 @@ mod tests {
             (x - TODAY_MARGIN_PX).abs() < 0.5,
             "today marker at {x}, expected ~{TODAY_MARGIN_PX}px from the splitter"
         );
+    }
+
+    #[test]
+    fn today_marker_sits_on_oct_30_not_the_oct_1_gridline() {
+        let mut gantt = GanttView::default();
+        let today = Date::new(2026, 10, 30).unwrap();
+        let oct1 = Date::new(2026, 10, 1).unwrap();
+        gantt.go_today(today);
+        let today_x = gantt.today_x(today);
+        let oct1_x = gantt.x_for_date(oct1);
+        assert!(
+            (today_x - oct1_x).abs() > 20.0,
+            "Today at {today_x} must not sit on the Oct 1 gridline at {oct1_x}"
+        );
+        let oct_tick = gantt
+            .timeline_ticks(1200.0)
+            .into_iter()
+            .find(|tick| tick.label == "Oct");
+        if let Some(tick) = oct_tick {
+            assert!(
+                (tick.x - oct1_x).abs() < 1.0,
+                "Oct header tick at {} should mark Oct 1 ({oct1_x})",
+                tick.x
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_left_reveals_earlier_months() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 8, 1).unwrap(),
+            ..Default::default()
+        };
+        let aug = Date::new(2026, 8, 1).unwrap();
+        let before = gantt.x_for_date(aug);
+        gantt.apply_wheel(-120.0, 0.0, false);
+        let after = gantt.x_for_date(aug);
+        assert!(
+            after > before,
+            "scroll-left must move August 1 to the right (earlier months into view): {before} -> {after}"
+        );
+        let labels: Vec<_> = gantt
+            .header_tick_labels(400.0)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "Jul" || label == "Aug"),
+            "after scrolling left the header should still show calendar months, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn link_gesture_does_not_resize_or_move_dates() {
+        let nodes = vec![node(1, None), node(2, None)];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        gantt
+            .begin_gesture(
+                &bars[0],
+                GestureKind::Link,
+                bars[0].x + bars[0].width + 6.0,
+                &nodes,
+            )
+            .expect("link");
+        gantt.update_gesture(bars[1].x + 10.0);
+        assert!(gantt.finish_gesture().is_none());
+        gantt
+            .begin_gesture(
+                &bars[0],
+                GestureKind::Link,
+                bars[0].x + bars[0].width + 6.0,
+                &nodes,
+            )
+            .expect("link again");
+        assert_eq!(gantt.take_link_gesture(), Some(1));
+        assert!(gantt.gesture.is_none());
+    }
+
+    #[test]
+    fn start_only_move_patches_start_not_target() {
+        let mut item = node(1, None);
+        item.target_date = None;
+        let nodes = vec![item];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        gantt
+            .begin_gesture(&bars[0], GestureKind::Move, 10.0, &nodes)
+            .expect("start-only");
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        gantt.update_gesture(10.0 + ppd * 3.0);
+        let gesture = gantt.gesture.clone().expect("live");
+        let (start, target) = GanttView::gesture_patch_dates(&gesture);
+        assert!(start.is_some(), "start-only drag must write Start Date");
+        assert!(
+            target.is_none(),
+            "start-only drag must not invent Target Date"
+        );
+        let original = parse_iso_date(nodes[0].start_date.as_deref()).unwrap();
+        assert_eq!(start, Some(original.saturating_add(3.days())));
     }
 
     #[test]

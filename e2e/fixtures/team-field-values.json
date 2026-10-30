@@ -1,3 +1,14 @@
 {
-  "values": [{ "value": "Shop\\Platform", "includeChildren": true }]
+  "Platform": {
+    "values": [{ "value": "Shop\\Platform", "includeChildren": true }]
+  },
+  "Growth": {
+    "values": [{ "value": "Shop\\Growth", "includeChildren": true }]
+  },
+  "Empty": {
+    "values": [{ "value": "Shop\\Empty", "includeChildren": true }]
+  },
+  "Delivery": {
+    "values": [{ "value": "Roadmap\\Delivery", "includeChildren": true }]
+  }
 }

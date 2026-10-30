@@ -178,12 +178,23 @@ async fn route(
         ));
     }
     if path.contains("/teams/") && path.ends_with("/members") {
-        let body = if path.contains("/Delivery/") || path.contains("/Roadmap/") {
-            fixtures.members.get("Delivery").cloned()
-        } else {
-            fixtures.members.get("Platform").cloned()
-        }
-        .unwrap_or(json!({ "value": [] }));
+        let team = path
+            .split("/teams/")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or("");
+        let body = fixtures
+            .members
+            .get(team)
+            .cloned()
+            .or_else(|| {
+                if path.contains("/Delivery/") || path.contains("/Roadmap/") {
+                    fixtures.members.get("Delivery").cloned()
+                } else {
+                    fixtures.members.get("Platform").cloned()
+                }
+            })
+            .unwrap_or(json!({ "value": [] }));
         return Ok(json_response(StatusCode::OK, body));
     }
     if path.contains("/_apis/projects/") && path.ends_with("/teams") {
@@ -196,10 +207,14 @@ async fn route(
         return Ok(json_response(StatusCode::OK, body));
     }
     if path.contains("/teamfieldvalues") {
-        return Ok(json_response(
-            StatusCode::OK,
-            fixtures.team_field_values.clone(),
-        ));
+        let team = team_name_before_apis(path);
+        let body = fixtures
+            .team_field_values
+            .get(team)
+            .cloned()
+            .or_else(|| fixtures.team_field_values.get("Platform").cloned())
+            .unwrap_or(json!({ "values": [] }));
+        return Ok(json_response(StatusCode::OK, body));
     }
     if path.ends_with("/backlogs") {
         return Ok(json_response(StatusCode::OK, fixtures.backlogs.clone()));
@@ -254,9 +269,12 @@ async fn route(
         return Ok(json_response(StatusCode::OK, fixtures.layout.clone()));
     }
     if path.contains("/wiql") && *method == Method::POST {
+        let body = read_json(req).await?;
+        let query = body.get("query").and_then(Value::as_str).unwrap_or("");
         let items = state.items.lock().await;
         let work_items: Vec<Value> = items
             .iter()
+            .filter(|item| wiql_matches_area(query, item))
             .filter_map(|item| item.get("id").cloned())
             .map(|id| json!({ "id": id }))
             .collect();
@@ -393,6 +411,32 @@ async fn route(
         StatusCode::NOT_FOUND,
         json!({ "message": format!("unmocked {method} {path}") }),
     ))
+}
+
+fn team_name_before_apis(path: &str) -> &str {
+    let mut prev = "";
+    for seg in path.split('/').filter(|seg| !seg.is_empty()) {
+        if seg == "_apis" {
+            return prev;
+        }
+        prev = seg;
+    }
+    prev
+}
+
+fn wiql_matches_area(query: &str, item: &Value) -> bool {
+    if !query.contains("[System.AreaPath]") {
+        return true;
+    }
+    let area = item
+        .get("fields")
+        .and_then(|fields| fields.get("System.AreaPath"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if area.is_empty() {
+        return false;
+    }
+    query.contains(area)
 }
 
 fn is_project_resource(path: &str) -> bool {

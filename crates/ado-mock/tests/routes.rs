@@ -106,7 +106,7 @@ async fn snapshots_each_route() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(body, fixtures("team-field-values.json"));
+    assert_eq!(body, fixtures("team-field-values.json")["Platform"]);
 
     let (status, body) = get(&client, url, "/contoso/Shop/Platform/_apis/work/backlogs").await;
     assert_eq!(status, 200);
@@ -158,7 +158,66 @@ async fn snapshots_each_route() {
     assert_eq!(status, 200);
     assert_eq!(
         body["workItems"],
-        json!([{ "id": 1001 }, { "id": 1002 }, { "id": 1003 }, { "id": 1005 }, { "id": 1012 }])
+        json!([
+            { "id": 1001 },
+            { "id": 1002 },
+            { "id": 1003 },
+            { "id": 1005 },
+            { "id": 1012 },
+            { "id": 1013 },
+            { "id": 1014 },
+            { "id": 1020 }
+        ])
+    );
+
+    let (status, body) = get(&client, url, "/contoso/_apis/projects/Shop/teams").await;
+    assert_eq!(status, 200);
+    let names: Vec<_> = body["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|team| team.get("name").and_then(Value::as_str))
+        .collect();
+    assert!(names.contains(&"Platform"));
+    assert!(names.contains(&"Growth"));
+    assert!(names.contains(&"Empty"));
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/Shop/Empty/_apis/work/teamsettings/teamfieldvalues",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("team-field-values.json")["Empty"]);
+
+    let (status, body) = post(
+        &client,
+        url,
+        "/contoso/Shop/_apis/wit/wiql",
+        json!({
+            "query": "SELECT [System.Id] FROM WorkItems WHERE [System.AreaPath] UNDER 'Shop\\Empty'"
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["workItems"], json!([]));
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/_apis/identities?searchFilter=General&filterValue=a",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("displayName").and_then(Value::as_str))
+            .count()
+            >= 4
     );
 
     let (status, body) = post(

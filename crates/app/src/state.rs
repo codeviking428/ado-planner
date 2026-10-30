@@ -882,6 +882,15 @@ impl PlannerState {
             .await
         {
             Ok(rev) => {
+                let labels: std::collections::HashMap<String, String> =
+                    if let Some(form) = self.form.as_ref() {
+                        ado_core::all_editable_controls(&form.model)
+                            .into_iter()
+                            .map(|control| (control.reference_name.clone(), control.label.clone()))
+                            .collect()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
                 if let Some(form) = self.form.as_ref() {
                     form.apply_saved(&mut self.nodes, rev);
                 }
@@ -889,7 +898,11 @@ impl PlannerState {
                 self.persist_hierarchy_cache();
                 let names: Vec<String> = ops
                     .iter()
-                    .filter_map(|op| op.path.strip_prefix("/fields/").map(field_toast_name))
+                    .filter_map(|op| {
+                        op.path.strip_prefix("/fields/").map(|reference| {
+                            field_toast_name(reference, labels.get(reference).map(String::as_str))
+                        })
+                    })
                     .collect();
                 let message = if names.is_empty() {
                     format!("Saved Work Item #{id}")
@@ -1208,7 +1221,7 @@ impl PlannerState {
                 self.persist_hierarchy_cache();
                 self.toasts.push(
                     ToastKind::Success,
-                    format!("Saved {}", field_toast_name(reference)),
+                    format!("Saved {}", field_toast_name(reference, None)),
                 );
                 Ok(())
             }
@@ -1462,13 +1475,26 @@ impl PlannerState {
     }
 }
 
-pub(crate) fn field_toast_name(reference: &str) -> String {
+pub(crate) fn field_toast_name(reference: &str, label: Option<&str>) -> String {
+    if let Some(label) = label.map(str::trim).filter(|text| !text.is_empty()) {
+        return label.to_lowercase();
+    }
     match reference {
         "System.Title" => "title".into(),
         "System.AssignedTo" => "assignee".into(),
         ado_core::START_DATE_FIELD => "start date".into(),
         ado_core::TARGET_DATE_FIELD => "target date".into(),
-        other => other.rsplit('.').next().unwrap_or(other).to_lowercase(),
+        other => {
+            let leaf = other.rsplit('.').next().unwrap_or(other);
+            let mut out = String::new();
+            for (i, ch) in leaf.chars().enumerate() {
+                if i > 0 && ch.is_uppercase() {
+                    out.push(' ');
+                }
+                out.extend(ch.to_lowercase());
+            }
+            out
+        }
     }
 }
 
