@@ -43,12 +43,24 @@ _Avoid_: Date cascade, summary bar (when meaning the persisted dates)
 The Dependency chain in the current forest whose last Target Date is latest. A derived highlight, not a stored field. Only Work Items with Start Date and Target Date are vertices.
 _Avoid_: critical-path field, Hierarchy as a path
 
+**Nudge**:
+Moving the selected Gantt bar's Start Date, Target Date, or both by one day from the keyboard. Rapid nudges save as one change.
+_Avoid_: shift, bump
+
 **Session**:
 The securely stored login that lets the app call Azure DevOps without signing in every launch — Entra work/school SSO when a public-client ID is configured, otherwise a stored personal access token.
 _Avoid_: personal Microsoft account, MSA
 
 **Flavor**:
 A Catppuccin palette: Latte, Frappé, Macchiato, or Mocha.
+
+**HTML field**:
+A Work Item field whose value is HTML, such as Description. The planner edits it only when it is a **Plain HTML field**; otherwise it is read-only and edited in Azure DevOps.
+_Avoid_: rich text field, Markdown field
+
+**Plain HTML field**:
+An HTML field whose content survives conversion to Markdown and back unchanged, so editing it in the planner loses nothing.
+_Avoid_: simple description, lossless field
 
 **Unscheduled**:
 A Work Item whose Start Date and Target Date are empty. Iteration Path dates may be shown as a display hint; they are not a schedule until the user drags or edits dates.
