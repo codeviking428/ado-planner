@@ -58,7 +58,9 @@ installer-mode = "perMachine"
 
 [package.metadata.packager.updater]
 endpoints = [
-    "https://github.com/codeviking428/ado-planner/releases/latest/download/latest.json",
+    "https://github.com/codeviking428/ado-planner/releases/download/rust-latest/latest.json",
 ]
-# Public minisign key. Replace with the key that matches UPDATER_PRIVATE_KEY in GitHub secrets.
+# Public minisign key is baked into the binary at pack time via
+# ADO_PLANNER_UPDATER_PUBKEY (see release-rust.yml). Leave empty here so
+# unsigned local packages stay inert.
 pubkey = ""

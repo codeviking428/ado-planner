@@ -30,7 +30,7 @@ jobs:
             packager-args: --formats appimage --release
           - name: macOS
             os: macos-latest
-            packager-args: --formats dmg --release
+            packager-args: --formats dmg,app --release
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +54,8 @@ jobs:
         working-directory: crates/app
         run: cargo packager ${{ matrix.packager-args }}
         env:
+          ADO_PLANNER_UPDATER_PUBKEY: ${{ secrets.UPDATER_PUBLIC_KEY }}
+          ADO_PLANNER_UPDATER_ENDPOINT: https://github.com/codeviking428/ado-planner/releases/download/rust-latest/latest.json
           UPDATER_PRIVATE_KEY: ${{ secrets.UPDATER_PRIVATE_KEY }}
           UPDATER_PRIVATE_KEY_PASSWORD: ${{ secrets.UPDATER_PRIVATE_KEY_PASSWORD }}
 
@@ -73,12 +75,39 @@ jobs:
         with:
           path: dist
 
-      - name: Create GitHub prerelease
+      - name: Write updater feed
+        env:
+          VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 .github/scripts/write-rust-latest-json.py \
+            --dist dist \
+            --version "$VERSION" \
+            --tag "rust-v$VERSION" \
+            --repo "$REPO" \
+            --out latest.json \
+            --notes "ADO Planner ${VERSION} (Rust)"
+
+      - name: Create versioned GitHub prerelease
         uses: softprops/action-gh-release@v2
         with:
           tag_name: rust-v${{ inputs.version }}
           name: ADO Planner ${{ inputs.version }} (Rust)
           prerelease: true
-          files: dist/**/*
+          make_latest: false
+          files: |
+            dist/**/*
+            latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish updater feed
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rust-latest
+          name: ADO Planner updater feed (Rust)
+          prerelease: false
+          make_latest: false
+          files: latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

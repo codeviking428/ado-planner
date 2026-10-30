@@ -1,5 +1,18 @@
 use ado_core::UpdaterPrompt;
 
+const DEFAULT_ENDPOINT: &str =
+    "https://github.com/codeviking428/ado-planner/releases/download/rust-latest/latest.json";
+
+const COMPILED_PUBKEY: &str = match option_env!("ADO_PLANNER_UPDATER_PUBKEY") {
+    Some(value) => value,
+    None => "",
+};
+
+const COMPILED_ENDPOINT: &str = match option_env!("ADO_PLANNER_UPDATER_ENDPOINT") {
+    Some(value) => value,
+    None => DEFAULT_ENDPOINT,
+};
+
 #[derive(Debug, Clone, Default)]
 pub struct Updater {
     pub prompt: Option<UpdaterPrompt>,
@@ -8,16 +21,36 @@ pub struct Updater {
     endpoint: String,
 }
 
+#[cfg(debug_assertions)]
+fn runtime_override(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn pubkey() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(value) = runtime_override("ADO_PLANNER_UPDATER_PUBKEY") {
+        return value;
+    }
+    COMPILED_PUBKEY.to_string()
+}
+
+fn endpoint() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(value) = runtime_override("ADO_PLANNER_UPDATER_ENDPOINT") {
+        return value;
+    }
+    COMPILED_ENDPOINT.to_string()
+}
+
 impl Updater {
     pub fn from_env() -> Self {
         Self {
             prompt: None,
             snoozed: false,
-            pubkey: std::env::var("ADO_PLANNER_UPDATER_PUBKEY").unwrap_or_default(),
-            endpoint: std::env::var("ADO_PLANNER_UPDATER_ENDPOINT").unwrap_or_else(|_| {
-                "https://github.com/codeviking428/ado-planner/releases/latest/download/latest.json"
-                    .into()
-            }),
+            pubkey: pubkey(),
+            endpoint: endpoint(),
         }
     }
 
@@ -107,6 +140,15 @@ mod tests {
         let mut updater = Updater::from_env();
         updater.pubkey.clear();
         assert!(updater.check_blocking("0.1.0").unwrap().is_none());
+    }
+
+    #[test]
+    fn compiled_pubkey_comes_from_build_env() {
+        assert_eq!(
+            COMPILED_PUBKEY,
+            option_env!("ADO_PLANNER_UPDATER_PUBKEY").unwrap_or("")
+        );
+        assert_eq!(COMPILED_ENDPOINT, DEFAULT_ENDPOINT);
     }
 
     #[test]
