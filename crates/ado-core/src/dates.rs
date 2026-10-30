@@ -1,6 +1,6 @@
 use jiff::ToSpan;
 use jiff::civil::Date;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::types::{JsonPatchOp, PatchOp, START_DATE_FIELD, TARGET_DATE_FIELD, WorkItemNode};
 
@@ -157,6 +157,21 @@ pub fn schedule_from_iteration(iteration: &IterationHint) -> Option<(Date, Date)
     let start = parse_iso_date(iteration.start_date.as_deref())?;
     let finish = parse_iso_date(iteration.finish_date.as_deref())?;
     Some((start, finish))
+}
+
+pub fn build_field_patch(rev: i64, reference: &str, value: Value) -> Vec<JsonPatchOp> {
+    vec![
+        JsonPatchOp {
+            op: PatchOp::Test,
+            path: "/rev".into(),
+            value: Some(json!(rev)),
+        },
+        JsonPatchOp {
+            op: PatchOp::Add,
+            path: format!("/fields/{reference}"),
+            value: Some(value),
+        },
+    ]
 }
 
 pub fn build_start_target_patch(rev: i64, start_date: Date, target_date: Date) -> Vec<JsonPatchOp> {

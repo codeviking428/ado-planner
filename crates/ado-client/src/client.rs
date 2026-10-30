@@ -11,8 +11,8 @@ use ado_core::{
     AreaPathValue, BATCH_SIZE, BacklogLevel, BatchWorkItem, FieldMetadata, HIERARCHY_FIELDS,
     HierarchyResult, IdentityValue, IterationNode, JsonPatchOp, Organization, ProcessLayout,
     Project, ScopeSelection, Team, TeamMemberIdentityRow, WIQL_RESULT_CAP, WorkItemFormModel,
-    WorkItemNode, assemble_forest, build_hierarchy_wiql, chunk_ids, flatten_layout,
-    map_batch_work_item, map_team_member_identities, top_backlog_types_from_levels,
+    WorkItemNode, assemble_forest, build_hierarchy_wiql, build_untyped_hierarchy_wiql, chunk_ids,
+    flatten_layout, map_batch_work_item, map_team_member_identities, top_backlog_types_from_levels,
     type_has_start_and_target,
 };
 
@@ -38,6 +38,20 @@ pub enum ClientError {
 impl ClientError {
     pub fn is_precondition_failed(&self) -> bool {
         matches!(self, Self::Status { status, .. } if *status == StatusCode::PRECONDITION_FAILED)
+    }
+
+    pub fn is_backlogs_failure(&self) -> bool {
+        match self {
+            Self::Status { url, body, status } => {
+                url.contains("/backlogs")
+                    && (body.contains("TF400497")
+                        || body.to_ascii_lowercase().contains("iteration path")
+                        || *status == StatusCode::INTERNAL_SERVER_ERROR
+                        || *status == StatusCode::BAD_REQUEST)
+            }
+            Self::Message(text) => text.contains("TF400497"),
+            _ => false,
+        }
     }
 }
 
@@ -316,9 +330,18 @@ impl AdoClient {
                 "{team_root}/_apis/work/teamsettings/teamfieldvalues?api-version=7.1"
             ))
             .await?;
-        let backlogs = self
+        let mut warning = None;
+        let backlogs = match self
             .get(&format!("{team_root}/_apis/work/backlogs?api-version=7.1"))
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(err) if err.is_backlogs_failure() => {
+                warning = Some(Self::team_settings_warning(&scope.team, &err));
+                json!({ "value": [] })
+            }
+            Err(err) => return Err(err),
+        };
         let levels: Vec<BacklogLevel> =
             serde_json::from_value(backlogs.get("value").cloned().unwrap_or(json!([])))
                 .map_err(|err| ClientError::Message(err.to_string()))?;
@@ -334,12 +357,13 @@ impl AdoClient {
             }
         }
         let top_backlog_types = top_backlog_types_from_levels(&levels);
-        if types.is_empty() {
+        if types.is_empty() && warning.is_none() {
             return Ok(HierarchyResult {
                 nodes: Vec::new(),
                 types,
                 top_backlog_types,
                 truncated: false,
+                warning,
             });
         }
         let areas: Vec<AreaPathValue> = field_values
@@ -359,11 +383,16 @@ impl AdoClient {
                     .unwrap_or(true),
             })
             .collect();
+        let query = if types.is_empty() {
+            build_untyped_hierarchy_wiql(&scope.project, &areas)
+        } else {
+            build_hierarchy_wiql(&scope.project, &types, &areas)
+        };
         let wiql = self
             .request(
                 Method::POST,
                 &format!("{project_root}/_apis/wit/wiql?$top={WIQL_RESULT_CAP}&api-version=7.1"),
-                Some(&json!({ "query": build_hierarchy_wiql(&scope.project, &types, &areas) })),
+                Some(&json!({ "query": query })),
             )
             .await?;
         let ids: Vec<i64> = wiql
@@ -375,7 +404,12 @@ impl AdoClient {
             .collect();
         let truncated = ids.len() >= WIQL_RESULT_CAP;
         let mut type_date_fields = HashSet::new();
-        for ty in &types {
+        let types_for_fields = if types.is_empty() {
+            Vec::new()
+        } else {
+            types.clone()
+        };
+        for ty in &types_for_fields {
             let fields = self
                 .get(&format!(
                     "{project_root}/_apis/wit/workitemtypes/{}/fields?api-version=7.1",
@@ -431,12 +465,62 @@ impl AdoClient {
                 ));
             }
         }
+        if types.is_empty() {
+            let mut discovered = Vec::new();
+            let mut seen_types = HashSet::new();
+            for node in &nodes {
+                if seen_types.insert(node.work_item_type.clone()) {
+                    discovered.push(node.work_item_type.clone());
+                }
+            }
+            for ty in &discovered {
+                let fields = self
+                    .get(&format!(
+                        "{project_root}/_apis/wit/workitemtypes/{}/fields?api-version=7.1",
+                        urlencoding::encode(ty)
+                    ))
+                    .await?;
+                let names: Vec<String> = fields
+                    .get("value")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|field| {
+                        field
+                            .get("referenceName")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect();
+                if type_has_start_and_target(&names) {
+                    type_date_fields.insert(ty.clone());
+                }
+            }
+            for node in &mut nodes {
+                node.has_date_fields = type_date_fields.contains(&node.work_item_type);
+            }
+            types = discovered;
+        }
         Ok(HierarchyResult {
             nodes: assemble_forest(&nodes),
             types,
             top_backlog_types,
             truncated,
+            warning,
         })
+    }
+
+    fn team_settings_warning(team: &str, err: &ClientError) -> String {
+        let raw = err.to_string();
+        if raw.contains("TF400497") || raw.to_ascii_lowercase().contains("iteration") {
+            format!(
+                "Team \"{team}\" has invalid backlog settings (the backlog iteration path is not in this team's area). Fix Team Settings in Azure DevOps, or pick another team."
+            )
+        } else {
+            format!(
+                "Team \"{team}\" backlog settings could not be loaded. Showing work items from the team's area paths."
+            )
+        }
     }
 
     pub async fn patch_work_item(

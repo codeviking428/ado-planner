@@ -194,6 +194,7 @@ pub struct GanttView {
     pub pending_nudge: Option<PendingNudge>,
     pub context_menu: Option<ContextTarget>,
     pub splitter_drag: Option<(f32, f32)>,
+    pub schedule_drag: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +222,7 @@ impl Default for GanttView {
             pending_nudge: None,
             context_menu: None,
             splitter_drag: None,
+            schedule_drag: None,
         }
     }
 }
@@ -292,6 +294,17 @@ impl GanttView {
     pub fn go_today(&mut self, today: Date) {
         self.origin = today;
         self.scroll_x = 0.0;
+    }
+
+    pub fn scroll_rows(&mut self, rows: i32, viewport_h: f32, row_count: usize) {
+        self.scroll_y += rows as f32 * ROW_HEIGHT;
+        self.clamp_scroll(row_count, viewport_h);
+    }
+
+    pub fn page_scroll(&mut self, direction: i32, viewport_h: f32, row_count: usize) {
+        let page = (viewport_h - TIMELINE_HEADER_H - ROW_HEIGHT).max(ROW_HEIGHT);
+        self.scroll_y += page * direction as f32;
+        self.clamp_scroll(row_count, viewport_h);
     }
 
     /// Place the timeline origin on the earliest scheduled or rollup/iteration
@@ -554,6 +567,8 @@ impl GanttView {
             }
         }
         let Some(start) = earliest else {
+            self.go_today(jiff::Zoned::now().date());
+            self.zoom = 1.0;
             return;
         };
         let end = latest.unwrap_or(start);
@@ -960,6 +975,31 @@ mod tests {
         assert_eq!(bars.len(), 1);
         assert!(bars[0].width < BAR_LABEL_INSIDE_MIN);
         assert_eq!(bars[0].title, "WI 1");
+    }
+
+    #[test]
+    fn auto_fit_without_dates_goes_to_today() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        let mut gantt = GanttView {
+            origin: Date::new(2025, 1, 1).unwrap(),
+            zoom: 0.4,
+            ..Default::default()
+        };
+        gantt.auto_fit(&[item], &[], 800.0);
+        assert_eq!(gantt.origin, jiff::Zoned::now().date());
+        assert!((gantt.zoom - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn page_scroll_moves_by_more_than_one_row() {
+        let mut gantt = GanttView {
+            viewport_h: 200.0,
+            ..Default::default()
+        };
+        gantt.page_scroll(1, 200.0, 40);
+        assert!(gantt.scroll_y > ROW_HEIGHT);
     }
 
     #[test]

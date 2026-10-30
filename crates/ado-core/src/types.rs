@@ -43,6 +43,8 @@ pub struct HierarchyResult {
     pub types: Vec<String>,
     pub top_backlog_types: Vec<String>,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 pub const ASSIGNEE_SPECIALS: [&str; 3] = ["anyone", "me", "unassigned"];

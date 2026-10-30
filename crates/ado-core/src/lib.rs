@@ -14,7 +14,7 @@ pub mod team_members;
 pub mod types;
 
 pub use dates::{
-    GanttBarDisplay, GanttBarKind, IterationHint, build_clear_dates_patch,
+    GanttBarDisplay, GanttBarKind, IterationHint, build_clear_dates_patch, build_field_patch,
     build_start_target_patch, client_rollup, dates_column_text, from_gantt_exclusive_end,
     gantt_bar_display, is_unscheduled, iso_date_only, iteration_hint_for_path, parse_iso_date,
     schedule_from_iteration, to_gantt_inclusive_target, type_has_start_and_target,
@@ -31,8 +31,8 @@ pub use form_layout::{
 };
 pub use hierarchy::{
     AreaPathValue, BatchWorkItem, HIERARCHY_FIELDS, assemble_forest, build_hierarchy_wiql,
-    chunk_ids, escape_wiql, identity_from_field, iso_date_from_field, map_batch_work_item,
-    parent_id_from_fields,
+    build_untyped_hierarchy_wiql, chunk_ids, escape_wiql, identity_from_field, iso_date_from_field,
+    map_batch_work_item, parent_id_from_fields,
 };
 pub use html_field::{html_to_markdown, is_plain_html_field, markdown_to_html};
 pub use organization_url::shorten_organization_url;

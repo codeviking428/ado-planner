@@ -6,10 +6,12 @@ use ado_client::{AdoClient, AdoRuntime, TokenSource};
 use ado_core::{
     AssigneeFilter, Flavor, HierarchyResult, IdentityValue, IterationNode, Organization,
     OverlayFilter, Project, ScopeSelection, SessionInfo, Team, WorkItemNode, apply_overlays,
-    build_clear_dates_patch, build_start_target_patch, choose_available, is_assignee_special,
-    iso_date_only, parse_iso_date, resolve_root_types, schedule_from_iteration,
+    build_clear_dates_patch, build_field_patch, build_start_target_patch, choose_available,
+    is_assignee_special, iso_date_only, parse_iso_date, resolve_root_types,
+    schedule_from_iteration,
 };
 use ado_session::{LoginCreds, PlannerSession, SharedSession};
+use jiff::ToSpan;
 use jiff::civil::Date;
 use serde_json::{Value, json};
 
@@ -47,6 +49,7 @@ pub struct PlannerState {
     pub iterations_loading: bool,
     pub members_loading: bool,
     pub hierarchy_loading: bool,
+    pub team_settings_error: Option<String>,
     pub scope_locked: bool,
     pub gantt: GanttView,
     pub form: Option<FormDraft>,
@@ -100,6 +103,7 @@ impl PlannerState {
             iterations_loading: false,
             members_loading: false,
             hierarchy_loading: false,
+            team_settings_error: None,
             scope_locked: false,
             gantt: GanttView::default(),
             form: None,
@@ -752,6 +756,7 @@ impl PlannerState {
             return Ok(());
         };
         self.hierarchy_loading = true;
+        self.team_settings_error = None;
         let key = self.hierarchy_cache_key(&scope);
         if let Some(hit) = self.cache.get(&key)
             && let Ok(result) = serde_json::from_value::<HierarchyResult>(hit.value.clone())
@@ -770,10 +775,15 @@ impl PlannerState {
                 self.apply_hierarchy(result);
             }
             Err(err) => {
-                self.toasts.push(
-                    ToastKind::Error,
-                    error_text(&err, "Could not load Hierarchy"),
-                );
+                let message = error_text(&err, "Could not load Hierarchy");
+                if err.is_backlogs_failure() || message.contains("TF400497") {
+                    self.team_settings_error = Some(team_settings_banner(&scope.team, &message));
+                    self.nodes.clear();
+                    self.hierarchy = None;
+                    self.hierarchy_loading = false;
+                    return Ok(());
+                }
+                self.toasts.push(ToastKind::Error, message);
                 self.hierarchy_loading = false;
                 return Err(err.into());
             }
@@ -789,6 +799,7 @@ impl PlannerState {
                 "Hierarchy is incomplete — WIQL hit the 20,000 result cap.",
             );
         }
+        self.team_settings_error = result.warning.clone();
         let first_load = self.nodes.is_empty();
         self.nodes = result.nodes.clone();
         self.hierarchy = Some(result);
@@ -983,6 +994,78 @@ impl PlannerState {
                 self.restore_node(previous);
                 self.toasts
                     .push(ToastKind::Error, error_text(&err, "Could not save dates"));
+                Err(err.into())
+            }
+        }
+    }
+
+    pub async fn schedule_at(&mut self, id: i64, start: Date) -> Result<(), AppError> {
+        let target = start.saturating_add(13.days());
+        self.save_dates(id, start, target).await
+    }
+
+    pub async fn save_title(&mut self, id: i64, title: String) -> Result<(), AppError> {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return Err(AppError::message("Title cannot be empty"));
+        }
+        self.patch_node_field(id, "System.Title", json!(title.clone()), move |node| {
+            node.title = title;
+        })
+        .await
+    }
+
+    pub async fn save_assignee(
+        &mut self,
+        id: i64,
+        identity: Option<IdentityValue>,
+    ) -> Result<(), AppError> {
+        let value = identity
+            .as_ref()
+            .map(crate::form::identity_json)
+            .unwrap_or(Value::Null);
+        self.patch_node_field(id, "System.AssignedTo", value, move |node| {
+            node.assigned_to = identity;
+        })
+        .await
+    }
+
+    async fn patch_node_field(
+        &mut self,
+        id: i64,
+        reference: &str,
+        value: Value,
+        apply: impl FnOnce(&mut WorkItemNode),
+    ) -> Result<(), AppError> {
+        let Some(scope) = self.scope() else {
+            return Ok(());
+        };
+        let Some(node) = self.nodes.iter().find(|node| node.id == id).cloned() else {
+            return Err(AppError::message("Work Item not found"));
+        };
+        let previous = node.clone();
+        if let Some(live) = self.nodes.iter_mut().find(|n| n.id == id) {
+            apply(live);
+        }
+        let ops = build_field_patch(node.rev, reference, value);
+        match self
+            .client
+            .patch_work_item(&scope.org, &scope.project, id, &ops)
+            .await
+        {
+            Ok(rev) => {
+                if let Some(live) = self.nodes.iter_mut().find(|n| n.id == id) {
+                    live.rev = rev;
+                }
+                self.persist_hierarchy_cache();
+                self.toasts
+                    .push(ToastKind::Success, format!("Saved {reference}"));
+                Ok(())
+            }
+            Err(err) => {
+                self.restore_node(previous);
+                self.toasts
+                    .push(ToastKind::Error, error_text(&err, "Could not save field"));
                 Err(err.into())
             }
         }
@@ -1241,6 +1324,16 @@ pub fn fake_hierarchy(count: usize) -> Vec<WorkItemNode> {
 
 pub fn json_scope(org: &str, project: &str, team: &str) -> Value {
     json!({ "org": org, "project": project, "team": team })
+}
+
+fn team_settings_banner(team: &str, raw: &str) -> String {
+    if raw.contains("TF400497") || raw.to_ascii_lowercase().contains("iteration path") {
+        format!(
+            "Team \"{team}\" has invalid backlog settings (the backlog iteration path is not in this team's area). Fix Team Settings in Azure DevOps, or pick another team."
+        )
+    } else {
+        format!("Could not load backlog settings for \"{team}\". {raw}")
+    }
 }
 
 #[allow(dead_code)]

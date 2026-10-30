@@ -128,3 +128,36 @@ async fn injected_failure() {
     assert!(text.contains("503"));
     assert!(text.contains("Projects unavailable"));
 }
+
+#[tokio::test]
+async fn invalid_backlog_settings_still_load_area_work_items() {
+    let mock = ado_mock::start().await;
+    mock.fail_next(
+        "/backlogs",
+        500,
+        "TF400497: The backlog iteration path is not valid.",
+    );
+    let ado = AdoClient::with_base_urls(
+        tokens(AuthScheme::Pat, Some("contoso")),
+        &mock.url,
+        &mock.url,
+    );
+    let hierarchy = ado
+        .load_hierarchy(&ScopeSelection {
+            org: "contoso".into(),
+            project: "Shop".into(),
+            team: "Platform".into(),
+            iteration_path: None,
+        })
+        .await
+        .expect("hierarchy despite TF400497");
+    assert!(
+        hierarchy
+            .warning
+            .as_deref()
+            .is_some_and(|text| text.contains("TF400497") || text.contains("backlog")),
+        "warning: {:?}",
+        hierarchy.warning
+    );
+    assert!(hierarchy.nodes.iter().any(|node| node.id == 1003));
+}

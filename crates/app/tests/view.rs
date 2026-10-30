@@ -138,8 +138,14 @@ fn escape_closes_filter_popup_and_form(cx: &mut gpui_kit::TestAppContext) {
         prefer_character_input: false,
     };
     view.update(cx, |view, cx| {
+        view.set_open_filter(Some("type-filter"));
+        assert!(view.popup_is_open());
         view.handle_key(&escape, cx);
-        assert!(view.state.form.is_none());
+        assert!(view.state.form.is_none(), "escape should close the form");
+        assert!(
+            !view.popup_is_open(),
+            "escape should close stacked popups together"
+        );
         view.set_open_filter(Some("type-filter"));
         assert!(view.popup_is_open());
         view.handle_key(&escape, cx);
@@ -155,6 +161,59 @@ fn escape_closes_filter_popup_and_form(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("overlay-popup-panel")
             .is_some_and(|bounds| bounds.size.width > gpui_kit::px(100.)),
         "filter popup should render as a full panel, not a clipped sliver"
+    );
+}
+
+#[gpui_kit::test]
+fn pagedown_moves_the_selection(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    let page = KeyDownEvent {
+        keystroke: Keystroke::parse("pagedown").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&page, cx);
+        assert_ne!(view.state.gantt.selected_id, Some(1));
+        assert!(view.state.gantt.scroll_y > 0.0 || view.state.gantt.selected_id.is_some());
+    });
+}
+
+#[gpui_kit::test]
+fn unscheduled_only_grid_shows_a_drop_hint(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    for node in &mut state.nodes {
+        node.start_date = None;
+        node.target_date = None;
+        node.has_date_fields = true;
+    }
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_some(),
+        "unscheduled-only teams should get a timeline drop hint"
+    );
+}
+
+#[gpui_kit::test]
+fn team_settings_error_renders_inline(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.team_settings_error =
+        Some("Team \"Amego Stakeholders\" has invalid backlog settings (TF400497).".into());
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("team-settings-error")
+            .is_some_and(|bounds| bounds.size.width > gpui_kit::px(200.)),
+        "team-settings errors should be an inline readable banner"
     );
 }
 

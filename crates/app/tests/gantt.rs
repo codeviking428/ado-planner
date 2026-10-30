@@ -174,6 +174,37 @@ async fn rollback_on_injected_failure() {
     assert!(state.toasts.last_error_message().is_some());
 }
 
+#[tokio::test]
+async fn schedule_at_writes_start_and_target_for_an_unscheduled_item() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields)
+        .cloned()
+        .unwrap();
+    state.clear_dates(node.id).await.expect("clear");
+    let start = parse_iso_date(Some("2026-08-03T00:00:00Z")).unwrap();
+    state.schedule_at(node.id, start).await.expect("schedule");
+    let updated = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(
+        parse_iso_date(updated.start_date.as_deref()).unwrap(),
+        start
+    );
+    assert!(parse_iso_date(updated.target_date.as_deref()).unwrap() > start);
+}
+
+#[tokio::test]
+async fn save_title_patches_system_title() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state
+        .save_title(1003, "Inline title".into())
+        .await
+        .expect("title");
+    let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();
+    assert_eq!(node.title, "Inline title");
+}
+
 #[gpui_kit::test]
 fn gpui_gantt_scale_and_zoom(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);

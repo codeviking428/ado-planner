@@ -224,14 +224,13 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     let response = client
         .get(url)
         .header("Authorization", header)
-        .header("Accept", "application/json")
         .send()
         .await
         .map_err(|err| Error::message(err.to_string()))?;
     if !response.status().is_success() {
         let status = response.status();
         if status.is_client_error() {
-            tracing::warn!("identity {url} returned {status}");
+            tracing::debug!("identity {url} returned {status}");
             return Ok(None);
         }
         return Err(Error::message(format!("identity {url} returned {status}")));

@@ -24,11 +24,16 @@ pub fn build_hierarchy_wiql(project: &str, types: &[String], areas: &[AreaPathVa
             escape_wiql(project)
         );
     }
-    let type_list = types
-        .iter()
-        .map(|ty| format!("'{}'", escape_wiql(ty)))
-        .collect::<Vec<_>>()
-        .join(", ");
+    hierarchy_wiql(project, Some(types), areas)
+}
+
+/// WIQL for a team's area paths with no work-item-type filter. Used when the
+/// team's backlog settings are invalid (TF400497) so we can still list work.
+pub fn build_untyped_hierarchy_wiql(project: &str, areas: &[AreaPathValue]) -> String {
+    hierarchy_wiql(project, None, areas)
+}
+
+fn hierarchy_wiql(project: &str, types: Option<&[String]>, areas: &[AreaPathValue]) -> String {
     let area_clause = areas
         .iter()
         .map(|area| {
@@ -45,9 +50,16 @@ pub fn build_hierarchy_wiql(project: &str, types: &[String], areas: &[AreaPathVa
     let mut parts = vec![
         "SELECT [System.Id] FROM WorkItems WHERE".to_string(),
         format!("[System.TeamProject] = '{}'", escape_wiql(project)),
-        format!("AND [System.WorkItemType] IN ({type_list})"),
-        "AND [System.State] <> 'Removed'".to_string(),
     ];
+    if let Some(types) = types.filter(|types| !types.is_empty()) {
+        let type_list = types
+            .iter()
+            .map(|ty| format!("'{}'", escape_wiql(ty)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("AND [System.WorkItemType] IN ({type_list})"));
+    }
+    parts.push("AND [System.State] <> 'Removed'".to_string());
     if !area_clause.is_empty() {
         parts.push(format!("AND ({area_clause})"));
     }
@@ -283,6 +295,20 @@ mod tests {
         let wiql = build_hierarchy_wiql("Shop", &[], &[]);
         assert!(!wiql.contains("IN ()"));
         assert!(wiql.contains("[System.Id] = 0"));
+    }
+
+    #[test]
+    fn untyped_wiql_omits_the_type_filter() {
+        let wiql = build_untyped_hierarchy_wiql(
+            "Shop",
+            &[AreaPathValue {
+                value: "Shop\\Area".into(),
+                include_children: true,
+            }],
+        );
+        assert!(!wiql.contains("WorkItemType"));
+        assert!(wiql.contains("[System.AreaPath] UNDER 'Shop\\Area'"));
+        assert!(wiql.contains("[System.State] <> 'Removed'"));
     }
 
     #[test]

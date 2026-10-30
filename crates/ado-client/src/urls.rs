@@ -65,15 +65,30 @@ pub fn profile_lookup_urls(ado_base: &str, vssps_base: &str, org: Option<&str>) 
     urls
 }
 
-/// Connection Data URL. Electron and the ADO REST docs use a bare `api-version`.
-/// `connectOptions=IncludeServices` is a string some orgs 400 on, so it is not
-/// sent.
+/// Connection Data URLs. `api-version=7.1` 400s on some orgs, so we try the
+/// documented preview and older versions, then the org-scoped VSSPS host,
+/// before the 7.1 query that Electron uses.
 pub fn connection_data_urls(ado_base: &str, org: &str) -> Vec<String> {
-    let root = format!(
-        "{}/{org}/_apis/connectionData",
-        ado_base.trim_end_matches('/')
-    );
-    vec![format!("{root}?api-version=7.1")]
+    let ado = ado_base.trim_end_matches('/');
+    let ado_root = format!("{ado}/{org}/_apis/connectionData");
+    let vssps_root = format!("{PRODUCTION_VSSPS_IDENTITIES_HOST}/{org}/_apis/connectionData");
+    let mut urls = Vec::new();
+    for root in [ado_root.as_str(), vssps_root.as_str()] {
+        for version in ["7.2-preview.1", "7.1-preview.1", "7.0", "1.0"] {
+            let url = format!("{root}?api-version={version}");
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        if !urls.contains(&root.to_string()) {
+            urls.push(root.to_string());
+        }
+    }
+    let electron = format!("{ado_root}?api-version=7.1");
+    if !urls.contains(&electron) {
+        urls.push(electron);
+    }
+    urls
 }
 
 #[cfg(test)]
@@ -134,9 +149,23 @@ mod tests {
     #[test]
     fn connection_data_matches_electron_and_skips_connect_options() {
         let urls = connection_data_urls(PRODUCTION_ADO_BASE, "amergis");
+        assert!(
+            urls.iter()
+                .any(|url| url
+                    == "https://dev.azure.com/amergis/_apis/connectionData?api-version=7.1")
+        );
+        assert!(
+            urls.iter()
+                .any(|url| url.contains("vssps.dev.azure.com/amergis/_apis/connectionData"))
+        );
+        assert!(
+            urls.iter()
+                .any(|url| url.contains("7.2-preview.1") || url.contains("7.0"))
+        );
+        assert!(urls.iter().all(|url| !url.contains("connectOptions")));
         assert_eq!(
-            urls,
-            vec!["https://dev.azure.com/amergis/_apis/connectionData?api-version=7.1".to_string()]
+            urls[0],
+            "https://dev.azure.com/amergis/_apis/connectionData?api-version=7.2-preview.1"
         );
     }
 }
