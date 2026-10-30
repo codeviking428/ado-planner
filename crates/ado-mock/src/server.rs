@@ -355,10 +355,19 @@ async fn route(
             }
             for op in ops {
                 let is_add = op.get("op").and_then(Value::as_str) == Some("add");
-                let field = op
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .and_then(|path| path.strip_prefix("/fields/"));
+                let path = op.get("path").and_then(Value::as_str).unwrap_or("");
+                if is_add && path == "/relations/-" {
+                    let relations = items[index]
+                        .as_object_mut()
+                        .map(|item| item.entry("relations").or_insert_with(|| json!([])));
+                    if let Some(Value::Array(relations)) = relations
+                        && let Some(value) = op.get("value")
+                    {
+                        relations.push(value.clone());
+                    }
+                    continue;
+                }
+                let field = path.strip_prefix("/fields/");
                 if is_add
                     && let Some(field) = field
                     && let Some(fields) = items[index]

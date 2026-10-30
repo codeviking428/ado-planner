@@ -7,18 +7,27 @@ use ado_core::{
 use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
 
-pub const ROW_HEIGHT: f32 = 36.0;
-pub const DEFAULT_TREE_WIDTH: f32 = 420.0;
+pub const ROW_HEIGHT: f32 = 40.0;
+pub const DEFAULT_TREE_WIDTH: f32 = 480.0;
 pub const MIN_TREE_WIDTH: f32 = 240.0;
 pub const MIN_TIMELINE_WIDTH: f32 = 240.0;
+pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
+pub const LINK_HANDLE: f32 = 10.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
 pub const TODAY_MARGIN_PX: f32 = 80.0;
 pub const PLACEHOLDER_MIN_WIDTH: f32 = 48.0;
-pub const MILESTONE_SIZE: f32 = 14.0;
+pub const MILESTONE_SIZE: f32 = 16.0;
+pub const SUMMARY_BAR_H: f32 = 14.0;
+pub const PLACEHOLDER_BAR_H: f32 = 24.0;
+pub const LEAF_BAR_H: f32 = 28.0;
+pub const DATES_COL_WIDTH: f32 = 200.0;
+pub const ID_COL_WIDTH: f32 = 64.0;
+pub const TYPE_COL_WIDTH: f32 = 88.0;
+pub const ASSIGNEE_COL_WIDTH: f32 = 88.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GanttScale {
@@ -127,6 +136,7 @@ pub enum GestureKind {
     Move,
     ResizeStart,
     ResizeEnd,
+    Link,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,6 +148,8 @@ pub struct Gesture {
     pub target: Date,
     pub live_start: Date,
     pub live_target: Date,
+    pub had_start: bool,
+    pub had_target: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +160,8 @@ pub struct PendingNudge {
     pub original_start: Date,
     pub original_target: Date,
     pub original_rev: i64,
+    pub had_start: bool,
+    pub had_target: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,18 +364,41 @@ impl GanttView {
     }
 
     pub fn max_tree_width(&self) -> f32 {
-        (self.viewport_w - 6.0 - MIN_TIMELINE_WIDTH).max(MIN_TREE_WIDTH)
+        (self.viewport_w - 6.0 - MIN_TIMELINE_WIDTH).max(HARD_MIN_TREE_WIDTH)
+    }
+
+    pub fn min_tree_width(&self) -> f32 {
+        if self.viewport_w >= MIN_TREE_WIDTH + MIN_TIMELINE_WIDTH + 6.0 {
+            MIN_TREE_WIDTH
+        } else {
+            (self.viewport_w - 6.0 - MIN_TIMELINE_WIDTH).max(HARD_MIN_TREE_WIDTH)
+        }
+    }
+
+    pub fn show_type_column(&self) -> bool {
+        self.tree_width >= 560.0
+    }
+
+    pub fn show_assignee_column(&self) -> bool {
+        self.tree_width >= 480.0
+    }
+
+    pub fn show_dates_column(&self) -> bool {
+        self.tree_width >= 340.0
     }
 
     pub fn set_tree_width(&mut self, width: f32) {
-        self.tree_width = width.clamp(MIN_TREE_WIDTH, self.max_tree_width());
+        let min = self.min_tree_width();
+        let max = self.max_tree_width().max(min);
+        self.tree_width = width.clamp(min, max);
         self.timeline_width = (self.viewport_w - self.tree_width - 6.0).max(MIN_TIMELINE_WIDTH);
     }
 
     /// Clamp against the live pane width so a stale `viewport_w` cannot let the
-    /// tree eat the timeline.
+    /// tree eat the timeline. Do not inflate a narrow pane — the tree shrinks
+    /// first so the timeline can keep `MIN_TIMELINE_WIDTH`.
     pub fn set_tree_width_for_pane(&mut self, width: f32, pane_w: f32) {
-        self.viewport_w = pane_w.max(MIN_TREE_WIDTH + MIN_TIMELINE_WIDTH + 6.0);
+        self.viewport_w = pane_w.max(1.0);
         self.set_tree_width(width);
     }
 
@@ -469,6 +506,22 @@ impl GanttView {
         origin_x: f32,
         nodes: &[WorkItemNode],
     ) -> Result<(), &'static str> {
+        if kind == GestureKind::Link {
+            self.selected_id = Some(bar.id);
+            let today = jiff::Zoned::now().date();
+            self.gesture = Some(Gesture {
+                kind,
+                id: bar.id,
+                origin_x,
+                start: today,
+                target: today,
+                live_start: today,
+                live_target: today,
+                had_start: false,
+                had_target: false,
+            });
+            return Ok(());
+        }
         if bar.kind != GanttBarKind::Scheduled {
             return Err("This Work Item has no Start Date and Target Date fields.");
         }
@@ -482,8 +535,12 @@ impl GanttView {
         if !node.has_date_fields {
             return Err("This Work Item has no Start Date and Target Date fields.");
         }
-        let start = parse_iso_date(node.start_date.as_deref()).ok_or("Unscheduled")?;
-        let target = parse_iso_date(node.target_date.as_deref()).ok_or("Unscheduled")?;
+        let had_start = parse_iso_date(node.start_date.as_deref()).is_some();
+        let had_target = parse_iso_date(node.target_date.as_deref()).is_some();
+        let hint = None;
+        let display = gantt_bar_display(node, nodes, hint);
+        let start = display.start.ok_or("Unscheduled")?;
+        let target = display.end.ok_or("Unscheduled")?;
         self.selected_id = Some(bar.id);
         self.gesture = Some(Gesture {
             kind,
@@ -493,6 +550,8 @@ impl GanttView {
             target,
             live_start: start,
             live_target: target,
+            had_start,
+            had_target,
         });
         Ok(())
     }
@@ -501,6 +560,9 @@ impl GanttView {
         let Some(gesture) = &mut self.gesture else {
             return;
         };
+        if gesture.kind == GestureKind::Link {
+            return;
+        }
         let delta_days =
             ((x - gesture.origin_x) / self.scale.pixels_per_day(self.zoom)).round() as i32;
         match gesture.kind {
@@ -508,6 +570,7 @@ impl GanttView {
                 gesture.live_start = gesture.start.saturating_add(delta_days.days());
                 gesture.live_target = gesture.target.saturating_add(delta_days.days());
             }
+            GestureKind::Link => {}
             GestureKind::ResizeStart => {
                 let next = gesture.start.saturating_add(delta_days.days());
                 if next <= gesture.target {
@@ -530,10 +593,31 @@ impl GanttView {
 
     pub fn finish_gesture(&mut self) -> Option<(i64, Date, Date)> {
         let gesture = self.gesture.take()?;
+        if gesture.kind == GestureKind::Link {
+            return None;
+        }
         if gesture.live_start == gesture.start && gesture.live_target == gesture.target {
             return None;
         }
         Some((gesture.id, gesture.live_start, gesture.live_target))
+    }
+
+    pub fn take_link_gesture(&mut self) -> Option<i64> {
+        let gesture = self.gesture.as_ref()?;
+        if gesture.kind != GestureKind::Link {
+            return None;
+        }
+        let id = gesture.id;
+        self.gesture = None;
+        Some(id)
+    }
+
+    pub fn gesture_patch_dates(gesture: &Gesture) -> (Option<Date>, Option<Date>) {
+        let start = (gesture.had_start || gesture.kind == GestureKind::ResizeStart)
+            .then_some(gesture.live_start);
+        let target = (gesture.had_target || gesture.kind == GestureKind::ResizeEnd)
+            .then_some(gesture.live_target);
+        (start, target)
     }
 
     pub fn timeline_ticks(&self, width: f32) -> Vec<TimelineTick> {
@@ -663,8 +747,11 @@ impl GanttView {
         if !node.has_date_fields {
             return Err("This Work Item has no Start Date and Target Date fields.");
         }
-        let start = parse_iso_date(node.start_date.as_deref()).ok_or("Unscheduled")?;
-        let target = parse_iso_date(node.target_date.as_deref()).ok_or("Unscheduled")?;
+        let had_start = parse_iso_date(node.start_date.as_deref()).is_some();
+        let had_target = parse_iso_date(node.target_date.as_deref()).is_some();
+        let display = gantt_bar_display(node, nodes, None);
+        let start = display.start.ok_or("Unscheduled")?;
+        let target = display.end.ok_or("Unscheduled")?;
         let mut pending = self
             .pending_nudge
             .clone()
@@ -676,6 +763,8 @@ impl GanttView {
                 original_start: start,
                 original_target: target,
                 original_rev: node.rev,
+                had_start,
+                had_target,
             });
         match which {
             NudgeAxis::Both => {
@@ -706,7 +795,9 @@ impl GanttView {
                 y >= bar.y && y < bar.y + ROW_HEIGHT && x >= bar.x && x <= bar.x + bar.width
             })?
             .clone();
-        let kind = if x <= bar.x + HANDLE_WIDTH {
+        let kind = if bar.milestone {
+            GestureKind::Move
+        } else if x <= bar.x + HANDLE_WIDTH {
             GestureKind::ResizeStart
         } else if x >= bar.x + bar.width - HANDLE_WIDTH {
             GestureKind::ResizeEnd
@@ -916,7 +1007,7 @@ mod tests {
             progress: None,
             predecessors: Vec::new(),
         };
-        let bars = [bar];
+        let bars = [bar.clone()];
         assert_eq!(
             GanttView::hit_test_bar(&bars, 102.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::ResizeStart)
@@ -928,6 +1019,91 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(&bars, 140.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::Move)
+        );
+        let milestone = BarLayout {
+            milestone: true,
+            width: MILESTONE_SIZE,
+            ..bar
+        };
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&milestone), 102.0, 4.0)
+                .map(|(_, kind)| kind),
+            Some(GestureKind::Move),
+            "a milestone is smaller than two resize handles; the whole diamond is a move"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&[milestone], 114.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::Move)
+        );
+    }
+
+    #[test]
+    fn start_only_and_milestone_bars_can_begin_a_move() {
+        let mut start_only = node(1, None);
+        start_only.target_date = None;
+        let mut milestone = node(2, None);
+        milestone.start_date = None;
+        let nodes = vec![start_only, milestone];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let start_bar = bars.iter().find(|bar| bar.id == 1).expect("start-only");
+        let mile_bar = bars.iter().find(|bar| bar.id == 2).expect("milestone");
+        assert!(mile_bar.milestone);
+        gantt
+            .begin_gesture(start_bar, GestureKind::Move, 10.0, &nodes)
+            .expect("start-only move");
+        assert!(
+            gantt
+                .gesture
+                .as_ref()
+                .is_some_and(|g| g.had_start && !g.had_target)
+        );
+        gantt.cancel_gesture();
+        gantt
+            .begin_gesture(mile_bar, GestureKind::Move, 10.0, &nodes)
+            .expect("milestone move");
+        assert!(
+            gantt
+                .gesture
+                .as_ref()
+                .is_some_and(|g| !g.had_start && g.had_target)
+        );
+        gantt.selected_id = Some(1);
+        assert!(gantt.apply_nudge(&nodes, NudgeAxis::Both, 1).is_ok());
+    }
+
+    #[test]
+    fn header_ticks_and_bars_share_scroll_x_after_today_and_a_horizontal_nudge() {
+        let today = Date::new(2026, 10, 30).unwrap();
+        let mut item = node(1, None);
+        item.start_date = Some("2026-10-30T00:00:00Z".into());
+        item.target_date = Some("2026-11-13T00:00:00Z".into());
+        let nodes = vec![item];
+        let mut gantt = GanttView::default();
+        gantt.go_today(today);
+        gantt.scroll_x += 96.0;
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let ticks = gantt.timeline_ticks(800.0);
+        let bar_x = bars[0].x;
+        let from_date = gantt.x_for_date(today);
+        assert!(
+            (bar_x - from_date).abs() < 0.5,
+            "bar.x {bar_x} must equal x_for_date {from_date}"
+        );
+        let on_screen = ticks
+            .iter()
+            .find(|tick| tick.x >= 0.0 && tick.x <= 800.0)
+            .expect("visible tick");
+        let decoded = gantt.x_for_date(gantt.date_for_x(on_screen.x));
+        assert!(
+            (decoded - on_screen.x).abs() < 0.5,
+            "tick.x {} must match x_for_date(date_for_x) {decoded} so header and bars share scroll_x",
+            on_screen.x
         );
     }
 
@@ -1147,6 +1323,33 @@ mod tests {
         assert!(gantt.tree_width <= gantt.max_tree_width());
         gantt.set_tree_width(0.0);
         assert!((gantt.tree_width - MIN_TREE_WIDTH).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn narrow_pane_keeps_a_240px_timeline_by_shrinking_the_tree() {
+        let mut gantt = GanttView {
+            viewport_w: 700.0,
+            tree_width: DEFAULT_TREE_WIDTH,
+            ..Default::default()
+        };
+        gantt.set_tree_width_for_pane(DEFAULT_TREE_WIDTH, 700.0);
+        assert!(
+            gantt.timeline_width >= MIN_TIMELINE_WIDTH - 0.5,
+            "timeline {} at 700px pane",
+            gantt.timeline_width
+        );
+        assert!(
+            gantt.tree_width <= 700.0 - 6.0 - MIN_TIMELINE_WIDTH + 0.5,
+            "tree {} ate the timeline",
+            gantt.tree_width
+        );
+        gantt.set_tree_width_for_pane(10_000.0, 400.0);
+        assert!(gantt.timeline_width >= MIN_TIMELINE_WIDTH - 0.5);
+        assert!(
+            gantt.tree_width < MIN_TREE_WIDTH,
+            "tree should shrink below 240 in a 400px pane, got {}",
+            gantt.tree_width
+        );
     }
 
     #[test]

@@ -201,6 +201,37 @@ pub fn build_field_patch(rev: i64, reference: &str, value: Value) -> Vec<JsonPat
 }
 
 pub fn build_start_target_patch(rev: i64, start_date: Date, target_date: Date) -> Vec<JsonPatchOp> {
+    build_dates_patch(rev, Some(start_date), Some(target_date))
+}
+
+pub fn build_dates_patch(
+    rev: i64,
+    start_date: Option<Date>,
+    target_date: Option<Date>,
+) -> Vec<JsonPatchOp> {
+    let mut ops = vec![JsonPatchOp {
+        op: PatchOp::Test,
+        path: "/rev".into(),
+        value: Some(json!(rev)),
+    }];
+    if let Some(start_date) = start_date {
+        ops.push(JsonPatchOp {
+            op: PatchOp::Add,
+            path: format!("/fields/{START_DATE_FIELD}"),
+            value: Some(json!(iso_date_only(start_date))),
+        });
+    }
+    if let Some(target_date) = target_date {
+        ops.push(JsonPatchOp {
+            op: PatchOp::Add,
+            path: format!("/fields/{TARGET_DATE_FIELD}"),
+            value: Some(json!(iso_date_only(target_date))),
+        });
+    }
+    ops
+}
+
+pub fn build_add_dependency_patch(rev: i64, predecessor_url: &str) -> Vec<JsonPatchOp> {
     vec![
         JsonPatchOp {
             op: PatchOp::Test,
@@ -209,13 +240,11 @@ pub fn build_start_target_patch(rev: i64, start_date: Date, target_date: Date) -
         },
         JsonPatchOp {
             op: PatchOp::Add,
-            path: format!("/fields/{START_DATE_FIELD}"),
-            value: Some(json!(iso_date_only(start_date))),
-        },
-        JsonPatchOp {
-            op: PatchOp::Add,
-            path: format!("/fields/{TARGET_DATE_FIELD}"),
-            value: Some(json!(iso_date_only(target_date))),
+            path: "/relations/-".into(),
+            value: Some(json!({
+                "rel": "System.LinkTypes.Dependency-Reverse",
+                "url": predecessor_url,
+            })),
         },
     ]
 }
@@ -384,6 +413,11 @@ mod tests {
         );
         let encoded = serde_json::to_string(&document).unwrap();
         assert!(!encoded.contains("IterationPath"));
+        let start_only = build_dates_patch(5, Some("2026-07-06".parse().unwrap()), None);
+        assert_eq!(start_only.len(), 2);
+        assert_eq!(start_only[1].path, format!("/fields/{START_DATE_FIELD}"));
+        let link = build_add_dependency_patch(3, "https://example/_apis/wit/workitems/1003");
+        assert_eq!(link[1].path, "/relations/-");
     }
 
     #[test]

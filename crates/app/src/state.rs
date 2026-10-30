@@ -6,7 +6,7 @@ use ado_client::{AdoClient, AdoRuntime, TokenSource};
 use ado_core::{
     AssigneeFilter, Flavor, HierarchyResult, IdentityValue, IterationNode, Organization,
     OverlayFilter, Project, ScopeSelection, SessionInfo, Team, WorkItemNode, apply_overlays,
-    build_clear_dates_patch, build_field_patch, build_start_target_patch, choose_available,
+    build_clear_dates_patch, build_dates_patch, build_field_patch, choose_available,
     is_assignee_special, iso_date_only, parse_iso_date, resolve_root_types,
     schedule_from_iteration,
 };
@@ -887,8 +887,16 @@ impl PlannerState {
                 }
                 self.form = None;
                 self.persist_hierarchy_cache();
-                self.toasts
-                    .push(ToastKind::Success, format!("Saved Work Item #{id}"));
+                let names: Vec<String> = ops
+                    .iter()
+                    .filter_map(|op| op.path.strip_prefix("/fields/").map(field_toast_name))
+                    .collect();
+                let message = if names.is_empty() {
+                    format!("Saved Work Item #{id}")
+                } else {
+                    format!("Saved {}", names.join(", "))
+                };
+                self.toasts.push(ToastKind::Success, message);
                 Ok(())
             }
             Err(err) if err.is_precondition_failed() => {
@@ -942,11 +950,39 @@ impl PlannerState {
         start: Date,
         target: Date,
     ) -> Option<WorkItemNode> {
+        self.apply_optimistic_partial(id, Some(start), Some(target))
+    }
+
+    pub fn apply_optimistic_partial(
+        &mut self,
+        id: i64,
+        start: Option<Date>,
+        target: Option<Date>,
+    ) -> Option<WorkItemNode> {
         let node = self.nodes.iter_mut().find(|node| node.id == id)?;
         let previous = node.clone();
-        node.start_date = Some(iso_date_only(start));
-        node.target_date = Some(iso_date_only(target));
+        if let Some(start) = start {
+            node.start_date = Some(iso_date_only(start));
+        }
+        if let Some(target) = target {
+            node.target_date = Some(iso_date_only(target));
+        }
         Some(previous)
+    }
+
+    fn restore_partial_dates(&mut self, id: i64, start: Option<Date>, target: Option<Date>) {
+        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
+            node.start_date = start.map(iso_date_only);
+            node.target_date = target.map(iso_date_only);
+        }
+    }
+
+    fn restore_nudge(&mut self, pending: &PendingNudge) {
+        self.restore_partial_dates(
+            pending.id,
+            pending.had_start.then_some(pending.original_start),
+            pending.had_target.then_some(pending.original_target),
+        );
     }
 
     pub fn restore_node(&mut self, previous: WorkItemNode) {
@@ -972,7 +1008,7 @@ impl PlannerState {
         let Some(previous) = self.apply_optimistic_dates(id, start, target) else {
             return Ok(());
         };
-        let ops = build_start_target_patch(node.rev, start, target);
+        let ops = build_dates_patch(node.rev, Some(start), Some(target));
         match self
             .client
             .patch_work_item(&scope.org, &scope.project, id, &ops)
@@ -999,6 +1035,121 @@ impl PlannerState {
     pub async fn schedule_at(&mut self, id: i64, start: Date) -> Result<(), AppError> {
         let target = start.saturating_add(13.days());
         self.save_dates(id, start, target).await
+    }
+
+    pub async fn save_partial_dates(
+        &mut self,
+        id: i64,
+        start: Option<Date>,
+        target: Option<Date>,
+    ) -> Result<(), AppError> {
+        match (start, target) {
+            (Some(start), Some(target)) => self.save_dates(id, start, target).await,
+            (None, None) => Ok(()),
+            (start, target) => {
+                let Some(scope) = self.scope() else {
+                    return Ok(());
+                };
+                let Some(node) = self.nodes.iter().find(|node| node.id == id).cloned() else {
+                    return Err(AppError::message("Work Item not found"));
+                };
+                if !node.has_date_fields {
+                    self.toasts.push(
+                        ToastKind::Error,
+                        "This Work Item has no Start Date and Target Date fields.",
+                    );
+                    return Err(AppError::message("no date fields"));
+                }
+                let Some(previous) = self.apply_optimistic_partial(id, start, target) else {
+                    return Ok(());
+                };
+                let ops = build_dates_patch(node.rev, start, target);
+                match self
+                    .client
+                    .patch_work_item(&scope.org, &scope.project, id, &ops)
+                    .await
+                {
+                    Ok(rev) => {
+                        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
+                            node.rev = rev;
+                        }
+                        self.persist_hierarchy_cache();
+                        let message = match (start, target) {
+                            (Some(_), None) => "Saved start date",
+                            (None, Some(_)) => "Saved target date",
+                            _ => "Saved Start Date and Target Date",
+                        };
+                        self.toasts.push(ToastKind::Success, message);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        self.restore_node(previous);
+                        self.toasts
+                            .push(ToastKind::Error, error_text(&err, "Could not save dates"));
+                        Err(err.into())
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn add_dependency(
+        &mut self,
+        successor_id: i64,
+        predecessor_id: i64,
+    ) -> Result<(), AppError> {
+        if successor_id == predecessor_id {
+            return Ok(());
+        }
+        let Some(scope) = self.scope() else {
+            return Ok(());
+        };
+        let Some(node) = self
+            .nodes
+            .iter()
+            .find(|node| node.id == successor_id)
+            .cloned()
+        else {
+            return Err(AppError::message("Work Item not found"));
+        };
+        if node.predecessors.contains(&predecessor_id) {
+            return Ok(());
+        }
+        let previous = node.clone();
+        if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
+            live.predecessors.push(predecessor_id);
+        }
+        match self
+            .client
+            .add_dependency(
+                &scope.org,
+                &scope.project,
+                successor_id,
+                predecessor_id,
+                node.rev,
+            )
+            .await
+        {
+            Ok(rev) => {
+                if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
+                    live.rev = rev;
+                }
+                self.persist_hierarchy_cache();
+                self.toasts.push(
+                    ToastKind::Success,
+                    format!("Linked #{predecessor_id} → #{successor_id}"),
+                );
+                Ok(())
+            }
+            Err(err) => {
+                self.restore_node(previous);
+                self.toasts.push(
+                    ToastKind::Error,
+                    error_text(&err, "Could not add dependency"),
+                );
+                Err(err.into())
+            }
+        }
     }
 
     pub async fn save_title(&mut self, id: i64, title: String) -> Result<(), AppError> {
@@ -1094,25 +1245,45 @@ impl PlannerState {
     pub fn update_bar_gesture(&mut self, x: f32) {
         self.gantt.update_gesture(x);
         if let Some(gesture) = &self.gantt.gesture {
-            let _ =
-                self.apply_optimistic_dates(gesture.id, gesture.live_start, gesture.live_target);
+            if gesture.kind == GestureKind::Link {
+                return;
+            }
+            let (start, target) = crate::gantt::GanttView::gesture_patch_dates(gesture);
+            let _ = self.apply_optimistic_partial(gesture.id, start, target);
         }
     }
 
     pub fn cancel_gesture(&mut self) {
         if let Some(gesture) = self.gantt.gesture.clone() {
-            let _ = self.apply_optimistic_dates(gesture.id, gesture.start, gesture.target);
+            self.restore_partial_dates(
+                gesture.id,
+                gesture.had_start.then_some(gesture.start),
+                gesture.had_target.then_some(gesture.target),
+            );
         }
         if let Some(nudge) = self.gantt.pending_nudge.clone() {
-            let _ =
-                self.apply_optimistic_dates(nudge.id, nudge.original_start, nudge.original_target);
+            self.restore_nudge(&nudge);
         }
         self.gantt.cancel_gesture();
     }
 
     pub async fn commit_gesture(&mut self) -> Result<(), AppError> {
-        if let Some((id, start, target)) = self.gantt.finish_gesture() {
-            self.save_dates(id, start, target).await?;
+        if let Some(from_id) = self.gantt.take_link_gesture() {
+            if let Some(to_id) = self.gantt.hovered_id
+                && to_id != from_id
+            {
+                return self.add_dependency(to_id, from_id).await;
+            }
+            return Ok(());
+        }
+        if let Some(gesture) = self.gantt.gesture.clone() {
+            if gesture.live_start == gesture.start && gesture.live_target == gesture.target {
+                self.gantt.gesture = None;
+                return Ok(());
+            }
+            let (start, target) = crate::gantt::GanttView::gesture_patch_dates(&gesture);
+            self.gantt.gesture = None;
+            return self.save_partial_dates(gesture.id, start, target).await;
         }
         Ok(())
     }
@@ -1121,7 +1292,9 @@ impl PlannerState {
         let visible = self.visible_nodes();
         match self.gantt.apply_nudge(&visible, axis, delta) {
             Ok(pending) => {
-                let _ = self.apply_optimistic_dates(pending.id, pending.start, pending.target);
+                let start = pending.had_start.then_some(pending.start);
+                let target = pending.had_target.then_some(pending.target);
+                let _ = self.apply_optimistic_partial(pending.id, start, target);
                 self.last_nudge_at = Some(Instant::now());
                 Ok(())
             }
@@ -1142,14 +1315,14 @@ impl PlannerState {
             return Ok(());
         };
         self.last_nudge_at = None;
-        self.save_dates(pending.id, pending.start, pending.target)
-            .await
+        let start = pending.had_start.then_some(pending.start);
+        let target = pending.had_target.then_some(pending.target);
+        self.save_partial_dates(pending.id, start, target).await
     }
 
     pub fn discard_nudge(&mut self) {
         if let Some(nudge) = self.gantt.pending_nudge.take() {
-            let _ =
-                self.apply_optimistic_dates(nudge.id, nudge.original_start, nudge.original_target);
+            self.restore_nudge(&nudge);
         }
         self.last_nudge_at = None;
     }
@@ -1289,7 +1462,7 @@ impl PlannerState {
     }
 }
 
-fn field_toast_name(reference: &str) -> String {
+pub(crate) fn field_toast_name(reference: &str) -> String {
     match reference {
         "System.Title" => "title".into(),
         "System.AssignedTo" => "assignee".into(),

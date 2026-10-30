@@ -178,7 +178,7 @@ async fn snapshots_each_route() {
     let (status, body) = get(
         &client,
         url,
-        "/contoso/Shop/_apis/wit/workitems?ids=1012&$expand=relations",
+        "/contoso/Shop/_apis/wit/workitems?ids=1012&$expand=relations&errorPolicy=Omit",
     )
     .await;
     assert_eq!(status, 200);
@@ -241,6 +241,32 @@ async fn patch_rev_conflict_and_success() {
         .await
         .expect("patch json");
     assert_eq!(response.status().as_u16(), 415);
+
+    let (status, body) = patch(
+        &client,
+        url,
+        "/contoso/Shop/_apis/wit/workitems/1012",
+        json!([
+            { "op": "test", "path": "/rev", "value": 2 },
+            { "op": "add", "path": "/relations/-", "value": {
+                "rel": "System.LinkTypes.Dependency-Reverse",
+                "url": format!("{url}/contoso/Shop/_apis/wit/workitems/1005")
+            }}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body["relations"]
+            .as_array()
+            .is_some_and(|rels| rels.iter().any(|rel| {
+                rel["rel"] == "System.LinkTypes.Dependency-Reverse"
+                    && rel["url"]
+                        .as_str()
+                        .is_some_and(|url| url.ends_with("/1005"))
+            })),
+        "PATCH /relations/- should append a dependency"
+    );
 }
 
 #[tokio::test]

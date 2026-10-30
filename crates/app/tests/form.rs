@@ -34,7 +34,7 @@ async fn open_and_save_work_item_form() {
             .toasts
             .last_message()
             .unwrap_or_default()
-            .contains("Saved Work Item #1003")
+            .contains("Saved title")
     );
     let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();
     assert_eq!(node.title, "Persist cart (saved)");

@@ -14,11 +14,11 @@ pub mod team_members;
 pub mod types;
 
 pub use dates::{
-    DEFAULT_BAR_DAYS, GanttBarDisplay, GanttBarKind, IterationHint, build_clear_dates_patch,
-    build_field_patch, build_start_target_patch, client_rollup, dates_column_text,
-    from_gantt_exclusive_end, gantt_bar_display, is_unscheduled, iso_date_only,
-    iteration_hint_for_path, parse_iso_date, schedule_from_iteration, to_gantt_inclusive_target,
-    type_has_start_and_target,
+    DEFAULT_BAR_DAYS, GanttBarDisplay, GanttBarKind, IterationHint, build_add_dependency_patch,
+    build_clear_dates_patch, build_dates_patch, build_field_patch, build_start_target_patch,
+    client_rollup, dates_column_text, from_gantt_exclusive_end, gantt_bar_display, is_unscheduled,
+    iso_date_only, iteration_hint_for_path, parse_iso_date, schedule_from_iteration,
+    to_gantt_inclusive_target, type_has_start_and_target,
 };
 pub use error::Error;
 pub use flavor::{

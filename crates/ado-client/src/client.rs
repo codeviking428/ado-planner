@@ -123,8 +123,10 @@ impl AdoClient {
                 serde_json::to_vec(body).map_err(|err| ClientError::Message(err.to_string()))?;
             builder = builder.body(bytes);
         }
+        tracing::debug!(method = %method, url, "ado request");
         let response = builder.send().await?;
         let status = response.status();
+        tracing::debug!(method = %method, url, %status, "ado response");
         if status == StatusCode::NO_CONTENT {
             return Ok(Value::Null);
         }
@@ -474,7 +476,7 @@ impl AdoClient {
                 .join(",");
             let expanded = self
                 .get(&format!(
-                    "{project_root}/_apis/wit/workitems?ids={ids_csv}&$expand=relations&api-version=7.1"
+                    "{project_root}/_apis/wit/workitems?ids={ids_csv}&$expand=relations&errorPolicy=Omit&api-version=7.1"
                 ))
                 .await;
             let Ok(expanded) = expanded else {
@@ -577,6 +579,28 @@ impl AdoClient {
             )
             .await?;
         Ok(updated.get("rev").and_then(Value::as_i64).unwrap_or(0))
+    }
+
+    pub async fn add_dependency(
+        &self,
+        org: &str,
+        project: &str,
+        successor_id: i64,
+        predecessor_id: i64,
+        rev: i64,
+    ) -> Result<i64, ClientError> {
+        let url = format!(
+            "{}/{}/_apis/wit/workitems/{predecessor_id}",
+            self.org_url(org),
+            urlencoding::encode(project)
+        );
+        self.patch_work_item(
+            org,
+            project,
+            successor_id,
+            &ado_core::build_add_dependency_patch(rev, &url),
+        )
+        .await
     }
 
     pub async fn load_form(

@@ -6,6 +6,7 @@ use ado_planner::gantt::{ContextTarget, GanttView, MIN_TIMELINE_WIDTH, ROW_HEIGH
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::ui::PlannerView;
+use ado_planner::ui::looks_like_pat;
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use gpui_kit::{KeyDownEvent, Keystroke, VisualTestContext, px};
 use jiff::civil::Date;
@@ -122,6 +123,90 @@ fn painted_tree_rows_and_bars_share_row_height(cx: &mut gpui_kit::TestAppContext
         (bar_mid - row_mid).abs() < 8.0,
         "bar for row 1 sits at {bar_mid}, tree row at {row_mid}"
     );
+}
+
+#[gpui_kit::test]
+fn painted_rows_are_monday_height_at_1280x800(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let row1 = cx.debug_bounds("gantt-tree-row-1").expect("row");
+    let height = f32::from(row1.size.height);
+    assert!(
+        (height - ROW_HEIGHT).abs() < 2.0 && height >= 36.0,
+        "tree row painted {height}px; expected ~{ROW_HEIGHT}"
+    );
+    let label = cx.debug_bounds("gantt-bar-label");
+    if let Some(label) = label {
+        let label_h = f32::from(label.size.height);
+        assert!(
+            label_h >= 12.0,
+            "bar labels must be unclipped, painted {label_h}px"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn painted_700x500_window_keeps_a_240px_timeline(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(700.),
+        height: px(500.),
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.state
+            .gantt
+            .set_tree_width_for_pane(view.state.gantt.tree_width, 700.0);
+        cx.notify();
+    });
+    draw(cx);
+    let tree = cx.debug_bounds("gantt-tree").expect("tree");
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    assert!(
+        f32::from(timeline.size.width) >= MIN_TIMELINE_WIDTH - 1.0,
+        "700×500 timeline painted {}px (tree {}px); MIN_TIMELINE_WIDTH is {MIN_TIMELINE_WIDTH}",
+        f32::from(timeline.size.width),
+        f32::from(tree.size.width)
+    );
+}
+
+#[gpui_kit::test]
+fn clicking_the_dates_cell_opens_a_range_picker(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let cell = cx
+        .debug_bounds("gantt-dates-cell")
+        .expect("dates cell should paint at default width");
+    cx.simulate_click(cell.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-dates").is_some(),
+        "clicking Dates must open the range picker, not only a tooltip"
+    );
+}
+
+#[test]
+fn looks_like_a_pat_masks_long_tokens() {
+    assert!(looks_like_pat("abcdefghijklmnopqrstuv123"));
+    assert!(!looks_like_pat("contoso"));
+    assert!(!looks_like_pat("https://dev.azure.com/contoso"));
 }
 
 #[gpui_kit::test]

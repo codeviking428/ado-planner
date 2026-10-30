@@ -20,12 +20,13 @@ use gpui_kit::component::calendar::Date as PickerDate;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::date_picker::{DatePicker, DatePickerEvent, DatePickerState};
 use gpui_kit::component::h_flex;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::v_flex;
+use gpui_kit::component::{FocusableExt as _, Placement};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
@@ -38,8 +39,10 @@ use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
-    BAR_LABEL_INSIDE_MIN, DependencyArrow, GanttScale, GestureKind, HANDLE_WIDTH, MILESTONE_SIZE,
-    MIN_TIMELINE_WIDTH, MIN_TREE_WIDTH, NUDGE_IDLE_MS, NudgeAxis, ROW_HEIGHT, TIMELINE_HEADER_H,
+    ASSIGNEE_COL_WIDTH, BAR_LABEL_INSIDE_MIN, DATES_COL_WIDTH, DependencyArrow, GanttScale,
+    GestureKind, HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, MILESTONE_SIZE,
+    MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SUMMARY_BAR_H,
+    TIMELINE_HEADER_H, TYPE_COL_WIDTH,
 };
 use crate::paths::AppPaths;
 use crate::state::PlannerState;
@@ -69,15 +72,17 @@ pub struct PlannerView {
     form_inputs: HashMap<String, Entity<InputState>>,
     form_dates: HashMap<String, Entity<DatePickerState>>,
     form_inputs_for: Option<i64>,
+    form_title_focused_for: Option<i64>,
     form_focus: FocusHandle,
     open_filter: Option<&'static str>,
     open_scope: Option<&'static str>,
     inline_edit: Option<InlineEdit>,
     inline_dates: Option<Entity<DatePickerState>>,
+    banner_dismissed: bool,
     io_busy: bool,
     update_checked: bool,
     toast_expiry_armed: bool,
-    _keystrokes: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl PlannerView {
@@ -115,7 +120,7 @@ impl PlannerView {
 
     #[allow(clippy::too_many_arguments)]
     fn from_session(
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
         state: PlannerState,
         org_input: Entity<InputState>,
@@ -125,19 +130,17 @@ impl PlannerView {
         inline_input: Entity<InputState>,
     ) -> Self {
         let view = cx.weak_entity();
-        let keystrokes = cx.intercept_keystrokes(move |event: &KeystrokeEvent, _, cx| {
-            if event.keystroke.key.as_str() != "escape" {
-                return;
-            }
+        let keystrokes = cx.intercept_keystrokes(move |event: &KeystrokeEvent, window, cx| {
+            let key = event.keystroke.key.as_str();
             let Some(view) = view.upgrade() else {
                 return;
             };
             view.update(cx, |this, cx| {
-                if this.state.form.is_some()
+                let overlay = this.state.form.is_some()
                     || this.state.gantt.context_menu.is_some()
                     || this.popup_open()
-                    || this.inline_edit.is_some()
-                {
+                    || this.inline_edit.is_some();
+                if key == "escape" && overlay {
                     this.on_key(
                         &KeyDownEvent {
                             keystroke: event.keystroke.clone(),
@@ -147,10 +150,24 @@ impl PlannerView {
                         cx,
                     );
                     cx.stop_propagation();
+                    return;
                 }
+                let nav = matches!(key, "up" | "down" | "pageup" | "pagedown" | "home" | "end");
+                if !nav || overlay || this.input_focused(window, cx) {
+                    return;
+                }
+                this.on_key(
+                    &KeyDownEvent {
+                        keystroke: event.keystroke.clone(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    cx,
+                );
+                cx.stop_propagation();
             });
         });
-        Self {
+        let mut this = Self {
             state,
             org_input,
             pat_input,
@@ -160,16 +177,20 @@ impl PlannerView {
             form_inputs: HashMap::new(),
             form_dates: HashMap::new(),
             form_inputs_for: None,
+            form_title_focused_for: None,
             form_focus: cx.focus_handle(),
             open_filter: None,
             open_scope: None,
             inline_edit: None,
             inline_dates: None,
+            banner_dismissed: false,
             io_busy: false,
             update_checked: false,
             toast_expiry_armed: false,
-            _keystrokes: keystrokes,
-        }
+            _subscriptions: vec![keystrokes],
+        };
+        this.bind_sign_in_events(window, cx);
+        this
     }
 
     /// Build a view that does not fetch a session. Tests use this to render a
@@ -241,6 +262,46 @@ impl PlannerView {
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(window)
+    }
+
+    fn input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.form_field_focused(window, cx)
+            || self.org_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.pat_input.read(cx).focus_handle(cx).is_focused(window)
+            || self
+                .filter_query
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .scope_query
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+    }
+
+    fn bind_sign_in_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pat = cx.subscribe(&self.pat_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.submit_pat(cx);
+            }
+        });
+        let org = cx.subscribe_in(
+            &self.org_input,
+            window,
+            |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_pat(cx),
+                InputEvent::Change => {
+                    let value = input.read(cx).value().to_string();
+                    input.update(cx, |state, cx| {
+                        state.set_masked(looks_like_pat(&value), window, cx);
+                    });
+                }
+                _ => {}
+            },
+        );
+        self._subscriptions.push(pat);
+        self._subscriptions.push(org);
     }
 
     fn spawn_state<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
@@ -540,6 +601,9 @@ impl PlannerView {
     }
 
     fn render_error_banner(&self, cx: &Context<Self>) -> impl IntoElement {
+        if self.banner_dismissed {
+            return div().into_any_element();
+        }
         let Some(message) = self.state.team_settings_error.as_ref() else {
             return div().into_any_element();
         };
@@ -547,18 +611,33 @@ impl PlannerView {
             .id("team-settings-error")
             .debug_selector(|| "team-settings-error".into())
             .w_full()
+            .max_w(px(720.))
             .flex_shrink_0()
-            .px_5()
-            .py_2()
+            .items_start()
+            .px_3()
+            .py_1()
             .gap_2()
-            .bg(cx.theme().danger)
-            .text_color(cx.theme().danger_foreground)
+            .mx_3()
+            .mt_2()
+            .rounded_md()
+            .bg(cx.theme().muted)
+            .text_color(cx.theme().foreground)
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.))
                     .text_sm()
                     .child(message.clone()),
+            )
+            .child(
+                Button::new("dismiss-team-banner")
+                    .ghost()
+                    .compact()
+                    .label("Dismiss")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.banner_dismissed = true;
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }
@@ -651,15 +730,19 @@ impl PlannerView {
     fn apply_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         let mods = event.modifiers;
         let delta = event.delta.pixel_delta(px(16.));
+        // GPUI reports wheel-down as a negative Y on this backend; invert so
+        // the content moves the same way as the wheel.
+        let dy = -f32::from(delta.y);
+        let dx = f32::from(delta.x);
         if mods.control || mods.platform {
-            let factor = if f32::from(delta.y) < 0.0 { 1.12 } else { 0.9 };
+            let factor = if dy < 0.0 { 1.12 } else { 0.9 };
             let pointer = self.state.gantt.timeline_width * 0.5;
             self.state.gantt.zoom_at(factor, pointer, 0.0);
         } else if mods.shift {
-            self.state.gantt.scroll_x += f32::from(delta.y) + f32::from(delta.x);
+            self.state.gantt.scroll_x += dy + dx;
         } else {
-            self.state.gantt.scroll_x += f32::from(delta.x);
-            self.state.gantt.scroll_y += f32::from(delta.y);
+            self.state.gantt.scroll_x += dx;
+            self.state.gantt.scroll_y += dy;
         }
         let rows = self.state.visible_rows().len();
         self.state
@@ -800,7 +883,13 @@ impl PlannerView {
                 cx,
             ))
             .child(self.render_scope("assignee", "Assignee", assignee, team_empty, cx))
-            .child(self.render_filters(cx))
+            .child(div().flex_1().min_w(px(8.)))
+            .child(
+                div()
+                    .id("header-filters")
+                    .flex_shrink_0()
+                    .child(self.render_filters(cx)),
+            )
             .child(self.render_flavor(cx))
             .child(
                 div()
@@ -908,6 +997,8 @@ impl PlannerView {
         }
         v_flex()
             .gap_1()
+            .max_w(px(180.))
+            .overflow_hidden()
             .child(Label::new(label).text_xs().text_color(muted))
             .child(popup)
     }
@@ -958,6 +1049,8 @@ impl PlannerView {
                 });
             }
             "team" => {
+                self.state.hierarchy_loading = true;
+                self.banner_dismissed = false;
                 self.spawn_state(cx, move |mut state| async move {
                     let result = state.set_team(value).await;
                     (state, result)
@@ -1180,6 +1273,7 @@ impl PlannerView {
         v_flex()
             .id("gantt")
             .size_full()
+            .relative()
             .child(self.render_gantt_nav(cx))
             .child(
                 h_flex()
@@ -1220,8 +1314,12 @@ impl PlannerView {
                 el.child(
                     div()
                         .id("gantt-loading")
+                        .debug_selector(|| "gantt-loading".into())
                         .absolute()
                         .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .bg(cx.theme().overlay)
                         .child(Label::new("Loading Hierarchy…")),
                 )
@@ -1339,7 +1437,8 @@ impl PlannerView {
                     .ghost()
                     .compact()
                     .label("▲")
-                    .tooltip("Scroll the Gantt up, or move the selection when every row is already on screen")
+                    .tooltip("Scroll up")
+                    .tooltip_placement(Placement::Bottom)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.scroll_or_select(-3, cx);
                     })),
@@ -1349,7 +1448,8 @@ impl PlannerView {
                     .ghost()
                     .compact()
                     .label("▼")
-                    .tooltip("Scroll the Gantt down, or move the selection when every row is already on screen")
+                    .tooltip("Scroll down")
+                    .tooltip_placement(Placement::Bottom)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.scroll_or_select(3, cx);
                     })),
@@ -1367,13 +1467,17 @@ impl PlannerView {
         let header_fg = cx.theme().muted_foreground;
         let hover_bg = cx.theme().list_hover;
         let remainder = self.state.gantt.row_scroll_remainder();
+        let show_type = self.state.gantt.show_type_column();
+        let show_assignee = self.state.gantt.show_assignee_column();
+        let show_dates = self.state.gantt.show_dates_column();
         v_flex()
             .id("gantt-tree")
             .debug_selector(|| "gantt-tree".into())
             .w(px(self.state.gantt.tree_width))
-            .min_w(px(MIN_TREE_WIDTH))
+            .min_w(px(0.))
             .max_w(px(self.state.gantt.max_tree_width()))
-            .flex_shrink_0()
+            .flex_shrink_1()
+            .overflow_hidden()
             .h_full()
             .child(
                 h_flex()
@@ -1392,14 +1496,16 @@ impl PlannerView {
                             .text_color(header_fg)
                             .child("Work item"),
                     )
-                    .child(
-                        div()
-                            .w(px(148.))
-                            .flex_shrink_0()
-                            .text_xs()
-                            .text_color(header_fg)
-                            .child("Dates"),
-                    ),
+                    .when(show_dates, |el| {
+                        el.child(
+                            div()
+                                .w(px(DATES_COL_WIDTH))
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(header_fg)
+                                .child("Dates"),
+                        )
+                    }),
             )
             .child(
                 v_flex()
@@ -1547,20 +1653,38 @@ impl PlannerView {
                                             )
                                             .child(
                                                 div()
-                                                    .w(px(56.))
+                                                    .id(("id-cell", id as u64))
+                                                    .w(px(ID_COL_WIDTH))
                                                     .flex_shrink_0()
                                                     .truncate()
-                                                    .child(format!("#{id}")),
+                                                    .child(format!("#{id}"))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(
+                                                            move |this, event: &MouseDownEvent, _, cx| {
+                                                                if event.click_count >= 2 {
+                                                                    this.open_form(id, cx);
+                                                                    cx.stop_propagation();
+                                                                }
+                                                            },
+                                                        ),
+                                                    ),
                                             )
                                             .child(self.title_cell(id, &title, selected, cx))
                                             .when(!editing_title, |el| {
-                                                el.child(self.type_badge(&node.work_item_type, cx))
-                                                    .child(
-                                                        self.assignee_cell(
-                                                            id, &assigned, selected, cx,
-                                                        ),
+                                                el.when(show_type, |el| {
+                                                    el.child(
+                                                        self.type_badge(&node.work_item_type, cx),
                                                     )
-                                                    .child(self.dates_cell(id, dates, selected, cx))
+                                                })
+                                                .when(show_assignee, |el| {
+                                                    el.child(self.assignee_cell(
+                                                        id, &assigned, selected, cx,
+                                                    ))
+                                                })
+                                                .when(show_dates, |el| {
+                                                    el.child(self.dates_cell(id, dates, cx))
+                                                })
                                             }),
                                     )
                                     .into_any_element()
@@ -1575,7 +1699,7 @@ impl PlannerView {
         h_flex()
             .gap_1()
             .px_1()
-            .max_w(px(88.))
+            .max_w(px(TYPE_COL_WIDTH))
             .flex_shrink_0()
             .overflow_hidden()
             .rounded_md()
@@ -1622,11 +1746,19 @@ impl PlannerView {
         div()
             .id(("title", id as u64))
             .flex_1()
-            .min_w(px(48.))
+            .min_w(px(120.))
             .truncate()
             .child(title_owned.clone())
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if event.click_count >= 2 {
+                        this.open_form(id, cx);
+                    }
+                }),
+            )
             .on_click(
                 cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
                     this.state.gantt.selected_id = Some(id);
@@ -1661,7 +1793,7 @@ impl PlannerView {
         let tip = assigned_owned.clone();
         div()
             .id(("assignee", id as u64))
-            .w(px(88.))
+            .w(px(ASSIGNEE_COL_WIDTH))
             .flex_shrink_0()
             .truncate()
             .text_xs()
@@ -1676,13 +1808,7 @@ impl PlannerView {
             .into_any_element()
     }
 
-    fn dates_cell(
-        &self,
-        id: i64,
-        text: String,
-        selected: bool,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
+    fn dates_cell(&self, id: i64, text: String, cx: &Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         if self.inline_edit == Some(InlineEdit::Dates(id))
             || self.inline_edit == Some(InlineEdit::Start(id))
@@ -1691,7 +1817,7 @@ impl PlannerView {
             return div()
                 .id(("inline-dates-wrap", id as u64))
                 .debug_selector(|| "gantt-inline-dates".into())
-                .w(px(220.))
+                .w(px(DATES_COL_WIDTH + 20.0))
                 .flex_shrink_0()
                 .when_some(self.inline_dates.clone(), |el, state| {
                     el.child(DatePicker::new(&state).w_full())
@@ -1701,42 +1827,38 @@ impl PlannerView {
                 })
                 .into_any_element();
         }
-        if let Some(rest) = text.strip_prefix("Unscheduled") {
+        let unscheduled = text.starts_with("Unscheduled");
+        let display = if let Some(rest) = text.strip_prefix("Unscheduled") {
             let hint = rest.trim_start_matches([' ', '·']).trim().to_string();
-            let chip = if hint.is_empty() {
+            if hint.is_empty() {
                 "Unscheduled · drop on timeline".to_string()
             } else {
                 format!("Unscheduled · {hint}")
-            };
-            let tip = chip.clone();
-            return div()
-                .id(("dates", id as u64))
-                .debug_selector(|| "unscheduled-chip".into())
-                .flex_shrink_0()
-                .w(px(148.))
-                .truncate()
-                .text_xs()
-                .text_color(muted)
-                .child(chip)
-                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                .into_any_element();
-        }
-        let display = text.clone();
-        let tip = text.clone();
+            }
+        } else {
+            text.clone()
+        };
+        let tip = display.clone();
         div()
             .id(("dates", id as u64))
+            .debug_selector(move || {
+                if unscheduled {
+                    "unscheduled-chip".into()
+                } else {
+                    "gantt-dates-cell".into()
+                }
+            })
             .flex_shrink_0()
-            .w(px(148.))
+            .w(px(DATES_COL_WIDTH))
             .truncate()
             .text_xs()
-            .child(text)
+            .when(unscheduled, |el| el.text_color(muted))
+            .child(display.clone())
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.state.gantt.selected_id = Some(id);
-                if selected {
-                    this.begin_inline(InlineEdit::Dates(id), display.clone(), window, cx);
-                }
+                this.begin_inline(InlineEdit::Dates(id), display.clone(), window, cx);
                 cx.stop_propagation();
             }))
             .into_any_element()
@@ -1768,7 +1890,9 @@ impl PlannerView {
         div()
             .id("gantt-timeline")
             .debug_selector(|| "gantt-timeline".into())
+            .w(px(width))
             .flex_1()
+            .flex_shrink_0()
             .min_w(px(MIN_TIMELINE_WIDTH))
             .h_full()
             .relative()
@@ -1899,16 +2023,22 @@ impl PlannerView {
                     .when(bars.is_empty(), |el| {
                         el.child(
                             div()
-                                .id("unscheduled-empty-hint")
-                                .debug_selector(|| "unscheduled-empty-hint".into())
                                 .absolute()
-                                .top(px(24.))
-                                .left(px(24.))
-                                .right(px(24.))
-                                .text_sm()
-                                .text_color(header_fg)
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .px_6()
                                 .child(
-                                    "No scheduled dates. Drag a work item onto the timeline to set Start and Target.",
+                                    div()
+                                        .id("unscheduled-empty-hint")
+                                        .debug_selector(|| "unscheduled-empty-hint".into())
+                                        .max_w(px(280.))
+                                        .text_sm()
+                                        .text_color(header_fg)
+                                        .child(
+                                            "No scheduled dates. Drag a work item onto the timeline to set Start and Target.",
+                                        ),
                                 ),
                         )
                     }),
@@ -2000,18 +2130,19 @@ impl PlannerView {
         let summary = bar.summary;
         let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
         let milestone = bar.milestone;
-        let inside = !unscheduled && !milestone && bar.width >= BAR_LABEL_INSIDE_MIN;
+        let inside = !unscheduled && !milestone && !summary && bar.width >= BAR_LABEL_INSIDE_MIN;
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
         let show_handles = !summary && !unscheduled && !milestone && hovered && !dragging;
+        let show_link_handles = !unscheduled && hovered && !dragging;
         let bar_h = if milestone {
             MILESTONE_SIZE
         } else if summary {
-            10.0
+            SUMMARY_BAR_H
         } else if unscheduled {
-            20.0
+            PLACEHOLDER_BAR_H
         } else {
-            ROW_HEIGHT - 10.0
+            LEAF_BAR_H
         };
         let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
         let label_pad = if show_handles {
@@ -2043,10 +2174,17 @@ impl PlannerView {
                 .rounded_md()
                 .relative()
                 .when(milestone, |el| {
-                    el.rounded_sm()
-                        .bg(rgb(bar.color))
-                        .border_2()
-                        .border_color(cx.theme().primary)
+                    el.bg(gpui_kit::transparent_white())
+                        .border_0()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_lg()
+                                .line_height(gpui_kit::relative(1.))
+                                .text_color(rgb(bar.color))
+                                .child("◆"),
+                        )
                 })
                 .when(summary && !milestone, |el| {
                     el.bg(cx.theme().muted).rounded_sm()
@@ -2056,11 +2194,12 @@ impl PlannerView {
                     el.bg(cx.theme().muted).opacity(0.7)
                 })
                 .text_color(if summary { muted_fg } else { bar_label_fg })
-                .border_1()
-                .border_color(if selected {
-                    cx.theme().primary
-                } else {
-                    cx.theme().border
+                .when(!milestone, |el| {
+                    el.border_1().border_color(if selected {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().border
+                    })
                 })
                 .overflow_hidden()
                 .when(show_progress, |el| {
@@ -2080,18 +2219,20 @@ impl PlannerView {
                             }),
                     )
                 })
-                .child(
-                    div()
-                        .pl(px(label_pad))
-                        .pr(px(label_pad))
-                        .truncate()
-                        .text_xs()
-                        .child(if inside {
-                            bar.title.clone()
-                        } else {
-                            String::new()
-                        }),
-                )
+                .when(!milestone, |el| {
+                    el.child(
+                        div()
+                            .pl(px(label_pad))
+                            .pr(px(label_pad))
+                            .truncate()
+                            .text_xs()
+                            .child(if inside {
+                                bar.title.clone()
+                            } else {
+                                String::new()
+                            }),
+                    )
+                })
                 .when(show_handles, |el| {
                     el.child(
                         div()
@@ -2130,7 +2271,9 @@ impl PlannerView {
                         }
                         let x: f32 = event.position.x.into();
                         let local_x = x - this.state.gantt.timeline_origin_x;
-                        let kind = if local_x <= bar_x + HANDLE_WIDTH {
+                        let kind = if milestone {
+                            GestureKind::Move
+                        } else if local_x <= bar_x + HANDLE_WIDTH {
                             GestureKind::ResizeStart
                         } else if local_x >= bar_x + bar_width - HANDLE_WIDTH {
                             GestureKind::ResizeEnd
@@ -2158,6 +2301,39 @@ impl PlannerView {
                 )
                 .into_any_element(),
         ];
+        if show_link_handles {
+            let start_x = bar.x - LINK_HANDLE / 2.0;
+            let end_x = bar.x + bar.width - LINK_HANDLE / 2.0;
+            let handle_top = ((ROW_HEIGHT - LINK_HANDLE) / 2.0).max(0.0);
+            for (handle_id, handle_x) in [("link-start", start_x), ("link-end", end_x)] {
+                let selector = format!("gantt-link-handle-{id}-{handle_id}");
+                items.push(
+                    div()
+                        .id((handle_id, id as u64))
+                        .debug_selector(move || selector.clone())
+                        .absolute()
+                        .left(px(handle_x))
+                        .top(px(handle_top))
+                        .size(px(LINK_HANDLE))
+                        .rounded_full()
+                        .bg(cx.theme().primary)
+                        .border_1()
+                        .border_color(cx.theme().background)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.dismiss_overlays();
+                                let local_x = this.state.gantt.timeline_origin_x;
+                                let _ =
+                                    this.state.begin_bar_gesture(id, GestureKind::Link, local_x);
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
         if !inside {
             let label = bar.title.clone();
             items.push(
@@ -2166,7 +2342,10 @@ impl PlannerView {
                     .debug_selector(|| "gantt-bar-label".into())
                     .absolute()
                     .left(px(bar.x + bar.width + 6.0))
-                    .top(px((ROW_HEIGHT - 14.0) / 2.0))
+                    .top(px(((ROW_HEIGHT - 16.0) / 2.0).max(2.0)))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
                     .text_xs()
                     .text_color(muted_fg)
                     .child(label.clone())
@@ -2201,8 +2380,6 @@ impl PlannerView {
         let h_len_2 = (arrow.x2 - mid_x).abs().max(2.0);
         let v_len = (arrow.y2 - arrow.y1).abs().max(2.0);
         div()
-            .id(SharedString::from(selector.clone()))
-            .debug_selector(move || selector)
             .absolute()
             .left(px(min_x))
             .top(px(min_y - 3.0))
@@ -2210,6 +2387,8 @@ impl PlannerView {
             .h(px(v_len.max(8.0)))
             .child(
                 div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
                     .absolute()
                     .left(px(arrow.x1 - min_x))
                     .top(px(arrow.y1 - min_y + 2.0))
@@ -2604,13 +2783,17 @@ impl PlannerView {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .border_2()
-                        .border_color(cx.theme().primary)
+                        .border_1()
+                        .border_color(cx.theme().border)
                         .bg(cx.theme().muted)
                         .child(
                             Checkbox::new(SharedString::from(id.clone()))
                                 .checked(checked)
+                                .tab_stop(false)
+                                .focus_ring(false)
                                 .label(if checked { "Yes" } else { "No" })
+                                .border_2()
+                                .border_color(cx.theme().foreground)
                                 .on_click(move |next, _, cx| {
                                     entity.update(cx, |this, cx| {
                                         if let Some(form) = this.state.form.as_mut() {
@@ -2626,7 +2809,23 @@ impl PlannerView {
                         .into_any_element()
                 }
                 FormControlKind::DateTime => {
-                    let picker = self.form_dates.get(&id).cloned();
+                    if id == ado_core::TARGET_DATE_FIELD
+                        && form
+                            .model
+                            .system_controls
+                            .iter()
+                            .chain(form.model.pages.iter().flat_map(|page| {
+                                page.groups.iter().flat_map(|group| group.controls.iter())
+                            }))
+                            .any(|control| control.reference_name == ado_core::START_DATE_FIELD)
+                    {
+                        return div().into_any_element();
+                    }
+                    let picker = self
+                        .form_dates
+                        .get(&id)
+                        .cloned()
+                        .or_else(|| self.form_dates.get(ado_core::START_DATE_FIELD).cloned());
                     v_flex()
                         .id(SharedString::from(format!("form-date-{id}")))
                         .debug_selector(|| "form-date-picker".into())
@@ -2709,25 +2908,21 @@ impl PlannerView {
                                 .py_1()
                                 .rounded_md()
                                 .border_1()
-                                .border_color(cx.theme().primary)
+                                .border_color(cx.theme().border)
                                 .hover(|el| el.bg(cx.theme().muted))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(form) = this.state.form.as_mut() {
+                                        form.values.insert(
+                                            field.clone(),
+                                            crate::form::identity_json(&identity),
+                                        );
+                                    }
+                                    cx.notify();
+                                }))
                                 .child(Avatar::new().name(chip.clone()).with_size(Size::XSmall))
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "ident-pick-{field}-{unique}"
-                                    )))
-                                    .ghost()
-                                    .label(label)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(form) = this.state.form.as_mut() {
-                                            form.values.insert(
-                                                field.clone(),
-                                                crate::form::identity_json(&identity),
-                                            );
-                                        }
-                                        cx.notify();
-                                    })),
-                                )
+                                .child(div().flex_1().child(label))
                         }))
                         .into_any_element()
                 }
@@ -2827,21 +3022,28 @@ impl PlannerView {
             }
         }
         for (reference, picker) in &self.form_dates {
-            let date = picker.read(cx).date();
-            if let PickerDate::Single(Some(naive)) = date {
-                if let Ok(jiff_date) = jiff::civil::Date::new(
-                    naive.year() as i16,
-                    naive.month() as i8,
-                    naive.day() as i8,
-                ) {
-                    form.values.insert(
-                        reference.clone(),
-                        serde_json::json!(iso_date_only(jiff_date)),
-                    );
+            match picker.read(cx).date() {
+                PickerDate::Single(Some(naive)) => {
+                    if let Some(date) = naive_to_jiff(naive) {
+                        form.values
+                            .insert(reference.clone(), serde_json::json!(iso_date_only(date)));
+                    }
                 }
-            } else {
-                form.values
-                    .insert(reference.clone(), serde_json::Value::Null);
+                PickerDate::Range(start, end) => {
+                    if let Some(start) = start.and_then(naive_to_jiff) {
+                        form.values.insert(
+                            ado_core::START_DATE_FIELD.into(),
+                            serde_json::json!(iso_date_only(start)),
+                        );
+                    }
+                    if let Some(end) = end.and_then(naive_to_jiff) {
+                        form.values.insert(
+                            ado_core::TARGET_DATE_FIELD.into(),
+                            serde_json::json!(iso_date_only(end)),
+                        );
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -2888,27 +3090,65 @@ impl PlannerView {
                 continue;
             }
             if control.kind == FormControlKind::DateTime {
+                let controls = crate::form::all_controls(&form.model);
+                let has_start = controls
+                    .iter()
+                    .any(|item| item.reference_name == ado_core::START_DATE_FIELD);
+                let has_target = controls
+                    .iter()
+                    .any(|item| item.reference_name == ado_core::TARGET_DATE_FIELD);
+                if control.reference_name == ado_core::TARGET_DATE_FIELD && has_start {
+                    continue;
+                }
                 if self.form_dates.contains_key(&control.reference_name) {
                     continue;
                 }
+                let range = control.reference_name == ado_core::START_DATE_FIELD && has_target;
+                let start = form
+                    .values
+                    .get(ado_core::START_DATE_FIELD)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|text| parse_iso_date(Some(text)))
+                    .and_then(jiff_to_naive);
+                let target = form
+                    .values
+                    .get(ado_core::TARGET_DATE_FIELD)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|text| parse_iso_date(Some(text)))
+                    .and_then(jiff_to_naive);
                 let initial = form
                     .values
                     .get(&control.reference_name)
                     .and_then(serde_json::Value::as_str)
                     .and_then(|text| parse_iso_date(Some(text)))
-                    .and_then(|date| {
-                        chrono::NaiveDate::from_ymd_opt(
-                            i32::from(date.year()),
-                            u32::from(date.month() as u8),
-                            u32::from(date.day() as u8),
-                        )
-                    });
+                    .and_then(jiff_to_naive);
                 let picker = cx.new(|cx| {
-                    let mut state = DatePickerState::new(window, cx).date_format("%Y-%m-%d");
-                    if let Some(naive) = initial {
-                        state.set_date(PickerDate::Single(Some(naive)), window, cx);
+                    if range {
+                        let mut state = DatePickerState::range(window, cx).date_format("%Y-%m-%d");
+                        match (start, target) {
+                            (Some(start), Some(target)) => {
+                                state.set_date(
+                                    PickerDate::Range(Some(start), Some(target)),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            (Some(start), None) => {
+                                state.set_date(PickerDate::Range(Some(start), None), window, cx);
+                            }
+                            (None, Some(target)) => {
+                                state.set_date(PickerDate::Range(None, Some(target)), window, cx);
+                            }
+                            _ => {}
+                        }
+                        state
+                    } else {
+                        let mut state = DatePickerState::new(window, cx).date_format("%Y-%m-%d");
+                        if let Some(naive) = initial {
+                            state.set_date(PickerDate::Single(Some(naive)), window, cx);
+                        }
+                        state
                     }
-                    state
                 });
                 self.form_dates
                     .insert(control.reference_name.clone(), picker);
@@ -3205,6 +3445,16 @@ fn naive_to_jiff(date: chrono::NaiveDate) -> Option<jiff::civil::Date> {
     jiff::civil::Date::new(date.year() as i16, date.month() as i8, date.day() as i8).ok()
 }
 
+pub fn looks_like_pat(value: &str) -> bool {
+    let text = value.trim();
+    text.len() >= 20
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_'))
+        && text.chars().any(|ch| ch.is_ascii_digit())
+        && text.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
 impl Focusable for PlannerView {
     fn focus_handle(&self, _: &gpui_kit::App) -> FocusHandle {
         self.form_focus.clone()
@@ -3219,14 +3469,20 @@ impl Render for PlannerView {
         self.state.gantt.viewport_w = viewport_w;
         self.state.gantt.clamp_tree_width();
         self.state.gantt.timeline_origin_x = self.state.gantt.tree_width + 6.0;
-        if self.state.form.is_some()
-            && !self.form_focus.is_focused(window)
-            && !self.form_field_focused(window, cx)
-        {
-            window.focus(&self.form_focus, cx);
-        }
         self.state.toasts.expire();
         self.ensure_form_inputs(window, cx);
+        if let Some(form_id) = self.state.form.as_ref().map(|form| form.model.id) {
+            if self.form_title_focused_for != Some(form_id) {
+                if let Some(input) = self.form_inputs.get("System.Title").cloned() {
+                    Self::focus_input(&input, window, cx);
+                } else {
+                    window.focus(&self.form_focus, cx);
+                }
+                self.form_title_focused_for = Some(form_id);
+            }
+        } else {
+            self.form_title_focused_for = None;
+        }
         self.schedule_toast_expiry(cx);
         div()
             .id("ado-planner")
