@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use oauth2::basic::BasicClient;
 use oauth2::{
@@ -83,25 +84,60 @@ pub async fn start_login(client_id: &str, endpoints: &OauthEndpoints) -> Result<
     })
 }
 
+fn http_client() -> Result<reqwest::Client, Error> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| Error::message(err.to_string()))
+}
+
 pub async fn wait_for_redirect(listener: TcpListener) -> Result<Url, Error> {
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .map_err(|err| Error::message(err.to_string()))?;
-    let mut buf = vec![0u8; 4096];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|err| Error::message(err.to_string()))?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let path = request
-        .lines()
-        .next()
-        .and_then(|line| line.split(' ').nth(1))
-        .unwrap_or("/");
-    let body = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body>You can close this window.</body></html>";
-    let _ = stream.write_all(body).await;
-    Url::parse(&format!("http://127.0.0.1{path}")).map_err(|err| Error::message(err.to_string()))
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::message("OAuth redirect timed out"));
+        }
+        let (mut stream, _) = tokio::time::timeout(remaining, listener.accept())
+            .await
+            .map_err(|_| Error::message("OAuth redirect timed out"))?
+            .map_err(|err| Error::message(err.to_string()))?;
+        let mut buf = vec![0u8; 4096];
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|err| Error::message(err.to_string()))?;
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split(' ').nth(1))
+            .unwrap_or("/");
+        let body = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body>You can close this window.</body></html>";
+        let _ = stream.write_all(body).await;
+        let url = Url::parse(&format!("http://127.0.0.1{path}"))
+            .map_err(|err| Error::message(err.to_string()))?;
+        let mut code = false;
+        let mut state = false;
+        let mut error: Option<String> = None;
+        let mut error_description: Option<String> = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "code" => code = true,
+                "state" => state = true,
+                "error" => error = Some(value.into_owned()),
+                "error_description" => error_description = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        if let Some(error) = error {
+            return Err(Error::message(error_description.unwrap_or(error)));
+        }
+        if code || state {
+            return Ok(url);
+        }
+    }
 }
 
 pub async fn exchange_code(
@@ -112,7 +148,7 @@ pub async fn exchange_code(
     pkce_verifier: PkceCodeVerifier,
 ) -> Result<StoredOauth, Error> {
     let oauth = client(client_id, endpoints, redirect)?;
-    let http = reqwest::Client::new();
+    let http = http_client()?;
     let token = oauth
         .exchange_code(AuthorizationCode::new(code.to_string()))
         .set_pkce_verifier(pkce_verifier)
@@ -129,7 +165,7 @@ pub async fn refresh(
     refresh_token: &str,
 ) -> Result<StoredOauth, Error> {
     let oauth = client(client_id, endpoints, redirect)?;
-    let http = reqwest::Client::new();
+    let http = http_client()?;
     let token = oauth
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
         .request_async(&http)
@@ -164,15 +200,38 @@ fn stored_from_token(
 pub fn parse_code(redirect: &Url, expected_csrf: &CsrfToken) -> Result<String, Error> {
     let mut code = None;
     let mut state = None;
+    let mut error = None;
+    let mut error_description = None;
     for (key, value) in redirect.query_pairs() {
         match key.as_ref() {
             "code" => code = Some(value.to_string()),
             "state" => state = Some(value.to_string()),
+            "error" => error = Some(value.to_string()),
+            "error_description" => error_description = Some(value.to_string()),
             _ => {}
         }
+    }
+    if let Some(error) = error {
+        return Err(Error::message(error_description.unwrap_or(error)));
     }
     if state.as_deref() != Some(expected_csrf.secret()) {
         return Err(Error::message("OAuth state mismatch"));
     }
     code.ok_or_else(|| Error::message("OAuth code missing"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_code_surfaces_error_description() {
+        let url = Url::parse(
+            "http://127.0.0.1:9/?error=access_denied&error_description=user%20cancelled&state=abc",
+        )
+        .unwrap();
+        let csrf = CsrfToken::new("abc".into());
+        let err = parse_code(&url, &csrf).unwrap_err();
+        assert!(err.to_string().contains("user cancelled"));
+    }
 }

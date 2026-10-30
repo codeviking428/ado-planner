@@ -94,4 +94,15 @@ async fn identity_search_returns_team_members() {
 #[gpui_kit::test]
 fn gpui_form_title_renders(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
+    let model = ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: Vec::new(),
+        pages: Vec::new(),
+        values: serde_json::Map::new(),
+    };
+    let draft = FormDraft::from_model(model);
+    assert!(draft.title().contains("#1003"));
+    assert!(draft.title().contains("User Story"));
 }

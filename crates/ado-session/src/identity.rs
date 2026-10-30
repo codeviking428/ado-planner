@@ -150,25 +150,40 @@ pub async fn fetch_session_identity(
     let vssps = resolve_vssps_base(vssps_base, env_vssps.as_deref(), &ado_base);
     let header = authorization_header(token, scheme);
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let connection = if let Some(org) = org.filter(|org| !org.is_empty()) {
-        get_json::<ConnectionDataPayload>(
+        match get_json::<ConnectionDataPayload>(
             &client,
             &header,
             &format!("{ado_base}/{org}/_apis/connectionData?api-version=7.1"),
         )
         .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("connectionData identity lookup failed: {err}");
+                None
+            }
+        }
     } else {
         None
     };
-    let profile = get_json::<ProfilePayload>(
+    let profile = match get_json::<ProfilePayload>(
         &client,
         &header,
         &format!("{vssps}/_apis/profile/profiles/me?api-version=7.1"),
     )
-    .await;
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("VSSPS profile identity lookup failed: {err}");
+            None
+        }
+    };
     Ok(profile
         .as_ref()
         .and_then(identity_from_profile)
@@ -179,18 +194,25 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     header: &str,
     url: &str,
-) -> Option<T> {
+) -> Result<Option<T>, Error> {
     let response = client
         .get(url)
         .header("Authorization", header)
         .header("Accept", "application/json")
         .send()
         .await
-        .ok()?;
+        .map_err(|err| Error::message(err.to_string()))?;
     if !response.status().is_success() {
-        return None;
+        return Err(Error::message(format!(
+            "identity {url} returned {}",
+            response.status()
+        )));
     }
-    response.json().await.ok()
+    let value = response
+        .json()
+        .await
+        .map_err(|err| Error::message(err.to_string()))?;
+    Ok(Some(value))
 }
 
 #[cfg(test)]

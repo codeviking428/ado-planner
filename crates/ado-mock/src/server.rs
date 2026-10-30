@@ -297,11 +297,26 @@ async fn route(
                 .lock()
                 .expect("patches")
                 .push(path.to_string());
-            *state.last_patch_content_type.lock().expect("content-type") = req
+            let content_type = req
                 .headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
-                .map(ToOwned::to_owned);
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            *state.last_patch_content_type.lock().expect("content-type") =
+                Some(content_type.clone());
+            if !content_type
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json-patch+json")
+            {
+                return Ok(json_response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    json!({ "message": "expected application/json-patch+json" }),
+                ));
+            }
             let document = read_json(req).await?;
             let ops = document.as_array().cloned().unwrap_or_default();
             let current_rev = items[index].get("rev").and_then(Value::as_i64).unwrap_or(0);
@@ -370,7 +385,7 @@ fn work_item_type_from_path(path: &str) -> String {
 }
 
 fn percent_decode(raw: &str) -> String {
-    let mut out = String::new();
+    let mut out = Vec::new();
     let bytes = raw.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -379,14 +394,14 @@ fn percent_decode(raw: &str) -> String {
             && let Ok(ch) =
                 u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
         {
-            out.push(ch as char);
+            out.push(ch);
             i += 3;
             continue;
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn work_item_id(path: &str) -> Option<i64> {

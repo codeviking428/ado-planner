@@ -7,7 +7,7 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/codeviking428/ado-planner"
 version = "0.1.0"
-rust-version = "1.88"
+rust-version = "1.99.1"
 
 [workspace.dependencies]
 ado-core = { path = "crates/ado-core" }

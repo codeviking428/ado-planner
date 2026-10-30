@@ -133,6 +133,8 @@ pub struct GanttView {
     pub scroll_x: f32,
     pub scroll_y: f32,
     pub tree_width: f32,
+    pub viewport_h: f32,
+    pub timeline_origin_x: f32,
     pub selected_id: Option<i64>,
     pub collapsed: HashSet<i64>,
     pub gesture: Option<Gesture>,
@@ -155,6 +157,8 @@ impl Default for GanttView {
             scroll_x: 0.0,
             scroll_y: 0.0,
             tree_width: DEFAULT_TREE_WIDTH,
+            viewport_h: 720.0,
+            timeline_origin_x: 0.0,
             selected_id: None,
             collapsed: HashSet::new(),
             gesture: None,
@@ -236,10 +240,19 @@ impl GanttView {
             .and_then(|id| rows.iter().position(|row| row.id == id))
             .unwrap_or(0);
         let next = (current as i32 + delta).clamp(0, rows.len() as i32 - 1) as usize;
+        if self
+            .pending_nudge
+            .as_ref()
+            .is_some_and(|pending| pending.id != rows[next].id)
+        {
+            self.pending_nudge = None;
+        }
         self.selected_id = Some(rows[next].id);
         let y = next as f32 * ROW_HEIGHT;
         if y < self.scroll_y {
             self.scroll_y = y;
+        } else if y + ROW_HEIGHT > self.scroll_y + self.viewport_h {
+            self.scroll_y = (y + ROW_HEIGHT - self.viewport_h).max(0.0);
         }
     }
 
@@ -381,14 +394,18 @@ impl GanttView {
         }
         let start = parse_iso_date(node.start_date.as_deref()).ok_or("Unscheduled")?;
         let target = parse_iso_date(node.target_date.as_deref()).ok_or("Unscheduled")?;
-        let mut pending = self.pending_nudge.clone().unwrap_or(PendingNudge {
-            id,
-            start,
-            target,
-            original_start: start,
-            original_target: target,
-            original_rev: node.rev,
-        });
+        let mut pending = self
+            .pending_nudge
+            .clone()
+            .filter(|pending| pending.id == id)
+            .unwrap_or(PendingNudge {
+                id,
+                start,
+                target,
+                original_start: start,
+                original_target: target,
+                original_rev: node.rev,
+            });
         match which {
             NudgeAxis::Both => {
                 pending.start = pending.start.saturating_add(delta_days.days());
@@ -577,5 +594,43 @@ mod tests {
             GanttView::hit_test_bar(&bars, 140.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::Move)
         );
+    }
+
+    #[test]
+    fn nudge_does_not_reuse_pending_from_another_row() {
+        let nodes = vec![node(1, None), node(2, None)];
+        let mut gantt = GanttView {
+            selected_id: Some(1),
+            ..Default::default()
+        };
+        gantt.apply_nudge(&nodes, NudgeAxis::Both, 1).unwrap();
+        assert_eq!(gantt.pending_nudge.as_ref().map(|p| p.id), Some(1));
+        let rows = gantt.flatten(&nodes);
+        gantt.select_relative(&rows, 1);
+        assert!(gantt.pending_nudge.is_none());
+        gantt.selected_id = Some(2);
+        let pending = gantt.apply_nudge(&nodes, NudgeAxis::Both, 2).unwrap();
+        assert_eq!(pending.id, 2);
+        assert_eq!(gantt.pending_nudge.as_ref().map(|p| p.id), Some(2));
+    }
+
+    #[test]
+    fn select_relative_scrolls_down_into_view() {
+        let rows: Vec<VisibleRow> = (0..40)
+            .map(|i| VisibleRow {
+                id: i + 1,
+                depth: 0,
+                has_children: false,
+                expanded: true,
+            })
+            .collect();
+        let mut gantt = GanttView {
+            viewport_h: 72.0,
+            ..Default::default()
+        };
+        gantt.selected_id = Some(1);
+        gantt.select_relative(&rows, 5);
+        assert_eq!(gantt.selected_id, Some(6));
+        assert!(gantt.scroll_y > 0.0);
     }
 }

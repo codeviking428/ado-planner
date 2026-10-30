@@ -37,20 +37,35 @@ pub fn parse_iso_date(value: Option<&str>) -> Option<Date> {
 
 pub fn client_rollup(nodes: &[WorkItemNode], parent_id: i64) -> Option<(Date, Date)> {
     let mut dates: Vec<(Date, Date)> = Vec::new();
+    let mut children: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(parent) = node.parent_id {
+            children.entry(parent).or_default().push(index);
+        }
+    }
 
-    fn walk(nodes: &[WorkItemNode], id: i64, dates: &mut Vec<(Date, Date)>) {
-        for child in nodes.iter().filter(|node| node.parent_id == Some(id)) {
+    fn walk(
+        nodes: &[WorkItemNode],
+        children: &std::collections::HashMap<i64, Vec<usize>>,
+        id: i64,
+        dates: &mut Vec<(Date, Date)>,
+    ) {
+        let Some(indexes) = children.get(&id) else {
+            return;
+        };
+        for &index in indexes {
+            let child = &nodes[index];
             if let (Some(start), Some(target)) = (
                 parse_iso_date(child.start_date.as_deref()),
                 parse_iso_date(child.target_date.as_deref()),
             ) {
                 dates.push((start, target));
             }
-            walk(nodes, child.id, dates);
+            walk(nodes, children, child.id, dates);
         }
     }
 
-    walk(nodes, parent_id, &mut dates);
+    walk(nodes, &children, parent_id, &mut dates);
     if dates.is_empty() {
         return None;
     }

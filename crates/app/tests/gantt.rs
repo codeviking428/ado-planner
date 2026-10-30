@@ -106,7 +106,7 @@ async fn nudge_coalesces_five_presses_into_one_patch() {
     state.gantt.selected_id = Some(node.id);
     let before = mock.patch_count();
     for _ in 0..5 {
-        state.nudge(NudgeAxis::Both, 1).await.expect("nudge");
+        state.nudge(NudgeAxis::Both, 1).expect("nudge");
     }
     assert_eq!(mock.patch_count(), before);
     state.flush_nudge().await.expect("flush");

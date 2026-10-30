@@ -22,6 +22,7 @@ use crate::prefs::AppPrefs;
 use crate::toasts::{ToastKind, Toasts, UndoAction, error_text};
 use crate::updater::Updater;
 
+#[derive(Clone)]
 pub struct PlannerState {
     pub paths: AppPaths,
     pub runtime: Arc<AdoRuntime>,
@@ -239,7 +240,7 @@ impl PlannerState {
         states
     }
 
-    pub fn hidden_root_count(&self) -> usize {
+    pub fn hidden_roots(&self) -> Vec<String> {
         let types = self.types();
         let resolved = resolve_root_types(
             self.prefs.planner.root_types.clone(),
@@ -250,9 +251,23 @@ impl PlannerState {
                 .unwrap_or(&[]),
         );
         match resolved {
-            None => 0,
-            Some(roots) => types.iter().filter(|ty| !roots.contains(ty)).count(),
+            None => Vec::new(),
+            Some(roots) => types.into_iter().filter(|ty| !roots.contains(ty)).collect(),
         }
+    }
+
+    pub fn hidden_root_count(&self) -> usize {
+        self.hidden_roots().len()
+    }
+
+    pub fn toggle_hidden_root(&mut self, ty: &str) {
+        let mut hidden = self.hidden_roots();
+        if let Some(index) = hidden.iter().position(|item| item == ty) {
+            hidden.remove(index);
+        } else {
+            hidden.push(ty.to_string());
+        }
+        self.set_hidden_roots(hidden);
     }
 
     pub fn set_hidden_roots(&mut self, hidden: Vec<String>) {
@@ -384,6 +399,7 @@ impl PlannerState {
         self.members.clear();
         self.hierarchy = None;
         self.nodes.clear();
+        self.cache.clear();
         Ok(())
     }
 
@@ -407,7 +423,7 @@ impl PlannerState {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let key = format!("orgs:{session_org}");
+        let key = self.cache_key("orgs", &session_org);
         if let Some(hit) = self.cache.get(&key)
             && let Ok(orgs) = serde_json::from_value::<Vec<Organization>>(hit.value.clone())
         {
@@ -479,7 +495,7 @@ impl PlannerState {
             return Ok(());
         }
         self.projects_loading = true;
-        let key = format!("projects:{org}");
+        let key = self.cache_key("projects", &org);
         if let Some(hit) = self.cache.get(&key)
             && let Ok(projects) = serde_json::from_value::<Vec<Project>>(hit.value.clone())
         {
@@ -541,7 +557,7 @@ impl PlannerState {
             return Ok(());
         }
         self.teams_loading = true;
-        let key = format!("teams:{org}:{project}");
+        let key = self.cache_key("teams", &format!("{org}:{project}"));
         if let Some(hit) = self.cache.get(&key)
             && let Ok(teams) = serde_json::from_value::<Vec<Team>>(hit.value.clone())
         {
@@ -596,7 +612,10 @@ impl PlannerState {
             return Ok(());
         };
         self.iterations_loading = true;
-        let key = format!("iterations:{}:{}:{}", scope.org, scope.project, scope.team);
+        let key = self.cache_key(
+            "iterations",
+            &format!("{}:{}:{}", scope.org, scope.project, scope.team),
+        );
         if let Some(hit) = self.cache.get(&key)
             && let Ok(iterations) = serde_json::from_value::<Vec<IterationNode>>(hit.value.clone())
         {
@@ -711,7 +730,7 @@ impl PlannerState {
             return Ok(());
         };
         self.hierarchy_loading = true;
-        let key = format!("hierarchy:{}:{}:{}", scope.org, scope.project, scope.team);
+        let key = self.hierarchy_cache_key(&scope);
         if let Some(hit) = self.cache.get(&key)
             && let Ok(result) = serde_json::from_value::<HierarchyResult>(hit.value.clone())
         {
@@ -750,6 +769,39 @@ impl PlannerState {
         }
         self.nodes = result.nodes.clone();
         self.hierarchy = Some(result);
+    }
+
+    fn cache_identity(&self) -> String {
+        self.session_info
+            .username
+            .clone()
+            .or_else(|| self.session_info.display_name.clone())
+            .unwrap_or_default()
+    }
+
+    fn cache_key(&self, kind: &str, rest: &str) -> String {
+        format!("{kind}:{}:{rest}", self.cache_identity())
+    }
+
+    fn hierarchy_cache_key(&self, scope: &ScopeSelection) -> String {
+        self.cache_key(
+            "hierarchy",
+            &format!("{}:{}:{}", scope.org, scope.project, scope.team),
+        )
+    }
+
+    fn persist_hierarchy_cache(&mut self) {
+        let Some(scope) = self.scope() else {
+            return;
+        };
+        let key = self.hierarchy_cache_key(&scope);
+        let Some(hierarchy) = self.hierarchy.as_mut() else {
+            return;
+        };
+        hierarchy.nodes = self.nodes.clone();
+        if let Ok(value) = serde_json::to_value(&*hierarchy) {
+            self.cache.set(&key, &value);
+        }
     }
 
     pub fn visible_rows(&self) -> Vec<VisibleRow> {
@@ -800,6 +852,7 @@ impl PlannerState {
                     form.apply_saved(&mut self.nodes, rev);
                 }
                 self.form = None;
+                self.persist_hierarchy_cache();
                 self.toasts
                     .push(ToastKind::Success, format!("Saved Work Item #{id}"));
                 Ok(())
@@ -807,10 +860,16 @@ impl PlannerState {
             Err(err) if err.is_precondition_failed() => {
                 self.toasts.push(
                     ToastKind::Error,
-                    "Work Item changed in Azure DevOps. Reloading.",
+                    "Work Item changed in Azure DevOps. Your edits are kept — review and save again.",
                 );
-                self.form = None;
+                let draft = self.form.as_ref().map(|form| form.values.clone());
+                if let Some(form) = self.form.as_mut() {
+                    form.saving = false;
+                }
                 let _ = self.open_form(id).await;
+                if let (Some(draft), Some(form)) = (draft, self.form.as_mut()) {
+                    form.values = draft;
+                }
                 Err(err.into())
             }
             Err(err) => {
@@ -889,6 +948,7 @@ impl PlannerState {
                 if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
                     node.rev = rev;
                 }
+                self.persist_hierarchy_cache();
                 self.toasts
                     .push(ToastKind::Success, "Saved Start Date and Target Date");
                 Ok(())
@@ -949,7 +1009,7 @@ impl PlannerState {
         Ok(())
     }
 
-    pub async fn nudge(&mut self, axis: NudgeAxis, delta: i32) -> Result<(), AppError> {
+    pub fn nudge(&mut self, axis: NudgeAxis, delta: i32) -> Result<(), AppError> {
         let visible = self.visible_nodes();
         match self.gantt.apply_nudge(&visible, axis, delta) {
             Ok(pending) => {
@@ -1015,6 +1075,7 @@ impl PlannerState {
                 if let Some(live) = self.nodes.iter_mut().find(|n| n.id == id) {
                     live.rev = rev;
                 }
+                self.persist_hierarchy_cache();
                 self.toasts.push_undo(
                     "Cleared dates",
                     UndoAction::RestoreDates {
@@ -1071,19 +1132,28 @@ impl PlannerState {
         self.save_dates(id, start, target).await
     }
 
-    pub fn copy_id(&mut self, id: i64) {
-        self.copied = Some(id.to_string());
+    pub fn copy_id(&mut self, id: i64) -> String {
+        let text = id.to_string();
+        self.copied = Some(text.clone());
+        text
     }
 
-    pub fn copy_link(&mut self, id: i64) {
-        if let Some(scope) = self.scope() {
-            self.copied = Some(crate::form::ado_edit_url(&scope.org, &scope.project, id));
-        }
+    pub fn copy_link(&mut self, id: i64) -> Option<String> {
+        let scope = self.scope()?;
+        let url =
+            crate::form::ado_edit_url_on(self.client.ado_base(), &scope.org, &scope.project, id);
+        self.copied = Some(url.clone());
+        Some(url)
     }
 
     pub fn open_in_ado(&self, id: i64) {
         if let Some(scope) = self.scope() {
-            let url = crate::form::ado_edit_url(&scope.org, &scope.project, id);
+            let url = crate::form::ado_edit_url_on(
+                self.client.ado_base(),
+                &scope.org,
+                &scope.project,
+                id,
+            );
             let _ = open::that(url);
         }
     }

@@ -73,4 +73,17 @@ mod tests {
         assert_eq!(loaded.planner.org, "contoso");
         assert_eq!(loaded.flavor, Flavor::Latte);
     }
+
+    #[test]
+    fn show_all_roots_round_trips_as_some_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        let mut prefs = AppPrefs::default();
+        prefs.planner.root_types = Some(None);
+        prefs.save(&path);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"rootTypes\": null") || raw.contains("\"rootTypes\":null"));
+        let loaded = AppPrefs::load(&path);
+        assert_eq!(loaded.planner.root_types, Some(None));
+    }
 }

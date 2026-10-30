@@ -20,8 +20,19 @@ pub struct PlannerPrefs {
     #[serde(default)]
     pub hidden_states: Vec<String>,
     /// `None` (missing key) = never set; `Some(None)` = Show all; `Some(Some([]))` = Hide all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_root_types",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub root_types: Option<Option<Vec<String>>>,
+}
+
+fn deserialize_root_types<'de, D>(deserializer: D) -> Result<Option<Option<Vec<String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<Vec<String>>::deserialize(deserializer)?))
 }
 
 fn anyone() -> String {

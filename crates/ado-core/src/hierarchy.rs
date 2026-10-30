@@ -18,6 +18,12 @@ pub struct BatchWorkItem {
 }
 
 pub fn build_hierarchy_wiql(project: &str, types: &[String], areas: &[AreaPathValue]) -> String {
+    if types.is_empty() {
+        return format!(
+            "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '{}' AND [System.Id] = 0",
+            escape_wiql(project)
+        );
+    }
     let type_list = types
         .iter()
         .map(|ty| format!("'{}'", escape_wiql(ty)))
@@ -166,7 +172,6 @@ pub const HIERARCHY_FIELDS: [&str; 11] = [
 
 fn string_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
     match map.get(key)? {
-        Value::String(text) if !text.is_empty() => Some(text.clone()),
         Value::String(text) => Some(text.clone()),
         _ => None,
     }
@@ -271,6 +276,13 @@ mod tests {
         assert!(wiql.contains("[System.AreaPath] = 'O''Malley\\Exact'"));
         assert!(wiql.contains("[System.State] <> 'Removed'"));
         assert!(wiql.contains("IN ('Epic', 'Task')"));
+    }
+
+    #[test]
+    fn empty_type_list_does_not_emit_invalid_in_clause() {
+        let wiql = build_hierarchy_wiql("Shop", &[], &[]);
+        assert!(!wiql.contains("IN ()"));
+        assert!(wiql.contains("[System.Id] = 0"));
     }
 
     #[test]

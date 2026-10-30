@@ -33,7 +33,8 @@ async fn post(client: &reqwest::Client, url: &str, path: &str, body: Value) -> (
 async fn patch(client: &reqwest::Client, url: &str, path: &str, body: Value) -> (u16, Value) {
     let response = client
         .patch(format!("{url}{path}"))
-        .json(&body)
+        .header("content-type", "application/json-patch+json")
+        .body(body.to_string())
         .send()
         .await
         .expect("patch");
@@ -218,6 +219,15 @@ async fn patch_rev_conflict_and_success() {
     assert_eq!(status, 200);
     assert_eq!(body["rev"], 6);
     assert_eq!(body["fields"][START_DATE_FIELD], "2026-07-07T00:00:00Z");
+
+    let response = client
+        .patch(format!("{url}/contoso/Shop/_apis/wit/workitems/1003"))
+        .header("content-type", "application/json")
+        .body(json!([{ "op": "test", "path": "/rev", "value": 6 }]).to_string())
+        .send()
+        .await
+        .expect("patch json");
+    assert_eq!(response.status().as_u16(), 415);
 }
 
 #[tokio::test]

@@ -1,4 +1,10 @@
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
+
+const TOAST_CAP: usize = 5;
+const SUCCESS_TTL: Duration = Duration::from_secs(5);
+const WARNING_TTL: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -24,6 +30,7 @@ pub struct Toast {
     pub message: String,
     pub copyable: bool,
     pub undo: Option<UndoAction>,
+    pub created_at: Instant,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -42,7 +49,9 @@ impl Toasts {
             message: message.into(),
             copyable,
             undo: None,
+            created_at: Instant::now(),
         });
+        self.cap();
         self.next_id
     }
 
@@ -54,13 +63,39 @@ impl Toasts {
             message: message.into(),
             copyable: false,
             undo: Some(undo),
+            created_at: Instant::now(),
         });
+        self.cap();
         self.next_id
     }
 
     pub fn take(&mut self, id: u64) -> Option<Toast> {
         let index = self.items.iter().position(|toast| toast.id == id)?;
         Some(self.items.remove(index))
+    }
+
+    pub fn dismiss(&mut self, id: u64) {
+        let _ = self.take(id);
+    }
+
+    pub fn expire(&mut self) {
+        let now = Instant::now();
+        self.items.retain(|toast| match toast.kind {
+            ToastKind::Error => true,
+            ToastKind::Success => {
+                toast.undo.is_some()
+                    || now.saturating_duration_since(toast.created_at) < SUCCESS_TTL
+            }
+            ToastKind::Warning => now.saturating_duration_since(toast.created_at) < WARNING_TTL,
+        });
+        self.cap();
+    }
+
+    fn cap(&mut self) {
+        if self.items.len() > TOAST_CAP {
+            let extra = self.items.len() - TOAST_CAP;
+            self.items.drain(0..extra);
+        }
     }
 
     pub fn last_error_message(&self) -> Option<&str> {

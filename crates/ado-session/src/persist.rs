@@ -133,12 +133,14 @@ impl EncryptedStore {
 
 pub fn load_or_create_keyring_key() -> Option<[u8; 32]> {
     let entry = keyring::Entry::new("ado-planner", "session-key").ok()?;
-    if let Ok(secret) = entry.get_secret()
-        && secret.len() >= 32
-    {
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&secret[..32]);
-        return Some(key);
+    match entry.get_secret() {
+        Ok(secret) if secret.len() >= 32 => {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&secret[..32]);
+            return Some(key);
+        }
+        Ok(_) | Err(keyring::Error::NoEntry) => {}
+        Err(_) => return None,
     }
     let mut key = [0u8; 32];
     rand::rng().fill_bytes(&mut key);
@@ -181,15 +183,24 @@ fn decrypt(key: &[u8; 32], bytes: &[u8]) -> Result<String, Error> {
     String::from_utf8(plain).map_err(|err| Error::message(err.to_string()))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredPat {
     pub pat: String,
     pub organization: String,
 }
 
+impl std::fmt::Debug for StoredPat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredPat")
+            .field("pat", &"<redacted>")
+            .field("organization", &self.organization)
+            .finish()
+    }
+}
+
 pub const ACCESS_TOKEN_REFRESH_SKEW_SECS: i64 = 5 * 60;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredOauth {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -199,6 +210,22 @@ pub struct StoredOauth {
     pub redirect: Option<String>,
     pub display_name: Option<String>,
     pub username: Option<String>,
+}
+
+impl std::fmt::Debug for StoredOauth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredOauth")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("redirect", &self.redirect)
+            .field("display_name", &self.display_name)
+            .field("username", &self.username)
+            .finish()
+    }
 }
 
 pub fn unix_now() -> i64 {

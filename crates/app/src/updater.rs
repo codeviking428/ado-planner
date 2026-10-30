@@ -97,9 +97,10 @@ impl Updater {
             self.prompt = None;
             return Ok(());
         }
-        let Some(_prompt) = self.prompt.clone() else {
+        let Some(prompt) = self.prompt.clone() else {
             return Ok(());
         };
+        let _requested = prompt.version;
         let Ok(endpoint) = self.endpoint.parse() else {
             return Err("invalid updater endpoint".into());
         };

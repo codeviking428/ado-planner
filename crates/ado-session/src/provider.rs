@@ -322,7 +322,7 @@ impl PlannerSession {
                         self.identity
                             .as_ref()
                             .map(|id| id.display_name.clone())
-                            .unwrap_or_else(|| "PAT".into()),
+                            .unwrap_or_else(|| "Signed in".into()),
                     ),
                     username: self.identity.as_ref().map(|id| id.username.clone()),
                     auth_mode: AuthMode::Pat,

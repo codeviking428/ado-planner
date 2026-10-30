@@ -47,6 +47,11 @@ async fn context_menu_open_copy_and_hide() {
         .clone();
     state.toggle_hidden_type(&ty);
     assert!(state.prefs.planner.hidden_types.contains(&ty));
+    let type_hidden = state.prefs.planner.hidden_types.clone();
+    let was_hidden_root = state.hidden_roots().contains(&ty);
+    state.toggle_hidden_root(&ty);
+    assert_ne!(state.hidden_roots().contains(&ty), was_hidden_root);
+    assert_eq!(state.prefs.planner.hidden_types, type_hidden);
 }
 
 #[tokio::test]
@@ -145,4 +150,19 @@ async fn expand_collapse_below_this_row() {
 #[gpui_kit::test]
 fn gpui_context_menu_action_labels(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
+    let labels = [
+        "Open",
+        "Open in Azure DevOps",
+        "Copy ID",
+        "Copy link",
+        "Clear dates",
+        "Schedule to iteration",
+        "Expand all",
+        "Collapse all",
+        "Hide this type",
+        "Hide this state",
+    ];
+    for label in labels {
+        assert!(!label.is_empty());
+    }
 }

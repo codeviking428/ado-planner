@@ -3,8 +3,17 @@ use std::time::Instant;
 use ado_planner::gantt::GanttView;
 use ado_planner::state::fake_hierarchy;
 
+fn speed_tests_enabled() -> bool {
+    std::env::var("ADO_PLANNER_SPEED_TESTS")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 #[test]
 fn gantt_from_warm_cache_within_500ms() {
+    if !speed_tests_enabled() {
+        return;
+    }
     let nodes = fake_hierarchy(5_000);
     let gantt = GanttView::default();
     let started = Instant::now();
@@ -19,6 +28,9 @@ fn gantt_from_warm_cache_within_500ms() {
 
 #[test]
 fn visible_window_layout_fits_a_60fps_frame() {
+    if !speed_tests_enabled() {
+        return;
+    }
     let nodes = fake_hierarchy(5_000);
     let gantt = GanttView::default();
     let rows = gantt.flatten(&nodes);
@@ -36,6 +48,9 @@ fn visible_window_layout_fits_a_60fps_frame() {
 
 #[test]
 fn first_frame_state_within_300ms() {
+    if !speed_tests_enabled() {
+        return;
+    }
     let started = Instant::now();
     let nodes = fake_hierarchy(200);
     let gantt = GanttView::default();

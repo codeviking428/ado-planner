@@ -35,6 +35,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+urlencoding.workspace = true
 cargo-packager-updater = "0.2"
 
 [dev-dependencies]
@@ -54,7 +55,7 @@ out-dir = "../../release/rust"
 binaries = [{ path = "ado-planner", main = true }]
 
 [package.metadata.packager.nsis]
-installer-mode = "perMachine"
+installer-mode = "currentUser"
 
 [package.metadata.packager.updater]
 endpoints = [

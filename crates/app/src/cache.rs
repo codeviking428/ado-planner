@@ -115,8 +115,19 @@ impl QueryCache {
             entries: self.entries.clone(),
         };
         if let Ok(bytes) = postcard::to_stdvec(&file) {
-            let _ = std::fs::write(&self.persist_path, bytes);
+            if let Some(parent) = self.persist_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let tmp = self.persist_path.with_extension("tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.persist_path);
+            }
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        let _ = std::fs::remove_file(&self.persist_path);
     }
 
     pub fn path(&self) -> &Path {

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Client, Method, StatusCode};
@@ -62,11 +63,19 @@ impl AdoClient {
         vssps_base: impl Into<String>,
     ) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             tokens,
             ado_base: ado_base.into().trim_end_matches('/').to_string(),
             vssps_base: vssps_base.into().trim_end_matches('/').to_string(),
         }
+    }
+
+    pub fn ado_base(&self) -> &str {
+        &self.ado_base
     }
 
     fn org_url(&self, org: &str) -> String {
@@ -81,11 +90,11 @@ impl AdoClient {
     ) -> Result<Value, ClientError> {
         let token = self.tokens.access_token().await?;
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
+        let mut authorization =
             HeaderValue::from_str(&authorization_header(&token, self.tokens.scheme()))
-                .map_err(|err| ClientError::Message(err.to_string()))?,
-        );
+                .map_err(|err| ClientError::Message(err.to_string()))?;
+        authorization.set_sensitive(true);
+        headers.insert(AUTHORIZATION, authorization);
         let content_type = if method == Method::PATCH {
             "application/json-patch+json"
         } else {
@@ -164,24 +173,18 @@ impl AdoClient {
     }
 
     pub async fn list_projects(&self, org: &str) -> Result<Vec<Project>, ClientError> {
-        let payload = self
-            .get(&format!(
-                "{}/_apis/projects?api-version=7.1",
-                self.org_url(org)
-            ))
-            .await?;
-        Ok(map_named(payload.get("value")))
+        self.list_named(&format!("{}/_apis/projects", self.org_url(org)))
+            .await
     }
 
     pub async fn list_teams(&self, org: &str, project: &str) -> Result<Vec<Team>, ClientError> {
-        let payload = self
-            .get(&format!(
-                "{}/_apis/projects/{}/teams?api-version=7.1",
+        Ok(self
+            .list_named(&format!(
+                "{}/_apis/projects/{}/teams",
                 self.org_url(org),
                 urlencoding::encode(project)
             ))
-            .await?;
-        Ok(map_named(payload.get("value"))
+            .await?
             .into_iter()
             .map(|row| Team {
                 id: row.id,
@@ -190,23 +193,51 @@ impl AdoClient {
             .collect())
     }
 
+    async fn list_named(&self, base: &str) -> Result<Vec<Project>, ClientError> {
+        let mut items = Vec::new();
+        let mut skip = 0usize;
+        loop {
+            let payload = self
+                .get(&format!("{base}?$top=200&$skip={skip}&api-version=7.1"))
+                .await?;
+            let page = map_named(payload.get("value"));
+            let count = page.len();
+            items.extend(page);
+            if count < 200 {
+                break;
+            }
+            skip += count;
+        }
+        Ok(items)
+    }
+
     pub async fn list_team_members(
         &self,
         org: &str,
         project: &str,
         team: &str,
     ) -> Result<Vec<IdentityValue>, ClientError> {
-        let payload = self
-            .get(&format!(
-                "{}/_apis/projects/{}/teams/{}/members?$top=1000&api-version=7.1",
-                self.org_url(org),
-                urlencoding::encode(project),
-                urlencoding::encode(team)
-            ))
-            .await?;
-        let rows: Vec<TeamMemberIdentityRow> =
-            serde_json::from_value(payload.get("value").cloned().unwrap_or(json!([])))
-                .unwrap_or_default();
+        let mut rows = Vec::new();
+        let mut skip = 0usize;
+        loop {
+            let payload = self
+                .get(&format!(
+                    "{}/_apis/projects/{}/teams/{}/members?$top=1000&$skip={skip}&api-version=7.1",
+                    self.org_url(org),
+                    urlencoding::encode(project),
+                    urlencoding::encode(team)
+                ))
+                .await?;
+            let page: Vec<TeamMemberIdentityRow> =
+                serde_json::from_value(payload.get("value").cloned().unwrap_or(json!([])))
+                    .map_err(|err| ClientError::Message(err.to_string()))?;
+            let count = page.len();
+            rows.extend(page);
+            if count < 1000 {
+                break;
+            }
+            skip += count;
+        }
         Ok(map_team_member_identities(&rows))
     }
 
@@ -279,7 +310,7 @@ impl AdoClient {
             .await?;
         let levels: Vec<BacklogLevel> =
             serde_json::from_value(backlogs.get("value").cloned().unwrap_or(json!([])))
-                .unwrap_or_default();
+                .map_err(|err| ClientError::Message(err.to_string()))?;
         let mut types = Vec::new();
         let mut seen = HashSet::new();
         for level in &levels {
@@ -292,6 +323,14 @@ impl AdoClient {
             }
         }
         let top_backlog_types = top_backlog_types_from_levels(&levels);
+        if types.is_empty() {
+            return Ok(HierarchyResult {
+                nodes: Vec::new(),
+                types,
+                top_backlog_types,
+                truncated: false,
+            });
+        }
         let areas: Vec<AreaPathValue> = field_values
             .get("values")
             .and_then(Value::as_array)
@@ -312,7 +351,7 @@ impl AdoClient {
         let wiql = self
             .request(
                 Method::POST,
-                &format!("{project_root}/_apis/wit/wiql?api-version=7.1"),
+                &format!("{project_root}/_apis/wit/wiql?$top={WIQL_RESULT_CAP}&api-version=7.1"),
                 Some(&json!({ "query": build_hierarchy_wiql(&scope.project, &types, &areas) })),
             )
             .await?;
@@ -427,10 +466,13 @@ impl AdoClient {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let layout = self
-            .process_layout(org, project, &type_name)
-            .await
-            .unwrap_or_default();
+        let layout = match self.process_layout(org, project, &type_name).await {
+            Ok(layout) => layout,
+            Err(err) => {
+                tracing::warn!("process layout unavailable: {err}");
+                ProcessLayout::default()
+            }
+        };
         let fields = self
             .get(&format!(
                 "{project_root}/_apis/wit/workitemtypes/{}/fields?$expand=All&api-version=7.1",
@@ -439,7 +481,7 @@ impl AdoClient {
             .await?;
         let meta: Vec<FieldMetadata> =
             serde_json::from_value(fields.get("value").cloned().unwrap_or(json!([])))
-                .unwrap_or_default();
+                .map_err(|err| ClientError::Message(err.to_string()))?;
         let (system_controls, pages) = flatten_layout(&layout, &meta);
         let values = item
             .get("fields")
@@ -512,7 +554,8 @@ impl AdoClient {
         );
         let payload = match self.get(&vssps_url).await {
             Ok(payload) => payload,
-            Err(_) => {
+            Err(err) => {
+                tracing::debug!("identity search on VSSPS failed, falling back to org host: {err}");
                 self.get(&format!("{}/_apis/identities?{qs}", self.org_url(org)))
                     .await?
             }

@@ -77,7 +77,11 @@ pub struct FieldMetadata {
 }
 
 pub fn strip_mnemonic(label: &str) -> String {
-    label.replace('&', "")
+    let placeholder = "\u{0}";
+    label
+        .replace("&&", placeholder)
+        .replace('&', "")
+        .replace(placeholder, "&")
 }
 
 pub fn kind_from_metadata(
@@ -236,13 +240,30 @@ pub fn build_form_patch(
         if json_equal(next, prev) {
             continue;
         }
+        let value = patch_value(control.kind, next);
         ops.push(JsonPatchOp {
             op: PatchOp::Add,
             path: format!("/fields/{}", control.reference_name),
-            value: Some(next.cloned().unwrap_or(Value::String(String::new()))),
+            value: Some(value),
         });
     }
     ops
+}
+
+fn patch_value(kind: FormControlKind, next: Option<&Value>) -> Value {
+    match next {
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::String(text))
+            if text.is_empty()
+                && !matches!(
+                    kind,
+                    FormControlKind::String | FormControlKind::PlainText | FormControlKind::Html
+                ) =>
+        {
+            Value::Null
+        }
+        Some(value) => value.clone(),
+    }
 }
 
 fn json_equal(next: Option<&Value>, prev: Option<&Value>) -> bool {
@@ -507,6 +528,7 @@ mod tests {
     #[test]
     fn strips_ado_mnemonics() {
         assert_eq!(strip_mnemonic("Stat&e"), "State");
+        assert_eq!(strip_mnemonic("R&&D Notes"), "R&D Notes");
     }
 
     #[test]
@@ -596,6 +618,43 @@ mod tests {
                     value: Some(json!("Persist cart (saved)")),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_non_string_fields_patch_as_null() {
+        let mut original = serde_json::Map::new();
+        original.insert("Custom.Count".into(), json!(3));
+        original.insert("System.AssignedTo".into(), json!({"displayName": "Ada"}));
+        let mut draft = serde_json::Map::new();
+        draft.insert("Custom.Count".into(), json!(""));
+        let document = build_form_patch(
+            2,
+            &original,
+            &draft,
+            &[
+                FormControl {
+                    id: "Custom.Count".into(),
+                    reference_name: "Custom.Count".into(),
+                    label: "Count".into(),
+                    kind: FormControlKind::Integer,
+                    required: false,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                },
+                assigned_control(),
+            ],
+        );
+        assert!(
+            document
+                .iter()
+                .any(|op| { op.path == "/fields/Custom.Count" && op.value == Some(Value::Null) })
+        );
+        assert!(
+            document.iter().any(|op| {
+                op.path == "/fields/System.AssignedTo" && op.value == Some(Value::Null)
+            })
         );
     }
 
