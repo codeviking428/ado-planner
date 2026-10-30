@@ -92,7 +92,7 @@ test('Roots hide unparented Work Items that are not a Root type', async ({ windo
   await window.getByTestId('root-filter').click()
   await window.getByRole('menuitem', { name: 'Show all' }).click()
   await expect(window.getByTestId('work-item-1012')).toContainText('Unparented spike')
-  await expect(window.getByTestId('dates-1012')).toContainText('Unscheduled')
+  await expect(window.getByTestId('dates-1012')).toContainText('2026-07-21 → 2026-08-04')
   await window.getByTestId('root-filter').click()
   await window.getByRole('menuitem', { name: 'Hide all' }).click()
   await expect(window.getByTestId('empty-gantt')).toBeVisible()
