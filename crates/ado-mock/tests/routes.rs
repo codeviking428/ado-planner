@@ -178,6 +178,19 @@ async fn snapshots_each_route() {
     let (status, body) = get(
         &client,
         url,
+        "/contoso/Shop/_apis/wit/workitems?ids=1012&$expand=relations",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["value"][0]["id"], 1012);
+    assert_eq!(
+        body["value"][0]["relations"][0]["rel"],
+        "System.LinkTypes.Dependency-Reverse"
+    );
+
+    let (status, body) = get(
+        &client,
+        url,
         "/contoso/_apis/identities?searchFilter=General",
     )
     .await;

@@ -15,6 +15,8 @@ pub struct BatchWorkItem {
     pub id: i64,
     pub rev: Option<i64>,
     pub fields: Option<serde_json::Map<String, Value>>,
+    #[serde(default)]
+    pub relations: Option<Vec<Value>>,
 }
 
 pub fn build_hierarchy_wiql(project: &str, types: &[String], areas: &[AreaPathValue]) -> String {
@@ -147,8 +149,30 @@ pub fn map_batch_work_item(
         start_date: fields.get(START_DATE_FIELD).and_then(iso_date_from_field),
         target_date: fields.get(TARGET_DATE_FIELD).and_then(iso_date_from_field),
         has_date_fields: type_date_fields.contains(&work_item_type),
+        predecessors: predecessor_ids(item.relations.as_deref()),
         fields: fields.clone(),
     }
+}
+
+const DEPENDENCY_REVERSE: &str = "System.LinkTypes.Dependency-Reverse";
+const DEPENDENCY: &str = "System.LinkTypes.Dependency";
+
+/// Predecessor IDs from ADO relations (`Dependency-Reverse` / `Dependency`).
+pub fn predecessor_ids(relations: Option<&[Value]>) -> Vec<i64> {
+    let Some(relations) = relations else {
+        return Vec::new();
+    };
+    relations
+        .iter()
+        .filter_map(|relation| {
+            let rel = relation.get("rel")?.as_str()?;
+            if rel != DEPENDENCY_REVERSE && rel != DEPENDENCY {
+                return None;
+            }
+            let url = relation.get("url")?.as_str()?;
+            url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+        })
+        .collect()
 }
 
 /// Unparented nodes and nodes whose parent is outside the loaded ID set become roots.
@@ -232,6 +256,7 @@ mod tests {
             start_date: None,
             target_date: None,
             has_date_fields: true,
+            predecessors: Vec::new(),
             fields: serde_json::Map::new(),
         }
     }
@@ -339,6 +364,7 @@ mod tests {
                 id: 10,
                 rev: Some(4),
                 fields: Some(fields),
+                relations: None,
             },
             &HashSet::from(["Feature".into()]),
         );
@@ -360,5 +386,25 @@ mod tests {
         let mut fields = serde_json::Map::new();
         fields.insert("System.Parent".into(), json!(0));
         assert_eq!(parent_id_from_fields(&fields), None);
+    }
+
+    #[test]
+    fn predecessor_ids_read_dependency_reverse_and_dependency() {
+        let relations = vec![
+            json!({
+                "rel": "System.LinkTypes.Dependency-Reverse",
+                "url": "https://dev.azure.com/contoso/Shop/_apis/wit/workItems/1003"
+            }),
+            json!({
+                "rel": "System.LinkTypes.Hierarchy-Reverse",
+                "url": "https://dev.azure.com/contoso/Shop/_apis/wit/workItems/1"
+            }),
+            json!({
+                "rel": "System.LinkTypes.Dependency",
+                "url": "https://dev.azure.com/contoso/_apis/wit/workItems/1010/"
+            }),
+        ];
+        assert_eq!(predecessor_ids(Some(&relations)), vec![1003, 1010]);
+        assert!(predecessor_ids(None).is_empty());
     }
 }

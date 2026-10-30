@@ -68,7 +68,15 @@
       "System.WorkItemType": "Task",
       "System.State": "Active",
       "System.AreaPath": "Shop\\Platform",
-      "System.IterationPath": "Shop\\FY26\\Sprint 12"
-    }
+      "System.IterationPath": "Shop\\FY26\\Sprint 12",
+      "Microsoft.VSTS.Scheduling.StartDate": "2026-07-21T00:00:00Z",
+      "Microsoft.VSTS.Scheduling.TargetDate": "2026-08-04T00:00:00Z"
+    },
+    "relations": [
+      {
+        "rel": "System.LinkTypes.Dependency-Reverse",
+        "url": "https://dev.azure.com/contoso/Shop/_apis/wit/workItems/1003"
+      }
+    ]
   }
 ]

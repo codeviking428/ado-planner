@@ -33,6 +33,9 @@ pub struct WorkItemNode {
     pub start_date: Option<String>,
     pub target_date: Option<String>,
     pub has_date_fields: bool,
+    /// Work item IDs this node waits on (`System.LinkTypes.Dependency-Reverse`).
+    #[serde(default)]
+    pub predecessors: Vec<i64>,
     pub fields: serde_json::Map<String, Value>,
 }
 

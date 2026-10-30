@@ -10,12 +10,15 @@ use jiff::{ToSpan, Unit};
 pub const ROW_HEIGHT: f32 = 36.0;
 pub const DEFAULT_TREE_WIDTH: f32 = 420.0;
 pub const MIN_TREE_WIDTH: f32 = 240.0;
-pub const MIN_TIMELINE_WIDTH: f32 = 200.0;
+pub const MIN_TIMELINE_WIDTH: f32 = 240.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
+pub const TODAY_MARGIN_PX: f32 = 80.0;
+pub const PLACEHOLDER_MIN_WIDTH: f32 = 48.0;
+pub const MILESTONE_SIZE: f32 = 14.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GanttScale {
@@ -172,10 +175,22 @@ pub struct BarLayout {
     pub width: f32,
     pub y: f32,
     pub summary: bool,
+    pub milestone: bool,
     pub label: String,
     pub title: String,
     pub color: u32,
     pub progress: Option<f32>,
+    pub predecessors: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DependencyArrow {
+    pub from_id: i64,
+    pub to_id: i64,
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -299,7 +314,7 @@ impl GanttView {
 
     pub fn go_today(&mut self, today: Date) {
         self.origin = today;
-        self.scroll_x = 0.0;
+        self.scroll_x = -TODAY_MARGIN_PX;
     }
 
     pub fn scroll_rows(&mut self, rows: i32, viewport_h: f32, row_count: usize) {
@@ -419,21 +434,29 @@ impl GanttView {
                 let (Some(start), Some(target)) = (display.start, display.end) else {
                     return None;
                 };
-                let x = self.x_for_date(start);
+                let mut x = self.x_for_date(start);
                 let end = ado_core::to_gantt_inclusive_target(target);
-                let width = (self.x_for_date(end) - x).max(6.0);
-                let summary = display.kind != GanttBarKind::Scheduled;
+                let mut width = (self.x_for_date(end) - x).max(6.0);
+                if display.milestone {
+                    width = MILESTONE_SIZE;
+                    x -= MILESTONE_SIZE / 2.0;
+                } else if display.kind == GanttBarKind::Unscheduled {
+                    width = width.max(PLACEHOLDER_MIN_WIDTH);
+                }
                 Some(BarLayout {
                     id: node.id,
                     kind: display.kind,
                     x,
                     width,
                     y: self.row_y(offset),
-                    summary,
+                    summary: row.has_children,
+                    milestone: display.milestone,
                     label: dates_column_text(node, nodes, hint.as_ref()),
                     title: node.title.clone(),
                     color: parse_type_color(ado_core::color_for_type(&node.work_item_type)),
-                    progress: child_completion(nodes, node.id),
+                    progress: child_completion(nodes, node.id)
+                        .or_else(|| Some(state_progress(&node.state))),
+                    predecessors: node.predecessors.clone(),
                 })
             })
             .collect()
@@ -446,8 +469,11 @@ impl GanttView {
         origin_x: f32,
         nodes: &[WorkItemNode],
     ) -> Result<(), &'static str> {
-        if bar.summary || bar.kind != GanttBarKind::Scheduled {
+        if bar.kind != GanttBarKind::Scheduled {
             return Err("This Work Item has no Start Date and Target Date fields.");
+        }
+        if bar.milestone && kind != GestureKind::Move {
+            return Err("Milestones can be moved, not resized.");
         }
         let node = nodes
             .iter()
@@ -689,6 +715,27 @@ impl GanttView {
         };
         Some((bar, kind))
     }
+
+    pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
+        let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
+        let mut out = Vec::new();
+        for bar in bars {
+            for pred_id in &bar.predecessors {
+                let Some(pred) = by_id.get(pred_id) else {
+                    continue;
+                };
+                out.push(DependencyArrow {
+                    from_id: *pred_id,
+                    to_id: bar.id,
+                    x1: pred.x + pred.width,
+                    y1: pred.y + ROW_HEIGHT / 2.0,
+                    x2: bar.x,
+                    y2: bar.y + ROW_HEIGHT / 2.0,
+                });
+            }
+        }
+        out
+    }
 }
 
 fn parse_type_color(hex: &str) -> u32 {
@@ -709,7 +756,17 @@ pub fn is_completed_state(state: &str) -> bool {
     )
 }
 
-/// Fraction of direct children in a completed state, for monday-style bar fill.
+pub fn state_progress(state: &str) -> f32 {
+    if is_completed_state(state) {
+        1.0
+    } else if state.eq_ignore_ascii_case("active") {
+        0.5
+    } else {
+        0.0
+    }
+}
+
+/// Fraction of direct children complete, counting Active as half done.
 pub fn child_completion(nodes: &[WorkItemNode], id: i64) -> Option<f32> {
     let children: Vec<_> = nodes
         .iter()
@@ -718,11 +775,11 @@ pub fn child_completion(nodes: &[WorkItemNode], id: i64) -> Option<f32> {
     if children.is_empty() {
         return None;
     }
-    let done = children
+    let total: f32 = children
         .iter()
-        .filter(|node| is_completed_state(&node.state))
-        .count();
-    Some(done as f32 / children.len() as f32)
+        .map(|node| state_progress(&node.state))
+        .sum();
+    Some(total / children.len() as f32)
 }
 
 pub fn flatten_visible(nodes: &[WorkItemNode], collapsed: &HashSet<i64>) -> Vec<VisibleRow> {
@@ -800,6 +857,7 @@ mod tests {
             start_date: Some("2026-07-06T00:00:00Z".into()),
             target_date: Some("2026-07-20T00:00:00Z".into()),
             has_date_fields: true,
+            predecessors: Vec::new(),
             fields: serde_json::Map::new(),
         }
     }
@@ -851,10 +909,12 @@ mod tests {
             width: 80.0,
             y: 0.0,
             summary: false,
+            milestone: false,
             label: "bar".into(),
             title: "bar".into(),
             color: 0x89b4fa,
             progress: None,
+            predecessors: Vec::new(),
         };
         let bars = [bar];
         assert_eq!(
@@ -952,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn unscheduled_iteration_still_gets_a_summary_bar() {
+    fn unscheduled_iteration_still_gets_a_placeholder_bar() {
         let mut item = node(1, None);
         item.start_date = None;
         item.target_date = None;
@@ -970,7 +1030,9 @@ mod tests {
         let rows = gantt.flatten(&[item.clone()]);
         let bars = gantt.layout_bars(&[item], &rows, &iterations, 720.0);
         assert_eq!(bars.len(), 1);
-        assert!(bars[0].summary);
+        assert!(!bars[0].summary);
+        assert_eq!(bars[0].kind, GanttBarKind::Unscheduled);
+        assert!(bars[0].width >= PLACEHOLDER_MIN_WIDTH);
     }
 
     #[test]
@@ -1130,6 +1192,59 @@ mod tests {
         nodes[2].state = "New".into();
         assert_eq!(child_completion(&nodes, 1), Some(0.5));
         assert_eq!(child_completion(&nodes, 2), None);
+        nodes[1].state = "Active".into();
+        assert_eq!(child_completion(&nodes, 1), Some(0.25));
+    }
+
+    #[test]
+    fn go_today_leaves_a_margin_from_the_splitter() {
+        let mut gantt = GanttView::default();
+        let today = Date::new(2026, 10, 30).unwrap();
+        gantt.go_today(today);
+        let x = gantt.today_x(today);
+        assert!(
+            (x - TODAY_MARGIN_PX).abs() < 0.5,
+            "today marker at {x}, expected ~{TODAY_MARGIN_PX}px from the splitter"
+        );
+    }
+
+    #[test]
+    fn parent_layout_is_a_summary_bar() {
+        let nodes = crate::state::fake_hierarchy(3);
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let parent = bars.iter().find(|bar| bar.id == 1).expect("parent bar");
+        let leaf = bars.iter().find(|bar| bar.id == 2).expect("leaf bar");
+        assert!(parent.summary, "parent with children must be a summary bar");
+        assert!(!leaf.summary, "leaf must not look like a summary bar");
+        assert!(parent.progress.is_some());
+    }
+
+    #[test]
+    fn dependency_arrows_join_predecessor_to_successor() {
+        let mut a = node(1, None);
+        let mut b = node(2, None);
+        b.start_date = Some("2026-07-21T00:00:00Z".into());
+        b.target_date = Some("2026-08-04T00:00:00Z".into());
+        b.predecessors = vec![1];
+        a.title = "Pred".into();
+        b.title = "Succ".into();
+        let nodes = vec![a, b];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 1);
+        assert_eq!(arrows[0].from_id, 1);
+        assert_eq!(arrows[0].to_id, 2);
+        assert!(arrows[0].x2 >= arrows[0].x1);
     }
 
     #[test]

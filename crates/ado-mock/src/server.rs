@@ -280,6 +280,24 @@ async fn route(
             .collect();
         return Ok(json_response(StatusCode::OK, json!({ "value": selected })));
     }
+    if path.contains("/workitems") && !path.contains("/workitems/") && *method == Method::GET {
+        let query = req.uri().query().unwrap_or("");
+        let ids = query_ids(query);
+        let items = state.items.lock().await;
+        let selected: Vec<Value> = items
+            .iter()
+            .filter(|item| {
+                item.get("id")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|id| ids.contains(&id))
+            })
+            .cloned()
+            .collect();
+        return Ok(json_response(
+            StatusCode::OK,
+            json!({ "count": selected.len(), "value": selected }),
+        ));
+    }
     if let Some(id) = work_item_id(path) {
         let mut items = state.items.lock().await;
         let Some(index) = items
@@ -402,6 +420,25 @@ fn percent_decode(raw: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_ids(query: &str) -> Vec<i64> {
+    query
+        .split('&')
+        .find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            if key == "ids" {
+                Some(
+                    value
+                        .split(',')
+                        .filter_map(|id| id.parse().ok())
+                        .collect::<Vec<i64>>(),
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn work_item_id(path: &str) -> Option<i64> {

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -460,9 +460,44 @@ impl AdoClient {
                         id,
                         rev: item.get("rev").and_then(Value::as_i64),
                         fields,
+                        relations: item.get("relations").and_then(Value::as_array).cloned(),
                     },
                     &type_date_fields,
                 ));
+            }
+        }
+        for chunk in chunk_ids(&ids, BATCH_SIZE) {
+            let ids_csv = chunk
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let expanded = self
+                .get(&format!(
+                    "{project_root}/_apis/wit/workitems?ids={ids_csv}&$expand=relations&api-version=7.1"
+                ))
+                .await;
+            let Ok(expanded) = expanded else {
+                continue;
+            };
+            let mut by_id: HashMap<i64, Vec<Value>> = HashMap::new();
+            for item in expanded
+                .get("value")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(id) = item.get("id").and_then(Value::as_i64) else {
+                    continue;
+                };
+                if let Some(relations) = item.get("relations").and_then(Value::as_array) {
+                    by_id.insert(id, relations.clone());
+                }
+            }
+            for node in &mut nodes {
+                if let Some(relations) = by_id.get(&node.id) {
+                    node.predecessors = ado_core::predecessor_ids(Some(relations.as_slice()));
+                }
             }
         }
         if types.is_empty() {

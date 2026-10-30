@@ -1055,8 +1055,10 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                self.toasts
-                    .push(ToastKind::Success, format!("Saved {reference}"));
+                self.toasts.push(
+                    ToastKind::Success,
+                    format!("Saved {}", field_toast_name(reference)),
+                );
                 Ok(())
             }
             Err(err) => {
@@ -1287,6 +1289,16 @@ impl PlannerState {
     }
 }
 
+fn field_toast_name(reference: &str) -> String {
+    match reference {
+        "System.Title" => "title".into(),
+        "System.AssignedTo" => "assignee".into(),
+        ado_core::START_DATE_FIELD => "start date".into(),
+        ado_core::TARGET_DATE_FIELD => "target date".into(),
+        other => other.rsplit('.').next().unwrap_or(other).to_lowercase(),
+    }
+}
+
 fn toggle_hidden(list: &mut Vec<String>, value: &str) {
     if let Some(index) = list.iter().position(|item| item == value) {
         list.remove(index);
@@ -1314,6 +1326,7 @@ pub fn fake_hierarchy(count: usize) -> Vec<WorkItemNode> {
             start_date: Some("2026-07-06T00:00:00Z".into()),
             target_date: Some("2026-07-20T00:00:00Z".into()),
             has_date_fields: true,
+            predecessors: Vec::new(),
             fields: serde_json::Map::new(),
         })
         .collect()

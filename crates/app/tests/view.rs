@@ -95,11 +95,14 @@ fn painted_tree_rows_and_bars_share_row_height(cx: &mut gpui_kit::TestAppContext
     let bar1 = cx
         .debug_bounds("gantt-bar-1")
         .expect("first bar should paint");
-    let bar2 = cx
-        .debug_bounds("gantt-bar-2")
-        .expect("second bar should paint");
+    let band1 = cx
+        .debug_bounds("gantt-row-band-1")
+        .expect("first timeline band should paint");
+    let band2 = cx
+        .debug_bounds("gantt-row-band-2")
+        .expect("second timeline band should paint");
     let tree_stride = f32::from(row2.origin.y) - f32::from(row1.origin.y);
-    let bar_stride = f32::from(bar2.origin.y) - f32::from(bar1.origin.y);
+    let band_stride = f32::from(band2.origin.y) - f32::from(band1.origin.y);
     assert!(
         (f32::from(row1.size.height) - ROW_HEIGHT).abs() < 2.0,
         "tree row height {} should be ROW_HEIGHT {ROW_HEIGHT}",
@@ -110,8 +113,8 @@ fn painted_tree_rows_and_bars_share_row_height(cx: &mut gpui_kit::TestAppContext
         "tree row stride {tree_stride} should be ROW_HEIGHT {ROW_HEIGHT}"
     );
     assert!(
-        (bar_stride - ROW_HEIGHT).abs() < 2.0,
-        "bar stride {bar_stride} should be ROW_HEIGHT {ROW_HEIGHT}, not the 24/44 mismatch"
+        (band_stride - ROW_HEIGHT).abs() < 2.0,
+        "timeline band stride {band_stride} should be ROW_HEIGHT {ROW_HEIGHT}, not the 24/44 mismatch"
     );
     let bar_mid = f32::from(bar1.origin.y) + f32::from(bar1.size.height) / 2.0;
     let row_mid = f32::from(row1.origin.y) + f32::from(row1.size.height) / 2.0;
@@ -406,14 +409,139 @@ fn escape_closes_a_freshly_opened_form_without_a_focused_field(cx: &mut gpui_kit
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
     assert!(cx.debug_bounds("work-item-form").is_some());
+    cx.update(|window, cx| {
+        window.blur(cx);
+    });
     cx.simulate_keystrokes("escape");
     draw(cx);
     view.update(cx, |view, _| {
         assert!(
             view.state.form.is_none(),
-            "Escape on a freshly opened form with no field focused should close it"
+            "Escape after double-clicking a row (form open, nothing focused) should close it"
         );
     });
+}
+
+#[gpui_kit::test]
+fn escape_closes_the_context_menu_when_nothing_is_focused(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.context_menu = Some(ContextTarget {
+        id: 1,
+        from_bar: false,
+        x: 320.0,
+        y: 280.0,
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(cx.debug_bounds("gantt-context-menu").is_some());
+    cx.update(|window, cx| {
+        window.blur(cx);
+    });
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.context_menu.is_none(),
+            "Escape on an unfocused right-click menu should close it"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn painted_parent_summary_bar_is_shorter_than_a_leaf_and_shows_fill(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(child) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        child.state = "Active".into();
+        child.parent_id = Some(1);
+    }
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let parent = cx
+        .debug_bounds("gantt-bar-1")
+        .expect("parent bar should paint");
+    let leaf = cx
+        .debug_bounds("gantt-bar-2")
+        .expect("leaf bar should paint");
+    assert!(
+        f32::from(parent.size.height) + 4.0 < f32::from(leaf.size.height),
+        "parent summary bar height {} should be shorter than leaf {}",
+        f32::from(parent.size.height),
+        f32::from(leaf.size.height)
+    );
+    let fill = cx
+        .debug_bounds("gantt-bar-progress-1")
+        .expect("parent progress fill must paint — Cart/Persist cart must not look like leaves");
+    assert!(
+        f32::from(fill.size.width) > 2.0,
+        "progress fill was {}px — Active children should show a visible fill",
+        f32::from(fill.size.width)
+    );
+}
+
+#[gpui_kit::test]
+fn painted_dependency_arrow_joins_predecessor_to_successor(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.predecessors = vec![1];
+        node.start_date = Some("2026-07-21T00:00:00Z".into());
+        node.target_date = Some("2026-08-04T00:00:00Z".into());
+    }
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-dep-arrow-1-2").is_some(),
+        "dependency arrows must paint once System.LinkTypes.Dependency predecessors are loaded"
+    );
+}
+
+#[gpui_kit::test]
+fn inline_dates_use_a_range_picker(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_dates(1, window, cx);
+        });
+    });
+    draw(cx);
+    let editor = cx
+        .debug_bounds("gantt-inline-dates")
+        .expect("inline dates should paint a range picker, not a 99px text field");
+    assert!(
+        f32::from(editor.size.width) >= 180.0,
+        "inline date editor was only {}px wide",
+        f32::from(editor.size.width)
+    );
+}
+
+#[gpui_kit::test]
+fn inline_assignee_opens_an_editor(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_assignee(1, window, cx);
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-assignee").is_some(),
+        "clicking assignee must open an editor, not only a tooltip"
+    );
 }
 
 #[gpui_kit::test]

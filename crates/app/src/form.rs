@@ -296,6 +296,7 @@ mod tests {
             start_date: Some("2026-07-06T00:00:00Z".into()),
             target_date: Some("2026-07-20T00:00:00Z".into()),
             has_date_fields: true,
+            predecessors: Vec::new(),
             fields: serde_json::Map::new(),
         }];
         draft.apply_saved(&mut nodes, 2);

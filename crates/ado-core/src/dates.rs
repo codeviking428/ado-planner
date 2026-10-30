@@ -11,8 +11,11 @@ pub struct IterationHint {
 }
 
 pub fn is_unscheduled(start_date: Option<&str>, target_date: Option<&str>) -> bool {
-    start_date.is_none() || target_date.is_none()
+    start_date.is_none() && target_date.is_none()
 }
+
+/// Inclusive length of a start-only bar when Target Date is still empty.
+pub const DEFAULT_BAR_DAYS: i32 = 7;
 
 pub fn to_gantt_inclusive_target(target_date: Date) -> Date {
     target_date.saturating_add(1.day())
@@ -86,6 +89,7 @@ pub struct GanttBarDisplay {
     pub kind: GanttBarKind,
     pub start: Option<Date>,
     pub end: Option<Date>,
+    pub milestone: bool,
 }
 
 pub fn gantt_bar_display(
@@ -98,6 +102,7 @@ pub fn gantt_bar_display(
             kind: GanttBarKind::NoFields,
             start: None,
             end: None,
+            milestone: false,
         };
     }
     let start = parse_iso_date(node.start_date.as_deref());
@@ -107,6 +112,24 @@ pub fn gantt_bar_display(
             kind: GanttBarKind::Scheduled,
             start: Some(start),
             end: Some(target),
+            milestone: false,
+        };
+    }
+    if let Some(start) = start {
+        let end = start.saturating_add((DEFAULT_BAR_DAYS - 1).days());
+        return GanttBarDisplay {
+            kind: GanttBarKind::Scheduled,
+            start: Some(start),
+            end: Some(end),
+            milestone: false,
+        };
+    }
+    if let Some(target) = target {
+        return GanttBarDisplay {
+            kind: GanttBarKind::Scheduled,
+            start: Some(target),
+            end: Some(target),
+            milestone: true,
         };
     }
     if let Some((start, target)) = client_rollup(nodes, node.id) {
@@ -114,6 +137,7 @@ pub fn gantt_bar_display(
             kind: GanttBarKind::Unscheduled,
             start: Some(start),
             end: Some(target),
+            milestone: false,
         };
     }
     if let Some(iteration) = iteration
@@ -124,12 +148,14 @@ pub fn gantt_bar_display(
             kind: GanttBarKind::Unscheduled,
             start: parse_iso_date(iteration.start_date.as_deref()),
             end: parse_iso_date(iteration.finish_date.as_deref()),
+            milestone: false,
         };
     }
     GanttBarDisplay {
         kind: GanttBarKind::Unscheduled,
         start: None,
         end: None,
+        milestone: false,
     }
 }
 
@@ -219,12 +245,16 @@ pub fn dates_column_text(
     if !node.has_date_fields {
         return "No Start/Target on type".into();
     }
-    if !is_unscheduled(node.start_date.as_deref(), node.target_date.as_deref()) {
-        return format!(
-            "{} → {}",
-            ymd(node.start_date.as_deref()),
-            ymd(node.target_date.as_deref())
-        );
+    let start = parse_iso_date(node.start_date.as_deref());
+    let target = parse_iso_date(node.target_date.as_deref());
+    if let (Some(start), Some(target)) = (start, target) {
+        return format!("{start} → {target}");
+    }
+    if let Some(start) = start {
+        return format!("{start} → …");
+    }
+    if let Some(target) = target {
+        return format!("◆ {target}");
     }
     if let Some((start, target)) = client_rollup(nodes, node.id) {
         return format!("Unscheduled · rollup {start}–{target}");
@@ -275,6 +305,7 @@ mod tests {
             start_date: None,
             target_date: None,
             has_date_fields: true,
+            predecessors: Vec::new(),
             fields: serde_json::Map::new(),
         }
     }
@@ -282,11 +313,46 @@ mod tests {
     #[test]
     fn empty_start_or_target_is_unscheduled() {
         assert!(is_unscheduled(None, None));
-        assert!(is_unscheduled(Some("2026-07-01T00:00:00Z"), None));
+        assert!(!is_unscheduled(Some("2026-07-01T00:00:00Z"), None));
+        assert!(!is_unscheduled(None, Some("2026-07-10T00:00:00Z")));
         assert!(!is_unscheduled(
             Some("2026-07-01T00:00:00Z"),
             Some("2026-07-10T00:00:00Z")
         ));
+    }
+
+    #[test]
+    fn start_only_gets_a_default_length_bar() {
+        let mut item = node(1);
+        item.start_date = Some("2026-07-06T00:00:00Z".into());
+        let display = gantt_bar_display(&item, &[item.clone()], None);
+        assert_eq!(display.kind, GanttBarKind::Scheduled);
+        assert!(!display.milestone);
+        assert_eq!(
+            display.start.map(|d| d.to_string()).as_deref(),
+            Some("2026-07-06")
+        );
+        assert_eq!(
+            display.end.map(|d| d.to_string()).as_deref(),
+            Some("2026-07-12")
+        );
+        assert_eq!(
+            dates_column_text(&item, &[item.clone()], None),
+            "2026-07-06 → …"
+        );
+    }
+
+    #[test]
+    fn target_only_is_a_milestone() {
+        let mut item = node(1);
+        item.target_date = Some("2026-07-20T00:00:00Z".into());
+        let display = gantt_bar_display(&item, &[item.clone()], None);
+        assert!(display.milestone);
+        assert_eq!(display.start, display.end);
+        assert_eq!(
+            dates_column_text(&item, &[item.clone()], None),
+            "◆ 2026-07-20"
+        );
     }
 
     #[test]

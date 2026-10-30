@@ -61,6 +61,16 @@ async fn every_call_against_ado_mock() {
     assert!(!hierarchy.truncated);
     assert!(hierarchy.nodes.iter().any(|node| node.id == 1003));
     assert!(hierarchy.types.contains(&"Epic".to_string()));
+    let spike = hierarchy
+        .nodes
+        .iter()
+        .find(|node| node.id == 1012)
+        .expect("unparented spike");
+    assert_eq!(
+        spike.predecessors,
+        vec![1003],
+        "hierarchy fetch should load System.LinkTypes.Dependency predecessors"
+    );
 
     let identities = ado
         .search_identities("contoso", "Ada")

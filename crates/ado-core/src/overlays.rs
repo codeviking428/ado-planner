@@ -129,6 +129,7 @@ mod tests {
             start_date: None,
             target_date: None,
             has_date_fields: true,
+            predecessors: Vec::new(),
             fields: serde_json::Map::new(),
         }
     }
