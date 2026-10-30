@@ -2,7 +2,7 @@
 
 use ado_core::SessionInfo;
 use ado_planner::form::FormDraft;
-use ado_planner::gantt::GanttView;
+use ado_planner::gantt::{ContextTarget, GanttView};
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::ui::PlannerView;
@@ -214,6 +214,61 @@ fn team_settings_error_renders_inline(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("team-settings-error")
             .is_some_and(|bounds| bounds.size.width > gpui_kit::px(200.)),
         "team-settings errors should be an inline readable banner"
+    );
+}
+
+#[gpui_kit::test]
+fn fractional_scroll_clips_rows_under_frozen_headers(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.scroll_y = 50.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-tree-body")
+            .is_some_and(|bounds| bounds.size.height > gpui_kit::px(0.)),
+        "tree body should clip rows that would paint over the frozen header"
+    );
+    assert!(
+        cx.debug_bounds("gantt-timeline-body")
+            .is_some_and(|bounds| bounds.size.height > gpui_kit::px(0.)),
+        "timeline body should clip bars that would paint over the scale header"
+    );
+    let header = cx.debug_bounds("gantt-scale-header").expect("scale header");
+    let tree_header = cx.debug_bounds("gantt-tree-header").expect("tree header");
+    let body = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    assert!(
+        body.origin.y >= header.origin.y + header.size.height - gpui_kit::px(1.),
+        "clipped timeline body must start at or below the frozen header"
+    );
+    assert!(
+        tree_header.size.height > gpui_kit::px(0.),
+        "tree header stays frozen above the clipped body"
+    );
+}
+
+#[gpui_kit::test]
+fn context_menu_opens_at_the_click_not_the_window_origin(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.context_menu = Some(ContextTarget {
+        id: 1,
+        from_bar: false,
+        x: 320.0,
+        y: 280.0,
+    });
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let menu = cx
+        .debug_bounds("gantt-context-menu")
+        .expect("context menu should paint");
+    assert!(
+        menu.origin.x > gpui_kit::px(100.) && menu.origin.y > gpui_kit::px(100.),
+        "context menu should open near the click, not over the Org/Project header"
     );
 }
 

@@ -4,6 +4,7 @@ use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use jiff::ToSpan;
+use jiff::civil::Date;
 
 async fn signed_in() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
     let mock = ado_mock::start().await;
@@ -192,6 +193,20 @@ async fn schedule_at_writes_start_and_target_for_an_unscheduled_item() {
         start
     );
     assert!(parse_iso_date(updated.target_date.as_deref()).unwrap() > start);
+}
+
+#[tokio::test]
+async fn changing_scope_reveals_timeline_content() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    assert!(!state.nodes.is_empty());
+    state.gantt.origin = Date::new(2025, 1, 1).unwrap();
+    let team = state.prefs.planner.team.clone();
+    state.set_team(team).await.expect("reload team");
+    assert_ne!(
+        state.gantt.origin,
+        Date::new(2025, 1, 1).unwrap(),
+        "reloading a team should reveal the new work on the timeline"
+    );
 }
 
 #[tokio::test]

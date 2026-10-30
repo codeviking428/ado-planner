@@ -800,12 +800,9 @@ impl PlannerState {
             );
         }
         self.team_settings_error = result.warning.clone();
-        let first_load = self.nodes.is_empty();
         self.nodes = result.nodes.clone();
         self.hierarchy = Some(result);
-        if first_load {
-            self.gantt.reveal_content(&self.nodes, &self.iterations);
-        }
+        self.gantt.reveal_content(&self.nodes, &self.iterations);
     }
 
     fn cache_identity(&self) -> String {

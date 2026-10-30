@@ -123,16 +123,24 @@ impl FormDraft {
                 node.area_path = area.clone();
             }
             if let Some(start) = self.values.get(ado_core::START_DATE_FIELD) {
-                node.start_date = start.as_str().map(ToOwned::to_owned);
+                node.start_date = gantt_date_from_draft(start);
             }
             if let Some(target) = self.values.get(ado_core::TARGET_DATE_FIELD) {
-                node.target_date = target.as_str().map(ToOwned::to_owned);
+                node.target_date = gantt_date_from_draft(target);
             }
             for (key, value) in &self.values {
                 node.fields.insert(key.clone(), value.clone());
             }
         }
     }
+}
+
+fn gantt_date_from_draft(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn identity_from_value(value: &Value) -> Option<IdentityValue> {
@@ -204,6 +212,44 @@ pub fn identity_json(value: &IdentityValue) -> Value {
 mod tests {
     use super::*;
     use ado_core::FormControlKind;
+
+    #[test]
+    fn apply_saved_clears_empty_or_null_dates() {
+        let mut values = serde_json::Map::new();
+        values.insert("System.Title".into(), Value::String("Cleared".into()));
+        values.insert(
+            ado_core::START_DATE_FIELD.into(),
+            Value::String(String::new()),
+        );
+        values.insert(ado_core::TARGET_DATE_FIELD.into(), Value::Null);
+        let draft = FormDraft::from_model(WorkItemFormModel {
+            id: 1,
+            rev: 1,
+            work_item_type: "User Story".into(),
+            system_controls: Vec::new(),
+            pages: Vec::new(),
+            values,
+        });
+        let mut nodes = vec![WorkItemNode {
+            id: 1,
+            rev: 1,
+            title: "Old".into(),
+            work_item_type: "User Story".into(),
+            state: "New".into(),
+            assigned_to: None,
+            parent_id: None,
+            area_path: "Shop".into(),
+            iteration_path: "Shop".into(),
+            start_date: Some("2026-07-06T00:00:00Z".into()),
+            target_date: Some("2026-07-20T00:00:00Z".into()),
+            has_date_fields: true,
+            fields: serde_json::Map::new(),
+        }];
+        draft.apply_saved(&mut nodes, 2);
+        assert_eq!(nodes[0].rev, 2);
+        assert!(nodes[0].start_date.is_none());
+        assert!(nodes[0].target_date.is_none());
+    }
 
     #[test]
     fn ado_edit_url_encodes_project_and_uses_base() {

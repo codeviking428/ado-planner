@@ -30,7 +30,7 @@ use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
-    BAR_LABEL_INSIDE_MIN, GanttScale, GestureKind, HANDLE_WIDTH, MIN_TREE_WIDTH, NUDGE_IDLE_MS,
+    BAR_LABEL_INSIDE_MIN, GanttScale, GestureKind, HANDLE_WIDTH, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS,
     NudgeAxis, ROW_HEIGHT, TIMELINE_HEADER_H,
 };
 use crate::paths::AppPaths;
@@ -1176,14 +1176,11 @@ impl PlannerView {
             .id("gantt-tree")
             .w(px(self.state.gantt.tree_width))
             .h_full()
-            .overflow_scroll()
-            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
-                this.apply_scroll(event, cx);
-            }))
             .child(
                 h_flex()
                     .id("gantt-tree-header")
                     .debug_selector(|| "gantt-tree-header".into())
+                    .flex_shrink_0()
                     .h(px(TIMELINE_HEADER_H))
                     .px_2()
                     .border_b_1()
@@ -1207,139 +1204,159 @@ impl PlannerView {
             )
             .child(
                 v_flex()
-                    .mt(px(-remainder))
-                    .children(window.iter().map(|row| {
-                        let node = by_id.get(&row.id).cloned();
-                        let Some(node) = node else {
-                            return div().into_any_element();
-                        };
-                        let id = node.id;
-                        let selected = self.state.gantt.selected_id == Some(id);
-                        let hovered = self.state.gantt.hovered_id == Some(id);
-                        let hint = crate::gantt::iteration_for(&node, &self.state.iterations);
-                        let dates = dates_column_text(&node, nodes, hint.as_ref());
-                        let depth = row.depth;
-                        let expanded = row.expanded;
-                        let has_children = row.has_children;
-                        let unscheduled =
-                            is_unscheduled(node.start_date.as_deref(), node.target_date.as_deref());
-                        let can_schedule = unscheduled && node.has_date_fields;
-                        let title = node.title.clone();
-                        let assigned = node
-                            .assigned_to
-                            .as_ref()
-                            .map(|a| a.display_name.clone())
-                            .unwrap_or_else(|| "Unassigned".into());
-                        h_flex()
-                            .id(("work-item", id as u64))
-                            .role(Role::Row)
-                            .aria_label(format!("#{id} {}", node.title))
-                            .h(px(ROW_HEIGHT))
-                            .min_h(px(ROW_HEIGHT))
-                            .max_h(px(ROW_HEIGHT))
-                            .flex_shrink_0()
-                            .items_center()
-                            .overflow_hidden()
-                            .px_2()
-                            .gap_2()
-                            .ml(px(depth as f32 * 16.))
-                            .bg(if selected {
-                                cx.theme().list_active
-                            } else if hovered {
-                                hover_bg
-                            } else {
-                                cx.theme().background
-                            })
-                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                this.set_hovered(if *hovered { Some(id) } else { None }, cx);
-                            }))
-                            .child(
-                                Button::new(("expand", id as u64))
-                                    .label(if !has_children {
-                                        " "
-                                    } else if expanded {
-                                        "▾"
+                    .id("gantt-tree-body")
+                    .debug_selector(|| "gantt-tree-body".into())
+                    .flex_1()
+                    .overflow_hidden()
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                        this.apply_scroll(event, cx);
+                    }))
+                    .child(
+                        v_flex()
+                            .mt(px(-remainder))
+                            .children(window.iter().map(|row| {
+                                let node = by_id.get(&row.id).cloned();
+                                let Some(node) = node else {
+                                    return div().into_any_element();
+                                };
+                                let id = node.id;
+                                let selected = self.state.gantt.selected_id == Some(id);
+                                let hovered = self.state.gantt.hovered_id == Some(id);
+                                let hint =
+                                    crate::gantt::iteration_for(&node, &self.state.iterations);
+                                let dates = dates_column_text(&node, nodes, hint.as_ref());
+                                let depth = row.depth;
+                                let expanded = row.expanded;
+                                let has_children = row.has_children;
+                                let unscheduled = is_unscheduled(
+                                    node.start_date.as_deref(),
+                                    node.target_date.as_deref(),
+                                );
+                                let can_schedule = unscheduled && node.has_date_fields;
+                                let title = node.title.clone();
+                                let assigned = node
+                                    .assigned_to
+                                    .as_ref()
+                                    .map(|a| a.display_name.clone())
+                                    .unwrap_or_else(|| "Unassigned".into());
+                                h_flex()
+                                    .id(("work-item", id as u64))
+                                    .role(Role::Row)
+                                    .aria_label(format!("#{id} {}", node.title))
+                                    .h(px(ROW_HEIGHT))
+                                    .min_h(px(ROW_HEIGHT))
+                                    .max_h(px(ROW_HEIGHT))
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .overflow_hidden()
+                                    .px_2()
+                                    .gap_2()
+                                    .ml(px(depth as f32 * 16.))
+                                    .bg(if selected {
+                                        cx.theme().list_active
+                                    } else if hovered {
+                                        hover_bg
                                     } else {
-                                        "▸"
+                                        cx.theme().background
                                     })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.state.gantt.toggle_expand(id);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .w(px(56.))
-                                    .flex_shrink_0()
-                                    .truncate()
-                                    .child(format!("#{id}")),
-                            )
-                            .child(self.title_cell(id, &title, selected, cx))
-                            .child(self.type_badge(&node.work_item_type, cx))
-                            .child(
-                                div()
-                                    .id(("assignee", id as u64))
-                                    .w(px(88.))
-                                    .flex_shrink_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .child(assigned.clone())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.state.gantt.selected_id = Some(id);
-                                        this.begin_inline(
-                                            InlineEdit::Assignee(id),
-                                            assigned.clone(),
-                                            window,
+                                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                        this.set_hovered(
+                                            if *hovered { Some(id) } else { None },
                                             cx,
                                         );
-                                    })),
-                            )
-                            .child(self.dates_cell(id, dates, selected, cx))
-                            .on_click(cx.listener(
-                                move |this, event: &gpui_kit::ClickEvent, window, cx| {
-                                    this.open_filter = None;
-                                    this.open_scope = None;
-                                    this.state.gantt.context_menu = None;
-                                    if this
-                                        .state
-                                        .gantt
-                                        .pending_nudge
-                                        .as_ref()
-                                        .is_some_and(|pending| pending.id != id)
-                                    {
-                                        this.state.discard_nudge();
-                                    }
-                                    this.state.gantt.selected_id = Some(id);
-                                    window.focus(&this.form_focus, cx);
-                                    if event.click_count() >= 2 {
-                                        this.open_form(id, cx);
-                                    }
-                                    cx.notify();
-                                },
-                            ))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    if can_schedule {
-                                        this.state.gantt.schedule_drag = Some(id);
-                                        this.state.gantt.selected_id = Some(id);
-                                        cx.notify();
-                                    }
-                                }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.state.gantt.context_menu =
-                                        Some(crate::gantt::ContextTarget {
-                                            id,
-                                            from_bar: false,
-                                        });
-                                    cx.notify();
-                                }),
-                            )
-                            .into_any_element()
-                    })),
+                                    }))
+                                    .child(
+                                        Button::new(("expand", id as u64))
+                                            .label(if !has_children {
+                                                " "
+                                            } else if expanded {
+                                                "▾"
+                                            } else {
+                                                "▸"
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.gantt.toggle_expand(id);
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(56.))
+                                            .flex_shrink_0()
+                                            .truncate()
+                                            .child(format!("#{id}")),
+                                    )
+                                    .child(self.title_cell(id, &title, selected, cx))
+                                    .child(self.type_badge(&node.work_item_type, cx))
+                                    .child(
+                                        div()
+                                            .id(("assignee", id as u64))
+                                            .w(px(88.))
+                                            .flex_shrink_0()
+                                            .truncate()
+                                            .text_xs()
+                                            .child(assigned.clone())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.state.gantt.selected_id = Some(id);
+                                                this.begin_inline(
+                                                    InlineEdit::Assignee(id),
+                                                    assigned.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(self.dates_cell(id, dates, selected, cx))
+                                    .on_click(cx.listener(
+                                        move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                                            this.open_filter = None;
+                                            this.open_scope = None;
+                                            this.state.gantt.context_menu = None;
+                                            if this
+                                                .state
+                                                .gantt
+                                                .pending_nudge
+                                                .as_ref()
+                                                .is_some_and(|pending| pending.id != id)
+                                            {
+                                                this.state.discard_nudge();
+                                            }
+                                            this.state.gantt.selected_id = Some(id);
+                                            window.focus(&this.form_focus, cx);
+                                            if event.click_count() >= 2 {
+                                                this.open_form(id, cx);
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if can_schedule {
+                                                this.state.gantt.schedule_drag = Some(id);
+                                                this.state.gantt.selected_id = Some(id);
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            let x: f32 = event.position.x.into();
+                                            let y: f32 = event.position.y.into();
+                                            this.state.gantt.context_menu =
+                                                Some(crate::gantt::ContextTarget {
+                                                    id,
+                                                    from_bar: false,
+                                                    x,
+                                                    y,
+                                                });
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .into_any_element()
+                            })),
+                    ),
             )
     }
 
@@ -1493,98 +1510,65 @@ impl PlannerView {
                     }
                 }),
             )
-            .children(
-                ticks
-                    .iter()
-                    .filter(|tick| show_weekends && tick.weekend)
-                    .map(|tick| {
-                        div()
-                            .absolute()
-                            .left(px(tick.x))
-                            .top(px(TIMELINE_HEADER_H))
-                            .bottom_0()
-                            .w(px(weekend_w))
-                            .bg(weekend)
-                    }),
-            )
-            .children(ticks.iter().map(|tick| {
+            .child(
                 div()
+                    .id("gantt-timeline-body")
+                    .debug_selector(|| "gantt-timeline-body".into())
                     .absolute()
-                    .left(px(tick.x))
                     .top(px(TIMELINE_HEADER_H))
-                    .bottom_0()
-                    .w(px(1.))
-                    .bg(grid)
-            }))
-            .children(window.iter().enumerate().map(|(offset, row)| {
-                let y = self.state.gantt.row_y(offset);
-                let selected = selected_id == Some(row.id);
-                let hovered = hovered_id == Some(row.id);
-                let id = row.id;
-                div()
-                    .id(("gantt-row-band", id as u64))
-                    .absolute()
                     .left_0()
                     .right_0()
-                    .top(px(y + TIMELINE_HEADER_H))
-                    .h(px(ROW_HEIGHT))
-                    .min_h(px(ROW_HEIGHT))
-                    .max_h(px(ROW_HEIGHT))
-                    .bg(if selected {
-                        selected_bg
-                    } else if hovered {
-                        hover_bg
-                    } else {
-                        gpui_kit::hsla(0., 0., 0., 0.)
-                    })
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        this.set_hovered(if *hovered { Some(id) } else { None }, cx);
-                    }))
-            }))
-            .child(
-                div()
-                    .id("gantt-today")
-                    .debug_selector(|| "gantt-today".into())
-                    .absolute()
-                    .left(px(today_x))
-                    .top_0()
                     .bottom_0()
-                    .w(px(2.))
-                    .bg(today_color),
-            )
-            .child(
-                div()
-                    .id("gantt-scale-header")
-                    .debug_selector(|| "gantt-scale-header".into())
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(TIMELINE_HEADER_H))
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
-                    .children(major_labels.into_iter().map(|(x, label)| {
-                        div()
-                            .absolute()
-                            .left(px(x))
-                            .top(px(2.))
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(muted_fg)
-                            .child(label)
-                    }))
+                    .overflow_hidden()
+                    .children(
+                        ticks
+                            .iter()
+                            .filter(|tick| show_weekends && tick.weekend)
+                            .map(|tick| {
+                                div()
+                                    .absolute()
+                                    .left(px(tick.x))
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(px(weekend_w))
+                                    .bg(weekend)
+                            }),
+                    )
                     .children(ticks.iter().map(|tick| {
                         div()
                             .absolute()
                             .left(px(tick.x))
-                            .top(px(22.))
-                            .text_xs()
-                            .text_color(header_fg)
-                            .child(tick.label.clone())
-                    })),
-            )
-            .children(bars.iter().flat_map(|bar| {
+                            .top_0()
+                            .bottom_0()
+                            .w(px(1.))
+                            .bg(grid)
+                    }))
+                    .children(window.iter().enumerate().map(|(offset, row)| {
+                        let y = self.state.gantt.row_y(offset);
+                        let selected = selected_id == Some(row.id);
+                        let hovered = hovered_id == Some(row.id);
+                        let id = row.id;
+                        div()
+                            .id(("gantt-row-band", id as u64))
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(px(y))
+                            .h(px(ROW_HEIGHT))
+                            .min_h(px(ROW_HEIGHT))
+                            .max_h(px(ROW_HEIGHT))
+                            .bg(if selected {
+                                selected_bg
+                            } else if hovered {
+                                hover_bg
+                            } else {
+                                gpui_kit::hsla(0., 0., 0., 0.)
+                            })
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                this.set_hovered(if *hovered { Some(id) } else { None }, cx);
+                            }))
+                    }))
+                    .children(bars.iter().flat_map(|bar| {
                 let id = bar.id;
                 let bar_x = bar.x;
                 let bar_width = bar.width;
@@ -1601,7 +1585,7 @@ impl PlannerView {
                         .aria_label(format!("Gantt bar #{id} {}", bar.title))
                         .absolute()
                         .left(px(bar.x))
-                        .top(px(bar.y + TIMELINE_HEADER_H))
+                        .top(px(bar.y))
                         .w(px(bar.width.max(8.0)))
                         .h(px(ROW_HEIGHT - 10.0))
                         .mt(px(5.))
@@ -1673,9 +1657,16 @@ impl PlannerView {
                         )
                         .on_mouse_down(
                             MouseButton::Right,
-                            cx.listener(move |this, _, _, cx| {
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                let x: f32 = event.position.x.into();
+                                let y: f32 = event.position.y.into();
                                 this.state.gantt.context_menu =
-                                    Some(crate::gantt::ContextTarget { id, from_bar: true });
+                                    Some(crate::gantt::ContextTarget {
+                                        id,
+                                        from_bar: true,
+                                        x,
+                                        y,
+                                    });
                                 cx.notify();
                             }),
                         )
@@ -1688,7 +1679,7 @@ impl PlannerView {
                             .debug_selector(|| "gantt-bar-label".into())
                             .absolute()
                             .left(px(bar.x + bar.width + 6.0))
-                            .top(px(bar.y + TIMELINE_HEADER_H + 8.0))
+                            .top(px(bar.y + 8.0))
                             .text_xs()
                             .text_color(muted_fg)
                             .child(bar.title.clone())
@@ -1697,22 +1688,66 @@ impl PlannerView {
                 }
                 items
             }))
-            .when(bars.is_empty(), |el| {
-                el.child(
-                    div()
-                        .id("unscheduled-empty-hint")
-                        .debug_selector(|| "unscheduled-empty-hint".into())
-                        .absolute()
-                        .top(px(TIMELINE_HEADER_H + 24.))
-                        .left(px(24.))
-                        .right(px(24.))
-                        .text_sm()
-                        .text_color(header_fg)
-                        .child(
-                            "No scheduled dates. Drag a work item onto the timeline to set Start and Target.",
-                        ),
-                )
-            })
+                    .when(bars.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .id("unscheduled-empty-hint")
+                                .debug_selector(|| "unscheduled-empty-hint".into())
+                                .absolute()
+                                .top(px(24.))
+                                .left(px(24.))
+                                .right(px(24.))
+                                .text_sm()
+                                .text_color(header_fg)
+                                .child(
+                                    "No scheduled dates. Drag a work item onto the timeline to set Start and Target.",
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("gantt-today")
+                    .debug_selector(|| "gantt-today".into())
+                    .absolute()
+                    .left(px(today_x))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(today_color),
+            )
+            .child(
+                div()
+                    .id("gantt-scale-header")
+                    .debug_selector(|| "gantt-scale-header".into())
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(TIMELINE_HEADER_H))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .children(major_labels.into_iter().map(|(x, label)| {
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(2.))
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(muted_fg)
+                            .child(label)
+                    }))
+                    .children(ticks.iter().map(|tick| {
+                        div()
+                            .absolute()
+                            .left(px(tick.x))
+                            .top(px(22.))
+                            .text_xs()
+                            .text_color(header_fg)
+                            .child(tick.label.clone())
+                    })),
+            )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.state.gantt.gesture.is_some() {
                     let x: f32 = event.position.x.into();
@@ -1735,12 +1770,20 @@ impl PlannerView {
         };
         let id = target.id;
         let from_row = !target.from_bar;
+        let menu_w = 240.0;
+        let x = target
+            .x
+            .clamp(8.0, (self.state.gantt.viewport_w - menu_w).max(8.0));
+        let y = target
+            .y
+            .clamp(72.0, (self.state.gantt.viewport_h + 64.0).max(72.0));
         v_flex()
             .id("gantt-context-menu")
+            .debug_selector(|| "gantt-context-menu".into())
             .absolute()
-            .left(px(40.))
-            .top(px(40.))
-            .w(px(240.))
+            .left(px(x))
+            .top(px(y))
+            .w(px(menu_w))
             .p_1()
             .gap_1()
             .border_1()
@@ -2526,9 +2569,11 @@ impl Render for PlannerView {
         let viewport_h = f32::from(window.viewport_size().height);
         let viewport_w = f32::from(window.viewport_size().width);
         self.state.gantt.viewport_h = (viewport_h - 140.0).max(120.0);
+        self.state.gantt.viewport_w = viewport_w;
+        self.state.gantt.clamp_tree_width();
         self.state.gantt.timeline_origin_x = self.state.gantt.tree_width + 6.0;
         self.state.gantt.timeline_width =
-            (viewport_w - self.state.gantt.tree_width - 6.0).max(200.0);
+            (viewport_w - self.state.gantt.tree_width - 6.0).max(MIN_TIMELINE_WIDTH);
         self.state.toasts.expire();
         self.ensure_form_inputs(window, cx);
         self.schedule_toast_expiry(cx);
@@ -2562,7 +2607,7 @@ impl Render for PlannerView {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 let x: f32 = event.position.x.into();
                 if let Some((origin_x, origin_w)) = this.state.gantt.splitter_drag {
-                    this.state.gantt.tree_width = (origin_w + x - origin_x).max(MIN_TREE_WIDTH);
+                    this.state.gantt.set_tree_width(origin_w + x - origin_x);
                     cx.notify();
                     return;
                 }

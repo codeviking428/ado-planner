@@ -10,6 +10,7 @@ use jiff::{ToSpan, Unit};
 pub const ROW_HEIGHT: f32 = 36.0;
 pub const DEFAULT_TREE_WIDTH: f32 = 420.0;
 pub const MIN_TREE_WIDTH: f32 = 240.0;
+pub const MIN_TIMELINE_WIDTH: f32 = 200.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
@@ -185,6 +186,7 @@ pub struct GanttView {
     pub scroll_y: f32,
     pub tree_width: f32,
     pub viewport_h: f32,
+    pub viewport_w: f32,
     pub timeline_origin_x: f32,
     pub timeline_width: f32,
     pub selected_id: Option<i64>,
@@ -197,10 +199,12 @@ pub struct GanttView {
     pub schedule_drag: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContextTarget {
     pub id: i64,
     pub from_bar: bool,
+    pub x: f32,
+    pub y: f32,
 }
 
 impl Default for GanttView {
@@ -213,6 +217,7 @@ impl Default for GanttView {
             scroll_y: 0.0,
             tree_width: DEFAULT_TREE_WIDTH,
             viewport_h: 720.0,
+            viewport_w: 1280.0,
             timeline_origin_x: 0.0,
             timeline_width: 800.0,
             selected_id: None,
@@ -328,12 +333,24 @@ impl GanttView {
         }
     }
 
+    pub fn max_tree_width(&self) -> f32 {
+        (self.viewport_w - 6.0 - MIN_TIMELINE_WIDTH).max(MIN_TREE_WIDTH)
+    }
+
+    pub fn set_tree_width(&mut self, width: f32) {
+        self.tree_width = width.clamp(MIN_TREE_WIDTH, self.max_tree_width());
+    }
+
+    pub fn clamp_tree_width(&mut self) {
+        self.set_tree_width(self.tree_width);
+    }
+
     pub fn nudge_tree_width(&mut self, delta: f32) {
-        self.tree_width = (self.tree_width + delta).max(MIN_TREE_WIDTH);
+        self.set_tree_width(self.tree_width + delta);
     }
 
     pub fn reset_tree_width(&mut self) {
-        self.tree_width = DEFAULT_TREE_WIDTH;
+        self.set_tree_width(DEFAULT_TREE_WIDTH);
     }
 
     pub fn select_relative(&mut self, rows: &[VisibleRow], delta: i32) {
@@ -1012,6 +1029,21 @@ mod tests {
         gantt.clamp_scroll(3, 80.0);
         assert!(gantt.scroll_y < 200.0);
         assert!(gantt.scroll_y >= 0.0);
+    }
+
+    #[test]
+    fn tree_width_clamps_to_leave_room_for_the_timeline() {
+        let mut gantt = GanttView {
+            viewport_w: 800.0,
+            tree_width: DEFAULT_TREE_WIDTH,
+            ..Default::default()
+        };
+        gantt.set_tree_width(10_000.0);
+        assert!((gantt.tree_width - (800.0 - 6.0 - MIN_TIMELINE_WIDTH)).abs() < f32::EPSILON);
+        gantt.nudge_tree_width(500.0);
+        assert!(gantt.tree_width <= gantt.max_tree_width());
+        gantt.set_tree_width(0.0);
+        assert!((gantt.tree_width - MIN_TREE_WIDTH).abs() < f32::EPSILON);
     }
 
     #[test]

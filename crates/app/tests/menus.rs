@@ -151,6 +151,8 @@ async fn expand_collapse_below_this_row() {
     state.gantt.context_menu = Some(ContextTarget {
         id: root,
         from_bar: false,
+        x: 320.0,
+        y: 280.0,
     });
     assert!(state.gantt.context_menu.is_some());
 }
