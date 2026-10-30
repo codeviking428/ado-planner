@@ -177,9 +177,41 @@ fn pagedown_moves_the_selection(cx: &mut gpui_kit::TestAppContext) {
         prefer_character_input: false,
     };
     view.update(cx, |view, cx| {
+        let before = view.state.gantt.selected_id;
         view.handle_key(&page, cx);
+        let after = view.state.gantt.selected_id;
+        assert_ne!(after, before, "PageDown should move the selection");
+        let rows = view.state.visible_rows();
+        let before_idx = rows
+            .iter()
+            .position(|row| Some(row.id) == before)
+            .unwrap_or(0);
+        let after_idx = rows
+            .iter()
+            .position(|row| Some(row.id) == after)
+            .unwrap_or(0);
+        assert!(
+            after_idx > before_idx + 1 || after_idx + 1 == rows.len(),
+            "PageDown should jump by a page of rows, not a single Down press"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn down_arrow_moves_the_selection_by_one_row(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    let down = KeyDownEvent {
+        keystroke: Keystroke::parse("down").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&down, cx);
         assert_ne!(view.state.gantt.selected_id, Some(1));
-        assert!(view.state.gantt.scroll_y > 0.0 || view.state.gantt.selected_id.is_some());
     });
 }
 

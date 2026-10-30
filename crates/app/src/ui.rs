@@ -17,6 +17,7 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::v_flex;
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -279,6 +280,7 @@ impl PlannerView {
         self.inline_edit = Some(edit);
         self.inline_input.update(cx, |input, cx| {
             input.set_value(&initial, window, cx);
+            input.select_all(window, cx);
         });
         Self::focus_input(&self.inline_input, window, cx);
         cx.notify();
@@ -1296,6 +1298,15 @@ impl PlannerView {
                                             .truncate()
                                             .text_xs()
                                             .child(assigned.clone())
+                                            .tooltip({
+                                                let tip = assigned.clone();
+                                                move |window, cx| {
+                                                    Tooltip::new(tip.clone()).build(window, cx)
+                                                }
+                                            })
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.state.gantt.selected_id = Some(id);
                                                 this.begin_inline(
@@ -1304,6 +1315,7 @@ impl PlannerView {
                                                     window,
                                                     cx,
                                                 );
+                                                cx.stop_propagation();
                                             })),
                                     )
                                     .child(self.dates_cell(id, dates, selected, cx))
@@ -1322,7 +1334,9 @@ impl PlannerView {
                                                 this.state.discard_nudge();
                                             }
                                             this.state.gantt.selected_id = Some(id);
-                                            window.focus(&this.form_focus, cx);
+                                            if this.inline_edit.is_none() {
+                                                window.focus(&this.form_focus, cx);
+                                            }
                                             if event.click_count() >= 2 {
                                                 this.open_form(id, cx);
                                             }
@@ -1332,6 +1346,9 @@ impl PlannerView {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
+                                            if this.inline_edit.is_some() {
+                                                return;
+                                            }
                                             if can_schedule {
                                                 this.state.gantt.schedule_drag = Some(id);
                                                 this.state.gantt.selected_id = Some(id);
@@ -1402,17 +1419,21 @@ impl PlannerView {
                 .into_any_element();
         }
         let title_owned = title.to_string();
+        let tip = title_owned.clone();
         div()
             .id(("title", id as u64))
             .flex_1()
             .min_w(px(48.))
             .truncate()
             .child(title_owned.clone())
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.state.gantt.selected_id = Some(id);
                 if selected {
                     this.begin_inline(InlineEdit::Title(id), title_owned.clone(), window, cx);
                 }
+                cx.stop_propagation();
             }))
             .into_any_element()
     }
@@ -1436,6 +1457,12 @@ impl PlannerView {
         }
         if let Some(rest) = text.strip_prefix("Unscheduled") {
             let hint = rest.trim_start_matches([' ', '·']).trim().to_string();
+            let chip = if hint.is_empty() {
+                "Unscheduled · drop on timeline".to_string()
+            } else {
+                format!("Unscheduled · {hint}")
+            };
+            let tip = chip.clone();
             return div()
                 .id(("dates", id as u64))
                 .debug_selector(|| "unscheduled-chip".into())
@@ -1444,14 +1471,12 @@ impl PlannerView {
                 .truncate()
                 .text_xs()
                 .text_color(muted)
-                .child(if hint.is_empty() {
-                    "Unscheduled · drop on timeline".to_string()
-                } else {
-                    format!("Unscheduled · {hint}")
-                })
+                .child(chip)
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 .into_any_element();
         }
         let display = text.clone();
+        let tip = text.clone();
         div()
             .id(("dates", id as u64))
             .flex_shrink_0()
@@ -1459,11 +1484,14 @@ impl PlannerView {
             .truncate()
             .text_xs()
             .child(text)
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.state.gantt.selected_id = Some(id);
                 if selected {
                     this.begin_inline(InlineEdit::Start(id), display.clone(), window, cx);
                 }
+                cx.stop_propagation();
             }))
             .into_any_element()
     }
@@ -1673,6 +1701,7 @@ impl PlannerView {
                         .into_any_element(),
                 ];
                 if !inside {
+                    let label = bar.title.clone();
                     items.push(
                         div()
                             .id(("gantt-bar-label", id as u64))
@@ -1682,7 +1711,11 @@ impl PlannerView {
                             .top(px(bar.y + 8.0))
                             .text_xs()
                             .text_color(muted_fg)
-                            .child(bar.title.clone())
+                            .child(label.clone())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.state.gantt.selected_id = Some(id);
+                                this.begin_inline(InlineEdit::Title(id), label.clone(), window, cx);
+                            }))
                             .into_any_element(),
                     );
                 }
@@ -2369,15 +2402,16 @@ impl PlannerView {
             cx.notify();
             return;
         }
+        let page_rows = ((viewport - TIMELINE_HEADER_H) / ROW_HEIGHT)
+            .floor()
+            .max(1.0) as i32;
         if key == "pageup" {
-            self.state.gantt.page_scroll(-1, viewport, rows);
-            self.select_relative_row(-1);
+            self.select_relative_row(-page_rows);
             cx.notify();
             return;
         }
         if key == "pagedown" {
-            self.state.gantt.page_scroll(1, viewport, rows);
-            self.select_relative_row(1);
+            self.select_relative_row(page_rows);
             cx.notify();
             return;
         }
