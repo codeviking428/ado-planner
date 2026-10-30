@@ -97,6 +97,48 @@ async fn roots_hide_unparented_work_items_that_are_not_a_root_type() {
 }
 
 #[tokio::test]
+async fn roots_count_is_the_selected_types_and_team_switch_matches_first_load() {
+    let (_mock, mut state, _dir) = signed_in_state().await;
+    let first_hidden = state.visible_nodes().iter().any(|n| n.id == 1012);
+    let first_selected = state.selected_root_count();
+    assert!(
+        !first_hidden,
+        "first load should seed the top backlog and hide Task root #1012"
+    );
+    assert!(
+        first_selected >= 1,
+        "Roots (N) is the selected count, got {first_selected}"
+    );
+    assert!(
+        first_selected < state.types().len() || state.hidden_root_count() == 0,
+        "selected count must not be the hidden-type count when some types are hidden"
+    );
+    if state.hidden_root_count() > 0 {
+        assert_ne!(
+            first_selected,
+            state.hidden_root_count(),
+            "Roots (N) used to show hidden types ({}) instead of selected ({first_selected})",
+            state.hidden_root_count()
+        );
+    }
+    state.set_team("Growth".into()).await.expect("Growth");
+    state
+        .set_team("Platform".into())
+        .await
+        .expect("back to Platform");
+    assert_eq!(
+        state.visible_nodes().iter().any(|n| n.id == 1012),
+        first_hidden,
+        "team switch must reseed the same default as the first load"
+    );
+    assert_eq!(
+        state.selected_root_count(),
+        first_selected,
+        "Roots selected count after a team switch must match the initial default"
+    );
+}
+
+#[tokio::test]
 async fn assignee_menu_lists_team_members_and_filters() {
     let (_mock, mut state, _dir) = signed_in_state().await;
     let options = state.assignee_options();

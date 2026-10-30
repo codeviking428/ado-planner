@@ -33,6 +33,49 @@ pub enum UndoAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryEntry {
+    Dates {
+        id: i64,
+        before_start: Option<String>,
+        before_target: Option<String>,
+        after_start: Option<String>,
+        after_target: Option<String>,
+    },
+    Link {
+        successor_id: i64,
+        predecessor_id: i64,
+        linked: bool,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EditHistory {
+    pub undo: Vec<HistoryEntry>,
+    pub redo: Vec<HistoryEntry>,
+}
+
+impl EditHistory {
+    const CAP: usize = 50;
+
+    pub fn push(&mut self, entry: HistoryEntry) {
+        self.undo.push(entry);
+        self.redo.clear();
+        if self.undo.len() > Self::CAP {
+            let extra = self.undo.len() - Self::CAP;
+            self.undo.drain(0..extra);
+        }
+    }
+
+    pub fn pop_undo(&mut self) -> Option<HistoryEntry> {
+        self.undo.pop()
+    }
+
+    pub fn pop_redo(&mut self) -> Option<HistoryEntry> {
+        self.redo.pop()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
     pub id: u64,
     pub kind: ToastKind,

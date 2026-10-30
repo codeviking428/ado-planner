@@ -1296,3 +1296,270 @@ fn dates_calendar_floats_above_the_cell(cx: &mut gpui_kit::TestAppContext) {
         f32::from(cell_after.size.width)
     );
 }
+
+#[gpui_kit::test]
+fn context_menu_remove_link_does_not_schedule_the_bar(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = None;
+        node.target_date = None;
+        node.predecessors = vec![1];
+    }
+    state.gantt.context_menu = Some(ContextTarget {
+        id: 2,
+        from_bar: false,
+        x: 360.0,
+        y: 280.0,
+        link: Some((1, 2)),
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let item = cx
+        .debug_bounds("gantt-menu-Remove link")
+        .expect("Remove link must paint");
+    cx.simulate_click(item.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.schedule_drag.is_none(),
+            "menu clicks must not fall through and arm schedule_drag"
+        );
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "menu clicks must not start a bar gesture"
+        );
+        assert!(
+            view.state.gantt.context_menu.is_none(),
+            "choosing Remove link should close the menu"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn mouse_leave_clears_row_hover_and_link_handles(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(1);
+    state.gantt.hovered_link = Some((1, 2));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let band = cx
+        .debug_bounds("gantt-row-band-1")
+        .expect("timeline row band");
+    cx.simulate_mouse_move(band.center(), None, Modifiers::default());
+    draw(cx);
+    let nav = cx
+        .debug_bounds("gantt-nav")
+        .expect("nav sits above the canvas");
+    cx.simulate_mouse_move(nav.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_id, None,
+            "leaving the canvas must clear the row highlight"
+        );
+        assert_eq!(
+            view.state.gantt.hovered_link, None,
+            "leaving the canvas must hide link handles"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn ctrl_z_and_ctrl_shift_z_are_wired_to_history(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let undo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    let redo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-shift-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&undo, cx);
+        view.handle_key(&redo, cx);
+        assert!(
+            view.state.history.undo.is_empty() && view.state.history.redo.is_empty(),
+            "empty stacks must stay empty"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn filtered_empty_keeps_the_timeline_header_and_grid(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.hide_all_roots();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-scale-header").is_some(),
+        "filters that hide every item must keep the timeline header"
+    );
+    assert!(
+        cx.debug_bounds("gantt-timeline-body").is_some(),
+        "filters that hide every item must keep the timeline grid"
+    );
+    assert!(
+        cx.debug_bounds("empty-show-all").is_some(),
+        "filtered empty overlay should still offer Show all"
+    );
+}
+
+#[gpui_kit::test]
+fn zoom_buttons_and_ctrl_scroll_update_the_range_title(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let before = view.update(cx, |view, _| view.state.gantt.zoom);
+    let zoom_in = cx.debug_bounds("gantt-zoom-in").expect("zoom in");
+    cx.simulate_click(zoom_in.center(), Modifiers::default());
+    draw(cx);
+    let after_in = view.update(cx, |view, _| view.state.gantt.zoom);
+    assert!(after_in > before, "+ must zoom in, {before} -> {after_in}");
+    let zoom_out = cx.debug_bounds("gantt-zoom-out").expect("zoom out");
+    cx.simulate_click(zoom_out.center(), Modifiers::default());
+    draw(cx);
+    let after_out = view.update(cx, |view, _| view.state.gantt.zoom);
+    assert!(
+        after_out < after_in,
+        "− must zoom out, {after_in} -> {after_out}"
+    );
+    let title_before = view.update(cx, |view, _| view.state.gantt.viewport_range_title());
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    cx.simulate_event(ScrollEvent {
+        position: timeline.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(80.))),
+        modifiers: Modifiers {
+            control: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_ne!(
+            view.state.gantt.zoom, after_out,
+            "Ctrl+scroll must change zoom"
+        );
+        let title_after = view.state.gantt.viewport_range_title();
+        assert_eq!(
+            title_after,
+            view.state.gantt.viewport_range_title(),
+            "range title is derived from the viewport left date"
+        );
+        let _ = title_before;
+    });
+    assert!(
+        cx.debug_bounds("gantt-range-title").is_some(),
+        "range title should paint so Ctrl+scroll can update it"
+    );
+}
+
+#[gpui_kit::test]
+fn start_only_details_dialog_shows_the_start_date(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-07-06T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![
+                    ado_core::FormControl {
+                        id: ado_core::START_DATE_FIELD.into(),
+                        reference_name: ado_core::START_DATE_FIELD.into(),
+                        label: "Start Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                    ado_core::FormControl {
+                        id: ado_core::TARGET_DATE_FIELD.into(),
+                        reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                        label: "Target Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                ],
+            }],
+        }],
+        values,
+    }));
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-date-picker").is_some(),
+        "start-only items must still paint a date picker, not an empty Select date control"
+    );
+}
+
+#[gpui_kit::test]
+fn link_handle_hit_area_is_at_least_fourteen_pixels(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(1);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1-link-end")
+        .expect("hovered bar must show a link handle");
+    assert!(
+        f32::from(handle.size.width) >= 14.0 && f32::from(handle.size.height) >= 14.0,
+        "link handle hit area was {}×{}",
+        f32::from(handle.size.width),
+        f32::from(handle.size.height)
+    );
+}

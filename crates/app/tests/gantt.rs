@@ -291,6 +291,114 @@ async fn removing_a_dependency_clears_the_predecessor() {
 }
 
 #[tokio::test]
+async fn undo_and_redo_restore_dates_and_links() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.id == 1003)
+        .cloned()
+        .expect("1003");
+    let original_start = node.start_date.clone();
+    let original_target = node.target_date.clone();
+    let start = parse_iso_date(original_start.as_deref()).unwrap();
+    let target = parse_iso_date(original_target.as_deref()).unwrap();
+    let next_start = start.saturating_add(3.days());
+    let next_target = target.saturating_add(3.days());
+    state
+        .save_dates(node.id, next_start, next_target)
+        .await
+        .expect("save dates");
+    let moved = state.nodes.iter().find(|n| n.id == 1003).unwrap();
+    assert_ne!(moved.start_date, original_start);
+    state.undo().await.expect("undo dates");
+    let restored = state.nodes.iter().find(|n| n.id == 1003).unwrap();
+    assert_eq!(restored.start_date, original_start);
+    assert_eq!(restored.target_date, original_target);
+    state.redo().await.expect("redo dates");
+    let redone = state.nodes.iter().find(|n| n.id == 1003).unwrap();
+    assert_eq!(
+        parse_iso_date(redone.start_date.as_deref()).unwrap(),
+        next_start
+    );
+    state.undo().await.expect("undo redo");
+
+    state
+        .add_dependency(1005, 1003)
+        .await
+        .expect("link 1003 → 1005");
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|n| n.id == 1005)
+            .unwrap()
+            .predecessors
+            .contains(&1003)
+    );
+    state
+        .remove_dependency(1005, 1003)
+        .await
+        .expect("remove link");
+    assert!(
+        !state
+            .nodes
+            .iter()
+            .find(|n| n.id == 1005)
+            .unwrap()
+            .predecessors
+            .contains(&1003)
+    );
+    state.undo().await.expect("undo remove link");
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|n| n.id == 1005)
+            .unwrap()
+            .predecessors
+            .contains(&1003),
+        "first Ctrl+Z after removing a link must restore it"
+    );
+    state.undo().await.expect("undo add link");
+    assert!(
+        !state
+            .nodes
+            .iter()
+            .find(|n| n.id == 1005)
+            .unwrap()
+            .predecessors
+            .contains(&1003),
+        "second Ctrl+Z must undo the original add, not remove the restored link again"
+    );
+}
+
+#[tokio::test]
+async fn resize_end_toasts_only_target_date() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.id == 1003 && n.target_date.is_some())
+        .cloned()
+        .expect("1003");
+    let target = parse_iso_date(node.target_date.as_deref()).unwrap();
+    state
+        .save_partial_dates(node.id, None, Some(target.saturating_add(2.days())))
+        .await
+        .expect("save target");
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert_eq!(
+        message, "Saved Target Date",
+        "end-only save must toast Target Date, got {message}"
+    );
+    assert!(
+        !message.to_lowercase().contains("start"),
+        "end-only toast must not mention Start Date: {message}"
+    );
+}
+
+#[tokio::test]
 async fn add_item_creates_a_work_item_on_the_team() {
     let (_mock, mut state, _dir) = signed_in().await;
     let before = state.nodes.len();

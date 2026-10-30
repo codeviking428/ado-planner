@@ -21,7 +21,7 @@ use crate::form::FormDraft;
 use crate::gantt::{GanttView, GestureKind, NudgeAxis, PendingNudge, VisibleRow};
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
-use crate::toasts::{ToastKind, Toasts, UndoAction, error_text};
+use crate::toasts::{EditHistory, HistoryEntry, ToastKind, Toasts, UndoAction, error_text};
 use crate::updater::Updater;
 
 #[derive(Clone)]
@@ -54,9 +54,11 @@ pub struct PlannerState {
     pub gantt: GanttView,
     pub form: Option<FormDraft>,
     pub toasts: Toasts,
+    pub history: EditHistory,
     pub updater: Updater,
     pub copied: Option<String>,
     last_nudge_at: Option<Instant>,
+    history_recording: bool,
 }
 
 impl PlannerState {
@@ -108,9 +110,11 @@ impl PlannerState {
             gantt: GanttView::default(),
             form: None,
             toasts: Toasts::default(),
+            history: EditHistory::default(),
             updater: Updater::from_env(),
             copied: None,
             last_nudge_at: None,
+            history_recording: true,
             prefs,
         }
     }
@@ -273,6 +277,10 @@ impl PlannerState {
 
     pub fn hidden_root_count(&self) -> usize {
         self.hidden_roots().len()
+    }
+
+    pub fn selected_root_count(&self) -> usize {
+        self.types().len().saturating_sub(self.hidden_root_count())
     }
 
     pub fn toggle_hidden_root(&mut self, ty: &str) {
@@ -774,8 +782,8 @@ impl PlannerState {
         if let Some(hit) = self.cache.get(&key)
             && let Ok(result) = serde_json::from_value::<HierarchyResult>(hit.value.clone())
         {
-            self.apply_hierarchy(result);
-            if hit.freshness == CacheFreshness::Fresh {
+            self.apply_hierarchy(result.clone());
+            if hit.freshness == CacheFreshness::Fresh && !result.top_backlog_types.is_empty() {
                 self.hierarchy_loading = false;
                 return Ok(());
             }
@@ -889,6 +897,7 @@ impl PlannerState {
         form.saving = true;
         let ops = form.patch_ops();
         let id = form.model.id;
+        let before = self.nodes.iter().find(|node| node.id == id).cloned();
         match self
             .client
             .patch_work_item(&scope.org, &scope.project, id, &ops)
@@ -906,6 +915,19 @@ impl PlannerState {
                     };
                 if let Some(form) = self.form.as_ref() {
                     form.apply_saved(&mut self.nodes, rev);
+                }
+                if let (Some(before), Some(after)) = (
+                    before.as_ref(),
+                    self.nodes.iter().find(|node| node.id == id),
+                ) && (before.start_date != after.start_date
+                    || before.target_date != after.target_date)
+                {
+                    self.record_dates(
+                        id,
+                        before,
+                        after.start_date.clone(),
+                        after.target_date.clone(),
+                    );
                 }
                 self.form = None;
                 self.persist_hierarchy_cache();
@@ -1017,6 +1039,28 @@ impl PlannerState {
         }
     }
 
+    fn record(&mut self, entry: HistoryEntry) {
+        if self.history_recording {
+            self.history.push(entry);
+        }
+    }
+
+    fn record_dates(
+        &mut self,
+        id: i64,
+        before: &WorkItemNode,
+        after_start: Option<String>,
+        after_target: Option<String>,
+    ) {
+        self.record(HistoryEntry::Dates {
+            id,
+            before_start: before.start_date.clone(),
+            before_target: before.target_date.clone(),
+            after_start,
+            after_target,
+        });
+    }
+
     pub async fn save_dates(&mut self, id: i64, start: Date, target: Date) -> Result<(), AppError> {
         let Some(scope) = self.scope() else {
             return Ok(());
@@ -1045,8 +1089,16 @@ impl PlannerState {
                     node.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                self.toasts
-                    .push(ToastKind::Success, "Saved Start Date and Target Date");
+                if self.history_recording {
+                    self.record_dates(
+                        id,
+                        &previous,
+                        Some(iso_date_only(start)),
+                        Some(iso_date_only(target)),
+                    );
+                    self.toasts
+                        .push(ToastKind::Success, "Saved Start Date and Target Date");
+                }
                 Ok(())
             }
             Err(err) => {
@@ -1100,12 +1152,21 @@ impl PlannerState {
                             node.rev = rev;
                         }
                         self.persist_hierarchy_cache();
+                        let after_start = start
+                            .map(iso_date_only)
+                            .or_else(|| previous.start_date.clone());
+                        let after_target = target
+                            .map(iso_date_only)
+                            .or_else(|| previous.target_date.clone());
                         let message = match (start, target) {
-                            (Some(_), None) => "Saved start date",
-                            (None, Some(_)) => "Saved target date",
+                            (Some(_), None) => "Saved Start Date",
+                            (None, Some(_)) => "Saved Target Date",
                             _ => "Saved Start Date and Target Date",
                         };
-                        self.toasts.push(ToastKind::Success, message);
+                        if self.history_recording {
+                            self.record_dates(id, &previous, after_start, after_target);
+                            self.toasts.push(ToastKind::Success, message);
+                        }
                         Ok(())
                     }
                     Err(err) => {
@@ -1161,13 +1222,20 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                self.toasts.push_undo(
-                    format!("Linked #{predecessor_id} → #{successor_id}"),
-                    UndoAction::RemoveLink {
+                if self.history_recording {
+                    self.record(HistoryEntry::Link {
                         successor_id,
                         predecessor_id,
-                    },
-                );
+                        linked: true,
+                    });
+                    self.toasts.push_undo(
+                        format!("Linked #{predecessor_id} → #{successor_id}"),
+                        UndoAction::RemoveLink {
+                            successor_id,
+                            predecessor_id,
+                        },
+                    );
+                }
                 Ok(())
             }
             Err(err) => {
@@ -1224,13 +1292,20 @@ impl PlannerState {
                 }
                 self.gantt.selected_link = None;
                 self.persist_hierarchy_cache();
-                self.toasts.push_undo(
-                    format!("Removed link #{predecessor_id} → #{successor_id}"),
-                    UndoAction::RestoreLink {
+                if self.history_recording {
+                    self.record(HistoryEntry::Link {
                         successor_id,
                         predecessor_id,
-                    },
-                );
+                        linked: false,
+                    });
+                    self.toasts.push_undo(
+                        format!("Removed link #{predecessor_id} → #{successor_id}"),
+                        UndoAction::RestoreLink {
+                            successor_id,
+                            predecessor_id,
+                        },
+                    );
+                }
                 Ok(())
             }
             Err(err) => {
@@ -1528,15 +1603,18 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                self.toasts.push_undo(
-                    "Cleared dates",
-                    UndoAction::RestoreDates {
-                        id,
-                        start_date: previous.start_date,
-                        target_date: previous.target_date,
-                        rev,
-                    },
-                );
+                if self.history_recording {
+                    self.record_dates(id, &previous, None, None);
+                    self.toasts.push_undo(
+                        "Cleared dates",
+                        UndoAction::RestoreDates {
+                            id,
+                            start_date: previous.start_date,
+                            target_date: previous.target_date,
+                            rev,
+                        },
+                    );
+                }
                 Ok(())
             }
             Err(err) => {
@@ -1548,34 +1626,84 @@ impl PlannerState {
         }
     }
 
-    pub async fn apply_undo(&mut self, action: UndoAction) -> Result<(), AppError> {
-        match action {
-            UndoAction::RestoreDates {
+    pub async fn undo(&mut self) -> Result<(), AppError> {
+        let Some(entry) = self.history.pop_undo() else {
+            return Ok(());
+        };
+        self.history_recording = false;
+        let result = self.apply_history_entry(&entry, true).await;
+        self.history_recording = true;
+        if result.is_ok() {
+            self.history.redo.push(entry);
+            self.toasts.items.retain(|toast| toast.undo.is_none());
+        } else {
+            self.history.undo.push(entry);
+        }
+        result
+    }
+
+    pub async fn redo(&mut self) -> Result<(), AppError> {
+        let Some(entry) = self.history.pop_redo() else {
+            return Ok(());
+        };
+        self.history_recording = false;
+        let result = self.apply_history_entry(&entry, false).await;
+        self.history_recording = true;
+        if result.is_ok() {
+            self.history.undo.push(entry);
+        } else {
+            self.history.redo.push(entry);
+        }
+        result
+    }
+
+    async fn apply_history_entry(
+        &mut self,
+        entry: &HistoryEntry,
+        is_undo: bool,
+    ) -> Result<(), AppError> {
+        match entry {
+            HistoryEntry::Dates {
                 id,
-                start_date,
-                target_date,
-                ..
+                before_start,
+                before_target,
+                after_start,
+                after_target,
             } => {
-                self.save_partial_dates(
-                    id,
-                    parse_iso_date(start_date.as_deref()),
-                    parse_iso_date(target_date.as_deref()),
-                )
-                .await
+                let (start, target) = if is_undo {
+                    (before_start, before_target)
+                } else {
+                    (after_start, after_target)
+                };
+                match (
+                    parse_iso_date(start.as_deref()),
+                    parse_iso_date(target.as_deref()),
+                ) {
+                    (None, None) => self.clear_dates(*id).await,
+                    (start, target) => self.save_partial_dates(*id, start, target).await,
+                }
             }
-            UndoAction::RemoveLink {
+            HistoryEntry::Link {
                 successor_id,
                 predecessor_id,
-            } => self.remove_dependency(successor_id, predecessor_id).await,
-            UndoAction::RestoreLink {
-                successor_id,
-                predecessor_id,
-            } => self.add_dependency(successor_id, predecessor_id).await,
+                linked,
+            } => {
+                let should_link = if is_undo { !*linked } else { *linked };
+                if should_link {
+                    self.add_dependency(*successor_id, *predecessor_id).await
+                } else {
+                    self.remove_dependency(*successor_id, *predecessor_id).await
+                }
+            }
         }
     }
 
-    pub async fn undo_clear_dates(&mut self, action: UndoAction) -> Result<(), AppError> {
-        self.apply_undo(action).await
+    pub async fn apply_undo(&mut self, _action: UndoAction) -> Result<(), AppError> {
+        self.undo().await
+    }
+
+    pub async fn undo_clear_dates(&mut self, _action: UndoAction) -> Result<(), AppError> {
+        self.undo().await
     }
 
     pub async fn schedule_to_iteration(&mut self, id: i64) -> Result<(), AppError> {

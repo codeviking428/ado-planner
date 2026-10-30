@@ -14,7 +14,7 @@ pub const MIN_TIMELINE_WIDTH: f32 = 240.0;
 pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
-pub const LINK_HANDLE: f32 = 10.0;
+pub const LINK_HANDLE: f32 = 14.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
@@ -242,6 +242,7 @@ pub struct DependencyArrow {
     pub y1: f32,
     pub x2: f32,
     pub y2: f32,
+    pub x_head: f32,
     pub lane_y: f32,
 }
 
@@ -362,6 +363,15 @@ impl GanttView {
             let world = (self.scroll_x + pointer_x - timeline_origin_x) / old;
             self.scroll_x = (world * new) - (pointer_x - timeline_origin_x);
         }
+    }
+
+    pub fn viewport_range_title(&self) -> String {
+        self.scale.range_title(self.date_for_x(0.0))
+    }
+
+    pub fn clear_hover(&mut self) {
+        self.hovered_id = None;
+        self.hovered_link = None;
     }
 
     pub fn step_period(&mut self, direction: i32) {
@@ -535,8 +545,17 @@ impl GanttView {
                 let node = by_id.get(&row.id)?;
                 let hint = iteration_hint_for_path(&node.iteration_path, iterations);
                 let display = gantt_bar_display(node, nodes, hint.as_ref());
-                let (Some(start), Some(target)) = (display.start, display.end) else {
-                    return None;
+                let live = self
+                    .gesture
+                    .as_ref()
+                    .filter(|gesture| gesture.id == node.id && gesture.kind != GestureKind::Link);
+                let (start, target) = if let Some(gesture) = live {
+                    (gesture.live_start, gesture.live_target)
+                } else {
+                    let (Some(start), Some(target)) = (display.start, display.end) else {
+                        return None;
+                    };
+                    (start, target)
                 };
                 let mut x = self.x_for_date(start);
                 let end = ado_core::to_gantt_inclusive_target(target);
@@ -731,11 +750,15 @@ impl GanttView {
         if !gesture.had_start && !gesture.had_target && gesture.kind == GestureKind::Move {
             return (Some(gesture.live_start), Some(gesture.live_target));
         }
-        let start = (gesture.had_start || gesture.kind == GestureKind::ResizeStart)
-            .then_some(gesture.live_start);
-        let target = (gesture.had_target || gesture.kind == GestureKind::ResizeEnd)
-            .then_some(gesture.live_target);
-        (start, target)
+        match gesture.kind {
+            GestureKind::ResizeStart => (Some(gesture.live_start), None),
+            GestureKind::ResizeEnd => (None, Some(gesture.live_target)),
+            GestureKind::Move => (
+                gesture.had_start.then_some(gesture.live_start),
+                gesture.had_target.then_some(gesture.live_target),
+            ),
+            GestureKind::Link => (None, None),
+        }
     }
 
     pub fn timeline_ticks(&self, width: f32) -> Vec<TimelineTick> {
@@ -945,7 +968,7 @@ impl GanttView {
     }
 
     pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
-        const STUB: f32 = 6.0;
+        const STUB: f32 = 12.0;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
         let mut out = Vec::new();
         for bar in bars {
@@ -960,13 +983,17 @@ impl GanttView {
                 } else {
                     pred.y.min(bar.y) + ROW_HEIGHT
                 };
+                let x1 = pred.x + pred.width + STUB;
+                let x_head = bar.x;
+                let x2 = bar.x - STUB;
                 out.push(DependencyArrow {
                     from_id: *pred_id,
                     to_id: bar.id,
-                    x1: pred.x + pred.width + STUB,
+                    x1,
                     y1,
-                    x2: bar.x,
+                    x2,
                     y2,
+                    x_head,
                     lane_y,
                 });
             }
@@ -1779,19 +1806,93 @@ mod tests {
         let pred = bars.iter().find(|bar| bar.id == 1).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 2).unwrap();
         assert!(
-            arrows[0].x1 >= pred.x + pred.width,
-            "connector must start after the source bar, not through its label"
+            arrows[0].x1 >= pred.x + pred.width + 8.0,
+            "outgoing stub must leave the source bar, got x1 {} vs right {}",
+            arrows[0].x1,
+            pred.x + pred.width
         );
         assert!(
-            (arrows[0].x2 - succ.x).abs() < 1.0,
-            "connector must end at the target start, got {} vs {}",
+            arrows[0].x2 <= succ.x - 8.0,
+            "incoming vertical must detour left of the target edge, got {} vs {}",
             arrows[0].x2,
             succ.x
+        );
+        assert!(
+            (arrows[0].x_head - succ.x).abs() < 1.0,
+            "arrowhead must sit on the target start, got {} vs {}",
+            arrows[0].x_head,
+            succ.x
+        );
+        assert!(
+            arrows[0].x1 > arrows[0].x2,
+            "adjacent bars must detour: outgoing stub {} should be to the right of incoming {}",
+            arrows[0].x1,
+            arrows[0].x2
         );
         assert!(
             arrows[0].lane_y >= pred.y.min(succ.y) + ROW_HEIGHT - 1.0,
             "horizontal run must sit in the gap between rows, got lane {}",
             arrows[0].lane_y
+        );
+    }
+
+    #[test]
+    fn resize_end_patches_target_only() {
+        let nodes = vec![node(1, None)];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let origin = bars[0].x + bars[0].width - 2.0;
+        gantt
+            .begin_gesture(&bars[0], GestureKind::ResizeEnd, origin, &nodes)
+            .expect("resize end");
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        gantt.update_gesture(origin + ppd * 2.0);
+        let gesture = gantt.gesture.clone().expect("live");
+        let (start, target) = GanttView::gesture_patch_dates(&gesture);
+        assert!(
+            start.is_none(),
+            "end-handle drag must not rewrite Start Date, got {start:?}"
+        );
+        assert_eq!(
+            target,
+            Some(Date::new(2026, 7, 22).unwrap()),
+            "end-handle drag should move Target Date by the snapped day delta"
+        );
+    }
+
+    #[test]
+    fn live_drag_preview_snaps_the_bar_to_whole_days() {
+        let nodes = vec![node(1, None)];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let origin = bars[0].x + bars[0].width / 2.0;
+        gantt
+            .begin_gesture(&bars[0], GestureKind::Move, origin, &nodes)
+            .expect("move");
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        gantt.update_gesture(origin + ppd * 2.4);
+        let gesture = gantt.gesture.clone().expect("live");
+        assert_eq!(
+            gesture.live_start,
+            Date::new(2026, 7, 8).unwrap(),
+            "preview must snap 2.4 days to 2, got {}",
+            gesture.live_start
+        );
+        let preview = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let live = preview.iter().find(|bar| bar.id == 1).unwrap();
+        let expected_x = gantt.x_for_date(gesture.live_start);
+        assert!(
+            (live.x - expected_x).abs() < 1.0,
+            "painted bar must follow the snapped preview, got {} vs {expected_x}",
+            live.x
         );
     }
 
