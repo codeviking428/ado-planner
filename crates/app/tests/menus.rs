@@ -82,9 +82,10 @@ async fn clear_dates_has_undo() {
         .rev()
         .find_map(|t| t.undo.clone())
         .expect("undo");
-    match undo {
-        UndoAction::RestoreDates { id, .. } => assert_eq!(id, node.id),
-    }
+    let UndoAction::RestoreDates { id, .. } = &undo else {
+        panic!("clear dates must offer RestoreDates undo, got {undo:?}");
+    };
+    assert_eq!(*id, node.id);
     state.undo_clear_dates(undo).await.expect("undo");
     let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
     assert_eq!(restored.start_date, original);
@@ -153,6 +154,7 @@ async fn expand_collapse_below_this_row() {
         from_bar: false,
         x: 320.0,
         y: 280.0,
+        link: None,
     });
     assert!(state.gantt.context_menu.is_some());
 }

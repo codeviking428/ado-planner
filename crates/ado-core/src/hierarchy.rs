@@ -157,6 +157,26 @@ pub fn map_batch_work_item(
 const DEPENDENCY_REVERSE: &str = "System.LinkTypes.Dependency-Reverse";
 const DEPENDENCY: &str = "System.LinkTypes.Dependency";
 
+/// Index of the dependency relation that points at `predecessor_id`.
+pub fn dependency_relation_index(
+    relations: Option<&[Value]>,
+    predecessor_id: i64,
+) -> Option<usize> {
+    let relations = relations?;
+    relations.iter().position(|relation| {
+        let rel = relation.get("rel").and_then(Value::as_str).unwrap_or("");
+        if rel != DEPENDENCY_REVERSE && rel != DEPENDENCY {
+            return false;
+        }
+        let url = relation.get("url").and_then(Value::as_str).unwrap_or("");
+        url.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .and_then(|id| id.parse::<i64>().ok())
+            == Some(predecessor_id)
+    })
+}
+
 /// Predecessor IDs from ADO relations (`Dependency-Reverse` / `Dependency`).
 pub fn predecessor_ids(relations: Option<&[Value]>) -> Vec<i64> {
     let Some(relations) = relations else {

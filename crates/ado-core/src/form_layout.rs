@@ -240,6 +240,13 @@ pub fn build_form_patch(
         if json_equal(next, prev) {
             continue;
         }
+        if control.kind == FormControlKind::Boolean {
+            let next_bool = boolean_value(next);
+            let prev_bool = boolean_value(prev);
+            if next_bool == prev_bool {
+                continue;
+            }
+        }
         if control.kind == FormControlKind::Html {
             let next_html = next.and_then(Value::as_str).unwrap_or("");
             let prev_html = prev.and_then(Value::as_str).unwrap_or("");
@@ -270,6 +277,20 @@ fn patch_value(kind: FormControlKind, next: Option<&Value>) -> Value {
             Value::Null
         }
         Some(value) => value.clone(),
+    }
+}
+
+fn boolean_value(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "true" | "yes" | "1"
+            )
+        }
+        Some(Value::Number(n)) => n.as_f64().is_some_and(|n| n != 0.0),
+        _ => false,
     }
 }
 
@@ -630,6 +651,76 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Microsoft.VSTS.Scheduling.StoryPoints"]
         );
+    }
+
+    #[test]
+    fn save_patch_treats_boolean_null_and_false_as_equal() {
+        let mut original = serde_json::Map::new();
+        original.insert("Custom.NeedsReview".into(), Value::Null);
+        original.insert(
+            "Microsoft.VSTS.Scheduling.StartDate".into(),
+            json!("2026-07-06T00:00:00Z"),
+        );
+        original.insert(
+            "Microsoft.VSTS.Scheduling.TargetDate".into(),
+            json!("2026-07-20T00:00:00Z"),
+        );
+        let mut draft = original.clone();
+        draft.insert("Custom.NeedsReview".into(), json!(false));
+        draft.insert(
+            "Microsoft.VSTS.Scheduling.StartDate".into(),
+            json!("2026-08-01T00:00:00Z"),
+        );
+        draft.insert(
+            "Microsoft.VSTS.Scheduling.TargetDate".into(),
+            json!("2026-08-14T00:00:00Z"),
+        );
+        let document = build_form_patch(
+            5,
+            &original,
+            &draft,
+            &[
+                FormControl {
+                    id: "Custom.NeedsReview".into(),
+                    reference_name: "Custom.NeedsReview".into(),
+                    label: "Needs Review".into(),
+                    kind: FormControlKind::Boolean,
+                    required: false,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                },
+                FormControl {
+                    id: "Microsoft.VSTS.Scheduling.StartDate".into(),
+                    reference_name: "Microsoft.VSTS.Scheduling.StartDate".into(),
+                    label: "Start Date".into(),
+                    kind: FormControlKind::DateTime,
+                    required: false,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                },
+                FormControl {
+                    id: "Microsoft.VSTS.Scheduling.TargetDate".into(),
+                    reference_name: "Microsoft.VSTS.Scheduling.TargetDate".into(),
+                    label: "Target Date".into(),
+                    kind: FormControlKind::DateTime,
+                    required: false,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                },
+            ],
+        );
+        let fields: Vec<_> = document
+            .iter()
+            .filter_map(|op| op.path.strip_prefix("/fields/"))
+            .collect();
+        assert!(
+            !fields.contains(&"Custom.NeedsReview"),
+            "null vs false must not count as a Needs Review change, got {fields:?}"
+        );
+        assert!(fields.contains(&"Microsoft.VSTS.Scheduling.StartDate"));
     }
 
     #[test]

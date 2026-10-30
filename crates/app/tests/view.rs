@@ -456,6 +456,7 @@ fn context_menu_opens_at_the_click_not_the_window_origin(cx: &mut gpui_kit::Test
         from_bar: false,
         x: 320.0,
         y: 280.0,
+        link: None,
     });
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
@@ -520,6 +521,7 @@ fn escape_closes_the_context_menu_when_nothing_is_focused(cx: &mut gpui_kit::Tes
         from_bar: false,
         x: 320.0,
         y: 280.0,
+        link: None,
     });
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
@@ -1090,11 +1092,11 @@ fn form_range_field_is_labelled_dates(cx: &mut gpui_kit::TestAppContext) {
     );
     assert!(
         cx.debug_bounds("form-boolean").is_some(),
-        "boolean should paint as Yes/No without a checkbox focus ring"
+        "boolean should paint as a labeled checkbox, not a ghost box plus Yes/No text"
     );
     assert!(
-        cx.debug_bounds("form-boolean-box").is_some(),
-        "Needs Review / booleans must show a visible checkbox box, not only Yes/No text"
+        cx.debug_bounds("form-boolean-box").is_none(),
+        "Needs Review must not draw a ghost box beside the real checkbox"
     );
 }
 
@@ -1185,6 +1187,82 @@ fn loading_overlay_paints_skeleton_rows(cx: &mut gpui_kit::TestAppContext) {
     assert!(
         cx.debug_bounds("gantt-loading-skeleton").is_some(),
         "loading overlay should include skeleton rows so it is visible"
+    );
+}
+
+#[gpui_kit::test]
+fn clicking_a_dependency_arrow_selects_the_link(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.predecessors = vec![1];
+        node.start_date = Some("2026-07-21T00:00:00Z".into());
+        node.target_date = Some("2026-08-04T00:00:00Z".into());
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let arrow = cx
+        .debug_bounds("gantt-dep-arrow-1-2")
+        .expect("dependency arrow hit target");
+    cx.simulate_mouse_down(arrow.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.selected_link,
+            Some((1, 2)),
+            "clicking the arrow must select the dependency so Delete can remove it"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn filtered_empty_gantt_offers_show_all(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.hide_all_roots();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("empty-gantt").is_some(),
+        "filters that hide every item must not use the 'team has no work' empty state"
+    );
+    assert!(
+        cx.debug_bounds("empty-show-all").is_some(),
+        "filtered empty state should offer Show all"
+    );
+    assert!(
+        cx.debug_bounds("gantt-add-item").is_some(),
+        "+ Add item must stay visible next to Today and Auto Fit"
+    );
+}
+
+#[gpui_kit::test]
+fn short_bar_paints_its_title_outside(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.title = "Unparented spike".into();
+        node.start_date = Some("2026-07-06T00:00:00Z".into());
+        node.target_date = Some("2026-07-07T00:00:00Z".into());
+        node.parent_id = None;
+    }
+    state.gantt.scale = ado_planner::gantt::GanttScale::Year;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-label").is_some(),
+        "a title that does not fit the bar must paint outside instead of truncating"
     );
 }
 

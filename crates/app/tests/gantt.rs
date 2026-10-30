@@ -217,9 +217,13 @@ async fn growth_team_loads_its_epic_and_empty_team_has_no_items() {
         .await
         .expect("switch to Growth");
     assert!(
-        state.nodes.iter().any(|node| node.id == 1020),
-        "Growth should include Epic 1020, got {:?}",
-        state.nodes.iter().map(|node| node.id).collect::<Vec<_>>()
+        state.visible_nodes().iter().any(|node| node.id == 1020),
+        "Growth's Epic must stay visible under the default Roots filter, got {:?}",
+        state
+            .visible_nodes()
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>()
     );
     state
         .set_team("Empty".into())
@@ -229,6 +233,72 @@ async fn growth_team_loads_its_epic_and_empty_team_has_no_items() {
         state.visible_nodes().is_empty(),
         "Empty team should have no work items"
     );
+}
+
+#[tokio::test]
+async fn switching_teams_reseeds_roots_so_growth_epic_stays_visible() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.prefs.planner.root_types = Some(Some(vec!["Feature".into()]));
+    state
+        .set_team("Growth".into())
+        .await
+        .expect("switch to Growth");
+    assert!(
+        state.visible_nodes().iter().any(|node| node.id == 1020),
+        "Roots must not carry Feature over from Platform and hide Growth's only Epic"
+    );
+}
+
+#[tokio::test]
+async fn filters_that_hide_every_item_are_counted() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.hide_all_roots();
+    assert!(
+        state.filters_hide_work_items(),
+        "hiding every root type should leave the Gantt empty because of filters, not because the team has no work"
+    );
+    assert_eq!(state.hidden_by_filters_count(), state.nodes.len());
+}
+
+#[tokio::test]
+async fn removing_a_dependency_clears_the_predecessor() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state
+        .add_dependency(1005, 1003)
+        .await
+        .expect("link 1003 → 1005");
+    let linked = state.nodes.iter().find(|node| node.id == 1005).unwrap();
+    assert!(
+        linked.predecessors.contains(&1003),
+        "adding a dependency must record the predecessor, got {:?}",
+        linked.predecessors
+    );
+    state
+        .remove_dependency(1005, 1003)
+        .await
+        .expect("remove link");
+    let cleared = state.nodes.iter().find(|node| node.id == 1005).unwrap();
+    assert!(
+        !cleared.predecessors.contains(&1003),
+        "removing a link must drop the predecessor, got {:?}",
+        cleared.predecessors
+    );
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.to_lowercase().contains("removed link"),
+        "delete should toast the removed link, got {message}"
+    );
+}
+
+#[tokio::test]
+async fn add_item_creates_a_work_item_on_the_team() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let before = state.nodes.len();
+    state.add_item().await.expect("create");
+    assert_eq!(state.nodes.len(), before + 1);
+    let created = state.nodes.last().expect("created");
+    assert_eq!(created.title, "New work item");
+    assert_eq!(state.gantt.selected_id, Some(created.id));
 }
 
 #[tokio::test]

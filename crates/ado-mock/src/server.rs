@@ -316,6 +316,45 @@ async fn route(
             json!({ "count": selected.len(), "value": selected }),
         ));
     }
+    if *method == Method::POST && path.contains("/workitems/$") {
+        let ty = work_item_type_from_create_path(path);
+        let document = read_json(req).await?;
+        let ops = document.as_array().cloned().unwrap_or_default();
+        let mut items = state.items.lock().await;
+        let new_id = items
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_i64))
+            .max()
+            .unwrap_or(1000)
+            + 1;
+        let mut fields = serde_json::Map::new();
+        fields.insert("System.WorkItemType".into(), json!(ty));
+        fields.insert("System.State".into(), json!("New"));
+        fields.insert("System.Title".into(), json!("New work item"));
+        for op in ops {
+            let is_add = op.get("op").and_then(Value::as_str) == Some("add");
+            let Some(field) = op
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| path.strip_prefix("/fields/"))
+            else {
+                continue;
+            };
+            if is_add {
+                fields.insert(
+                    field.to_string(),
+                    op.get("value").cloned().unwrap_or(Value::Null),
+                );
+            }
+        }
+        let item = json!({
+            "id": new_id,
+            "rev": 1,
+            "fields": fields,
+        });
+        items.push(item.clone());
+        return Ok(json_response(StatusCode::OK, item));
+    }
     if let Some(id) = work_item_id(path) {
         let mut items = state.items.lock().await;
         let Some(index) = items
@@ -382,6 +421,17 @@ async fn route(
                         && let Some(value) = op.get("value")
                     {
                         relations.push(value.clone());
+                    }
+                    continue;
+                }
+                if op.get("op").and_then(Value::as_str) == Some("remove")
+                    && let Some(index_text) = path.strip_prefix("/relations/")
+                    && let Ok(rel_index) = index_text.parse::<usize>()
+                {
+                    if let Some(Value::Array(relations)) = items[index].get_mut("relations")
+                        && rel_index < relations.len()
+                    {
+                        relations.remove(rel_index);
                     }
                     continue;
                 }
@@ -453,6 +503,14 @@ fn work_item_type_from_path(path: &str) -> String {
         .and_then(|rest| rest.split('/').next())
         .map(percent_decode)
         .unwrap_or_default()
+}
+
+fn work_item_type_from_create_path(path: &str) -> String {
+    path.split("/workitems/$")
+        .nth(1)
+        .and_then(|rest| rest.split(['?', '/']).next())
+        .map(percent_decode)
+        .unwrap_or_else(|| "User Story".into())
 }
 
 fn percent_decode(raw: &str) -> String {

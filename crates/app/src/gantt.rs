@@ -242,6 +242,7 @@ pub struct DependencyArrow {
     pub y1: f32,
     pub x2: f32,
     pub y2: f32,
+    pub lane_y: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +259,8 @@ pub struct GanttView {
     pub timeline_width: f32,
     pub selected_id: Option<i64>,
     pub hovered_id: Option<i64>,
+    pub selected_link: Option<(i64, i64)>,
+    pub hovered_link: Option<(i64, i64)>,
     pub collapsed: HashSet<i64>,
     pub gesture: Option<Gesture>,
     pub pending_nudge: Option<PendingNudge>,
@@ -272,6 +275,7 @@ pub struct ContextTarget {
     pub from_bar: bool,
     pub x: f32,
     pub y: f32,
+    pub link: Option<(i64, i64)>,
 }
 
 impl Default for GanttView {
@@ -289,6 +293,8 @@ impl Default for GanttView {
             timeline_width: 800.0,
             selected_id: None,
             hovered_id: None,
+            selected_link: None,
+            hovered_link: None,
             collapsed: HashSet::new(),
             gesture: None,
             pending_nudge: None,
@@ -939,8 +945,7 @@ impl GanttView {
     }
 
     pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
-        const GAP: f32 = 10.0;
-        const LANE: f32 = 7.0;
+        const STUB: f32 = 6.0;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
         let mut out = Vec::new();
         for bar in bars {
@@ -948,13 +953,21 @@ impl GanttView {
                 let Some(pred) = by_id.get(pred_id) else {
                     continue;
                 };
+                let y1 = pred.y + ROW_HEIGHT / 2.0;
+                let y2 = bar.y + ROW_HEIGHT / 2.0;
+                let lane_y = if (pred.y - bar.y).abs() < 1.0 {
+                    y1
+                } else {
+                    pred.y.min(bar.y) + ROW_HEIGHT
+                };
                 out.push(DependencyArrow {
                     from_id: *pred_id,
                     to_id: bar.id,
-                    x1: pred.x + pred.width + GAP,
-                    y1: pred.y + ROW_HEIGHT - LANE,
-                    x2: bar.x - GAP,
-                    y2: bar.y + ROW_HEIGHT - LANE,
+                    x1: pred.x + pred.width + STUB,
+                    y1,
+                    x2: bar.x,
+                    y2,
+                    lane_y,
                 });
             }
         }
@@ -1770,12 +1783,15 @@ mod tests {
             "connector must start after the source bar, not through its label"
         );
         assert!(
-            arrows[0].x2 <= succ.x,
-            "connector must end before the target bar"
+            (arrows[0].x2 - succ.x).abs() < 1.0,
+            "connector must end at the target start, got {} vs {}",
+            arrows[0].x2,
+            succ.x
         );
         assert!(
-            arrows[0].y1 > pred.y + 8.0,
-            "connector must sit below the source label"
+            arrows[0].lane_y >= pred.y.min(succ.y) + ROW_HEIGHT - 1.0,
+            "horizontal run must sit in the gap between rows, got lane {}",
+            arrows[0].lane_y
         );
     }
 

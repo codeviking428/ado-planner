@@ -110,7 +110,7 @@ impl AdoClient {
         authorization.set_sensitive(true);
         headers.insert(AUTHORIZATION, authorization);
         if method != Method::GET && method != Method::HEAD {
-            let content_type = if method == Method::PATCH {
+            let content_type = if method == Method::PATCH || url.contains("/workitems/$") {
                 "application/json-patch+json"
             } else {
                 "application/json"
@@ -601,6 +601,66 @@ impl AdoClient {
             &ado_core::build_add_dependency_patch(rev, &url),
         )
         .await
+    }
+
+    pub async fn remove_dependency(
+        &self,
+        org: &str,
+        project: &str,
+        successor_id: i64,
+        predecessor_id: i64,
+        rev: i64,
+    ) -> Result<i64, ClientError> {
+        let item = self
+            .get(&format!(
+                "{}/{}/_apis/wit/workitems/{successor_id}?$expand=relations&api-version=7.1",
+                self.org_url(org),
+                urlencoding::encode(project)
+            ))
+            .await?;
+        let relations = item.get("relations").and_then(Value::as_array);
+        let Some(index) =
+            ado_core::dependency_relation_index(relations.map(|v| v.as_slice()), predecessor_id)
+        else {
+            return Err(ClientError::Message("dependency not found".into()));
+        };
+        self.patch_work_item(
+            org,
+            project,
+            successor_id,
+            &ado_core::build_remove_dependency_patch(rev, index),
+        )
+        .await
+    }
+
+    pub async fn create_work_item(
+        &self,
+        org: &str,
+        project: &str,
+        work_item_type: &str,
+        document: &[JsonPatchOp],
+    ) -> Result<WorkItemNode, ClientError> {
+        let encoded_type = urlencoding::encode(work_item_type);
+        let created = self
+            .request(
+                Method::POST,
+                &format!(
+                    "{}/{}/_apis/wit/workitems/${encoded_type}?api-version=7.1",
+                    self.org_url(org),
+                    urlencoding::encode(project)
+                ),
+                Some(&serde_json::to_value(document).unwrap_or(Value::Null)),
+            )
+            .await?;
+        let item = BatchWorkItem {
+            id: created.get("id").and_then(Value::as_i64).unwrap_or(0),
+            rev: created.get("rev").and_then(Value::as_i64),
+            fields: created.get("fields").and_then(Value::as_object).cloned(),
+            relations: created.get("relations").and_then(Value::as_array).cloned(),
+        };
+        let mut types_with_dates = HashSet::new();
+        types_with_dates.insert(work_item_type.to_string());
+        Ok(map_batch_work_item(&item, &types_with_dates))
     }
 
     pub async fn load_form(

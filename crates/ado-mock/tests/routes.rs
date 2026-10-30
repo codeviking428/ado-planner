@@ -326,6 +326,53 @@ async fn patch_rev_conflict_and_success() {
             })),
         "PATCH /relations/- should append a dependency"
     );
+
+    let rev = body["rev"].as_i64().expect("rev");
+    let (status, body) = patch(
+        &client,
+        url,
+        "/contoso/Shop/_apis/wit/workitems/1012",
+        json!([
+            { "op": "test", "path": "/rev", "value": rev },
+            { "op": "remove", "path": "/relations/1" }
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body["relations"]
+            .as_array()
+            .is_some_and(|rels| !rels.iter().any(|rel| {
+                rel["url"]
+                    .as_str()
+                    .is_some_and(|url| url.ends_with("/1005"))
+            })),
+        "PATCH remove /relations/n should drop that dependency"
+    );
+}
+
+#[tokio::test]
+async fn create_work_item_assigns_the_next_id() {
+    let mock = ado_mock::start().await;
+    let client = reqwest::Client::new();
+    let (status, body) = post(
+        &client,
+        &mock.url,
+        "/contoso/Shop/_apis/wit/workitems/$User%20Story",
+        json!([
+            { "op": "add", "path": "/fields/System.Title", "value": "New work item" },
+            { "op": "add", "path": "/fields/System.AreaPath", "value": "Shop\\Platform" }
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body["id"].as_i64().is_some_and(|id| id > 1020),
+        "create should allocate an id after the fixtures, got {}",
+        body["id"]
+    );
+    assert_eq!(body["fields"]["System.Title"], "New work item");
+    assert_eq!(body["fields"]["System.WorkItemType"], "User Story");
 }
 
 #[tokio::test]

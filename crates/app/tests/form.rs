@@ -111,6 +111,38 @@ async fn save_toast_does_not_report_description_when_only_story_points_changed()
 }
 
 #[tokio::test]
+async fn save_toast_does_not_report_needs_review_when_only_dates_changed() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.open_form(1003).await.expect("open");
+    let form = state.form.as_mut().expect("form");
+    form.model.values.remove("Custom.NeedsReview");
+    form.values
+        .insert("Custom.NeedsReview".into(), serde_json::json!(false));
+    form.values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-08-10T00:00:00Z"),
+    );
+    form.values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-08-21T00:00:00Z"),
+    );
+    state.save_form().await.expect("save");
+    let message = state
+        .toasts
+        .last_message()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        message.contains("start date") && message.contains("target date"),
+        "toast should mention the dates that changed, got {message}"
+    );
+    assert!(
+        !message.contains("needs review"),
+        "null vs false must not count as a Needs Review change: {message}"
+    );
+}
+
+#[tokio::test]
 async fn non_plain_html_field_is_read_only() {
     let html = r#"<p>Hello <span style="color:red">Ada</span></p>"#;
     assert!(!ado_core::is_plain_html_field(html));

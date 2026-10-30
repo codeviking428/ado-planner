@@ -22,6 +22,14 @@ pub enum UndoAction {
         target_date: Option<String>,
         rev: i64,
     },
+    RemoveLink {
+        successor_id: i64,
+        predecessor_id: i64,
+    },
+    RestoreLink {
+        successor_id: i64,
+        predecessor_id: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

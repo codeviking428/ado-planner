@@ -627,10 +627,23 @@ impl PlannerState {
     pub async fn set_team(&mut self, team: String) -> Result<(), AppError> {
         self.prefs.planner.team = team;
         self.prefs.planner.iteration_path.clear();
+        self.prefs.planner.root_types = None;
         self.persist_prefs();
         self.heal_and_load_iterations().await?;
         self.load_members().await?;
         self.load_hierarchy().await
+    }
+
+    pub fn hidden_by_filters_count(&self) -> usize {
+        let visible: HashSet<i64> = self.visible_nodes().iter().map(|node| node.id).collect();
+        self.nodes
+            .iter()
+            .filter(|node| !visible.contains(&node.id))
+            .count()
+    }
+
+    pub fn filters_hide_work_items(&self) -> bool {
+        !self.nodes.is_empty() && self.visible_nodes().is_empty()
     }
 
     pub async fn heal_and_load_iterations(&mut self) -> Result<(), AppError> {
@@ -1148,9 +1161,12 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                self.toasts.push(
-                    ToastKind::Success,
+                self.toasts.push_undo(
                     format!("Linked #{predecessor_id} → #{successor_id}"),
+                    UndoAction::RemoveLink {
+                        successor_id,
+                        predecessor_id,
+                    },
                 );
                 Ok(())
             }
@@ -1159,6 +1175,148 @@ impl PlannerState {
                 self.toasts.push(
                     ToastKind::Error,
                     error_text(&err, "Could not add dependency"),
+                );
+                Err(err.into())
+            }
+        }
+    }
+
+    pub async fn remove_dependency(
+        &mut self,
+        successor_id: i64,
+        predecessor_id: i64,
+    ) -> Result<(), AppError> {
+        if successor_id == predecessor_id {
+            return Ok(());
+        }
+        let Some(scope) = self.scope() else {
+            return Ok(());
+        };
+        let Some(node) = self
+            .nodes
+            .iter()
+            .find(|node| node.id == successor_id)
+            .cloned()
+        else {
+            return Err(AppError::message("Work Item not found"));
+        };
+        if !node.predecessors.contains(&predecessor_id) {
+            return Ok(());
+        }
+        let previous = node.clone();
+        if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
+            live.predecessors.retain(|id| *id != predecessor_id);
+        }
+        match self
+            .client
+            .remove_dependency(
+                &scope.org,
+                &scope.project,
+                successor_id,
+                predecessor_id,
+                node.rev,
+            )
+            .await
+        {
+            Ok(rev) => {
+                if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
+                    live.rev = rev;
+                }
+                self.gantt.selected_link = None;
+                self.persist_hierarchy_cache();
+                self.toasts.push_undo(
+                    format!("Removed link #{predecessor_id} → #{successor_id}"),
+                    UndoAction::RestoreLink {
+                        successor_id,
+                        predecessor_id,
+                    },
+                );
+                Ok(())
+            }
+            Err(err) => {
+                self.restore_node(previous);
+                self.toasts.push(
+                    ToastKind::Error,
+                    error_text(&err, "Could not remove dependency"),
+                );
+                Err(err.into())
+            }
+        }
+    }
+
+    pub async fn add_item(&mut self) -> Result<(), AppError> {
+        let Some(scope) = self.scope() else {
+            return Err(AppError::message("Choose a Team first"));
+        };
+        let types = self.types();
+        let work_item_type = ["User Story", "Task", "Bug", "Feature", "Epic"]
+            .into_iter()
+            .find(|ty| types.iter().any(|item| item == ty))
+            .map(ToString::to_string)
+            .or_else(|| types.first().cloned())
+            .unwrap_or_else(|| "User Story".into());
+        let parent = self
+            .gantt
+            .selected_id
+            .and_then(|id| self.nodes.iter().find(|node| node.id == id));
+        let area = parent
+            .map(|node| node.area_path.clone())
+            .or_else(|| self.nodes.first().map(|node| node.area_path.clone()))
+            .unwrap_or_else(|| scope.project.clone());
+        let iteration = parent
+            .map(|node| node.iteration_path.clone())
+            .filter(|path| !path.is_empty())
+            .or_else(|| {
+                let path = self.prefs.planner.iteration_path.clone();
+                (!path.is_empty()).then_some(path)
+            })
+            .unwrap_or_default();
+        let parent_id = parent.map(|node| node.id);
+        let mut ops = vec![
+            ado_core::JsonPatchOp {
+                op: ado_core::PatchOp::Add,
+                path: "/fields/System.Title".into(),
+                value: Some(json!("New work item")),
+            },
+            ado_core::JsonPatchOp {
+                op: ado_core::PatchOp::Add,
+                path: "/fields/System.AreaPath".into(),
+                value: Some(json!(area)),
+            },
+        ];
+        if !iteration.is_empty() {
+            ops.push(ado_core::JsonPatchOp {
+                op: ado_core::PatchOp::Add,
+                path: "/fields/System.IterationPath".into(),
+                value: Some(json!(iteration)),
+            });
+        }
+        if let Some(parent_id) = parent_id {
+            ops.push(ado_core::JsonPatchOp {
+                op: ado_core::PatchOp::Add,
+                path: "/fields/System.Parent".into(),
+                value: Some(json!(parent_id)),
+            });
+        }
+        match self
+            .client
+            .create_work_item(&scope.org, &scope.project, &work_item_type, &ops)
+            .await
+        {
+            Ok(mut node) => {
+                node.parent_id = parent_id;
+                let id = node.id;
+                self.nodes.push(node);
+                self.gantt.selected_id = Some(id);
+                self.persist_hierarchy_cache();
+                self.toasts
+                    .push(ToastKind::Success, format!("Created #{id}"));
+                Ok(())
+            }
+            Err(err) => {
+                self.toasts.push(
+                    ToastKind::Error,
+                    error_text(&err, "Could not create work item"),
                 );
                 Err(err.into())
             }
@@ -1390,18 +1548,34 @@ impl PlannerState {
         }
     }
 
+    pub async fn apply_undo(&mut self, action: UndoAction) -> Result<(), AppError> {
+        match action {
+            UndoAction::RestoreDates {
+                id,
+                start_date,
+                target_date,
+                ..
+            } => {
+                self.save_partial_dates(
+                    id,
+                    parse_iso_date(start_date.as_deref()),
+                    parse_iso_date(target_date.as_deref()),
+                )
+                .await
+            }
+            UndoAction::RemoveLink {
+                successor_id,
+                predecessor_id,
+            } => self.remove_dependency(successor_id, predecessor_id).await,
+            UndoAction::RestoreLink {
+                successor_id,
+                predecessor_id,
+            } => self.add_dependency(successor_id, predecessor_id).await,
+        }
+    }
+
     pub async fn undo_clear_dates(&mut self, action: UndoAction) -> Result<(), AppError> {
-        let UndoAction::RestoreDates {
-            id,
-            start_date,
-            target_date,
-            ..
-        } = action;
-        let start = parse_iso_date(start_date.as_deref())
-            .ok_or_else(|| AppError::message("missing start"))?;
-        let target = parse_iso_date(target_date.as_deref())
-            .ok_or_else(|| AppError::message("missing target"))?;
-        self.save_dates(id, start, target).await
+        self.apply_undo(action).await
     }
 
     pub async fn schedule_to_iteration(&mut self, id: i64) -> Result<(), AppError> {

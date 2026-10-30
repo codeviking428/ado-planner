@@ -249,6 +249,21 @@ pub fn build_add_dependency_patch(rev: i64, predecessor_url: &str) -> Vec<JsonPa
     ]
 }
 
+pub fn build_remove_dependency_patch(rev: i64, relation_index: usize) -> Vec<JsonPatchOp> {
+    vec![
+        JsonPatchOp {
+            op: PatchOp::Test,
+            path: "/rev".into(),
+            value: Some(json!(rev)),
+        },
+        JsonPatchOp {
+            op: PatchOp::Remove,
+            path: format!("/relations/{relation_index}"),
+            value: None,
+        },
+    ]
+}
+
 pub fn type_has_start_and_target(field_reference_names: &[impl AsRef<str>]) -> bool {
     let has_start = field_reference_names
         .iter()

@@ -39,10 +39,9 @@ use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
-    ASSIGNEE_COL_WIDTH, BAR_LABEL_INSIDE_MIN, DATES_COL_WIDTH, DependencyArrow, GanttScale,
-    GestureKind, HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, MILESTONE_SIZE,
-    MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SUMMARY_BAR_H,
-    TIMELINE_HEADER_H, TYPE_COL_WIDTH,
+    ASSIGNEE_COL_WIDTH, DATES_COL_WIDTH, DependencyArrow, GanttScale, GestureKind, HANDLE_WIDTH,
+    ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS,
+    NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SUMMARY_BAR_H, TIMELINE_HEADER_H, TYPE_COL_WIDTH,
 };
 use crate::paths::AppPaths;
 use crate::state::PlannerState;
@@ -154,7 +153,24 @@ impl PlannerView {
                     cx.stop_propagation();
                     return;
                 }
+                let undo = (event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.platform)
+                    && key == "z";
+                let delete_link = matches!(key, "delete" | "backspace")
+                    && this.state.gantt.selected_link.is_some();
                 let nav = matches!(key, "up" | "down" | "pageup" | "pagedown" | "home" | "end");
+                if undo || delete_link {
+                    this.on_key(
+                        &KeyDownEvent {
+                            keystroke: event.keystroke.clone(),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        cx,
+                    );
+                    cx.stop_propagation();
+                    return;
+                }
                 if !nav || overlay || this.input_focused(window, cx) {
                     return;
                 }
@@ -765,9 +781,22 @@ impl PlannerView {
             .items
             .retain(|toast| toast.undo.as_ref() != Some(&action));
         self.spawn_state(cx, |mut state| async move {
-            let result = state.undo_clear_dates(action).await;
+            let result = state.apply_undo(action).await;
             (state, result)
         });
+    }
+
+    fn undo_last(&mut self, cx: &mut Context<Self>) {
+        if let Some(action) = self
+            .state
+            .toasts
+            .items
+            .iter()
+            .rev()
+            .find_map(|toast| toast.undo.clone())
+        {
+            self.undo(action, cx);
+        }
     }
 
     fn apply_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
@@ -1108,17 +1137,25 @@ impl PlannerView {
         h_flex()
             .id("filters")
             .gap_2()
-            .child(self.filter_button("root-filter", "Roots", self.state.hidden_root_count(), cx))
+            .child(self.filter_button(
+                "root-filter",
+                "Roots",
+                self.state.hidden_root_count(),
+                "Top-level types shown on the Gantt. Defaults to this team's top backlog.",
+                cx,
+            ))
             .child(self.filter_button(
                 "type-filter",
                 "Types",
                 self.state.prefs.planner.hidden_types.len(),
+                "Hide work item types from the tree and timeline.",
                 cx,
             ))
             .child(self.filter_button(
                 "state-filter",
                 "States",
                 self.state.prefs.planner.hidden_states.len(),
+                "Hide work item states from the tree and timeline.",
                 cx,
             ))
     }
@@ -1128,6 +1165,7 @@ impl PlannerView {
         id: &'static str,
         label: &'static str,
         hidden: usize,
+        tooltip: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let caption = if hidden > 0 {
@@ -1148,6 +1186,7 @@ impl PlannerView {
         let trigger = div().w(px(120.)).flex_shrink_0().overflow_hidden().child(
             Button::new(id)
                 .label(caption)
+                .tooltip(tooltip)
                 .selected(open || hidden > 0)
                 .when(open || hidden > 0, |btn| btn.primary())
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -1379,15 +1418,13 @@ impl PlannerView {
 
     fn render_empty_gantt(&self, cx: &Context<Self>) -> impl IntoElement {
         let team = self.state.prefs.planner.team.clone();
-        let filtered = !self.state.prefs.planner.hidden_types.is_empty()
-            || !self.state.prefs.planner.hidden_states.is_empty()
-            || (self.state.prefs.planner.assignee != "anyone"
-                && !self.state.prefs.planner.assignee.is_empty());
+        let hidden = self.state.hidden_by_filters_count();
+        let filtered = hidden > 0 || self.state.filters_hide_work_items();
         let message = if let Some(error) = self.state.team_settings_error.as_ref() {
             error.clone()
         } else if filtered {
-            "No work items match the current filters. Clear Types, States, or Assignee to see more."
-                .into()
+            let noun = if hidden == 1 { "item" } else { "items" };
+            format!("{hidden} {noun} hidden by filters")
         } else if team.is_empty() {
             "Choose a team to load work items.".into()
         } else {
@@ -1404,11 +1441,32 @@ impl PlannerView {
             .px_8()
             .gap_2()
             .child(Label::new(message))
-            .child(
-                Label::new("Use Org / Project / Team above to switch scope.")
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground),
-            )
+            .when(filtered, |el| {
+                el.child(
+                    div()
+                        .id("empty-show-all")
+                        .debug_selector(|| "empty-show-all".into())
+                        .child(
+                            Button::new("empty-show-all-btn")
+                                .primary()
+                                .label("Show all")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.show_all_types();
+                                    this.state.show_all_states();
+                                    this.state.show_all_roots();
+                                    this.state.set_assignee("anyone".into());
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when(!filtered, |el| {
+                el.child(
+                    Label::new("Use Org / Project / Team above to switch scope.")
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                )
+            })
     }
 
     fn render_gantt_nav(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1438,9 +1496,27 @@ impl PlannerView {
                     ),
             )
             .child(
+                div()
+                    .id("gantt-add-item")
+                    .debug_selector(|| "gantt-add-item".into())
+                    .child(
+                        Button::new("add-item")
+                            .primary()
+                            .label("+ Add item")
+                            .tooltip("Create a work item on this team.")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.spawn_state(cx, |mut state| async move {
+                                    let result = state.add_item().await;
+                                    (state, result)
+                                });
+                            })),
+                    ),
+            )
+            .child(
                 Button::new("auto-fit")
                     .primary()
                     .label("Auto Fit")
+                    .tooltip("Fit every bar into the visible timeline.")
                     .on_click(cx.listener(|this, _, _, cx| {
                         let nodes = this.state.visible_nodes();
                         let width = this.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
@@ -1708,6 +1784,7 @@ impl PlannerView {
                                                     from_bar: false,
                                                     x,
                                                     y,
+                                                    link: None,
                                                 });
                                             cx.notify();
                                         }),
@@ -2069,6 +2146,17 @@ impl PlannerView {
                             .bg(grid)
                     }))
                     .child(
+                        div()
+                            .id("gantt-today")
+                            .debug_selector(|| "gantt-today".into())
+                            .absolute()
+                            .left(px(today_x))
+                            .top_0()
+                            .bottom_0()
+                            .w(px(3.))
+                            .bg(today_color),
+                    )
+                    .child(
                         v_flex()
                             .mt(px(-self.state.gantt.row_scroll_remainder()))
                             .children(window.iter().map(|row| {
@@ -2228,17 +2316,6 @@ impl PlannerView {
                         )
                     }),
             )
-            .child(
-                div()
-                    .id("gantt-today")
-                    .debug_selector(|| "gantt-today".into())
-                    .absolute()
-                    .left(px(today_x))
-                    .top_0()
-                    .bottom_0()
-                    .w(px(3.))
-                    .bg(today_color),
-            )
             .when(today_x >= 0.0 && today_x <= width, |el| {
                 el.child(
                     div()
@@ -2319,7 +2396,8 @@ impl PlannerView {
         let summary = bar.summary;
         let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
         let milestone = bar.milestone;
-        let inside = !unscheduled && !milestone && !summary && bar.width >= BAR_LABEL_INSIDE_MIN;
+        let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
+        let inside = !unscheduled && !milestone && !summary && bar.width >= title_width.max(40.0);
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
         let show_handles = !summary && !unscheduled && !milestone && hovered && !dragging;
@@ -2490,6 +2568,7 @@ impl PlannerView {
                             from_bar: true,
                             x,
                             y,
+                            link: None,
                         });
                         cx.notify();
                     }),
@@ -2570,53 +2649,55 @@ impl PlannerView {
     }
 
     fn render_dependency_arrow(&self, arrow: &DependencyArrow, cx: &Context<Self>) -> AnyElement {
-        let color = cx.theme().primary.opacity(0.9);
-        let elbow_x = if arrow.x2 >= arrow.x1 + 16.0 {
-            (arrow.x1 + arrow.x2) / 2.0
+        let selected = self.state.gantt.selected_link == Some((arrow.from_id, arrow.to_id));
+        let hovered = self.state.gantt.hovered_link == Some((arrow.from_id, arrow.to_id));
+        let color = if selected || hovered {
+            cx.theme().primary
         } else {
-            arrow.x1
+            cx.theme().primary.opacity(0.7)
         };
-        let min_x = arrow.x1.min(arrow.x2).min(elbow_x) - 2.0;
-        let max_x = arrow.x1.max(arrow.x2).max(elbow_x) + 16.0;
-        let min_y = arrow.y1.min(arrow.y2) - 8.0;
-        let max_y = arrow.y1.max(arrow.y2) + 8.0;
+        let stroke = if selected || hovered { 3.0 } else { 2.0 };
+        let min_x = arrow.x1.min(arrow.x2) - 10.0;
+        let max_x = arrow.x1.max(arrow.x2) + 18.0;
+        let min_y = arrow.y1.min(arrow.y2).min(arrow.lane_y) - 10.0;
+        let max_y = arrow.y1.max(arrow.y2).max(arrow.lane_y) + 10.0;
         let selector = format!("gantt-dep-arrow-{}-{}", arrow.from_id, arrow.to_id);
-        let h1 = (elbow_x - arrow.x1).abs().max(2.0);
-        let h2 = (arrow.x2 - elbow_x).abs().max(2.0);
-        let v_len = (arrow.y2 - arrow.y1).abs().max(2.0);
+        let from_id = arrow.from_id;
+        let to_id = arrow.to_id;
+        let v1 = (arrow.lane_y - arrow.y1).abs().max(2.0);
+        let h_len = (arrow.x2 - arrow.x1).abs().max(2.0);
+        let v2 = (arrow.y2 - arrow.lane_y).abs().max(2.0);
         div()
             .absolute()
             .left(px(min_x))
             .top(px(min_y))
-            .w(px((max_x - min_x).max(16.0)))
-            .h(px((max_y - min_y).max(16.0)))
+            .w(px((max_x - min_x).max(20.0)))
+            .h(px((max_y - min_y).max(20.0)))
             .child(
                 div()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
                     .absolute()
-                    .left(px(arrow.x1.min(elbow_x) - min_x))
-                    .top(px(arrow.y1 - min_y))
-                    .w(px(h1))
-                    .h(px(2.))
+                    .left(px(arrow.x1 - min_x))
+                    .top(px(arrow.y1.min(arrow.lane_y) - min_y))
+                    .w(px(stroke))
+                    .h(px(v1))
                     .bg(color),
             )
             .child(
                 div()
                     .absolute()
-                    .left(px(elbow_x - min_x))
-                    .top(px(arrow.y1.min(arrow.y2) - min_y))
-                    .w(px(2.))
-                    .h(px(v_len))
+                    .left(px(arrow.x1.min(arrow.x2) - min_x))
+                    .top(px(arrow.lane_y - min_y))
+                    .w(px(h_len))
+                    .h(px(stroke))
                     .bg(color),
             )
             .child(
                 div()
                     .absolute()
-                    .left(px(elbow_x.min(arrow.x2) - min_x))
-                    .top(px(arrow.y2 - min_y))
-                    .w(px(h2))
-                    .h(px(2.))
+                    .left(px(arrow.x2 - min_x))
+                    .top(px(arrow.lane_y.min(arrow.y2) - min_y))
+                    .w(px(stroke))
+                    .h(px(v2))
                     .bg(color),
             )
             .child(
@@ -2627,14 +2708,58 @@ impl PlannerView {
                     )))
                     .debug_selector(|| "gantt-dep-arrowhead".into())
                     .absolute()
-                    .left(px(arrow.x2 - min_x - 2.0))
-                    .top(px(arrow.y2 - min_y - 8.0))
-                    .w(px(14.))
-                    .h(px(16.))
-                    .text_lg()
+                    .left(px(arrow.x2 - min_x - 16.0))
+                    .top(px(arrow.y2 - min_y - 10.0))
+                    .w(px(18.))
+                    .h(px(20.))
+                    .text_xl()
                     .line_height(gpui_kit::relative(1.))
                     .text_color(color)
                     .child("▶"),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .absolute()
+                    .inset_0()
+                    .cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.state.gantt.hovered_link = if *hovered {
+                            Some((from_id, to_id))
+                        } else if this.state.gantt.hovered_link == Some((from_id, to_id)) {
+                            None
+                        } else {
+                            this.state.gantt.hovered_link
+                        };
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.state.gantt.selected_link = Some((from_id, to_id));
+                            this.state.gantt.selected_id = Some(to_id);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.state.gantt.selected_link = Some((from_id, to_id));
+                            let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            this.state.gantt.context_menu = Some(crate::gantt::ContextTarget {
+                                id: to_id,
+                                from_bar: false,
+                                x,
+                                y,
+                                link: Some((from_id, to_id)),
+                            });
+                            cx.notify();
+                        }),
+                    ),
             )
             .into_any_element()
     }
@@ -2645,6 +2770,7 @@ impl PlannerView {
         };
         let id = target.id;
         let from_row = !target.from_bar;
+        let link = target.link;
         let menu_w = 240.0;
         let x = target
             .x
@@ -2673,6 +2799,16 @@ impl PlannerView {
             .bg(cx.theme().popover)
             .rounded_md()
             .shadow_md()
+            .when_some(link, |el, (from_id, to_id)| {
+                el.child(self.menu_item("Remove link", cx, move |this, cx| {
+                    this.state.gantt.context_menu = None;
+                    this.state.gantt.selected_link = None;
+                    this.spawn_state(cx, move |mut state| async move {
+                        let result = state.remove_dependency(to_id, from_id).await;
+                        (state, result)
+                    });
+                }))
+            })
             .child(self.menu_item("Open", cx, move |this, cx| this.open_form(id, cx)))
             .child(
                 self.menu_item("Open in Azure DevOps", cx, move |this, _cx| {
@@ -3015,28 +3151,18 @@ impl PlannerView {
                         .gap_2()
                         .items_center()
                         .child(
-                            div()
-                                .id(SharedString::from(format!("form-boolean-box-{id}")))
-                                .debug_selector(|| "form-boolean-box".into())
-                                .size(px(16.))
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(cx.theme().primary)
-                                .when(checked, |el| el.bg(cx.theme().primary))
-                                .when(!checked, |el| el.bg(cx.theme().background)),
-                        )
-                        .child(
                             Checkbox::new(SharedString::from(format!("form-bool-{id}")))
                                 .checked(checked)
                                 .label(if checked { "Yes" } else { "No" })
                                 .tab_stop(false)
                                 .focus_ring(false)
-                                .on_click(move |_, _, app| {
+                                .on_click(move |next, _, app| {
+                                    let next = *next;
                                     entity.update(app, |this, cx| {
                                         if let Some(form) = this.state.form.as_mut() {
                                             form.values.insert(
                                                 field.clone(),
-                                                serde_json::Value::Bool(!checked),
+                                                serde_json::Value::Bool(next),
                                             );
                                         }
                                         cx.notify();
@@ -3437,6 +3563,19 @@ impl PlannerView {
             return;
         }
         if self.inline_edit.is_some() {
+            return;
+        }
+        if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform) && key == "z" {
+            self.undo_last(cx);
+            return;
+        }
+        if matches!(key, "delete" | "backspace")
+            && let Some((from_id, to_id)) = self.state.gantt.selected_link.take()
+        {
+            self.spawn_state(cx, move |mut state| async move {
+                let result = state.remove_dependency(to_id, from_id).await;
+                (state, result)
+            });
             return;
         }
         if self.state.form.is_some() || self.popup_open() {
