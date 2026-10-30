@@ -1,0 +1,24 @@
+{
+  "withDates": [
+    {
+      "referenceName": "System.Title",
+      "type": "string",
+      "alwaysRequired": true
+    },
+    {
+      "referenceName": "System.State",
+      "type": "string",
+      "isPicklist": true,
+      "allowedValues": ["New", "Active", "Closed"]
+    },
+    {
+      "referenceName": "System.AssignedTo",
+      "type": "string",
+      "isIdentity": true
+    },
+    { "referenceName": "System.Description", "type": "html" },
+    { "referenceName": "Microsoft.VSTS.Scheduling.StartDate", "type": "dateTime" },
+    { "referenceName": "Microsoft.VSTS.Scheduling.TargetDate", "type": "dateTime" }
+  ],
+  "typesWithDates": ["Epic", "Feature", "User Story", "Task"]
+}

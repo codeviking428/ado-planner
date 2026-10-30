@@ -1,0 +1,31 @@
+{
+  "Platform": {
+    "value": [
+      {
+        "identity": {
+          "displayName": "Ada Lovelace",
+          "uniqueName": "ada@contoso.com",
+          "id": "a1"
+        }
+      },
+      {
+        "identity": {
+          "displayName": "Grace Hopper",
+          "uniqueName": "grace@contoso.com",
+          "id": "g1"
+        }
+      }
+    ]
+  },
+  "Delivery": {
+    "value": [
+      {
+        "identity": {
+          "displayName": "Grace Hopper",
+          "uniqueName": "grace@contoso.com",
+          "id": "g1"
+        }
+      }
+    ]
+  }
+}

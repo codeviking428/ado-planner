@@ -1,0 +1,231 @@
+use ado_core::{START_DATE_FIELD, TARGET_DATE_FIELD};
+use serde_json::{Value, json};
+
+fn fixtures(name: &str) -> Value {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../e2e/fixtures");
+    let text = std::fs::read_to_string(dir.join(name)).expect("fixture");
+    serde_json::from_str(&text).expect("json")
+}
+
+async fn get(client: &reqwest::Client, url: &str, path: &str) -> (u16, Value) {
+    let response = client
+        .get(format!("{url}{path}"))
+        .send()
+        .await
+        .expect("get");
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
+async fn post(client: &reqwest::Client, url: &str, path: &str, body: Value) -> (u16, Value) {
+    let response = client
+        .post(format!("{url}{path}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("post");
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
+async fn patch(client: &reqwest::Client, url: &str, path: &str, body: Value) -> (u16, Value) {
+    let response = client
+        .patch(format!("{url}{path}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("patch");
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
+#[tokio::test]
+async fn snapshots_each_route() {
+    let mock = ado_mock::start().await;
+    let client = reqwest::Client::new();
+    let url = &mock.url;
+
+    let (status, body) = get(&client, url, "/contoso/_apis/connectionData").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("connection-data.json"));
+
+    let (status, body) = get(&client, url, "/_apis/profile/profiles/me").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("profile.json"));
+
+    let (status, body) = get(&client, url, "/_apis/accounts").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("accounts.json"));
+
+    let (status, body) = get(&client, url, "/contoso/_apis/projects").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("projects.json")["contoso"]);
+
+    let (status, body) = get(&client, url, "/fabrikam/_apis/projects").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("projects.json")["fabrikam"]);
+
+    let (status, body) = get(&client, url, "/contoso/_apis/projects/Shop").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("process.json")["project"]);
+
+    let (status, body) = get(&client, url, "/contoso/_apis/projects/Shop/teams").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("teams.json")["Shop"]);
+
+    let (status, body) = get(&client, url, "/contoso/_apis/projects/Roadmap/teams").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("teams.json")["Roadmap"]);
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/_apis/projects/Shop/teams/Platform/members",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("members.json")["Platform"]);
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/_apis/projects/Roadmap/teams/Delivery/members",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("members.json")["Delivery"]);
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/Shop/Platform/_apis/work/teamsettings/teamfieldvalues",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("team-field-values.json"));
+
+    let (status, body) = get(&client, url, "/contoso/Shop/Platform/_apis/work/backlogs").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("backlogs.json"));
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/Shop/Platform/_apis/work/teamsettings/iterations",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("iterations.json"));
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/_apis/work/processes/adcc42ab-9882-485e-a3ed-7678f126f1c0/workItemTypes",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("process.json")["workItemTypes"]);
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/Shop/_apis/wit/workitemtypes/Epic/fields",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["value"], fixtures("type-fields.json")["withDates"]);
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/_apis/work/processes/agile/workItemTypes/User%20Story/layout",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("layout.json"));
+
+    let (status, body) = post(
+        &client,
+        url,
+        "/contoso/Shop/_apis/wit/wiql",
+        json!({ "query": "SELECT [System.Id] FROM WorkItems" }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["workItems"],
+        json!([{ "id": 1001 }, { "id": 1002 }, { "id": 1003 }, { "id": 1005 }, { "id": 1012 }])
+    );
+
+    let (status, body) = post(
+        &client,
+        url,
+        "/contoso/Shop/_apis/wit/workitemsbatch",
+        json!({ "ids": [1003] }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["value"][0]["id"], 1003);
+
+    let (status, body) = get(&client, url, "/contoso/Shop/_apis/wit/workitems/1003").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["fields"]["System.Title"], "Persist cart");
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/_apis/identities?searchFilter=General",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("identities.json"));
+
+    mock.close().await;
+}
+
+#[tokio::test]
+async fn patch_rev_conflict_and_success() {
+    let mock = ado_mock::start().await;
+    let client = reqwest::Client::new();
+    let url = &mock.url;
+
+    let (status, _) = patch(
+        &client,
+        url,
+        "/contoso/Shop/_apis/wit/workitems/1003",
+        json!([
+            { "op": "test", "path": "/rev", "value": 1 },
+            { "op": "add", "path": "/fields/System.Title", "value": "nope" }
+        ]),
+    )
+    .await;
+    assert_eq!(status, 412);
+
+    let (status, body) = patch(
+        &client,
+        url,
+        "/contoso/Shop/_apis/wit/workitems/1003",
+        json!([
+            { "op": "test", "path": "/rev", "value": 5 },
+            { "op": "add", "path": format!("/fields/{START_DATE_FIELD}"), "value": "2026-07-07T00:00:00Z" },
+            { "op": "add", "path": format!("/fields/{TARGET_DATE_FIELD}"), "value": "2026-07-21T00:00:00Z" }
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["rev"], 6);
+    assert_eq!(body["fields"][START_DATE_FIELD], "2026-07-07T00:00:00Z");
+}
+
+#[tokio::test]
+async fn fail_next_injects_error() {
+    let mock = ado_mock::start().await;
+    mock.fail_next("/fabrikam/_apis/projects", 503, "Projects unavailable");
+    let client = reqwest::Client::new();
+    let (status, body) = get(&client, &mock.url, "/fabrikam/_apis/projects").await;
+    assert_eq!(status, 503);
+    assert_eq!(body["message"], "Projects unavailable");
+}

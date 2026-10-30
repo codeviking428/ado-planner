@@ -1,0 +1,71 @@
+[
+  {
+    "id": 1001,
+    "rev": 12,
+    "fields": {
+      "System.Title": "Checkout rewrite",
+      "System.WorkItemType": "Epic",
+      "System.State": "New",
+      "System.AreaPath": "Shop\\Platform",
+      "System.IterationPath": "Shop\\FY26",
+      "Microsoft.VSTS.Scheduling.StartDate": "2026-07-01T00:00:00Z",
+      "Microsoft.VSTS.Scheduling.TargetDate": "2026-09-30T00:00:00Z"
+    }
+  },
+  {
+    "id": 1002,
+    "rev": 8,
+    "fields": {
+      "System.Title": "Cart",
+      "System.WorkItemType": "Feature",
+      "System.State": "Active",
+      "System.Parent": 1001,
+      "System.AreaPath": "Shop\\Platform",
+      "System.IterationPath": "Shop\\FY26\\Sprint 11",
+      "Microsoft.VSTS.Scheduling.StartDate": "2026-07-06T00:00:00Z",
+      "Microsoft.VSTS.Scheduling.TargetDate": "2026-08-14T00:00:00Z"
+    }
+  },
+  {
+    "id": 1003,
+    "rev": 5,
+    "fields": {
+      "System.Title": "Persist cart",
+      "System.WorkItemType": "User Story",
+      "System.State": "Active",
+      "System.Parent": 1002,
+      "System.AssignedTo": {
+        "displayName": "Ada Lovelace",
+        "uniqueName": "ada@contoso.com"
+      },
+      "System.AreaPath": "Shop\\Platform",
+      "System.IterationPath": "Shop\\FY26\\Sprint 10",
+      "System.Description": "<p>Keep the cart</p>",
+      "Microsoft.VSTS.Scheduling.StartDate": "2026-07-06T00:00:00Z",
+      "Microsoft.VSTS.Scheduling.TargetDate": "2026-07-20T00:00:00Z"
+    }
+  },
+  {
+    "id": 1005,
+    "rev": 1,
+    "fields": {
+      "System.Title": "Cart UI",
+      "System.WorkItemType": "Task",
+      "System.State": "New",
+      "System.Parent": 1003,
+      "System.AreaPath": "Shop\\Platform",
+      "System.IterationPath": "Shop\\FY26\\Sprint 12"
+    }
+  },
+  {
+    "id": 1012,
+    "rev": 2,
+    "fields": {
+      "System.Title": "Unparented spike",
+      "System.WorkItemType": "Task",
+      "System.State": "Active",
+      "System.AreaPath": "Shop\\Platform",
+      "System.IterationPath": "Shop\\FY26\\Sprint 12"
+    }
+  }
+]

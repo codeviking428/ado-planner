@@ -1,0 +1,21 @@
+{
+  "processId": "agile-process-id",
+  "project": {
+    "id": "p1",
+    "name": "Shop",
+    "capabilities": {
+      "processTemplate": {
+        "templateName": "Agile",
+        "templateTypeId": "adcc42ab-9882-485e-a3ed-7678f126f1c0"
+      }
+    }
+  },
+  "workItemTypes": {
+    "value": [
+      { "referenceName": "Microsoft.VSTS.WorkItemTypes.Epic", "name": "Epic" },
+      { "referenceName": "Microsoft.VSTS.WorkItemTypes.Feature", "name": "Feature" },
+      { "referenceName": "Microsoft.VSTS.WorkItemTypes.UserStory", "name": "User Story" },
+      { "referenceName": "Microsoft.VSTS.WorkItemTypes.Task", "name": "Task" }
+    ]
+  }
+}

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { START_DATE_FIELD, TARGET_DATE_FIELD } from '../src/shared/types'
 
@@ -20,81 +22,18 @@ export type AdoMock = {
   close: () => Promise<void>
 }
 
-const TYPES_WITH_DATES = new Set(['Epic', 'Feature', 'User Story', 'Task'])
+const FIXTURES = join(__dirname, 'fixtures')
 
-function day(iso: string) {
-  return `${iso}T00:00:00Z`
+function loadJson<T>(name: string): T {
+  return JSON.parse(readFileSync(join(FIXTURES, name), 'utf8')) as T
 }
 
+const TYPES_WITH_DATES = new Set(
+  loadJson<{ typesWithDates: string[] }>('type-fields.json').typesWithDates
+)
+
 function seedItems(): WorkItemRecord[] {
-  return [
-    {
-      id: 1001,
-      rev: 12,
-      fields: {
-        'System.Title': 'Checkout rewrite',
-        'System.WorkItemType': 'Epic',
-        'System.State': 'New',
-        'System.AreaPath': 'Shop\\Platform',
-        'System.IterationPath': 'Shop\\FY26',
-        [START_DATE_FIELD]: day('2026-07-01'),
-        [TARGET_DATE_FIELD]: day('2026-09-30')
-      }
-    },
-    {
-      id: 1002,
-      rev: 8,
-      fields: {
-        'System.Title': 'Cart',
-        'System.WorkItemType': 'Feature',
-        'System.State': 'Active',
-        'System.Parent': 1001,
-        'System.AreaPath': 'Shop\\Platform',
-        'System.IterationPath': 'Shop\\FY26\\Sprint 11',
-        [START_DATE_FIELD]: day('2026-07-06'),
-        [TARGET_DATE_FIELD]: day('2026-08-14')
-      }
-    },
-    {
-      id: 1003,
-      rev: 5,
-      fields: {
-        'System.Title': 'Persist cart',
-        'System.WorkItemType': 'User Story',
-        'System.State': 'Active',
-        'System.Parent': 1002,
-        'System.AssignedTo': { displayName: 'Ada Lovelace', uniqueName: 'ada@contoso.com' },
-        'System.AreaPath': 'Shop\\Platform',
-        'System.IterationPath': 'Shop\\FY26\\Sprint 10',
-        'System.Description': '<p>Keep the cart</p>',
-        [START_DATE_FIELD]: day('2026-07-06'),
-        [TARGET_DATE_FIELD]: day('2026-07-20')
-      }
-    },
-    {
-      id: 1005,
-      rev: 1,
-      fields: {
-        'System.Title': 'Cart UI',
-        'System.WorkItemType': 'Task',
-        'System.State': 'New',
-        'System.Parent': 1003,
-        'System.AreaPath': 'Shop\\Platform',
-        'System.IterationPath': 'Shop\\FY26\\Sprint 12'
-      }
-    },
-    {
-      id: 1012,
-      rev: 2,
-      fields: {
-        'System.Title': 'Unparented spike',
-        'System.WorkItemType': 'Task',
-        'System.State': 'Active',
-        'System.AreaPath': 'Shop\\Platform',
-        'System.IterationPath': 'Shop\\FY26\\Sprint 12'
-      }
-    }
-  ]
+  return structuredClone(loadJson<WorkItemRecord[]>('work-items.json'))
 }
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -110,59 +49,25 @@ async function readBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-const LAYOUT = {
-  systemControls: [
-    { id: 'System.Title', label: 'Title', visible: true, controlType: 'FieldControl' },
-    { id: 'System.State', label: 'State', visible: true, controlType: 'FieldControl' }
-  ],
-  pages: [
-    {
-      id: 'details',
-      label: 'Details',
-      visible: true,
-      pageType: 'custom',
-      sections: [
-        {
-          groups: [
-            {
-              id: 'planning',
-              label: 'Planning',
-              visible: true,
-              controls: [
-                {
-                  id: 'System.AssignedTo',
-                  label: 'Assigned To',
-                  visible: true,
-                  controlType: 'FieldControl'
-                },
-                {
-                  id: 'System.Description',
-                  label: 'Description',
-                  visible: true,
-                  controlType: 'HtmlFieldControl'
-                }
-              ]
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}
-
-const TYPE_FIELDS = [
-  { referenceName: 'System.Title', type: 'string', alwaysRequired: true },
-  {
-    referenceName: 'System.State',
-    type: 'string',
-    isPicklist: true,
-    allowedValues: ['New', 'Active', 'Closed']
-  },
-  { referenceName: 'System.AssignedTo', type: 'string', isIdentity: true },
-  { referenceName: 'System.Description', type: 'html' },
-  { referenceName: START_DATE_FIELD, type: 'dateTime' },
-  { referenceName: TARGET_DATE_FIELD, type: 'dateTime' }
-]
+const LAYOUT = loadJson('layout.json')
+const TYPE_FIELDS_FILE = loadJson<{
+  withDates: Array<Record<string, unknown>>
+}>('type-fields.json')
+const CONNECTION_DATA = loadJson('connection-data.json')
+const PROFILE = loadJson('profile.json')
+const ACCOUNTS = loadJson('accounts.json')
+const PROJECTS = loadJson<Record<string, { value: unknown }>>('projects.json')
+const TEAMS = loadJson<Record<string, { value: unknown }>>('teams.json')
+const MEMBERS = loadJson<Record<string, { value: unknown }>>('members.json')
+const ITERATIONS = loadJson('iterations.json')
+const TEAM_FIELD_VALUES = loadJson('team-field-values.json')
+const BACKLOGS = loadJson('backlogs.json')
+const IDENTITIES = loadJson('identities.json')
+const PROCESS = loadJson<{
+  processId: string
+  project: unknown
+  workItemTypes: unknown
+}>('process.json')
 
 export function startAdoMock(port = 0) {
   const items = seedItems()
@@ -186,115 +91,56 @@ export function startAdoMock(port = 0) {
       }
 
       if (path.endsWith('/_apis/connectionData')) {
-        return json(res, 200, {
-          authenticatedUser: {
-            uniqueName: 'ada@contoso.com',
-            providerDisplayName: 'Ada Lovelace'
-          }
-        })
+        return json(res, 200, CONNECTION_DATA)
       }
       if (path.endsWith('/_apis/profile/profiles/me')) {
-        return json(res, 200, {
-          id: 'user-1',
-          displayName: 'Ada Lovelace',
-          emailAddress: 'ada@contoso.com'
-        })
+        return json(res, 200, PROFILE)
       }
       if (path.endsWith('/_apis/accounts')) {
-        return json(res, 200, {
-          value: [{ accountName: 'contoso' }, { accountName: 'fabrikam' }]
-        })
+        return json(res, 200, ACCOUNTS)
       }
       if (path.endsWith('/_apis/projects') && method === 'GET') {
         return json(
           res,
           200,
-          path.startsWith('/fabrikam/')
-            ? { value: [{ id: 'p2', name: 'Roadmap' }] }
-            : { value: [{ id: 'p1', name: 'Shop' }] }
+          path.startsWith('/fabrikam/') ? PROJECTS.fabrikam : PROJECTS.contoso
         )
+      }
+      if (path.includes('/_apis/projects/') && method === 'GET' && !path.includes('/teams')) {
+        const projectMatch = path.match(/\/_apis\/projects\/([^/]+)$/)
+        if (projectMatch) {
+          return json(res, 200, PROCESS.project)
+        }
       }
       if (path.includes('/teams/') && path.endsWith('/members')) {
         return json(
           res,
           200,
           path.includes('/Delivery/') || path.includes('/Roadmap/')
-            ? {
-                value: [
-                  {
-                    identity: {
-                      displayName: 'Grace Hopper',
-                      uniqueName: 'grace@contoso.com',
-                      id: 'g1'
-                    }
-                  }
-                ]
-              }
-            : {
-                value: [
-                  {
-                    identity: {
-                      displayName: 'Ada Lovelace',
-                      uniqueName: 'ada@contoso.com',
-                      id: 'a1'
-                    }
-                  },
-                  {
-                    identity: {
-                      displayName: 'Grace Hopper',
-                      uniqueName: 'grace@contoso.com',
-                      id: 'g1'
-                    }
-                  }
-                ]
-              }
+            ? MEMBERS.Delivery
+            : MEMBERS.Platform
         )
       }
       if (path.includes('/_apis/projects/') && path.endsWith('/teams')) {
-        return json(
-          res,
-          200,
-          path.includes('/Roadmap/')
-            ? { value: [{ id: 't2', name: 'Delivery' }] }
-            : { value: [{ id: 't1', name: 'Platform' }] }
-        )
+        return json(res, 200, path.includes('/Roadmap/') ? TEAMS.Roadmap : TEAMS.Shop)
       }
       if (path.includes('/teamfieldvalues')) {
-        return json(res, 200, {
-          values: [{ value: 'Shop\\Platform', includeChildren: true }]
-        })
+        return json(res, 200, TEAM_FIELD_VALUES)
       }
       if (path.endsWith('/backlogs')) {
-        return json(res, 200, {
-          value: [
-            { rank: 30, workItemTypes: [{ name: 'Epic' }] },
-            { rank: 20, workItemTypes: [{ name: 'Feature' }] },
-            { rank: 10, workItemTypes: [{ name: 'User Story' }] },
-            { rank: 5, workItemTypes: [{ name: 'Task' }] }
-          ]
-        })
+        return json(res, 200, BACKLOGS)
       }
       if (path.includes('/teamsettings/iterations')) {
-        return json(res, 200, {
-          value: [
-            {
-              name: 'Sprint 10',
-              path: 'Shop\\FY26\\Sprint 10',
-              attributes: { startDate: day('2026-07-13'), finishDate: day('2026-07-24') }
-            },
-            {
-              name: 'Sprint 12',
-              path: 'Shop\\FY26\\Sprint 12',
-              attributes: { startDate: day('2026-08-10'), finishDate: day('2026-08-21') }
-            }
-          ]
-        })
+        return json(res, 200, ITERATIONS)
+      }
+      if (path.includes('/work/processes/') && path.endsWith('/workItemTypes')) {
+        return json(res, 200, PROCESS.workItemTypes)
       }
       if (path.includes('/workitemtypes/') && path.includes('/fields')) {
         const type = decodeURIComponent(path.split('/workitemtypes/')[1]?.split('/')[0] ?? '')
         const fields = TYPES_WITH_DATES.has(type)
-          ? TYPE_FIELDS
-          : TYPE_FIELDS.filter(
+          ? TYPE_FIELDS_FILE.withDates
+          : TYPE_FIELDS_FILE.withDates.filter(
               (field) =>
                 field.referenceName !== START_DATE_FIELD &&
                 field.referenceName !== TARGET_DATE_FIELD
@@ -339,9 +185,7 @@ export function startAdoMock(port = 0) {
         return json(res, 200, item)
       }
       if (path.includes('/identities')) {
-        return json(res, 200, {
-          value: [{ displayName: 'Ada Lovelace', uniqueName: 'ada@contoso.com' }]
-        })
+        return json(res, 200, IDENTITIES)
       }
       json(res, 404, { message: `unmocked ${method} ${path}` })
     } catch (error) {

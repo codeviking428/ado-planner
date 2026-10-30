@@ -1,0 +1,25 @@
+[package]
+name = "ado-mock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Loopback Azure DevOps REST mock for planner tests"
+publish = false
+
+[dependencies]
+ado-core.workspace = true
+axum = { version = "0.8", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+tower = "0.5"
+tracing.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

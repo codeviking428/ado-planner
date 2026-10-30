@@ -1,0 +1,84 @@
+name: Release (Rust)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver to publish (no v prefix), e.g. 0.2.0
+        required: true
+        type: string
+
+concurrency:
+  group: release-rust
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            packager-args: --formats nsis --release
+          - name: Linux
+            os: ubuntu-latest
+            packager-args: --formats appimage --release
+          - name: macOS
+            os: macos-latest
+            packager-args: --formats dmg --release
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux GPUI deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan-dev cmake pkg-config libfontconfig1-dev libfreetype6-dev clang
+
+      - name: Install cargo-packager
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager
+
+      - name: Package
+        working-directory: crates/app
+        run: cargo packager ${{ matrix.packager-args }}
+        env:
+          UPDATER_PRIVATE_KEY: ${{ secrets.UPDATER_PRIVATE_KEY }}
+          UPDATER_PRIVATE_KEY_PASSWORD: ${{ secrets.UPDATER_PRIVATE_KEY_PASSWORD }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ado-planner-${{ matrix.name }}
+          path: release/rust/**
+
+  publish:
+    needs: pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create GitHub prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rust-v${{ inputs.version }}
+          name: ADO Planner ${{ inputs.version }} (Rust)
+          prerelease: true
+          files: dist/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

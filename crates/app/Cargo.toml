@@ -1,0 +1,64 @@
+[package]
+name = "ado-planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ADO Planner native GPUI app"
+publish = false
+default-run = "ado-planner"
+
+[[bin]]
+name = "ado-planner"
+path = "src/main.rs"
+
+[lib]
+name = "ado_planner"
+path = "src/lib.rs"
+
+[dependencies]
+ado-client.workspace = true
+ado-core.workspace = true
+ado-session.workspace = true
+async-trait.workspace = true
+dirs.workspace = true
+gpui-kit.workspace = true
+jiff.workspace = true
+open.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+single-instance.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+cargo-packager-updater = "0.2"
+
+[dev-dependencies]
+ado-mock.workspace = true
+gpui-kit = { version = "0.8.1", features = ["component", "assets", "test-support"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.packager]
+product-name = "ADO Planner"
+identifier = "com.codeviking428.ado-planner"
+before-packaging-command = "cargo build --release -p ado-planner"
+formats = ["nsis", "appimage", "dmg"]
+out-dir = "../../release/rust"
+binaries = [{ path = "ado-planner", main = true }]
+
+[package.metadata.packager.nsis]
+installer-mode = "perMachine"
+
+[package.metadata.packager.updater]
+endpoints = [
+    "https://github.com/codeviking428/ado-planner/releases/latest/download/latest.json",
+]
+# Public minisign key. Replace with the key that matches UPDATER_PRIVATE_KEY in GitHub secrets.
+pubkey = ""

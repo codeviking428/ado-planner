@@ -1,0 +1,20 @@
+{
+  "value": [
+    {
+      "name": "Sprint 10",
+      "path": "Shop\\FY26\\Sprint 10",
+      "attributes": {
+        "startDate": "2026-07-13T00:00:00Z",
+        "finishDate": "2026-07-24T00:00:00Z"
+      }
+    },
+    {
+      "name": "Sprint 12",
+      "path": "Shop\\FY26\\Sprint 12",
+      "attributes": {
+        "startDate": "2026-08-10T00:00:00Z",
+        "finishDate": "2026-08-21T00:00:00Z"
+      }
+    }
+  ]
+}
