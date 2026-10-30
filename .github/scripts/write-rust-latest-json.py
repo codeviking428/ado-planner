@@ -28,20 +28,39 @@ def signature_for(path: Path) -> str | None:
     return sig.read_text(encoding="utf-8").strip() or None
 
 
-def platform_for(path: Path) -> tuple[str, str] | None:
+def darwin_arch(name: str) -> str:
+    """Arch for a macOS artifact name.
+
+    cargo-packager often omits arch from `.app.tar.gz` names. This workflow
+    only packs macOS on `macos-latest` (Apple Silicon), so unlabeled Darwin
+    artifacts are aarch64. Explicit x86_64 tokens still map to Intel.
+    """
+    if any(token in name for token in ("aarch64", "arm64")):
+        return "aarch64"
+    if any(token in name for token in ("x86_64", "amd64", "x64", "intel")):
+        return "x86_64"
+    return "aarch64"
+
+
+def mac_platform_keys(arch: str) -> list[str]:
+    # cargo-packager-updater 0.2 README examples use `darwin-*`; the 0.2.3
+    # client looks up `macos-{arch}` via get_updater_target(). Emit both.
+    return [f"darwin-{arch}", f"macos-{arch}"]
+
+
+def platform_for(path: Path) -> tuple[list[str], str] | None:
     name = path.name.lower()
     if name.endswith(".sig"):
         return None
     if name.endswith(".exe") or "nsis" in name or name.endswith(".msi"):
-        return "windows-x86_64", "nsis" if not name.endswith(".msi") else "wix"
+        fmt = "nsis" if not name.endswith(".msi") else "wix"
+        return ["windows-x86_64"], fmt
     if "appimage" in name:
-        return "linux-x86_64", "appimage"
+        return ["linux-x86_64"], "appimage"
     if name.endswith(".app.tar.gz") or name.endswith(".app.tar.gz.zip"):
-        key = "darwin-aarch64" if any(token in name for token in ("aarch64", "arm64")) else "darwin-x86_64"
-        return key, "app"
-    if name.endswith(".dmg"):
-        key = "darwin-aarch64" if any(token in name for token in ("aarch64", "arm64")) else "darwin-x86_64"
-        return key, "app"
+        return mac_platform_keys(darwin_arch(name)), "app"
+    # DMGs are GitHub-release downloads only. cargo-packager-updater's `app`
+    # format gunzips a .app tar; advertising a .dmg as `app` would fail install.
     return None
 
 
@@ -49,7 +68,7 @@ def rank(path: Path) -> int:
     name = path.name.lower()
     if name.endswith(".nsis.zip") or name.endswith(".app.tar.gz") or "appimage.tar.gz" in name:
         return 0
-    if name.endswith(".exe") or name.endswith(".appimage") or name.endswith(".dmg"):
+    if name.endswith(".exe") or name.endswith(".appimage"):
         return 1
     return 2
 
@@ -66,7 +85,7 @@ def collect(dist: Path, repo: str, tag: str) -> dict[str, dict[str, str]]:
         mapped = platform_for(path)
         if mapped is None:
             continue
-        key, fmt = mapped
+        keys, fmt = mapped
         signature = signature_for(path)
         if signature is None:
             continue
@@ -76,9 +95,10 @@ def collect(dist: Path, repo: str, tag: str) -> dict[str, dict[str, str]]:
             "format": fmt,
         }
         score = rank(path)
-        previous = candidates.get(key)
-        if previous is None or score < previous[0]:
-            candidates[key] = (score, entry)
+        for key in keys:
+            previous = candidates.get(key)
+            if previous is None or score < previous[0]:
+                candidates[key] = (score, entry)
     return {key: entry for key, (_, entry) in sorted(candidates.items())}
 
 
