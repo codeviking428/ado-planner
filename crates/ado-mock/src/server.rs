@@ -26,6 +26,7 @@ struct AppState {
     pending: StdMutex<Vec<Pending>>,
     fixtures: Fixtures,
     patches: StdMutex<Vec<String>>,
+    last_patch_content_type: StdMutex<Option<String>>,
 }
 
 pub struct AdoMock {
@@ -55,6 +56,14 @@ impl AdoMock {
         self.state.patches.lock().expect("patches").len()
     }
 
+    pub fn last_patch_content_type(&self) -> Option<String> {
+        self.state
+            .last_patch_content_type
+            .lock()
+            .expect("content-type")
+            .clone()
+    }
+
     pub async fn close(mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -78,6 +87,7 @@ pub async fn start() -> AdoMock {
         pending: StdMutex::new(Vec::new()),
         fixtures,
         patches: StdMutex::new(Vec::new()),
+        last_patch_content_type: StdMutex::new(None),
     });
     let app = Router::new()
         .fallback(any(handle))
@@ -287,6 +297,11 @@ async fn route(
                 .lock()
                 .expect("patches")
                 .push(path.to_string());
+            *state.last_patch_content_type.lock().expect("content-type") = req
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
             let document = read_json(req).await?;
             let ops = document.as_array().cloned().unwrap_or_default();
             let current_rev = items[index].get("rev").and_then(Value::as_i64).unwrap_or(0);

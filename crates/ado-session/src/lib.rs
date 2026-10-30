@@ -10,7 +10,8 @@ mod shared;
 
 pub use auth_mode::entra_client_id_from_env;
 pub use identity::{
-    PatIdentity, fetch_pat_identity, identity_from_connection_data, identity_from_profile,
+    PatIdentity, fetch_pat_identity, fetch_session_identity, identity_from_connection_data,
+    identity_from_profile,
 };
 pub use oauth::OauthEndpoints;
 pub use organization::normalize_organization;

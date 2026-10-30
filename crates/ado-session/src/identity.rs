@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 
-use ado_client::{AuthScheme, authorization_header};
+use ado_client::{AuthScheme, authorization_header, resolve_ado_base, resolve_vssps_base};
 use ado_core::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,30 +134,35 @@ pub async fn fetch_pat_identity(
     ado_base: Option<&str>,
     vssps_base: Option<&str>,
 ) -> Result<Option<PatIdentity>, Error> {
+    fetch_session_identity(pat, AuthScheme::Pat, Some(org), ado_base, vssps_base).await
+}
+
+pub async fn fetch_session_identity(
+    token: &str,
+    scheme: AuthScheme,
+    org: Option<&str>,
+    ado_base: Option<&str>,
+    vssps_base: Option<&str>,
+) -> Result<Option<PatIdentity>, Error> {
     let env_ado = std::env::var("ADO_PLANNER_ADO_BASE_URL").ok();
     let env_vssps = std::env::var("ADO_PLANNER_VSSPS_URL").ok();
-    let ado_base = ado_base
-        .map(ToOwned::to_owned)
-        .or(env_ado)
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://dev.azure.com".into())
-        .trim_end_matches('/')
-        .to_string();
-    let vssps = vssps_base
-        .map(ToOwned::to_owned)
-        .or(env_vssps)
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| ado_base.clone())
-        .trim_end_matches('/')
-        .to_string();
-    let header = authorization_header(pat, AuthScheme::Pat);
-    let client = reqwest::Client::new();
-    let connection = get_json::<ConnectionDataPayload>(
-        &client,
-        &header,
-        &format!("{ado_base}/{org}/_apis/connectionData?api-version=7.1"),
-    )
-    .await;
+    let ado_base = resolve_ado_base(ado_base, env_ado.as_deref());
+    let vssps = resolve_vssps_base(vssps_base, env_vssps.as_deref(), &ado_base);
+    let header = authorization_header(token, scheme);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let connection = if let Some(org) = org.filter(|org| !org.is_empty()) {
+        get_json::<ConnectionDataPayload>(
+            &client,
+            &header,
+            &format!("{ado_base}/{org}/_apis/connectionData?api-version=7.1"),
+        )
+        .await
+    } else {
+        None
+    };
     let profile = get_json::<ProfilePayload>(
         &client,
         &header,

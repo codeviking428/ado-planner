@@ -7,11 +7,11 @@ use ado_client::{AdoClient, AuthScheme, StaticTokens, TokenSource};
 use ado_core::{AuthMode, Error, SessionInfo};
 
 use crate::auth_mode::entra_client_id;
-use crate::identity::{PatIdentity, fetch_pat_identity};
+use crate::identity::{PatIdentity, fetch_pat_identity, fetch_session_identity};
 use crate::oauth::{self, OauthEndpoints};
 use crate::organization::normalize_organization;
 use crate::persist::{
-    EncryptedStore, FileStore, MemoryStore, StoredOauth, StoredPat, delete_keyring_key,
+    EncryptedStore, FileStore, MemoryStore, StoredOauth, StoredPat, delete_keyring_key, unix_now,
 };
 
 pub struct LoginCreds {
@@ -86,17 +86,45 @@ impl PlannerSession {
         self.scheme
     }
 
-    fn load_pat(&mut self) -> Option<StoredPat> {
-        if !self.loaded {
-            self.loaded = true;
-            if self.store.persist_to_disk()
-                && let Some(plain) = self.store.read_plain()
-            {
-                self.memory_pat = serde_json::from_str(&plain).ok();
-                self.memory_oauth = serde_json::from_str(&plain).ok();
-            }
+    fn load_stored(&mut self) {
+        if self.loaded {
+            return;
         }
+        self.loaded = true;
+        if self.store.persist_to_disk()
+            && let Some(plain) = self.store.read_plain()
+        {
+            self.memory_pat = serde_json::from_str(&plain).ok();
+            self.memory_oauth = serde_json::from_str(&plain).ok();
+        }
+    }
+
+    fn load_pat(&mut self) -> Option<StoredPat> {
+        self.load_stored();
         self.memory_pat.clone()
+    }
+
+    fn persist_oauth(&self, stored: &StoredOauth) -> Result<(), Error> {
+        if self.store.persist_to_disk() {
+            self.store
+                .write_plain(&serde_json::to_string(stored).unwrap_or_else(|_| "{}".into()))?;
+        }
+        Ok(())
+    }
+
+    async fn attach_oauth_identity(&self, stored: &mut StoredOauth) {
+        if let Ok(Some(identity)) = fetch_session_identity(
+            &stored.access_token,
+            AuthScheme::Bearer,
+            None,
+            self.ado_base.as_deref(),
+            self.vssps_base.as_deref(),
+        )
+        .await
+        {
+            stored.display_name = Some(identity.display_name);
+            stored.username = Some(identity.username);
+        }
     }
 
     pub async fn login(&mut self, creds: Option<LoginCreds>) -> Result<SessionInfo, Error> {
@@ -170,13 +198,10 @@ impl PlannerSession {
             start.pkce_verifier,
         )
         .await?;
-        stored.username = stored.username.clone();
+        self.attach_oauth_identity(&mut stored).await;
         self.memory_oauth = Some(stored.clone());
         self.loaded = true;
-        if self.store.persist_to_disk() {
-            self.store
-                .write_plain(&serde_json::to_string(&stored).unwrap_or_else(|_| "{}".into()))?;
-        }
+        self.persist_oauth(&stored)?;
         self.session_info().await
     }
 
@@ -196,7 +221,7 @@ impl PlannerSession {
         if parsed != code {
             return Err(Error::message("code mismatch"));
         }
-        let stored = oauth::exchange_code(
+        let mut stored = oauth::exchange_code(
             &client_id,
             &self.oauth_endpoints,
             redirect,
@@ -204,52 +229,57 @@ impl PlannerSession {
             pkce_verifier,
         )
         .await?;
+        self.attach_oauth_identity(&mut stored).await;
         self.memory_oauth = Some(stored.clone());
         self.loaded = true;
-        if self.store.persist_to_disk() {
-            self.store
-                .write_plain(&serde_json::to_string(&stored).unwrap_or_else(|_| "{}".into()))?;
-        }
+        self.persist_oauth(&stored)?;
         self.session_info().await
     }
 
     pub async fn ensure_access_token(&mut self) -> Result<String, Error> {
+        self.load_stored();
         match self.scheme {
             AuthScheme::Pat => self.access_token().await,
             AuthScheme::Bearer => {
-                if let Some(oauth) = &self.memory_oauth {
-                    if let Some(refresh_token) = &oauth.refresh_token {
-                        let client_id = self
-                            .client_id
-                            .clone()
-                            .ok_or_else(|| Error::message("ENTRA_CLIENT_ID is not set"))?;
-                        match crate::oauth::refresh(
-                            &client_id,
-                            &self.oauth_endpoints,
-                            "http://127.0.0.1",
-                            refresh_token,
-                        )
-                        .await
-                        {
-                            Ok(next) => {
-                                self.memory_oauth = Some(next.clone());
-                                if self.store.persist_to_disk() {
-                                    self.store.write_plain(
-                                        &serde_json::to_string(&next)
-                                            .unwrap_or_else(|_| "{}".into()),
-                                    )?;
-                                }
-                                return Ok(next.access_token);
-                            }
-                            Err(_) => {
-                                self.memory_oauth = None;
-                                return Err(Error::message("OAuth refresh failed"));
-                            }
-                        }
-                    }
-                    return Ok(oauth.access_token.clone());
+                let Some(oauth) = self.memory_oauth.clone() else {
+                    return Err(Error::message("No OAuth Session"));
+                };
+                if !oauth.needs_refresh(unix_now()) {
+                    return Ok(oauth.access_token);
                 }
-                Err(Error::message("No OAuth Session"))
+                let Some(refresh_token) = oauth.refresh_token.clone() else {
+                    return Ok(oauth.access_token);
+                };
+                let client_id = self
+                    .client_id
+                    .clone()
+                    .ok_or_else(|| Error::message("ENTRA_CLIENT_ID is not set"))?;
+                let redirect = oauth
+                    .redirect
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1".into());
+                match crate::oauth::refresh(
+                    &client_id,
+                    &self.oauth_endpoints,
+                    &redirect,
+                    &refresh_token,
+                )
+                .await
+                {
+                    Ok(mut next) => {
+                        if next.display_name.is_none() {
+                            next.display_name = oauth.display_name;
+                            next.username = oauth.username;
+                        }
+                        if next.refresh_token.is_none() {
+                            next.refresh_token = oauth.refresh_token;
+                        }
+                        self.memory_oauth = Some(next.clone());
+                        self.persist_oauth(&next)?;
+                        Ok(next.access_token)
+                    }
+                    Err(_) => Ok(oauth.access_token),
+                }
             }
         }
     }
@@ -299,14 +329,7 @@ impl PlannerSession {
                 })
             }
             AuthScheme::Bearer => {
-                if !self.loaded {
-                    self.loaded = true;
-                    if self.store.persist_to_disk()
-                        && let Some(plain) = self.store.read_plain()
-                    {
-                        self.memory_oauth = serde_json::from_str(&plain).ok();
-                    }
-                }
+                self.load_stored();
                 match &self.memory_oauth {
                     Some(oauth) => Ok(SessionInfo {
                         signed_in: true,

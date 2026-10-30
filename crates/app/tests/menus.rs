@@ -97,8 +97,13 @@ async fn schedule_to_iteration_sets_start_and_target() {
         .await
         .expect("schedule");
     let updated = state.nodes.iter().find(|n| n.id == node.id).unwrap();
-    assert!(updated.start_date.is_some());
-    assert!(updated.target_date.is_some());
+    let iteration = state
+        .iterations
+        .iter()
+        .find(|iteration| iteration.path == node.iteration_path)
+        .unwrap();
+    assert_eq!(updated.start_date, iteration.start_date);
+    assert_eq!(updated.target_date, iteration.finish_date);
 }
 
 #[tokio::test]

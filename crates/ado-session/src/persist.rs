@@ -187,12 +187,39 @@ pub struct StoredPat {
     pub organization: String,
 }
 
+pub const ACCESS_TOKEN_REFRESH_SKEW_SECS: i64 = 5 * 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredOauth {
     pub access_token: String,
     pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub redirect: Option<String>,
     pub display_name: Option<String>,
     pub username: Option<String>,
+}
+
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+impl StoredOauth {
+    pub fn needs_refresh(&self, now_unix: i64) -> bool {
+        if self.refresh_token.is_none() {
+            return false;
+        }
+        match self.expires_at {
+            Some(expires_at) => {
+                expires_at <= now_unix.saturating_add(ACCESS_TOKEN_REFRESH_SKEW_SECS)
+            }
+            None => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,5 +247,30 @@ mod tests {
         let store = EncryptedStore::new(Box::new(inner), None);
         store.write_plain("pat").unwrap();
         assert!(!store.persist_to_disk());
+    }
+
+    #[test]
+    fn legacy_oauth_json_without_expiry_deserializes() {
+        let stored: StoredOauth = serde_json::from_str(
+            r#"{"access_token":"a","refresh_token":"r","display_name":null,"username":null}"#,
+        )
+        .unwrap();
+        assert_eq!(stored.access_token, "a");
+        assert!(stored.expires_at.is_none());
+        assert!(stored.needs_refresh(unix_now()));
+    }
+
+    #[test]
+    fn fresh_access_token_does_not_need_refresh() {
+        let stored = StoredOauth {
+            access_token: "a".into(),
+            refresh_token: Some("r".into()),
+            expires_at: Some(unix_now() + 3600),
+            redirect: Some("http://127.0.0.1:9/".into()),
+            display_name: None,
+            username: None,
+        };
+        assert!(!stored.needs_refresh(unix_now()));
+        assert!(stored.needs_refresh(unix_now() + 3600));
     }
 }

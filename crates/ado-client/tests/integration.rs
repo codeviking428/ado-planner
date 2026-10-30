@@ -84,6 +84,10 @@ async fn every_call_against_ado_mock() {
         .await
         .expect("patch");
     assert_eq!(rev, form.rev + 1);
+    assert_eq!(
+        mock.last_patch_content_type().as_deref(),
+        Some("application/json-patch+json")
+    );
 }
 
 #[tokio::test]

@@ -141,12 +141,7 @@ pub fn build_clear_dates_patch(rev: i64) -> Vec<JsonPatchOp> {
 pub fn schedule_from_iteration(iteration: &IterationHint) -> Option<(Date, Date)> {
     let start = parse_iso_date(iteration.start_date.as_deref())?;
     let finish = parse_iso_date(iteration.finish_date.as_deref())?;
-    let target = if finish > start {
-        from_gantt_exclusive_end(finish)
-    } else {
-        finish
-    };
-    Some((start, target))
+    Some((start, finish))
 }
 
 pub fn build_start_target_patch(rev: i64, start_date: Date, target_date: Date) -> Vec<JsonPatchOp> {
@@ -391,6 +386,17 @@ mod tests {
             ),
             "2026-07-06 → 2026-07-20"
         );
+    }
+
+    #[test]
+    fn schedule_from_iteration_keeps_inclusive_finish_date() {
+        let (start, target) = schedule_from_iteration(&IterationHint {
+            start_date: Some("2026-07-13T00:00:00Z".into()),
+            finish_date: Some("2026-07-24T00:00:00Z".into()),
+        })
+        .unwrap();
+        assert_eq!(start.to_string(), "2026-07-13");
+        assert_eq!(target.to_string(), "2026-07-24");
     }
 
     #[test]

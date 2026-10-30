@@ -16,6 +16,7 @@ use ado_core::{
 };
 
 use crate::auth::{AuthScheme, TokenSource, authorization_header};
+use crate::urls::{identities_search_host, resolve_ado_base, resolve_vssps_base};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -48,16 +49,10 @@ pub struct AdoClient {
 
 impl AdoClient {
     pub fn new(tokens: Arc<dyn TokenSource>) -> Self {
-        let ado_base = std::env::var("ADO_PLANNER_ADO_BASE_URL")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(|value| value.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| "https://dev.azure.com".into());
-        let vssps_base = std::env::var("ADO_PLANNER_VSSPS_URL")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(|value| value.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| ado_base.clone());
+        let env_ado = std::env::var("ADO_PLANNER_ADO_BASE_URL").ok();
+        let env_vssps = std::env::var("ADO_PLANNER_VSSPS_URL").ok();
+        let ado_base = resolve_ado_base(None, env_ado.as_deref());
+        let vssps_base = resolve_vssps_base(None, env_vssps.as_deref(), &ado_base);
         Self::with_base_urls(tokens, ado_base, vssps_base)
     }
 
@@ -91,13 +86,17 @@ impl AdoClient {
             HeaderValue::from_str(&authorization_header(&token, self.tokens.scheme()))
                 .map_err(|err| ClientError::Message(err.to_string()))?,
         );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let content_type = if method == Method::PATCH {
+            "application/json-patch+json"
+        } else {
+            "application/json"
+        };
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
         let mut builder = self.http.request(method.clone(), url).headers(headers);
-        if method == Method::PATCH {
-            builder = builder.header(CONTENT_TYPE, "application/json-patch+json");
-        }
         if let Some(body) = body {
-            builder = builder.json(body);
+            let bytes =
+                serde_json::to_vec(body).map_err(|err| ClientError::Message(err.to_string()))?;
+            builder = builder.body(bytes);
         }
         let response = builder.send().await?;
         let status = response.status();
@@ -503,32 +502,44 @@ impl AdoClient {
         org: &str,
         query: &str,
     ) -> Result<Vec<IdentityValue>, ClientError> {
-        let payload = self
-            .get(&format!(
-                "{}/_apis/identities?searchFilter=General&filterValue={}&api-version=7.1",
-                self.org_url(org),
-                urlencoding::encode(query)
-            ))
-            .await?;
-        Ok(payload
-            .get("value")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|row| {
-                let display = row.get("displayName").and_then(Value::as_str);
-                let unique = row.get("uniqueName").and_then(Value::as_str);
-                if display.is_none() && unique.is_none() {
-                    return None;
-                }
-                Some(IdentityValue {
-                    display_name: display.or(unique).unwrap_or("").to_string(),
-                    unique_name: unique.or(display).unwrap_or("").to_string(),
-                    id: row.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
-                })
-            })
-            .collect())
+        let qs = format!(
+            "searchFilter=General&filterValue={}&api-version=7.1",
+            urlencoding::encode(query)
+        );
+        let vssps_url = format!(
+            "{}/_apis/identities?{qs}",
+            identities_search_host(&self.ado_base, org)
+        );
+        let payload = match self.get(&vssps_url).await {
+            Ok(payload) => payload,
+            Err(_) => {
+                self.get(&format!("{}/_apis/identities?{qs}", self.org_url(org)))
+                    .await?
+            }
+        };
+        Ok(parse_identities(&payload))
     }
+}
+
+fn parse_identities(payload: &Value) -> Vec<IdentityValue> {
+    payload
+        .get("value")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let display = row.get("displayName").and_then(Value::as_str);
+            let unique = row.get("uniqueName").and_then(Value::as_str);
+            if display.is_none() && unique.is_none() {
+                return None;
+            }
+            Some(IdentityValue {
+                display_name: display.or(unique).unwrap_or("").to_string(),
+                unique_name: unique.or(display).unwrap_or("").to_string(),
+                id: row.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
+            })
+        })
+        .collect()
 }
 
 fn map_named(value: Option<&Value>) -> Vec<Project> {

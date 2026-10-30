@@ -11,7 +11,7 @@ use url::Url;
 
 use ado_core::{ADO_RESOURCE_SCOPE, ENTRA_AUTHORITY, Error};
 
-use crate::persist::StoredOauth;
+use crate::persist::{StoredOauth, unix_now};
 
 type ConfiguredClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
@@ -119,7 +119,7 @@ pub async fn exchange_code(
         .request_async(&http)
         .await
         .map_err(|err| Error::message(err.to_string()))?;
-    Ok(stored_from_token(&token))
+    Ok(stored_from_token(&token, redirect))
 }
 
 pub async fn refresh(
@@ -135,18 +135,27 @@ pub async fn refresh(
         .request_async(&http)
         .await
         .map_err(|err| Error::message(err.to_string()))?;
-    Ok(stored_from_token(&token))
+    Ok(stored_from_token(&token, redirect))
 }
+
+const DEFAULT_ACCESS_TOKEN_LIFETIME_SECS: i64 = 3600;
 
 fn stored_from_token(
     token: &oauth2::StandardTokenResponse<
         oauth2::EmptyExtraTokenFields,
         oauth2::basic::BasicTokenType,
     >,
+    redirect: &str,
 ) -> StoredOauth {
+    let lifetime = token
+        .expires_in()
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(DEFAULT_ACCESS_TOKEN_LIFETIME_SECS);
     StoredOauth {
         access_token: token.access_token().secret().to_string(),
         refresh_token: token.refresh_token().map(|t| t.secret().to_string()),
+        expires_at: Some(unix_now().saturating_add(lifetime)),
+        redirect: Some(redirect.to_string()),
         display_name: None,
         username: None,
     }
