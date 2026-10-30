@@ -174,6 +174,19 @@ async fn type_filter_hide_all_clears_the_hierarchy() {
     assert!(state.visible_nodes().iter().any(|n| n.id == 1001));
 }
 
+#[tokio::test]
+async fn types_fall_back_to_loaded_nodes_when_hierarchy_types_are_empty() {
+    let (_mock, mut state, _dir) = signed_in_state().await;
+    if let Some(hierarchy) = state.hierarchy.as_mut() {
+        hierarchy.types.clear();
+    }
+    let types = state.types();
+    assert!(types.iter().any(|ty| ty == "Epic" || ty == "User Story"));
+    assert!(
+        !state.filter_options(&types, "user").is_empty() || types.iter().any(|ty| ty == "Epic")
+    );
+}
+
 #[gpui_kit::test]
 fn gpui_sign_in_shell_renders(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);

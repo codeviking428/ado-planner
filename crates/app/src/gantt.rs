@@ -13,6 +13,7 @@ pub const MIN_TREE_WIDTH: f32 = 240.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
+pub const TIMELINE_HEADER_H: f32 = 28.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GanttScale {
@@ -153,7 +154,7 @@ impl Default for GanttView {
         Self {
             scale: GanttScale::Month,
             zoom: 1.0,
-            origin: Date::new(2026, 7, 1).unwrap_or(Date::MIN),
+            origin: jiff::Zoned::now().date(),
             scroll_x: 0.0,
             scroll_y: 0.0,
             tree_width: DEFAULT_TREE_WIDTH,
@@ -221,6 +222,27 @@ impl GanttView {
     pub fn go_today(&mut self, today: Date) {
         self.origin = today;
         self.scroll_x = 0.0;
+    }
+
+    /// Place the timeline origin on the earliest scheduled or rollup/iteration
+    /// bar so loaded work is on-screen instead of sitting off to one side.
+    pub fn reveal_content(&mut self, nodes: &[WorkItemNode], iterations: &[IterationNode]) {
+        let mut earliest: Option<Date> = None;
+        for node in nodes {
+            let hint = iteration_hint_for_path(&node.iteration_path, iterations);
+            let display = gantt_bar_display(node, nodes, hint.as_ref());
+            if let Some(start) = display.start {
+                earliest = Some(match earliest {
+                    Some(current) if start < current => start,
+                    Some(current) => current,
+                    None => start,
+                });
+            }
+        }
+        if let Some(start) = earliest {
+            self.origin = start;
+            self.scroll_x = 0.0;
+        }
     }
 
     pub fn nudge_tree_width(&mut self, delta: f32) {
@@ -375,7 +397,29 @@ impl GanttView {
 
     pub fn finish_gesture(&mut self) -> Option<(i64, Date, Date)> {
         let gesture = self.gesture.take()?;
+        if gesture.live_start == gesture.start && gesture.live_target == gesture.target {
+            return None;
+        }
         Some((gesture.id, gesture.live_start, gesture.live_target))
+    }
+
+    pub fn timeline_ticks(&self, width: f32) -> Vec<(f32, String)> {
+        let ppd = self.scale.pixels_per_day(self.zoom);
+        if ppd <= 0.0 || width <= 0.0 {
+            return Vec::new();
+        }
+        let start_days = (self.scroll_x / ppd).floor() as i32;
+        let end_days = ((self.scroll_x + width) / ppd).ceil() as i32 + self.scale.step_days();
+        let step = self.scale.step_days().max(1);
+        let mut day = (start_days / step) * step;
+        let mut ticks = Vec::new();
+        while day <= end_days {
+            let date = self.origin.saturating_add(day.days());
+            let x = day as f32 * ppd - self.scroll_x;
+            ticks.push((x, self.scale.range_title(date)));
+            day += step;
+        }
+        ticks
     }
 
     pub fn apply_nudge(
@@ -612,6 +656,69 @@ mod tests {
         let pending = gantt.apply_nudge(&nodes, NudgeAxis::Both, 2).unwrap();
         assert_eq!(pending.id, 2);
         assert_eq!(gantt.pending_nudge.as_ref().map(|p| p.id), Some(2));
+    }
+
+    #[test]
+    fn click_without_drag_does_not_finish_as_a_save() {
+        let nodes = vec![node(1, None)];
+        let mut gantt = GanttView {
+            selected_id: Some(1),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        gantt
+            .begin_gesture(&bars[0], GestureKind::Move, 10.0, &nodes)
+            .unwrap();
+        assert!(gantt.finish_gesture().is_none());
+    }
+
+    #[test]
+    fn timeline_ticks_cover_the_visible_width() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let ticks = gantt.timeline_ticks(400.0);
+        assert!(ticks.len() >= 2);
+        assert!(ticks.iter().any(|(_, label)| label.contains("2026")));
+    }
+
+    #[test]
+    fn reveal_content_moves_origin_to_the_earliest_bar() {
+        let nodes = vec![node(1, None)];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 1, 1).unwrap(),
+            ..Default::default()
+        };
+        gantt.reveal_content(&nodes, &[]);
+        assert_eq!(gantt.origin, Date::new(2026, 7, 6).unwrap());
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert!(!bars.is_empty());
+        assert!(bars.iter().all(|bar| bar.x >= -1.0));
+    }
+
+    #[test]
+    fn unscheduled_iteration_still_gets_a_summary_bar() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        let iterations = vec![ado_core::IterationNode {
+            path: "Shop\\Sprint 12".into(),
+            name: "Sprint 12".into(),
+            start_date: Some("2026-07-01T00:00:00Z".into()),
+            finish_date: Some("2026-07-14T00:00:00Z".into()),
+            children: Vec::new(),
+        }];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&[item.clone()]);
+        let bars = gantt.layout_bars(&[item], &rows, &iterations, 720.0);
+        assert_eq!(bars.len(), 1);
+        assert!(bars[0].summary);
     }
 
     #[test]

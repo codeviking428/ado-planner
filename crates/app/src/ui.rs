@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ado_core::{AuthMode, FLAVORS, FormControlKind, color_for_type, dates_column_text};
 use ado_session::PlannerSession;
-use gpui_kit::base::Selectable;
+use gpui_kit::base::{Popup, Selectable};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -13,20 +13,23 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::h_flex;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::v_flex;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, ClipboardItem, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
-    Role, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Window, actions, div, px,
-    rgb,
+    AnyElement, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Render, Role, ScrollEvent, SharedString, StatefulInteractiveElement, Styled,
+    Window, actions, div, px, rgb,
 };
 
 use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
-use crate::gantt::{GanttScale, GestureKind, HANDLE_WIDTH, NUDGE_IDLE_MS, NudgeAxis, ROW_HEIGHT};
+use crate::gantt::{
+    GanttScale, GestureKind, HANDLE_WIDTH, NUDGE_IDLE_MS, NudgeAxis, ROW_HEIGHT, TIMELINE_HEADER_H,
+};
 use crate::paths::AppPaths;
 use crate::state::PlannerState;
 use crate::toasts::{ToastKind, UndoAction};
@@ -67,7 +70,32 @@ impl PlannerView {
         let pat_input = cx.new(|cx| InputState::new(window, cx).masked(true));
         let filter_query = cx.new(|cx| InputState::new(window, cx));
         let scope_query = cx.new(|cx| InputState::new(window, cx));
-        let mut view = Self {
+        let mut view = Self::from_session(
+            window,
+            cx,
+            state,
+            org_input,
+            pat_input,
+            filter_query,
+            scope_query,
+        );
+        view.spawn_state(cx, |mut state| async move {
+            let result = state.bootstrap().await;
+            (state, result)
+        });
+        view
+    }
+
+    fn from_session(
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+        state: PlannerState,
+        org_input: Entity<InputState>,
+        pat_input: Entity<InputState>,
+        filter_query: Entity<InputState>,
+        scope_query: Entity<InputState>,
+    ) -> Self {
+        Self {
             state,
             org_input,
             pat_input,
@@ -81,11 +109,27 @@ impl PlannerView {
             io_busy: false,
             update_checked: false,
             toast_expiry_armed: false,
-        };
-        view.spawn_state(cx, |mut state| async move {
-            let result = state.bootstrap().await;
-            (state, result)
-        });
+        }
+    }
+
+    /// Build a view that does not fetch a session. Tests use this to render a
+    /// prepared `PlannerState` without racing bootstrap.
+    pub fn for_state(window: &mut Window, cx: &mut Context<Self>, state: PlannerState) -> Self {
+        apply_flavor(cx, state.flavor());
+        let org_input = cx.new(|cx| InputState::new(window, cx));
+        let pat_input = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let filter_query = cx.new(|cx| InputState::new(window, cx));
+        let scope_query = cx.new(|cx| InputState::new(window, cx));
+        let mut view = Self::from_session(
+            window,
+            cx,
+            state,
+            org_input,
+            pat_input,
+            filter_query,
+            scope_query,
+        );
+        view.update_checked = true;
         view
     }
 
@@ -157,6 +201,53 @@ impl PlannerView {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
+    pub fn dismiss_overlays(&mut self) {
+        self.open_filter = None;
+        self.open_scope = None;
+        self.state.gantt.context_menu = None;
+    }
+
+    pub fn set_open_filter(&mut self, id: Option<&'static str>) {
+        self.open_scope = None;
+        self.state.gantt.context_menu = None;
+        self.open_filter = id;
+    }
+
+    pub fn popup_is_open(&self) -> bool {
+        self.popup_open()
+    }
+
+    fn popup_open(&self) -> bool {
+        self.open_filter.is_some() || self.open_scope.is_some()
+    }
+
+    fn popup_panel(
+        &self,
+        id: impl Into<gpui_kit::ElementId>,
+        cx: &Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        v_flex()
+            .id(id)
+            .debug_selector(|| "overlay-popup-panel".into())
+            .w(px(280.))
+            .min_w(px(240.))
+            .min_h(px(120.))
+            .max_h(px(360.))
+            .overflow_scroll()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .rounded_md()
+            .p_1()
+            .shadow_md()
+            .occlude()
+    }
+
+    fn focus_input(input: &Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&input.read(cx).focus_handle(cx), cx);
+    }
+
     fn submit_pat(&mut self, cx: &mut Context<Self>) {
         self.state.sign_in_org = self.org_input.read(cx).value().to_string();
         self.state.sign_in_pat = self.pat_input.read(cx).value().to_string();
@@ -221,10 +312,31 @@ impl PlannerView {
     }
 
     fn undo(&mut self, action: UndoAction, cx: &mut Context<Self>) {
+        self.state
+            .toasts
+            .items
+            .retain(|toast| toast.undo.as_ref() != Some(&action));
         self.spawn_state(cx, |mut state| async move {
             let result = state.undo_clear_dates(action).await;
             (state, result)
         });
+    }
+
+    fn apply_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
+        let mods = event.modifiers;
+        if mods.control || mods.platform {
+            let factor = if event.delta.pixel_delta(px(12.)).y > px(0.) {
+                1.1
+            } else {
+                0.9
+            };
+            self.state.gantt.zoom_at(factor, 0.0, 0.0);
+        } else {
+            self.state.gantt.scroll_x += f32::from(event.delta.pixel_delta(px(12.)).x);
+            self.state.gantt.scroll_y += f32::from(event.delta.pixel_delta(px(12.)).y);
+            self.state.gantt.scroll_y = self.state.gantt.scroll_y.max(0.0);
+        }
+        cx.notify();
     }
 
     fn render_sign_in(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -389,65 +501,74 @@ impl PlannerView {
         let open = self.open_scope == Some(id);
         let options = self.scope_options(id);
         let search = self.scope_query.read(cx).value().to_string();
+        let muted = cx.theme().muted_foreground;
+        let trigger = Button::new(id)
+            .label(if value.is_empty() {
+                format!("Select {label}")
+            } else {
+                value
+            })
+            .disabled(disabled)
+            .on_click(cx.listener(move |this, event, window, cx| {
+                this.open_filter = None;
+                this.state.gantt.context_menu = None;
+                this.open_scope = if this.open_scope == Some(id) {
+                    None
+                } else {
+                    Some(id)
+                };
+                this.scope_query.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                if this.open_scope == Some(id) {
+                    Self::focus_input(&this.scope_query, window, cx);
+                }
+                let _ = event;
+                cx.notify();
+            }));
+        let option_buttons: Vec<_> = if open {
+            options
+                .iter()
+                .filter(|(val, lab)| {
+                    search.is_empty()
+                        || lab.to_lowercase().contains(&search.to_lowercase())
+                        || val.to_lowercase().contains(&search.to_lowercase())
+                })
+                .map(|(val, lab)| {
+                    let val_click = val.clone();
+                    Button::new(SharedString::from(format!("{id}-{val}")))
+                        .label(lab.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.choose_scope(id, val_click.clone(), cx);
+                        }))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let empty_label = match id {
+            "assignee" => "No team members loaded",
+            _ => "No options",
+        };
+        let mut popup = Popup::new(format!("{id}-popup"), trigger).offset(px(4.));
+        if open {
+            popup = popup.content(
+                self.popup_panel(format!("{id}-panel"), cx)
+                    .child(
+                        Input::new(&self.scope_query)
+                            .id(format!("{id}-search"))
+                            .w_full(),
+                    )
+                    .when(option_buttons.is_empty(), |el| {
+                        el.child(Label::new(empty_label).text_xs().text_color(muted))
+                    })
+                    .children(option_buttons),
+            );
+        }
         v_flex()
             .gap_1()
-            .child(
-                Label::new(label)
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground),
-            )
-            .child(
-                Button::new(id)
-                    .label(if value.is_empty() {
-                        format!("Select {label}")
-                    } else {
-                        value
-                    })
-                    .disabled(disabled)
-                    .on_click(cx.listener(move |this, event, window, cx| {
-                        this.open_scope = if this.open_scope == Some(id) {
-                            None
-                        } else {
-                            Some(id)
-                        };
-                        this.scope_query.update(cx, |input, cx| {
-                            input.set_value("", window, cx);
-                        });
-                        let _ = event;
-                        cx.notify();
-                    })),
-            )
-            .when(open, |el| {
-                el.child(
-                    v_flex()
-                        .absolute()
-                        .mt(px(48.))
-                        .w(px(220.))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(cx.theme().popover)
-                        .rounded_md()
-                        .p_1()
-                        .shadow_md()
-                        .child(Input::new(&self.scope_query).id(format!("{id}-search")))
-                        .children(options.into_iter().filter_map(move |(val, lab)| {
-                            if !search.is_empty()
-                                && !lab.to_lowercase().contains(&search.to_lowercase())
-                                && !val.to_lowercase().contains(&search.to_lowercase())
-                            {
-                                return None;
-                            }
-                            let val_click = val.clone();
-                            Some(
-                                Button::new(SharedString::from(format!("{id}-{val}")))
-                                    .label(lab)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.choose_scope(id, val_click.clone(), cx);
-                                    })),
-                            )
-                        })),
-                )
-            })
+            .child(Label::new(label).text_xs().text_color(muted))
+            .child(popup)
     }
 
     fn scope_options(&self, id: &str) -> Vec<(String, String)> {
@@ -549,9 +670,12 @@ impl PlannerView {
             "state-filter" => self.state.prefs.planner.hidden_states.clone(),
             _ => self.state.hidden_roots(),
         };
-        v_flex()
-            .child(Button::new(id).label(caption).on_click(cx.listener(
-                move |this, _, window, cx| {
+        let trigger =
+            Button::new(id)
+                .label(caption)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_scope = None;
+                    this.state.gantt.context_menu = None;
                     this.open_filter = if this.open_filter == Some(id) {
                         None
                     } else {
@@ -560,12 +684,16 @@ impl PlannerView {
                     this.filter_query.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                     });
+                    if this.open_filter == Some(id) {
+                        Self::focus_input(&this.filter_query, window, cx);
+                    }
                     cx.notify();
-                },
-            )))
-            .when(open, |el| {
-                el.child(self.filter_menu(id, items, hidden_set, cx))
-            })
+                }));
+        let mut popup = Popup::new(format!("{id}-popup"), trigger).offset(px(4.));
+        if open {
+            popup = popup.content(self.filter_menu(id, items, hidden_set, cx));
+        }
+        popup
     }
 
     fn filter_menu(
@@ -577,16 +705,13 @@ impl PlannerView {
     ) -> impl IntoElement {
         let search = self.filter_query.read(cx).value().to_string();
         let filtered = self.state.filter_options(&items, &search);
-        v_flex()
-            .absolute()
-            .mt(px(36.))
-            .w(px(240.))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().popover)
-            .rounded_md()
-            .p_1()
-            .child(Input::new(&self.filter_query).id(format!("{id}-search")))
+        let muted = cx.theme().muted_foreground;
+        self.popup_panel(format!("{id}-panel"), cx)
+            .child(
+                Input::new(&self.filter_query)
+                    .id(format!("{id}-search"))
+                    .w_full(),
+            )
             .child(
                 Button::new(SharedString::from(format!("show-all-{id}")))
                     .label("Show all")
@@ -611,14 +736,28 @@ impl PlannerView {
                         cx.notify();
                     })),
             )
+            .when(filtered.is_empty(), |el| {
+                el.child(
+                    Label::new("No matching options")
+                        .text_xs()
+                        .text_color(muted),
+                )
+            })
             .children(filtered.into_iter().map(|item| {
                 let checked = !hidden.contains(&item);
                 let item_click = item.clone();
                 h_flex()
                     .id(SharedString::from(format!("filter-item-{item}")))
+                    .w_full()
+                    .min_w(px(220.))
                     .gap_2()
-                    .child(Checkbox::new(SharedString::from(format!("cb-{item}"))).checked(checked))
-                    .child(item.clone())
+                    .px_1()
+                    .py_1()
+                    .child(
+                        Checkbox::new(SharedString::from(format!("cb-{item}")))
+                            .checked(checked)
+                            .label(item.clone()),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         match id {
                             "type-filter" => this.state.toggle_hidden_type(&item_click),
@@ -685,11 +824,19 @@ impl PlannerView {
         v_flex()
             .id("gantt")
             .size_full()
+            .track_focus(&self.form_focus)
+            .overflow_scroll()
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                this.apply_scroll(event, cx);
+            }))
             .child(self.render_gantt_nav(cx))
             .child(
                 h_flex()
                     .id("gantt-body")
                     .flex_1()
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                        this.apply_scroll(event, cx);
+                    }))
                     .child(self.render_tree(&visible, &window, cx))
                     .child(
                         div()
@@ -752,13 +899,19 @@ impl PlannerView {
                         cx.notify();
                     })),
             )
-            .child(div().child(self.state.gantt.scale.range_title(self.state.gantt.origin)))
+            .child(
+                div()
+                    .w(px(168.))
+                    .flex_shrink_0()
+                    .child(self.state.gantt.scale.range_title(self.state.gantt.origin)),
+            )
             .children(GanttScale::ALL.iter().map(|scale| {
                 let scale = *scale;
                 Button::new(scale.label())
                     .label(scale.label())
                     .selected(self.state.gantt.scale == scale)
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.dismiss_overlays();
                         this.state.gantt.scale = scale;
                         cx.notify();
                     }))
@@ -793,7 +946,10 @@ impl PlannerView {
             .id("gantt-tree")
             .w(px(self.state.gantt.tree_width))
             .h_full()
-            .overflow_hidden()
+            .overflow_scroll()
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                this.apply_scroll(event, cx);
+            }))
             .children(window.iter().map(|row| {
                 let node = by_id.get(&row.id).cloned();
                 let Some(node) = node else {
@@ -834,11 +990,26 @@ impl PlannerView {
                             })),
                     )
                     .child(div().child(format!("#{id}")))
-                    .child(div().flex_1().child(node.title.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(48.))
+                            .overflow_hidden()
+                            .child(node.title.clone()),
+                    )
                     .child(self.type_badge(&node.work_item_type))
-                    .child(div().id(("dates", id as u64)).child(dates))
+                    .child(
+                        div()
+                            .id(("dates", id as u64))
+                            .flex_shrink_0()
+                            .min_w(px(148.))
+                            .overflow_hidden()
+                            .text_xs()
+                            .child(dates),
+                    )
                     .on_click(
-                        cx.listener(move |this, event: &gpui_kit::ClickEvent, _, cx| {
+                        cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                            this.dismiss_overlays();
                             if this
                                 .state
                                 .gantt
@@ -849,6 +1020,7 @@ impl PlannerView {
                                 this.state.discard_nudge();
                             }
                             this.state.gantt.selected_id = Some(id);
+                            window.focus(&this.form_focus, cx);
                             if event.click_count() >= 2 {
                                 this.open_form(id, cx);
                             }
@@ -885,28 +1057,51 @@ impl PlannerView {
         bars: &[crate::gantt::BarLayout],
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let ticks = self.state.gantt.timeline_ticks(2400.0);
+        let header_fg = cx.theme().muted_foreground;
+        let bar_fg = cx.theme().primary_foreground;
+        let muted_fg = cx.theme().foreground;
         div()
             .id("gantt-timeline")
             .flex_1()
             .h_full()
             .relative()
-            .overflow_hidden()
+            .overflow_scroll()
             .bg(cx.theme().background)
             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
-                let mods = event.modifiers;
-                if mods.control || mods.platform {
-                    let factor = if event.delta.pixel_delta(px(12.)).y > px(0.) {
-                        1.1
-                    } else {
-                        0.9
-                    };
-                    this.state.gantt.zoom_at(factor, 0.0, 0.0);
-                } else {
-                    this.state.gantt.scroll_x += f32::from(event.delta.pixel_delta(px(12.)).x);
-                    this.state.gantt.scroll_y += f32::from(event.delta.pixel_delta(px(12.)).y);
-                }
-                cx.notify();
+                this.apply_scroll(event, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.state.gantt.context_menu.is_some() {
+                        this.state.gantt.context_menu = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .id("gantt-scale-header")
+                    .debug_selector(|| "gantt-scale-header".into())
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(TIMELINE_HEADER_H))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .children(ticks.into_iter().map(|(x, label)| {
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(4.))
+                            .text_xs()
+                            .text_color(header_fg)
+                            .child(label)
+                    })),
+            )
             .children(bars.iter().map(|bar| {
                 let id = bar.id;
                 let bar_x = bar.x;
@@ -914,12 +1109,13 @@ impl PlannerView {
                 let summary = bar.summary;
                 div()
                     .id(("gantt-bar", id as u64))
+                    .debug_selector(|| "gantt-bar".into())
                     .role(Role::Button)
                     .aria_label(format!("Gantt bar #{id}"))
                     .absolute()
                     .left(px(bar.x.max(0.0)))
-                    .top(px(bar.y))
-                    .w(px(bar.width))
+                    .top(px(bar.y + TIMELINE_HEADER_H))
+                    .w(px(bar.width.max(8.0)))
                     .h(px(ROW_HEIGHT - 8.0))
                     .mt(px(4.))
                     .rounded_md()
@@ -928,6 +1124,7 @@ impl PlannerView {
                     } else {
                         cx.theme().primary
                     })
+                    .text_color(if bar.summary { muted_fg } else { bar_fg })
                     .border_1()
                     .border_color(cx.theme().border)
                     .overflow_hidden()
@@ -953,6 +1150,7 @@ impl PlannerView {
                             } else {
                                 GestureKind::Move
                             };
+                            this.dismiss_overlays();
                             let _ = this.state.begin_bar_gesture(id, kind, local_x);
                             cx.notify();
                         }),
@@ -980,7 +1178,6 @@ impl PlannerView {
                     this.commit_gesture(cx);
                 }),
             )
-            .child(self.render_context_menu(cx))
     }
 
     fn render_context_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1088,21 +1285,38 @@ impl PlannerView {
         let pages = form.model.pages.clone();
         let system = form.model.system_controls.clone();
         let active = form.active_page;
+        let dialog_h = (self.state.gantt.viewport_h + 80.0).clamp(360.0, 900.0);
         v_flex()
             .id("work-item-form")
+            .debug_selector(|| "work-item-form".into())
             .absolute()
             .inset_0()
+            .occlude()
             .bg(cx.theme().overlay)
             .items_center()
             .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.state.close_form();
+                    cx.notify();
+                }),
+            )
             .child(
                 v_flex()
+                    .id("work-item-form-dialog")
                     .w(px(720.))
-                    .max_h(px(720.))
+                    .h(px(dialog_h))
+                    .max_h(px(dialog_h))
                     .bg(cx.theme().popover)
+                    .text_color(cx.theme().popover_foreground)
                     .rounded_xl()
                     .p_6()
                     .gap_3()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     .child(div().text_lg().child(title))
                     .child(
                         h_flex()
@@ -1121,24 +1335,28 @@ impl PlannerView {
                     )
                     .child(
                         v_flex()
+                            .id("work-item-form-body")
+                            .flex_1()
+                            .min_h(px(120.))
+                            .overflow_y_scrollbar()
                             .gap_2()
-                            .children(system.iter().map(|control| self.render_field(control, cx))),
+                            .children(system.iter().map(|control| self.render_field(control, cx)))
+                            .when(active < pages.len(), |el| {
+                                el.child(v_flex().gap_3().children(
+                                    pages[active].groups.iter().map(|group| {
+                                        v_flex()
+                                            .gap_2()
+                                            .child(Label::new(group.label.clone()))
+                                            .children(
+                                                group
+                                                    .controls
+                                                    .iter()
+                                                    .map(|control| self.render_field(control, cx)),
+                                            )
+                                    }),
+                                ))
+                            }),
                     )
-                    .when(active < pages.len(), |el| {
-                        el.child(v_flex().gap_3().children(pages[active].groups.iter().map(
-                            |group| {
-                                v_flex()
-                                    .gap_2()
-                                    .child(Label::new(group.label.clone()))
-                                    .children(
-                                        group
-                                            .controls
-                                            .iter()
-                                            .map(|control| self.render_field(control, cx)),
-                                    )
-                            },
-                        )))
-                    })
                     .child(
                         h_flex()
                             .gap_2()
@@ -1296,6 +1514,7 @@ impl PlannerView {
                             Button::new(SharedString::from(format!("opt-{field}-{opt}")))
                                 .label(opt)
                                 .selected(value == selected)
+                                .when(value == selected, |btn| btn.primary())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(form) = this.state.form.as_mut() {
                                         form.set_string(&field, value.clone());
@@ -1326,6 +1545,7 @@ impl PlannerView {
     }
 
     fn open_form(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.dismiss_overlays();
         self.form_inputs.clear();
         self.form_inputs_for = None;
         self.spawn_state(cx, move |mut state| async move {
@@ -1445,11 +1665,23 @@ impl PlannerView {
         }
     }
 
+    pub fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        self.on_key(event, cx);
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if event.keystroke.key == "escape" {
-            self.state.cancel_gesture();
-            self.state.gantt.context_menu = None;
+            if self.state.form.is_some() {
+                self.state.close_form();
+            } else if self.popup_open() || self.state.gantt.context_menu.is_some() {
+                self.dismiss_overlays();
+            } else {
+                self.state.cancel_gesture();
+            }
             cx.notify();
+            return;
+        }
+        if self.state.form.is_some() || self.popup_open() {
             return;
         }
         if event.keystroke.key == "enter" {
@@ -1628,6 +1860,12 @@ fn this_state(state: &PlannerState, id: i64) -> Option<String> {
         .map(|n| n.state.clone())
 }
 
+impl Focusable for PlannerView {
+    fn focus_handle(&self, _: &gpui_kit::App) -> FocusHandle {
+        self.form_focus.clone()
+    }
+}
+
 impl Render for PlannerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport_h = f32::from(window.viewport_size().height);
@@ -1641,7 +1879,6 @@ impl Render for PlannerView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .track_focus(&self.form_focus)
             .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, _, cx| {
                 if this.state.gantt.gesture.is_some() {
                     this.commit_gesture(cx);
@@ -1679,6 +1916,28 @@ impl Render for PlannerView {
                             .child(self.render_header(cx))
                             .child(self.render_updater(cx))
                             .child(div().flex_1().child(self.render_gantt(cx)))
+                            .when(
+                                self.popup_open() || self.state.gantt.context_menu.is_some(),
+                                |el| {
+                                    el.child(
+                                        div()
+                                            .id("popup-dismiss")
+                                            .absolute()
+                                            .top(px(72.))
+                                            .left_0()
+                                            .right_0()
+                                            .bottom_0()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.dismiss_overlays();
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                },
+                            )
+                            .child(self.render_context_menu(cx))
                             .child(self.render_form(cx))
                             .child(self.render_toasts(cx)),
                     )

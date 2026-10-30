@@ -108,7 +108,7 @@ pub fn theme_color(flavor: Flavor) -> ThemeColor {
     colors.ring = fg;
     colors.accent = secondary;
     colors.accent_foreground = fg;
-    colors.popover = bg;
+    colors.popover = muted;
     colors.popover_foreground = fg;
     colors.danger = danger;
     colors.danger_foreground = primary_fg;
@@ -154,5 +154,6 @@ mod tests {
         let mocha = theme_color(Flavor::Mocha);
         let latte = theme_color(Flavor::Latte);
         assert!(mocha.background.l < latte.background.l);
+        assert_ne!(mocha.popover, mocha.background);
     }
 }

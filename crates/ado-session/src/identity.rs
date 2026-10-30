@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use ado_client::{AuthScheme, authorization_header, resolve_ado_base, resolve_vssps_base};
+use ado_client::{
+    AuthScheme, authorization_header, connection_data_urls, profile_lookup_urls, resolve_ado_base,
+    resolve_vssps_base,
+};
 use ado_core::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,44 +153,67 @@ pub async fn fetch_session_identity(
     let vssps = resolve_vssps_base(vssps_base, env_vssps.as_deref(), &ado_base);
     let header = authorization_header(token, scheme);
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let connection = if let Some(org) = org.filter(|org| !org.is_empty()) {
-        match get_json::<ConnectionDataPayload>(
-            &client,
-            &header,
-            &format!("{ado_base}/{org}/_apis/connectionData?api-version=7.1"),
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!("connectionData identity lookup failed: {err}");
-                None
+
+    let connection_urls = org
+        .filter(|org| !org.is_empty())
+        .map(|org| connection_data_urls(&ado_base, org))
+        .unwrap_or_default();
+    let profile_urls = profile_lookup_urls(&ado_base, &vssps, org);
+
+    let connection_fut = async {
+        let mut last_err = None;
+        for url in &connection_urls {
+            match get_json::<ConnectionDataPayload>(&client, &header, url).await {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(err) => last_err = Some(err),
             }
         }
-    } else {
-        None
-    };
-    let profile = match get_json::<ProfilePayload>(
-        &client,
-        &header,
-        &format!("{vssps}/_apis/profile/profiles/me?api-version=7.1"),
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!("VSSPS profile identity lookup failed: {err}");
-            None
+        if let Some(err) = last_err {
+            Err(err)
+        } else {
+            Ok(None)
         }
     };
+    let profile_fut = async {
+        let mut last_err = None;
+        for url in &profile_urls {
+            match get_json::<ProfilePayload>(&client, &header, url).await {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(err) => last_err = Some(err),
+            }
+        }
+        if let Some(err) = last_err {
+            Err(err)
+        } else {
+            Ok(None)
+        }
+    };
+
+    let (connection, profile) = tokio::join!(connection_fut, profile_fut);
+    if let Err(err) = &connection {
+        tracing::warn!("connectionData identity lookup failed: {err}");
+    }
+    if let Err(err) = &profile {
+        tracing::warn!("VSSPS profile identity lookup failed: {err}");
+    }
     Ok(profile
+        .ok()
+        .flatten()
         .as_ref()
         .and_then(identity_from_profile)
-        .or_else(|| connection.as_ref().and_then(identity_from_connection_data)))
+        .or_else(|| {
+            connection
+                .ok()
+                .flatten()
+                .as_ref()
+                .and_then(identity_from_connection_data)
+        }))
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(
@@ -203,10 +229,12 @@ async fn get_json<T: serde::de::DeserializeOwned>(
         .await
         .map_err(|err| Error::message(err.to_string()))?;
     if !response.status().is_success() {
-        return Err(Error::message(format!(
-            "identity {url} returned {}",
-            response.status()
-        )));
+        let status = response.status();
+        if status.is_client_error() {
+            tracing::warn!("identity {url} returned {status}");
+            return Ok(None);
+        }
+        return Err(Error::message(format!("identity {url} returned {status}")));
     }
     let value = response
         .json()

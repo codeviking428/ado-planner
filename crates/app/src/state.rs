@@ -227,10 +227,21 @@ impl PlannerState {
     }
 
     pub fn types(&self) -> Vec<String> {
-        self.hierarchy
+        let mut types = self
+            .hierarchy
             .as_ref()
             .map(|h| h.types.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if types.is_empty() {
+            types = self
+                .nodes
+                .iter()
+                .map(|n| n.work_item_type.clone())
+                .collect();
+            types.sort();
+            types.dedup();
+        }
+        types
     }
 
     pub fn states(&self) -> Vec<String> {
@@ -353,6 +364,7 @@ impl PlannerState {
         self.session_info = info;
         self.session_loading = false;
         if self.session_info.signed_in {
+            self.warn_if_identity_missing();
             self.reload_after_sign_in().await?;
         }
         Ok(())
@@ -375,6 +387,7 @@ impl PlannerState {
                 .push(ToastKind::Error, "Sign-in did not create a Session");
             return Ok(());
         }
+        self.warn_if_identity_missing();
         self.reload_after_sign_in().await
     }
 
@@ -386,7 +399,17 @@ impl PlannerState {
                 .push(ToastKind::Error, "Sign-in did not create a Session");
             return Ok(());
         }
+        self.warn_if_identity_missing();
         self.reload_after_sign_in().await
+    }
+
+    fn warn_if_identity_missing(&mut self) {
+        if self.session_info.username.is_none() {
+            self.toasts.push(
+                ToastKind::Warning,
+                "Could not load your identity. Assignee → Me is unavailable. The PAT may be missing the Profile scope (vso.profile).",
+            );
+        }
     }
 
     pub async fn logout(&mut self) -> Result<(), AppError> {
@@ -681,11 +704,10 @@ impl PlannerState {
             Ok(members) => self.members = members,
             Err(err) => {
                 self.toasts.push(
-                    ToastKind::Error,
+                    ToastKind::Warning,
                     error_text(&err, "Could not load Team members"),
                 );
-                self.members_loading = false;
-                return Err(err.into());
+                self.members.clear();
             }
         }
         self.members_loading = false;
@@ -767,8 +789,12 @@ impl PlannerState {
                 "Hierarchy is incomplete — WIQL hit the 20,000 result cap.",
             );
         }
+        let first_load = self.nodes.is_empty();
         self.nodes = result.nodes.clone();
         self.hierarchy = Some(result);
+        if first_load {
+            self.gantt.reveal_content(&self.nodes, &self.iterations);
+        }
     }
 
     fn cache_identity(&self) -> String {
@@ -1135,6 +1161,8 @@ impl PlannerState {
     pub fn copy_id(&mut self, id: i64) -> String {
         let text = id.to_string();
         self.copied = Some(text.clone());
+        self.toasts
+            .push(ToastKind::Success, format!("Copied #{id}"));
         text
     }
 
@@ -1143,6 +1171,7 @@ impl PlannerState {
         let url =
             crate::form::ado_edit_url_on(self.client.ado_base(), &scope.org, &scope.project, id);
         self.copied = Some(url.clone());
+        self.toasts.push(ToastKind::Success, "Copied link");
         Some(url)
     }
 

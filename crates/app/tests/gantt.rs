@@ -78,6 +78,22 @@ async fn drag_patches_start_and_target() {
 }
 
 #[tokio::test]
+async fn selecting_a_bar_without_moving_does_not_save() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some())
+        .cloned()
+        .unwrap();
+    let before = state.toasts.items.len();
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.commit_gesture().await.expect("commit click");
+    assert_eq!(state.toasts.items.len(), before);
+    assert_eq!(state.gantt.selected_id, Some(node.id));
+}
+
+#[tokio::test]
 async fn escape_cancels_a_gesture() {
     let (_mock, mut state, _dir) = signed_in().await;
     let node = state

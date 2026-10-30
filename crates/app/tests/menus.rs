@@ -30,6 +30,13 @@ async fn context_menu_open_copy_and_hide() {
     state.close_form();
     state.copy_id(1003);
     assert_eq!(state.copied.as_deref(), Some("1003"));
+    assert!(
+        state
+            .toasts
+            .last_message()
+            .unwrap_or_default()
+            .contains("Copied #1003")
+    );
     state.copy_link(1003);
     assert!(
         state
@@ -38,6 +45,7 @@ async fn context_menu_open_copy_and_hide() {
             .unwrap_or_default()
             .contains("_workitems/edit/1003")
     );
+    assert_eq!(state.toasts.last_message(), Some("Copied link"));
     let ty = state
         .nodes
         .iter()

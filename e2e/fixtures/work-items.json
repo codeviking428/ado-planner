@@ -42,7 +42,10 @@
       "System.IterationPath": "Shop\\FY26\\Sprint 10",
       "System.Description": "<p>Keep the cart</p>",
       "Microsoft.VSTS.Scheduling.StartDate": "2026-07-06T00:00:00Z",
-      "Microsoft.VSTS.Scheduling.TargetDate": "2026-07-20T00:00:00Z"
+      "Microsoft.VSTS.Scheduling.TargetDate": "2026-07-20T00:00:00Z",
+      "Microsoft.VSTS.Scheduling.StoryPoints": 5,
+      "Microsoft.VSTS.Scheduling.RemainingWork": 8,
+      "Custom.NeedsReview": true
     }
   },
   {

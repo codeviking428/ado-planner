@@ -34,6 +34,36 @@
                   "controlType": "FieldControl"
                 },
                 {
+                  "id": "Microsoft.VSTS.Scheduling.StartDate",
+                  "label": "Start Date",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "Microsoft.VSTS.Scheduling.TargetDate",
+                  "label": "Target Date",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "Microsoft.VSTS.Scheduling.StoryPoints",
+                  "label": "Story Points",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "Microsoft.VSTS.Scheduling.RemainingWork",
+                  "label": "Remaining Work",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "Custom.NeedsReview",
+                  "label": "Needs Review",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
                   "id": "System.Description",
                   "label": "Description",
                   "visible": true,

@@ -4,6 +4,7 @@ use serde_json::Value;
 
 const TOAST_CAP: usize = 5;
 const SUCCESS_TTL: Duration = Duration::from_secs(5);
+const UNDO_TTL: Duration = Duration::from_secs(8);
 const WARNING_TTL: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,8 +84,12 @@ impl Toasts {
         self.items.retain(|toast| match toast.kind {
             ToastKind::Error => true,
             ToastKind::Success => {
-                toast.undo.is_some()
-                    || now.saturating_duration_since(toast.created_at) < SUCCESS_TTL
+                let ttl = if toast.undo.is_some() {
+                    UNDO_TTL
+                } else {
+                    SUCCESS_TTL
+                };
+                now.saturating_duration_since(toast.created_at) < ttl
             }
             ToastKind::Warning => now.saturating_duration_since(toast.created_at) < WARNING_TTL,
         });
@@ -125,4 +130,26 @@ pub fn json_error_message(value: &Value) -> Option<String> {
         .get("message")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undo_toasts_expire_after_ttl() {
+        let mut toasts = Toasts::default();
+        toasts.push_undo(
+            "Cleared dates",
+            UndoAction::RestoreDates {
+                id: 1,
+                start_date: None,
+                target_date: None,
+                rev: 1,
+            },
+        );
+        toasts.items[0].created_at = Instant::now() - Duration::from_secs(20);
+        toasts.expire();
+        assert!(toasts.items.is_empty());
+    }
 }

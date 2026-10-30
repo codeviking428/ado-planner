@@ -91,6 +91,24 @@ async fn identity_search_returns_team_members() {
     );
 }
 
+#[tokio::test]
+async fn planning_section_includes_date_number_and_boolean_fields() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.open_form(1003).await.expect("open");
+    let form = state.form.as_ref().expect("form");
+    let planning = form
+        .model
+        .pages
+        .iter()
+        .flat_map(|page| page.groups.iter())
+        .find(|group| group.label == "Planning")
+        .expect("planning group");
+    let kinds: Vec<_> = planning.controls.iter().map(|c| c.kind).collect();
+    assert!(kinds.contains(&ado_core::FormControlKind::DateTime));
+    assert!(kinds.contains(&ado_core::FormControlKind::Double));
+    assert!(kinds.contains(&ado_core::FormControlKind::Boolean));
+}
+
 #[gpui_kit::test]
 fn gpui_form_title_renders(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);

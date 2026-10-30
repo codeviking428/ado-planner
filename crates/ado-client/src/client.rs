@@ -95,12 +95,14 @@ impl AdoClient {
                 .map_err(|err| ClientError::Message(err.to_string()))?;
         authorization.set_sensitive(true);
         headers.insert(AUTHORIZATION, authorization);
-        let content_type = if method == Method::PATCH {
-            "application/json-patch+json"
-        } else {
-            "application/json"
-        };
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        if method != Method::GET && method != Method::HEAD {
+            let content_type = if method == Method::PATCH {
+                "application/json-patch+json"
+            } else {
+                "application/json"
+            };
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        }
         let mut builder = self.http.request(method.clone(), url).headers(headers);
         if let Some(body) = body {
             let bytes =
@@ -170,6 +172,15 @@ impl AdoClient {
                     })
             })
             .collect())
+    }
+
+    pub async fn ping_org(&self, org: &str) -> Result<(), ClientError> {
+        self.get(&format!(
+            "{}/_apis/projects?$top=1&api-version=7.1",
+            self.org_url(org)
+        ))
+        .await?;
+        Ok(())
     }
 
     pub async fn list_projects(&self, org: &str) -> Result<Vec<Project>, ClientError> {

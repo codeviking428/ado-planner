@@ -173,7 +173,7 @@ impl PlannerSession {
             _ => AdoClient::new(tokens),
         };
         client
-            .list_projects(org)
+            .ping_org(org)
             .await
             .map_err(|err| Error::message(err.to_string()))?;
         Ok(())

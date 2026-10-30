@@ -18,7 +18,10 @@
     },
     { "referenceName": "System.Description", "type": "html" },
     { "referenceName": "Microsoft.VSTS.Scheduling.StartDate", "type": "dateTime" },
-    { "referenceName": "Microsoft.VSTS.Scheduling.TargetDate", "type": "dateTime" }
+    { "referenceName": "Microsoft.VSTS.Scheduling.TargetDate", "type": "dateTime" },
+    { "referenceName": "Microsoft.VSTS.Scheduling.StoryPoints", "type": "double" },
+    { "referenceName": "Microsoft.VSTS.Scheduling.RemainingWork", "type": "double" },
+    { "referenceName": "Custom.NeedsReview", "type": "boolean" }
   ],
   "typesWithDates": ["Epic", "Feature", "User Story", "Task"]
 }
