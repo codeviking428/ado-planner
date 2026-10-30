@@ -240,6 +240,13 @@ pub fn build_form_patch(
         if json_equal(next, prev) {
             continue;
         }
+        if control.kind == FormControlKind::Html {
+            let next_html = next.and_then(Value::as_str).unwrap_or("");
+            let prev_html = prev.and_then(Value::as_str).unwrap_or("");
+            if crate::html_field::html_equivalent(next_html, prev_html) {
+                continue;
+            }
+        }
         let value = patch_value(control.kind, next);
         ops.push(JsonPatchOp {
             op: PatchOp::Add,
@@ -573,6 +580,56 @@ mod tests {
     fn strips_ado_mnemonics() {
         assert_eq!(strip_mnemonic("Stat&e"), "State");
         assert_eq!(strip_mnemonic("R&&D Notes"), "R&D Notes");
+    }
+
+    #[test]
+    fn save_patch_ignores_html_round_trip_as_unchanged_description() {
+        let original_html = "<p>Keep the cart</p>";
+        let mut original = serde_json::Map::new();
+        original.insert("System.Description".into(), json!(original_html));
+        original.insert("Microsoft.VSTS.Scheduling.StoryPoints".into(), json!(5));
+        let mut draft = original.clone();
+        draft.insert(
+            "System.Description".into(),
+            json!(crate::html_field::markdown_to_html(
+                &crate::html_field::html_to_markdown(original_html).unwrap_or_default()
+            )),
+        );
+        draft.insert("Microsoft.VSTS.Scheduling.StoryPoints".into(), json!(8));
+        let document = build_form_patch(
+            5,
+            &original,
+            &draft,
+            &[
+                FormControl {
+                    id: "System.Description".into(),
+                    reference_name: "System.Description".into(),
+                    label: "Description".into(),
+                    kind: FormControlKind::Html,
+                    required: false,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                },
+                FormControl {
+                    id: "Microsoft.VSTS.Scheduling.StoryPoints".into(),
+                    reference_name: "Microsoft.VSTS.Scheduling.StoryPoints".into(),
+                    label: "Story Points".into(),
+                    kind: FormControlKind::Double,
+                    required: false,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                },
+            ],
+        );
+        assert_eq!(
+            document
+                .iter()
+                .filter_map(|op| op.path.strip_prefix("/fields/"))
+                .collect::<Vec<_>>(),
+            vec!["Microsoft.VSTS.Scheduling.StoryPoints"]
+        );
     }
 
     #[test]

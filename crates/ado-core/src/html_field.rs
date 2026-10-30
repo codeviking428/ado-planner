@@ -18,6 +18,21 @@ pub fn html_to_markdown(html: &str) -> Option<String> {
     htmd::HtmlToMarkdown::new().convert(html).ok()
 }
 
+/// True when two HTML strings are the same document after normalization
+/// (whitespace, markdown round-trip, and trivial wrapper tags).
+pub fn html_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    if normalize_html(left) == normalize_html(right) {
+        return true;
+    }
+    match (html_to_markdown(left), html_to_markdown(right)) {
+        (Some(a), Some(b)) => a.trim() == b.trim(),
+        _ => false,
+    }
+}
+
 pub fn markdown_to_html(markdown: &str) -> String {
     let mut options = comrak::Options::default();
     options.extension.strikethrough = true;
@@ -95,6 +110,16 @@ mod tests {
         assert!(
             !is_plain_html_field(html),
             "colored span must not round-trip"
+        );
+    }
+
+    #[test]
+    fn html_equivalent_treats_markdown_round_trip_as_unchanged() {
+        let original = "<p>Keep the cart</p>";
+        let round_trip = markdown_to_html(&html_to_markdown(original).unwrap_or_default());
+        assert!(
+            html_equivalent(original, &round_trip),
+            "plain HTML that only changed through markdown round-trip must compare equal"
         );
     }
 

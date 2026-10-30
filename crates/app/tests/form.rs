@@ -74,6 +74,43 @@ async fn save_toast_uses_display_names_and_skips_unchanged_fields() {
 }
 
 #[tokio::test]
+async fn save_toast_does_not_report_description_when_only_story_points_changed() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.open_form(1003).await.expect("open");
+    let form = state.form.as_mut().expect("form");
+    let markdown = form
+        .html_markdown
+        .get("System.Description")
+        .cloned()
+        .or_else(|| {
+            form.values
+                .get("System.Description")
+                .and_then(serde_json::Value::as_str)
+                .and_then(ado_core::html_to_markdown)
+        })
+        .expect("description markdown");
+    form.set_markdown("System.Description", markdown);
+    form.values.insert(
+        "Microsoft.VSTS.Scheduling.StoryPoints".into(),
+        serde_json::json!(8),
+    );
+    state.save_form().await.expect("save");
+    let message = state
+        .toasts
+        .last_message()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        message.contains("story points"),
+        "toast should mention story points, got {message}"
+    );
+    assert!(
+        !message.contains("description"),
+        "rewriting description HTML through markdown must not count as a change: {message}"
+    );
+}
+
+#[tokio::test]
 async fn non_plain_html_field_is_read_only() {
     let html = r#"<p>Hello <span style="color:red">Ada</span></p>"#;
     assert!(!ado_core::is_plain_html_field(html));

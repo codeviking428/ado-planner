@@ -210,6 +210,28 @@ async fn changing_scope_reveals_timeline_content() {
 }
 
 #[tokio::test]
+async fn growth_team_loads_its_epic_and_empty_team_has_no_items() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state
+        .set_team("Growth".into())
+        .await
+        .expect("switch to Growth");
+    assert!(
+        state.nodes.iter().any(|node| node.id == 1020),
+        "Growth should include Epic 1020, got {:?}",
+        state.nodes.iter().map(|node| node.id).collect::<Vec<_>>()
+    );
+    state
+        .set_team("Empty".into())
+        .await
+        .expect("switch to Empty");
+    assert!(
+        state.visible_nodes().is_empty(),
+        "Empty team should have no work items"
+    );
+}
+
+#[tokio::test]
 async fn save_title_patches_system_title() {
     let (_mock, mut state, _dir) = signed_in().await;
     state

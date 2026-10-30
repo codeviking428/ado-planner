@@ -78,10 +78,12 @@ pub struct PlannerView {
     open_scope: Option<&'static str>,
     inline_edit: Option<InlineEdit>,
     inline_dates: Option<Entity<CalendarState>>,
+    dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
     io_busy: bool,
     update_checked: bool,
     toast_expiry_armed: bool,
+    loading_shown_at: Option<std::time::Instant>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -183,10 +185,12 @@ impl PlannerView {
             open_scope: None,
             inline_edit: None,
             inline_dates: None,
+            dates_anchor: None,
             banner_dismissed: false,
             io_busy: false,
             update_checked: false,
             toast_expiry_armed: false,
+            loading_shown_at: None,
             _subscriptions: vec![keystrokes],
         };
         this.bind_sign_in_events(window, cx);
@@ -240,6 +244,7 @@ impl PlannerView {
     }
 
     pub fn open_inline_dates(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.dates_anchor = Some((self.state.gantt.tree_width.max(240.0), 160.0));
         self.begin_inline(InlineEdit::Dates(id), String::new(), window, cx);
     }
 
@@ -322,7 +327,29 @@ impl PlannerView {
                 this.io_busy = false;
                 match outcome {
                     Ok((working, result)) => {
+                        let shown_at = this.loading_shown_at;
                         this.state = working;
+                        if let Some(at) = shown_at
+                            && !this.state.hierarchy_loading
+                        {
+                            let remain = Duration::from_millis(280).saturating_sub(at.elapsed());
+                            if remain > Duration::ZERO {
+                                this.state.hierarchy_loading = true;
+                                cx.spawn(async move |this, cx| {
+                                    cx.background_executor().timer(remain).await;
+                                    if let Some(this) = this.upgrade() {
+                                        this.update(cx, |this, cx| {
+                                            this.state.hierarchy_loading = false;
+                                            this.loading_shown_at = None;
+                                            cx.notify();
+                                        });
+                                    }
+                                })
+                                .detach();
+                            } else {
+                                this.loading_shown_at = None;
+                            }
+                        }
                         if let Err(err) = result {
                             tracing::warn!("planner action failed: {err}");
                         }
@@ -403,6 +430,7 @@ impl PlannerView {
         self.open_scope = None;
         self.inline_edit = None;
         self.inline_dates = None;
+        self.dates_anchor = None;
         self.state.gantt.context_menu = None;
     }
 
@@ -411,9 +439,23 @@ impl PlannerView {
         self.state.close_form();
         self.state.cancel_gesture();
         self.state.gantt.schedule_drag = None;
+        self.dates_anchor = None;
     }
 
     fn set_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
+        let linking = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link);
+        if linking {
+            if let Some(id) = id {
+                self.state.gantt.set_link_target(id);
+                cx.notify();
+            }
+            return;
+        }
         if self.state.gantt.hovered_id != id {
             self.state.gantt.hovered_id = id;
             cx.notify();
@@ -1048,6 +1090,7 @@ impl PlannerView {
             }
             "team" => {
                 self.state.hierarchy_loading = true;
+                self.loading_shown_at = Some(std::time::Instant::now());
                 self.banner_dismissed = false;
                 self.spawn_state(cx, move |mut state| async move {
                     let result = state.set_team(value).await;
@@ -1244,20 +1287,15 @@ impl PlannerView {
         }
         let visible = self.state.visible_nodes();
         if visible.is_empty() {
-            let message = self
-                .state
-                .team_settings_error
-                .clone()
-                .unwrap_or_else(|| "No Work Items match…".into());
             return v_flex()
-                .id("empty-gantt")
-                .debug_selector(|| "empty-gantt".into())
+                .id("gantt")
                 .size_full()
-                .items_center()
-                .justify_center()
-                .px_8()
-                .gap_2()
-                .child(Label::new(message))
+                .relative()
+                .child(self.render_gantt_nav(cx))
+                .child(self.render_empty_gantt(cx))
+                .when(self.state.hierarchy_loading, |el| {
+                    el.child(self.render_gantt_loading(cx))
+                })
                 .into_any_element();
         }
         let rows = self.state.gantt.flatten(&visible);
@@ -1309,20 +1347,68 @@ impl PlannerView {
                     .child(self.render_timeline(&window, &bars, cx)),
             )
             .when(self.state.hierarchy_loading, |el| {
-                el.child(
-                    div()
-                        .id("gantt-loading")
-                        .debug_selector(|| "gantt-loading".into())
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(cx.theme().overlay)
-                        .child(Label::new("Loading Hierarchy…")),
-                )
+                el.child(self.render_gantt_loading(cx))
             })
             .into_any_element()
+    }
+
+    fn render_gantt_loading(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("gantt-loading")
+            .debug_selector(|| "gantt-loading".into())
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .bg(cx.theme().overlay)
+            .child(Label::new("Loading Hierarchy…"))
+            .child(
+                v_flex()
+                    .id("gantt-loading-skeleton")
+                    .debug_selector(|| "gantt-loading-skeleton".into())
+                    .w(px(320.))
+                    .gap_2()
+                    .children(
+                        (0..4).map(|_| div().h(px(12.)).w_full().rounded_sm().bg(cx.theme().muted)),
+                    ),
+            )
+    }
+
+    fn render_empty_gantt(&self, cx: &Context<Self>) -> impl IntoElement {
+        let team = self.state.prefs.planner.team.clone();
+        let filtered = !self.state.prefs.planner.hidden_types.is_empty()
+            || !self.state.prefs.planner.hidden_states.is_empty()
+            || (self.state.prefs.planner.assignee != "anyone"
+                && !self.state.prefs.planner.assignee.is_empty());
+        let message = if let Some(error) = self.state.team_settings_error.as_ref() {
+            error.clone()
+        } else if filtered {
+            "No work items match the current filters. Clear Types, States, or Assignee to see more."
+                .into()
+        } else if team.is_empty() {
+            "Choose a team to load work items.".into()
+        } else {
+            format!(
+                "Team \"{team}\" has no work items. Pick another team, or create work in Azure DevOps."
+            )
+        };
+        v_flex()
+            .id("empty-gantt")
+            .debug_selector(|| "empty-gantt".into())
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .px_8()
+            .gap_2()
+            .child(Label::new(message))
+            .child(
+                Label::new("Use Org / Project / Team above to switch scope.")
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground),
+            )
     }
 
     fn render_gantt_nav(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1813,23 +1899,9 @@ impl PlannerView {
 
     fn dates_cell(&self, id: i64, text: String, cx: &Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        if self.inline_edit == Some(InlineEdit::Dates(id))
+        let editing = self.inline_edit == Some(InlineEdit::Dates(id))
             || self.inline_edit == Some(InlineEdit::Start(id))
-            || self.inline_edit == Some(InlineEdit::Target(id))
-        {
-            return div()
-                .id(("inline-dates-wrap", id as u64))
-                .debug_selector(|| "gantt-inline-dates".into())
-                .w(px(280.))
-                .flex_shrink_0()
-                .when_some(self.inline_dates.clone(), |el, state| {
-                    el.child(Calendar::new(&state).number_of_months(1))
-                })
-                .when(self.inline_dates.is_none(), |el| {
-                    el.child(Input::new(&self.inline_input).id(("inline-date", id as u64)))
-                })
-                .into_any_element();
-        }
+            || self.inline_edit == Some(InlineEdit::Target(id));
         let unscheduled = text.starts_with("Unscheduled");
         let display = if let Some(rest) = text.strip_prefix("Unscheduled") {
             let hint = rest.trim_start_matches([' ', '·']).trim().to_string();
@@ -1856,16 +1928,62 @@ impl PlannerView {
             .truncate()
             .text_xs()
             .when(unscheduled, |el| el.text_color(muted))
+            .when(editing, |el| el.bg(cx.theme().accent.opacity(0.35)))
             .child(display.clone())
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     this.state.gantt.selected_id = Some(id);
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    this.dates_anchor = Some((x, y + 18.0));
                     this.begin_inline(InlineEdit::Dates(id), display.clone(), window, cx);
                 }),
             )
+            .into_any_element()
+    }
+
+    fn render_dates_popover(&self, cx: &Context<Self>) -> impl IntoElement {
+        let editing_dates = matches!(
+            self.inline_edit,
+            Some(InlineEdit::Dates(_) | InlineEdit::Start(_) | InlineEdit::Target(_))
+        );
+        if !editing_dates {
+            return div().into_any_element();
+        }
+        let (x, y) = self.dates_anchor.unwrap_or((320.0, 160.0));
+        div()
+            .id("gantt-dates-popover")
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .when_some(self.inline_dates.clone(), |el, state| {
+                el.child(
+                    v_flex()
+                        .id("gantt-inline-dates")
+                        .debug_selector(|| "gantt-inline-dates".into())
+                        .min_w(px(280.))
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().popover)
+                        .shadow_md()
+                        .occlude()
+                        .child(Calendar::new(&state).number_of_months(1)),
+                )
+            })
+            .when(self.inline_dates.is_none(), |el| {
+                el.child(
+                    div()
+                        .id("inline-date-fallback")
+                        .debug_selector(|| "gantt-inline-dates".into())
+                        .min_w(px(220.))
+                        .child(Input::new(&self.inline_input).id("inline-date")),
+                )
+            })
             .into_any_element()
     }
 
@@ -1969,7 +2087,6 @@ impl PlannerView {
                                     .max_h(px(ROW_HEIGHT))
                                     .flex_basis(px(ROW_HEIGHT))
                                     .flex_shrink_0()
-                                    .overflow_hidden()
                                     .bg(if selected {
                                         selected_bg
                                     } else if hovered {
@@ -1982,6 +2099,18 @@ impl PlannerView {
                                             if *hovered { Some(id) } else { None },
                                             cx,
                                         );
+                                    }))
+                                    .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                                        if this
+                                            .state
+                                            .gantt
+                                            .gesture
+                                            .as_ref()
+                                            .is_some_and(|g| g.kind == GestureKind::Link)
+                                        {
+                                            this.state.gantt.set_link_target(id);
+                                            cx.notify();
+                                        }
                                     }))
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -2032,12 +2161,11 @@ impl PlannerView {
                                 return None;
                             }
                             let bar = bars.iter().find(|bar| bar.id == gesture.id)?;
-                            Some((bar.x + bar.width, bar.y + ROW_HEIGHT / 2.0, gesture.live_x))
+                            Some((bar.x + bar.width + 10.0, bar.y + ROW_HEIGHT - 7.0, gesture.live_x))
                         });
                         rubber.map(|(x1, y, x2)| {
                             let min_x = x1.min(x2);
                             div()
-                                .id("gantt-link-preview")
                                 .debug_selector(|| "gantt-link-preview".into())
                                 .absolute()
                                 .left(px(min_x))
@@ -2045,6 +2173,36 @@ impl PlannerView {
                                 .w(px((x2 - x1).abs().max(2.0)))
                                 .h(px(2.))
                                 .bg(cx.theme().primary)
+                        })
+                    })
+                    .children({
+                        self.state.gantt.gesture.as_ref().and_then(|gesture| {
+                            if gesture.kind == GestureKind::Link {
+                                return None;
+                            }
+                            let text = crate::gantt::GanttView::drag_preview_text(gesture);
+                            let x = self.state.gantt.x_for_date(gesture.live_start).max(4.0);
+                            let y = bars
+                                .iter()
+                                .find(|bar| bar.id == gesture.id)
+                                .map(|bar| (bar.y - 18.0).max(0.0))
+                                .unwrap_or(4.0);
+                            Some(
+                                div()
+                                    .id("gantt-drag-preview")
+                                    .debug_selector(|| "gantt-drag-preview".into())
+                                    .absolute()
+                                    .left(px(x))
+                                    .top(px(y))
+                                    .px_2()
+                                    .py(px(2.))
+                                    .rounded_sm()
+                                    .bg(cx.theme().popover)
+                                    .text_color(cx.theme().popover_foreground)
+                                    .text_xs()
+                                    .shadow_sm()
+                                    .child(text),
+                            )
                         })
                     })
                     .when(bars.is_empty(), |el| {
@@ -2341,7 +2499,7 @@ impl PlannerView {
         if show_link_handles {
             let start_x = bar.x - LINK_HANDLE - 4.0;
             let end_x = bar.x + bar.width + 4.0;
-            let handle_top = ((ROW_HEIGHT - LINK_HANDLE) / 2.0).max(0.0);
+            let handle_top = 1.0;
             for (handle_id, handle_x) in [("link-start", start_x), ("link-end", end_x)] {
                 let selector = format!("gantt-link-handle-{id}-{handle_id}");
                 let origin = handle_x + LINK_HANDLE / 2.0;
@@ -2372,16 +2530,22 @@ impl PlannerView {
         }
         if !inside {
             let label = bar.title.clone();
+            let label_gap = if show_link_handles {
+                LINK_HANDLE + 10.0
+            } else {
+                10.0
+            };
             items.push(
                 div()
                     .id(("gantt-bar-label", id as u64))
                     .debug_selector(|| "gantt-bar-label".into())
                     .absolute()
-                    .left(px(bar.x + bar.width + 6.0))
+                    .left(px(bar.x + bar.width + label_gap))
                     .top(px(((ROW_HEIGHT - 16.0) / 2.0).max(2.0)))
                     .h(px(16.))
                     .flex()
                     .items_center()
+                    .whitespace_nowrap()
                     .text_xs()
                     .text_color(muted_fg)
                     .child(label.clone())
@@ -2406,37 +2570,42 @@ impl PlannerView {
     }
 
     fn render_dependency_arrow(&self, arrow: &DependencyArrow, cx: &Context<Self>) -> AnyElement {
-        let color = cx.theme().primary.opacity(0.85);
-        let mid_x = (arrow.x1 + arrow.x2) / 2.0;
-        let min_x = arrow.x1.min(arrow.x2).min(mid_x);
-        let max_x = arrow.x1.max(arrow.x2).max(mid_x);
-        let min_y = arrow.y1.min(arrow.y2);
+        let color = cx.theme().primary.opacity(0.9);
+        let elbow_x = if arrow.x2 >= arrow.x1 + 16.0 {
+            (arrow.x1 + arrow.x2) / 2.0
+        } else {
+            arrow.x1
+        };
+        let min_x = arrow.x1.min(arrow.x2).min(elbow_x) - 2.0;
+        let max_x = arrow.x1.max(arrow.x2).max(elbow_x) + 16.0;
+        let min_y = arrow.y1.min(arrow.y2) - 8.0;
+        let max_y = arrow.y1.max(arrow.y2) + 8.0;
         let selector = format!("gantt-dep-arrow-{}-{}", arrow.from_id, arrow.to_id);
-        let h_len_1 = (mid_x - arrow.x1).abs().max(2.0);
-        let h_len_2 = (arrow.x2 - mid_x).abs().max(2.0);
+        let h1 = (elbow_x - arrow.x1).abs().max(2.0);
+        let h2 = (arrow.x2 - elbow_x).abs().max(2.0);
         let v_len = (arrow.y2 - arrow.y1).abs().max(2.0);
         div()
             .absolute()
             .left(px(min_x))
-            .top(px(min_y - 3.0))
-            .w(px((max_x - min_x).max(8.0)))
-            .h(px(v_len.max(8.0)))
+            .top(px(min_y))
+            .w(px((max_x - min_x).max(16.0)))
+            .h(px((max_y - min_y).max(16.0)))
             .child(
                 div()
                     .id(SharedString::from(selector.clone()))
                     .debug_selector(move || selector.clone())
                     .absolute()
-                    .left(px(arrow.x1 - min_x))
-                    .top(px(arrow.y1 - min_y + 2.0))
-                    .w(px(h_len_1))
+                    .left(px(arrow.x1.min(elbow_x) - min_x))
+                    .top(px(arrow.y1 - min_y))
+                    .w(px(h1))
                     .h(px(2.))
                     .bg(color),
             )
             .child(
                 div()
                     .absolute()
-                    .left(px(mid_x - min_x))
-                    .top(px(0.0))
+                    .left(px(elbow_x - min_x))
+                    .top(px(arrow.y1.min(arrow.y2) - min_y))
                     .w(px(2.))
                     .h(px(v_len))
                     .bg(color),
@@ -2444,9 +2613,9 @@ impl PlannerView {
             .child(
                 div()
                     .absolute()
-                    .left(px(mid_x.min(arrow.x2) - min_x))
-                    .top(px(arrow.y2 - min_y + 2.0))
-                    .w(px(h_len_2))
+                    .left(px(elbow_x.min(arrow.x2) - min_x))
+                    .top(px(arrow.y2 - min_y))
+                    .w(px(h2))
                     .h(px(2.))
                     .bg(color),
             )
@@ -2458,9 +2627,11 @@ impl PlannerView {
                     )))
                     .debug_selector(|| "gantt-dep-arrowhead".into())
                     .absolute()
-                    .left(px(arrow.x2 - min_x - 4.0))
-                    .top(px(arrow.y2 - min_y - 4.0))
-                    .text_sm()
+                    .left(px(arrow.x2 - min_x - 2.0))
+                    .top(px(arrow.y2 - min_y - 8.0))
+                    .w(px(14.))
+                    .h(px(16.))
+                    .text_lg()
                     .line_height(gpui_kit::relative(1.))
                     .text_color(color)
                     .child("▶"),
@@ -2837,26 +3008,40 @@ impl PlannerView {
                 FormControlKind::Boolean => {
                     let checked = value.as_bool().unwrap_or(false);
                     let field = id.clone();
+                    let entity = cx.entity();
                     h_flex()
+                        .id(SharedString::from(format!("form-boolean-{id}")))
                         .debug_selector(|| "form-boolean".into())
                         .gap_2()
                         .items_center()
                         .child(
-                            Button::new(SharedString::from(format!("form-bool-{id}")))
-                                .ghost()
-                                .compact()
+                            div()
+                                .id(SharedString::from(format!("form-boolean-box-{id}")))
+                                .debug_selector(|| "form-boolean-box".into())
+                                .size(px(16.))
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(cx.theme().primary)
+                                .when(checked, |el| el.bg(cx.theme().primary))
+                                .when(!checked, |el| el.bg(cx.theme().background)),
+                        )
+                        .child(
+                            Checkbox::new(SharedString::from(format!("form-bool-{id}")))
+                                .checked(checked)
+                                .label(if checked { "Yes" } else { "No" })
                                 .tab_stop(false)
                                 .focus_ring(false)
-                                .label(if checked { "Yes" } else { "No" })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(form) = this.state.form.as_mut() {
-                                        form.values.insert(
-                                            field.clone(),
-                                            serde_json::Value::Bool(!checked),
-                                        );
-                                    }
-                                    cx.notify();
-                                })),
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        if let Some(form) = this.state.form.as_mut() {
+                                            form.values.insert(
+                                                field.clone(),
+                                                serde_json::Value::Bool(!checked),
+                                            );
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
                         )
                         .into_any_element()
                 }
@@ -3551,10 +3736,7 @@ impl Render for PlannerView {
                 if let Some(id) = this.state.gantt.schedule_drag.take() {
                     let x: f32 = event.position.x.into();
                     if x > this.state.gantt.timeline_origin_x {
-                        let date = this
-                            .state
-                            .gantt
-                            .date_for_x(x - this.state.gantt.timeline_origin_x);
+                        let date = this.state.gantt.drop_date(x);
                         this.spawn_state(cx, move |mut state| async move {
                             let result = state.schedule_at(id, date).await;
                             (state, result)
@@ -3626,6 +3808,7 @@ impl Render for PlannerView {
                                 )
                             })
                             .child(self.render_context_menu(cx))
+                            .child(self.render_dates_popover(cx))
                             .child(self.render_form(cx))
                             .child(self.render_toasts(cx)),
                     )

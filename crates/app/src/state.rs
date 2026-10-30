@@ -1281,8 +1281,8 @@ impl PlannerState {
     }
 
     pub async fn commit_gesture(&mut self) -> Result<(), AppError> {
-        if let Some(from_id) = self.gantt.take_link_gesture() {
-            if let Some(to_id) = self.gantt.hovered_id
+        if let Some((from_id, to_id)) = self.gantt.take_link_gesture() {
+            if let Some(to_id) = to_id
                 && to_id != from_id
             {
                 return self.add_dependency(to_id, from_id).await;

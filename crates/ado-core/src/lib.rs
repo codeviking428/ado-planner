@@ -35,7 +35,7 @@ pub use hierarchy::{
     build_untyped_hierarchy_wiql, chunk_ids, escape_wiql, identity_from_field, iso_date_from_field,
     map_batch_work_item, parent_id_from_fields, predecessor_ids,
 };
-pub use html_field::{html_to_markdown, is_plain_html_field, markdown_to_html};
+pub use html_field::{html_equivalent, html_to_markdown, is_plain_html_field, markdown_to_html};
 pub use organization_url::shorten_organization_url;
 pub use overlays::apply_overlays;
 pub use planner_prefs::{

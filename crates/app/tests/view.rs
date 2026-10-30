@@ -929,6 +929,11 @@ fn dragging_a_link_dot_starts_a_link_not_a_resize(cx: &mut gpui_kit::TestAppCont
     view.update(cx, |view, _| {
         let gesture = view.state.gantt.gesture.as_ref().expect("still linking");
         assert_eq!(gesture.kind, GestureKind::Link);
+        assert_eq!(
+            gesture.link_to,
+            Some(2),
+            "a simple press, move and hover over the target must arm the link"
+        );
         let start = view
             .state
             .nodes
@@ -1086,5 +1091,130 @@ fn form_range_field_is_labelled_dates(cx: &mut gpui_kit::TestAppContext) {
     assert!(
         cx.debug_bounds("form-boolean").is_some(),
         "boolean should paint as Yes/No without a checkbox focus ring"
+    );
+    assert!(
+        cx.debug_bounds("form-boolean-box").is_some(),
+        "Needs Review / booleans must show a visible checkbox box, not only Yes/No text"
+    );
+}
+
+#[gpui_kit::test]
+fn placeholder_drop_on_august_keeps_august_dates(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = None;
+        node.target_date = None;
+        node.title = "Backlog grooming".into();
+        node.iteration_path = "Shop\\FY26\\Sprint 12".into();
+    }
+    state.iterations = vec![ado_core::IterationNode {
+        path: "Shop\\FY26\\Sprint 12".into(),
+        name: "Sprint 12".into(),
+        start_date: Some("2026-08-10T00:00:00Z".into()),
+        finish_date: Some("2026-08-21T00:00:00Z".into()),
+        children: Vec::new(),
+    }];
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scroll_x = 0.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-2")
+        .expect("unscheduled placeholder should paint from the sprint hint");
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.clone().expect("placeholder move");
+        assert_eq!(gesture.kind, GestureKind::Move);
+        let (start, _) = GanttView::gesture_patch_dates(&gesture);
+        let start = start.expect("start");
+        assert_eq!(
+            start.month(),
+            8,
+            "placeholder must use the painted sprint dates, not the July origin, got {start}"
+        );
+        assert_ne!(
+            start,
+            Date::new(2026, 7, 1).unwrap(),
+            "gesture start must not fall back to the timeline origin"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_some(),
+        "dragging a bar or placeholder must show a live date preview"
+    );
+}
+
+#[gpui_kit::test]
+fn empty_team_keeps_the_gantt_toolbar(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes.clear();
+    state.prefs.planner.team = "Empty".into();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-nav").is_some(),
+        "an empty team must keep Org/Project/Team/Today controls"
+    );
+    assert!(
+        cx.debug_bounds("empty-gantt").is_some(),
+        "empty team should show a friendly empty state, not only a missing gantt"
+    );
+}
+
+#[gpui_kit::test]
+fn loading_overlay_paints_skeleton_rows(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.hierarchy_loading = true;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-loading").is_some(),
+        "loading the hierarchy must show an overlay"
+    );
+    assert!(
+        cx.debug_bounds("gantt-loading-skeleton").is_some(),
+        "loading overlay should include skeleton rows so it is visible"
+    );
+}
+
+#[gpui_kit::test]
+fn dates_calendar_floats_above_the_cell(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let cell = cx.debug_bounds("gantt-dates-cell").expect("dates cell");
+    let cell_w = f32::from(cell.size.width);
+    cx.simulate_mouse_down(cell.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let popover = cx
+        .debug_bounds("gantt-inline-dates")
+        .expect("calendar popover");
+    assert!(
+        f32::from(popover.size.width) >= 180.0,
+        "calendar popover was only {}px wide",
+        f32::from(popover.size.width)
+    );
+    let cell_after = cx.debug_bounds("gantt-dates-cell").expect("cell stays");
+    assert!(
+        (f32::from(cell_after.size.width) - cell_w).abs() < 8.0,
+        "opening Dates must not stretch the tree column; cell grew from {cell_w} to {}",
+        f32::from(cell_after.size.width)
     );
 }

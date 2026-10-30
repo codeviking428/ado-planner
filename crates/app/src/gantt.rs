@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ado_core::{
-    GanttBarKind, IterationHint, IterationNode, WorkItemNode, dates_column_text, gantt_bar_display,
-    iteration_hint_for_path, parse_iso_date,
+    GanttBarKind, IterationHint, IterationNode, WorkItemNode, dates_column_text,
+    from_gantt_exclusive_end, gantt_bar_display, iteration_hint_for_path, parse_iso_date,
 };
 use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
@@ -184,6 +184,7 @@ pub struct Gesture {
     pub live_start: Date,
     pub live_target: Date,
     pub live_x: f32,
+    pub link_to: Option<i64>,
     pub had_start: bool,
     pub had_target: bool,
 }
@@ -508,6 +509,10 @@ impl GanttView {
         self.origin.saturating_add(days.days())
     }
 
+    pub fn drop_date(&self, window_x: f32) -> Date {
+        self.date_for_x(window_x - self.timeline_origin_x)
+    }
+
     pub fn layout_bars(
         &self,
         nodes: &[WorkItemNode],
@@ -574,6 +579,7 @@ impl GanttView {
                 live_start: today,
                 live_target: today,
                 live_x: origin_x,
+                link_to: None,
                 had_start: false,
                 had_target: false,
             });
@@ -594,11 +600,7 @@ impl GanttView {
         }
         let had_start = parse_iso_date(node.start_date.as_deref()).is_some();
         let had_target = parse_iso_date(node.target_date.as_deref()).is_some();
-        let display = gantt_bar_display(node, nodes, None);
-        let start = display.start.unwrap_or(self.origin);
-        let target = display
-            .end
-            .unwrap_or_else(|| start.saturating_add((ado_core::DEFAULT_BAR_DAYS - 1).days()));
+        let (start, target) = self.dates_from_painted_bar(bar, node, nodes);
         if bar.kind == GanttBarKind::Unscheduled && kind != GestureKind::Move {
             return Err("Unscheduled bars can be moved to set dates.");
         }
@@ -612,10 +614,28 @@ impl GanttView {
             live_start: start,
             live_target: target,
             live_x: origin_x,
+            link_to: None,
             had_start,
             had_target,
         });
         Ok(())
+    }
+
+    fn dates_from_painted_bar(
+        &self,
+        bar: &BarLayout,
+        node: &WorkItemNode,
+        nodes: &[WorkItemNode],
+    ) -> (Date, Date) {
+        let display = gantt_bar_display(node, nodes, None);
+        if bar.milestone {
+            let start = display.start.or(display.end).unwrap_or(self.origin);
+            return (start, display.end.unwrap_or(start));
+        }
+        let start = self.date_for_x(bar.x);
+        let end = self.date_for_x(bar.x + bar.width.max(1.0));
+        let target = from_gantt_exclusive_end(end);
+        (start, target.max(start))
     }
 
     pub fn update_gesture(&mut self, x: f32) {
@@ -667,14 +687,38 @@ impl GanttView {
         Some((gesture.id, gesture.live_start, gesture.live_target))
     }
 
-    pub fn take_link_gesture(&mut self) -> Option<i64> {
+    pub fn take_link_gesture(&mut self) -> Option<(i64, Option<i64>)> {
         let gesture = self.gesture.as_ref()?;
         if gesture.kind != GestureKind::Link {
             return None;
         }
-        let id = gesture.id;
+        let from_id = gesture.id;
+        let to_id = gesture.link_to.or(self.hovered_id);
         self.gesture = None;
-        Some(id)
+        Some((from_id, to_id))
+    }
+
+    pub fn set_link_target(&mut self, id: i64) {
+        if let Some(gesture) = self.gesture.as_mut()
+            && gesture.kind == GestureKind::Link
+        {
+            gesture.link_to = Some(id);
+            self.hovered_id = Some(id);
+        }
+    }
+
+    pub fn drag_preview_text(gesture: &Gesture) -> String {
+        if gesture.kind == GestureKind::Link {
+            return match gesture.link_to {
+                Some(to) => format!("Link to #{to}"),
+                None => "Drop on a bar to link".into(),
+            };
+        }
+        if gesture.live_start == gesture.live_target {
+            gesture.live_start.to_string()
+        } else {
+            format!("{} – {}", gesture.live_start, gesture.live_target)
+        }
     }
 
     pub fn gesture_patch_dates(gesture: &Gesture) -> (Option<Date>, Option<Date>) {
@@ -895,6 +939,8 @@ impl GanttView {
     }
 
     pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
+        const GAP: f32 = 10.0;
+        const LANE: f32 = 7.0;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
         let mut out = Vec::new();
         for bar in bars {
@@ -905,10 +951,10 @@ impl GanttView {
                 out.push(DependencyArrow {
                     from_id: *pred_id,
                     to_id: bar.id,
-                    x1: pred.x + pred.width,
-                    y1: pred.y + ROW_HEIGHT / 2.0,
-                    x2: bar.x,
-                    y2: bar.y + ROW_HEIGHT / 2.0,
+                    x1: pred.x + pred.width + GAP,
+                    y1: pred.y + ROW_HEIGHT - LANE,
+                    x2: bar.x - GAP,
+                    y2: bar.y + ROW_HEIGHT - LANE,
                 });
             }
         }
@@ -1605,8 +1651,53 @@ mod tests {
                 &nodes,
             )
             .expect("link again");
-        assert_eq!(gantt.take_link_gesture(), Some(1));
+        assert_eq!(gantt.take_link_gesture(), Some((1, None)));
         assert!(gantt.gesture.is_none());
+    }
+
+    #[test]
+    fn placeholder_drop_uses_painted_dates_not_today_origin() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        item.title = "Backlog grooming".into();
+        item.iteration_path = "Shop\\FY26\\Sprint 12".into();
+        let nodes = vec![item];
+        let iterations = vec![ado_core::IterationNode {
+            path: "Shop\\FY26\\Sprint 12".into(),
+            name: "Sprint 12".into(),
+            start_date: Some("2026-08-10T00:00:00Z".into()),
+            finish_date: Some("2026-08-21T00:00:00Z".into()),
+            children: Vec::new(),
+        }];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 10, 30).unwrap(),
+            scroll_x: -TODAY_MARGIN_PX,
+            timeline_origin_x: 486.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &iterations, 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 1).expect("placeholder");
+        let drop = Date::new(2026, 8, 20).unwrap();
+        let drop_x = gantt.x_for_date(drop);
+        gantt
+            .begin_gesture(bar, GestureKind::Move, drop_x, &nodes)
+            .expect("placeholder move");
+        gantt.update_gesture(drop_x);
+        let gesture = gantt.gesture.clone().expect("live");
+        let (start, target) = GanttView::gesture_patch_dates(&gesture);
+        let start = start.expect("start");
+        assert_eq!(
+            start.month(),
+            8,
+            "drop around Aug 20 must not save November (got {start}–{target:?})"
+        );
+        assert!(
+            start >= Date::new(2026, 8, 1).unwrap() && start <= Date::new(2026, 8, 31).unwrap(),
+            "placeholder drop around Aug 20 saved {start}–{target:?}"
+        );
+        assert_eq!(gantt.drop_date(gantt.timeline_origin_x + drop_x), drop);
     }
 
     #[test]
@@ -1672,7 +1763,20 @@ mod tests {
         assert_eq!(arrows.len(), 1);
         assert_eq!(arrows[0].from_id, 1);
         assert_eq!(arrows[0].to_id, 2);
-        assert!(arrows[0].x2 >= arrows[0].x1);
+        let pred = bars.iter().find(|bar| bar.id == 1).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 2).unwrap();
+        assert!(
+            arrows[0].x1 >= pred.x + pred.width,
+            "connector must start after the source bar, not through its label"
+        );
+        assert!(
+            arrows[0].x2 <= succ.x,
+            "connector must end before the target bar"
+        );
+        assert!(
+            arrows[0].y1 > pred.y + 8.0,
+            "connector must sit below the source label"
+        );
     }
 
     #[test]
