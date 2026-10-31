@@ -179,7 +179,16 @@ test('Work Item titles and types are not clipped', async ({ window }) => {
 })
 
 test('drag date PATCHes Start/Target and shows a success toast', async ({ window }) => {
+  await expect(window.getByTestId('work-item-1003')).toBeVisible()
+  // Month view is the current calendar month, so a July 2026 bar is not in
+  // the occurrence list at all on an October (or later) CI run. Year puts
+  // the whole of 2026 on the axis so #1003 exists in the DOM.
+  await window.locator('[data-slot="gantt-scale-switcher"]').click()
+  await window.getByRole('menuitem', { name: 'Year' }).click()
   const bar = window.locator('[data-gantt-row-id="1003"] [data-slot="gantt-bar"]')
+  if ((await bar.count()) === 0) {
+    await window.getByRole('button', { name: 'Previous' }).click()
+  }
   await expect(bar).toBeAttached()
   const pane = window.locator('[data-slot="gantt-timeline-pane"]')
   await expect(pane).toBeVisible()
