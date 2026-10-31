@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/codeviking428/ado-planner"
+version = "0.1.0"
+rust-version = "1.99.1"
+
+[workspace.dependencies]
+ado-core = { path = "crates/ado-core" }
+ado-client = { path = "crates/ado-client" }
+ado-mock = { path = "crates/ado-mock" }
+ado-session = { path = "crates/ado-session" }
+async-trait = "0.1"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+comrak = "0.41"
+dirs = "6"
+html5ever = "0.35"
+htmd = "0.3"
+jiff = { version = "0.2", features = ["serde"] }
+keyring = "3"
+markup5ever_rcdom = "0.35"
+oauth2 = "5"
+open = "5"
+postcard = { version = "1", features = ["use-std"] }
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+urlencoding = "2"
+single-instance = "0.3"
+gpui-kit = { version = "0.8.1", default-features = false, features = ["component", "assets"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }

@@ -1,3 +1,4 @@
+/target
 node_modules
 dist
 out
@@ -10,3 +11,5 @@ release
 !.env.example
 test-results
 playwright-report
+__pycache__/
+*.pyc

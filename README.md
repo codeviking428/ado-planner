@@ -108,8 +108,10 @@ Pick **Org → Project → Team** in the header. The Gantt loads that Team's Wor
 | Hide clutter                 | Check **Hide types** / **Hide states**                          |
 | Move work in time            | Drag a bar; Start + Target save together                        |
 | Change just the finish       | Drag the bar's right edge (left edge changes Start)             |
-| Nudge a day at a time        | Focus a bar, then **←** / **→**                                 |
-| Cancel a drag                | **Escape**                                                      |
+| Nudge a day at a time        | Focus a bar, then **←** / **→** (one day at every scale)        |
+| Nudge Target only            | **Shift+←** / **Shift+→**                                       |
+| Nudge Start only             | **Alt+←** / **Alt+→**                                           |
+| Cancel a drag or unsaved Nudge | **Escape**                                                    |
 | Edit title, state, assignee… | Double-click a bar or a Work Item row                           |
 | Jump around the timeline     | **Today**, **‹ ›**, scale (Day → Year), and **+ −** zoom        |
 | Switch light/dark            | **Flavor** — Catppuccin `latte`, `frappe`, `macchiato`, `mocha` |

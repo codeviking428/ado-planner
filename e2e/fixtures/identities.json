@@ -1,0 +1,8 @@
+{
+  "value": [
+    { "displayName": "Ada Lovelace", "uniqueName": "ada@contoso.com" },
+    { "displayName": "Grace Hopper", "uniqueName": "grace@contoso.com" },
+    { "displayName": "Alan Turing", "uniqueName": "alan@contoso.com" },
+    { "displayName": "Katherine Johnson", "uniqueName": "katherine@contoso.com" }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "Shop": {
+    "value": [
+      { "id": "t1", "name": "Platform" },
+      { "id": "t3", "name": "Growth" },
+      { "id": "t4", "name": "Empty" }
+    ]
+  },
+  "Roadmap": { "value": [{ "id": "t2", "name": "Delivery" }] }
+}
