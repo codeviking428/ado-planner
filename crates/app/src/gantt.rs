@@ -15,6 +15,7 @@ pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
 pub const LINK_HANDLE: f32 = 14.0;
+pub const LINK_HANDLE_HIT: f32 = 18.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
@@ -55,6 +56,14 @@ impl GanttScale {
             Self::Month => "Month",
             Self::Quarter => "Quarter",
             Self::Year => "Year",
+        }
+    }
+
+    pub fn button_label(self, zoom: f32) -> String {
+        if (zoom - 1.0).abs() < 0.005 {
+            self.label().to_string()
+        } else {
+            format!("{} ({:.0}%)", self.label(), zoom * 100.0)
         }
     }
 
@@ -667,10 +676,7 @@ impl GanttView {
         let Some(gesture) = &mut self.gesture else {
             return;
         };
-        if gesture.kind == GestureKind::Link {
-            gesture.live_x = x;
-            return;
-        }
+        gesture.live_x = x;
         let delta_days =
             ((x - gesture.origin_x) / self.scale.pixels_per_day(self.zoom)).round() as i32;
         match gesture.kind {
@@ -678,9 +684,7 @@ impl GanttView {
                 gesture.live_start = gesture.start.saturating_add(delta_days.days());
                 gesture.live_target = gesture.target.saturating_add(delta_days.days());
             }
-            GestureKind::Link => {
-                gesture.live_x = x;
-            }
+            GestureKind::Link => {}
             GestureKind::ResizeStart => {
                 let next = gesture.start.saturating_add(delta_days.days());
                 if next <= gesture.target {
@@ -699,6 +703,7 @@ impl GanttView {
     pub fn cancel_gesture(&mut self) {
         self.gesture = None;
         self.pending_nudge = None;
+        self.clear_hover();
     }
 
     pub fn finish_gesture(&mut self) -> Option<(i64, Date, Date)> {
@@ -742,7 +747,7 @@ impl GanttView {
         if gesture.live_start == gesture.live_target {
             gesture.live_start.to_string()
         } else {
-            format!("{} – {}", gesture.live_start, gesture.live_target)
+            format!("{} → {}", gesture.live_start, gesture.live_target)
         }
     }
 
@@ -1893,6 +1898,10 @@ mod tests {
             (live.x - expected_x).abs() < 1.0,
             "painted bar must follow the snapped preview, got {} vs {expected_x}",
             live.x
+        );
+        assert_eq!(
+            GanttView::drag_preview_text(&gesture),
+            format!("{} → {}", gesture.live_start, gesture.live_target)
         );
     }
 

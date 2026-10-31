@@ -1170,6 +1170,14 @@ fn empty_team_keeps_the_gantt_toolbar(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("empty-gantt").is_some(),
         "empty team should show a friendly empty state, not only a missing gantt"
     );
+    assert!(
+        cx.debug_bounds("gantt-timeline-body").is_some(),
+        "empty-state body must still draw the timeline grid"
+    );
+    assert!(
+        cx.debug_bounds("gantt-today").is_some(),
+        "empty-state body must still draw the Today line"
+    );
 }
 
 #[gpui_kit::test]
@@ -1373,6 +1381,69 @@ fn mouse_leave_clears_row_hover_and_link_handles(cx: &mut gpui_kit::TestAppConte
             view.state.gantt.hovered_link, None,
             "leaving the canvas must hide link handles"
         );
+    });
+}
+
+#[gpui_kit::test]
+fn drag_end_clears_row_hover_and_link_handles(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1").expect("bar");
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let moved = gpui_kit::point(bar.center().x + px(36.), bar.center().y);
+    cx.simulate_mouse_move(moved, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_some(),
+            "mouse down + move must start a drag"
+        );
+        assert_eq!(
+            view.state.gantt.hovered_id,
+            Some(1),
+            "hover stays during the drag so the bar can follow the pointer"
+        );
+    });
+    cx.simulate_mouse_up(moved, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_id, None,
+            "drag end must clear the row highlight"
+        );
+        assert_eq!(
+            view.state.gantt.hovered_link, None,
+            "drag end must hide link handles"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-handle-1-link-end").is_none(),
+        "link handles must not stick after a drag"
+    );
+}
+
+#[gpui_kit::test]
+fn closing_a_dialog_clears_canvas_hover(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(1);
+    state.gantt.hovered_link = Some((1, 2));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, _| {
+        view.state.close_form();
+        assert_eq!(view.state.gantt.hovered_id, None);
+        assert_eq!(view.state.gantt.hovered_link, None);
     });
 }
 

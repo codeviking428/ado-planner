@@ -40,8 +40,9 @@ use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
     ASSIGNEE_COL_WIDTH, DATES_COL_WIDTH, DependencyArrow, GanttScale, GestureKind, HANDLE_WIDTH,
-    ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS,
-    NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SUMMARY_BAR_H, TIMELINE_HEADER_H, TYPE_COL_WIDTH,
+    ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH,
+    NUDGE_IDLE_MS, NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SUMMARY_BAR_H, TIMELINE_HEADER_H,
+    TYPE_COL_WIDTH,
 };
 use crate::paths::AppPaths;
 use crate::state::PlannerState;
@@ -456,6 +457,7 @@ impl PlannerView {
         self.state.close_form();
         self.state.cancel_gesture();
         self.state.gantt.schedule_drag = None;
+        self.state.gantt.clear_hover();
         self.dates_anchor = None;
     }
 
@@ -1155,7 +1157,7 @@ impl PlannerView {
                 "root-filter",
                 "Roots",
                 self.state.hidden_root_count(),
-                "Top-level types shown on the Gantt. Defaults to this team's top backlog.",
+                "Top-level types shown on the Gantt. Defaults to every loaded type.",
                 cx,
             ))
             .child(self.filter_button(
@@ -1346,19 +1348,7 @@ impl PlannerView {
                 .into_any_element();
         }
         let visible = self.state.visible_nodes();
-        let filtered_empty = self.state.filters_hide_work_items();
-        if visible.is_empty() && !filtered_empty {
-            return v_flex()
-                .id("gantt")
-                .size_full()
-                .relative()
-                .child(self.render_gantt_nav(cx))
-                .child(self.render_empty_gantt(cx))
-                .when(self.state.hierarchy_loading, |el| {
-                    el.child(self.render_gantt_loading(cx))
-                })
-                .into_any_element();
-        }
+        let empty_canvas = visible.is_empty();
         let rows = self.state.gantt.flatten(&visible);
         let viewport_h = self.state.gantt.viewport_h.max(120.0);
         let content_h = (viewport_h - TIMELINE_HEADER_H).max(80.0);
@@ -1412,7 +1402,7 @@ impl PlannerView {
                             ),
                     )
                     .child(self.render_timeline(&window, &bars, cx))
-                    .when(filtered_empty, |el| {
+                    .when(empty_canvas, |el| {
                         el.child(
                             div()
                                 .absolute()
@@ -1612,8 +1602,13 @@ impl PlannerView {
                     .children(GanttScale::ALL.iter().map(|scale| {
                         let scale = *scale;
                         let selected = self.state.gantt.scale == scale;
+                        let label = if selected {
+                            scale.button_label(self.state.gantt.zoom)
+                        } else {
+                            scale.label().to_string()
+                        };
                         Button::new(scale.label())
-                            .label(scale.label())
+                            .label(label)
                             .compact()
                             .selected(selected)
                             .when(selected, |btn| btn.primary())
@@ -2334,11 +2329,11 @@ impl PlannerView {
                                 return None;
                             }
                             let text = crate::gantt::GanttView::drag_preview_text(gesture);
-                            let x = self.state.gantt.x_for_date(gesture.live_start).max(4.0);
+                            let x = gesture.live_x.max(4.0);
                             let y = bars
                                 .iter()
                                 .find(|bar| bar.id == gesture.id)
-                                .map(|bar| (bar.y - 18.0).max(0.0))
+                                .map(|bar| (bar.y - 22.0).max(2.0))
                                 .unwrap_or(4.0);
                             Some(
                                 div()
@@ -2353,12 +2348,16 @@ impl PlannerView {
                                     .bg(cx.theme().popover)
                                     .text_color(cx.theme().popover_foreground)
                                     .text_xs()
-                                    .shadow_sm()
+                                    .shadow_md()
                                     .child(text),
                             )
                         })
                     })
-                    .when(bars.is_empty() && !self.state.filters_hide_work_items(), |el| {
+                    .when(
+                        bars.is_empty()
+                            && !self.state.nodes.is_empty()
+                            && !self.state.filters_hide_work_items(),
+                        |el| {
                         el.child(
                             div()
                                 .absolute()
@@ -2466,7 +2465,7 @@ impl PlannerView {
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
         let show_handles = !summary && !unscheduled && !milestone && hovered && !dragging;
-        let show_link_handles = !unscheduled && (hovered || selected) && !dragging;
+        let show_link_handles = !unscheduled && hovered && !dragging;
         let bar_h = if milestone {
             MILESTONE_SIZE
         } else if summary {
@@ -2521,7 +2520,10 @@ impl PlannerView {
                 .when(summary && !milestone, |el| {
                     el.bg(cx.theme().muted).rounded_sm()
                 })
-                .when(!summary && !milestone, |el| el.bg(rgb(bar.color)))
+                .when(!summary && !milestone, |el| {
+                    el.bg(rgb(bar.color))
+                        .when(hovered && !dragging, |el| el.opacity(0.92))
+                })
                 .when(unscheduled && !summary, |el| {
                     el.bg(cx.theme().muted)
                         .opacity(0.95)
@@ -2530,11 +2532,12 @@ impl PlannerView {
                 })
                 .text_color(if summary { muted_fg } else { bar_label_fg })
                 .when(!milestone && !unscheduled, |el| {
-                    el.border_1().border_color(if selected {
-                        cx.theme().primary
-                    } else {
-                        cx.theme().border
-                    })
+                    el.border_1()
+                        .border_color(if selected || (hovered && !dragging) {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().border
+                        })
                 })
                 .overflow_hidden()
                 .when(show_progress, |el| {
@@ -2641,12 +2644,12 @@ impl PlannerView {
                 .into_any_element(),
         ];
         if show_link_handles {
-            let start_x = bar.x - LINK_HANDLE - 4.0;
+            let start_x = bar.x - LINK_HANDLE_HIT - 4.0;
             let end_x = bar.x + bar.width + 4.0;
-            let handle_top = 1.0;
+            let handle_top = ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
             for (handle_id, handle_x) in [("link-start", start_x), ("link-end", end_x)] {
                 let selector = format!("gantt-link-handle-{id}-{handle_id}");
-                let origin = handle_x + LINK_HANDLE / 2.0;
+                let origin = handle_x + LINK_HANDLE_HIT / 2.0;
                 items.push(
                     div()
                         .id((handle_id, id as u64))
@@ -2654,11 +2657,15 @@ impl PlannerView {
                         .absolute()
                         .left(px(handle_x))
                         .top(px(handle_top))
-                        .size(px(LINK_HANDLE))
-                        .rounded_full()
-                        .bg(cx.theme().background)
-                        .border_2()
-                        .border_color(cx.theme().primary)
+                        .size(px(LINK_HANDLE_HIT))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.set_hovered(Some(id), cx);
+                            }
+                        }))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -2668,6 +2675,14 @@ impl PlannerView {
                                 cx.notify();
                             }),
                         )
+                        .child(
+                            div()
+                                .size(px(LINK_HANDLE))
+                                .rounded_full()
+                                .bg(cx.theme().background)
+                                .border_2()
+                                .border_color(cx.theme().primary),
+                        )
                         .into_any_element(),
                 );
             }
@@ -2675,7 +2690,7 @@ impl PlannerView {
         if !inside {
             let label = bar.title.clone();
             let label_gap = if show_link_handles {
-                LINK_HANDLE + 10.0
+                LINK_HANDLE_HIT + 10.0
             } else {
                 10.0
             };
@@ -3510,6 +3525,15 @@ impl PlannerView {
     fn commit_gesture(&mut self, cx: &mut Context<Self>) {
         if self.state.gantt.gesture.is_none() {
             return;
+        }
+        let linking = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link);
+        if !linking {
+            self.state.gantt.clear_hover();
         }
         self.spawn_state(cx, |mut state| async move {
             let result = state.commit_gesture().await;

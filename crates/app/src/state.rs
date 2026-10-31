@@ -188,14 +188,7 @@ impl PlannerState {
         let mut states: Vec<_> = self.nodes.iter().map(|n| n.state.clone()).collect();
         states.sort();
         states.dedup();
-        let resolved = resolve_root_types(
-            self.prefs.planner.root_types.clone(),
-            &types,
-            self.hierarchy
-                .as_ref()
-                .map(|h| h.top_backlog_types.as_slice())
-                .unwrap_or(&[]),
-        );
+        let resolved = self.planner_root_types(&types);
         OverlayFilter {
             types: if self.prefs.planner.hidden_types.is_empty() {
                 None
@@ -259,16 +252,15 @@ impl PlannerState {
         states
     }
 
+    fn planner_root_types(&self, types: &[String]) -> Option<Vec<String>> {
+        // Unset Roots prefs mean every loaded type, matching the first-load default.
+        // Team switch must not reseed from the team's top backlog (Epic-only).
+        resolve_root_types(self.prefs.planner.root_types.clone(), types, &[])
+    }
+
     pub fn hidden_roots(&self) -> Vec<String> {
         let types = self.types();
-        let resolved = resolve_root_types(
-            self.prefs.planner.root_types.clone(),
-            &types,
-            self.hierarchy
-                .as_ref()
-                .map(|h| h.top_backlog_types.as_slice())
-                .unwrap_or(&[]),
-        );
+        let resolved = self.planner_root_types(&types);
         match resolved {
             None => Vec::new(),
             Some(roots) => types.into_iter().filter(|ty| !roots.contains(ty)).collect(),
@@ -635,7 +627,7 @@ impl PlannerState {
     pub async fn set_team(&mut self, team: String) -> Result<(), AppError> {
         self.prefs.planner.team = team;
         self.prefs.planner.iteration_path.clear();
-        self.prefs.planner.root_types = None;
+        self.prefs.planner.root_types = Some(None);
         self.persist_prefs();
         self.heal_and_load_iterations().await?;
         self.load_members().await?;
@@ -884,6 +876,7 @@ impl PlannerState {
 
     pub fn close_form(&mut self) {
         self.form = None;
+        self.gantt.clear_hover();
     }
 
     pub async fn save_form(&mut self) -> Result<(), AppError> {
@@ -1052,6 +1045,9 @@ impl PlannerState {
         after_start: Option<String>,
         after_target: Option<String>,
     ) {
+        if before.start_date == after_start && before.target_date == after_target {
+            return;
+        }
         self.record(HistoryEntry::Dates {
             id,
             before_start: before.start_date.clone(),
@@ -1490,13 +1486,6 @@ impl PlannerState {
 
     pub fn update_bar_gesture(&mut self, x: f32) {
         self.gantt.update_gesture(x);
-        if let Some(gesture) = &self.gantt.gesture {
-            if gesture.kind == GestureKind::Link {
-                return;
-            }
-            let (start, target) = crate::gantt::GanttView::gesture_patch_dates(gesture);
-            let _ = self.apply_optimistic_partial(gesture.id, start, target);
-        }
     }
 
     pub fn cancel_gesture(&mut self) {
@@ -1515,6 +1504,7 @@ impl PlannerState {
 
     pub async fn commit_gesture(&mut self) -> Result<(), AppError> {
         if let Some((from_id, to_id)) = self.gantt.take_link_gesture() {
+            self.gantt.clear_hover();
             if let Some(to_id) = to_id
                 && to_id != from_id
             {
@@ -1525,12 +1515,15 @@ impl PlannerState {
         if let Some(gesture) = self.gantt.gesture.clone() {
             if gesture.live_start == gesture.start && gesture.live_target == gesture.target {
                 self.gantt.gesture = None;
+                self.gantt.clear_hover();
                 return Ok(());
             }
             let (start, target) = crate::gantt::GanttView::gesture_patch_dates(&gesture);
             self.gantt.gesture = None;
+            self.gantt.clear_hover();
             return self.save_partial_dates(gesture.id, start, target).await;
         }
+        self.gantt.clear_hover();
         Ok(())
     }
 
@@ -1561,6 +1554,7 @@ impl PlannerState {
             return Ok(());
         };
         self.last_nudge_at = None;
+        self.restore_nudge(&pending);
         let start = pending.had_start.then_some(pending.start);
         let target = pending.had_target.then_some(pending.target);
         self.save_partial_dates(pending.id, start, target).await

@@ -77,14 +77,22 @@ async fn loads_hierarchy_including_an_unparented_root() {
             .iter()
             .any(|n| n.id == 1003 && n.title.contains("Persist cart"))
     );
-    assert!(!visible.iter().any(|n| n.id == 1012));
+    assert!(
+        visible.iter().any(|n| n.id == 1012),
+        "startup Roots default is every loaded type, including Task root #1012"
+    );
 }
 
 #[tokio::test]
 async fn roots_hide_unparented_work_items_that_are_not_a_root_type() {
     let (_mock, mut state, _dir) = signed_in_state().await;
+    assert!(
+        state.visible_nodes().iter().any(|n| n.id == 1012),
+        "Task root #1012 is visible under the startup Roots default"
+    );
+    assert_eq!(state.hidden_root_count(), 0);
+    state.toggle_hidden_root("Task");
     assert!(!state.visible_nodes().iter().any(|n| n.id == 1012));
-    assert!(state.hidden_root_count() >= 1);
     state.show_all_roots();
     assert!(
         state
@@ -102,40 +110,31 @@ async fn roots_count_is_the_selected_types_and_team_switch_matches_first_load() 
     let first_hidden = state.visible_nodes().iter().any(|n| n.id == 1012);
     let first_selected = state.selected_root_count();
     assert!(
-        !first_hidden,
-        "first load should seed the top backlog and hide Task root #1012"
+        first_hidden,
+        "first load should show every root type, including Task root #1012"
     );
-    assert!(
-        first_selected >= 1,
-        "Roots (N) is the selected count, got {first_selected}"
+    assert_eq!(
+        first_selected,
+        state.types().len(),
+        "Roots selected count should be every loaded type, got {first_selected} of {}",
+        state.types().len()
     );
-    assert!(
-        first_selected < state.types().len() || state.hidden_root_count() == 0,
-        "selected count must not be the hidden-type count when some types are hidden"
-    );
-    if state.hidden_root_count() > 0 {
-        assert_ne!(
-            first_selected,
-            state.hidden_root_count(),
-            "Roots (N) used to show hidden types ({}) instead of selected ({first_selected})",
-            state.hidden_root_count()
-        );
-    }
+    assert_eq!(state.hidden_root_count(), 0);
     state.set_team("Growth".into()).await.expect("Growth");
     state
         .set_team("Platform".into())
         .await
         .expect("back to Platform");
-    assert_eq!(
+    assert!(
         state.visible_nodes().iter().any(|n| n.id == 1012),
-        first_hidden,
-        "team switch must reseed the same default as the first load"
+        "Platform→Growth→Platform must keep Task root #1012, matching the startup default"
     );
     assert_eq!(
         state.selected_root_count(),
         first_selected,
         "Roots selected count after a team switch must match the initial default"
     );
+    assert_eq!(state.hidden_root_count(), 0);
 }
 
 #[tokio::test]

@@ -37,8 +37,13 @@ fn expand_collapse_and_scale_change() {
     assert_eq!(gantt.flatten(&nodes).len(), rows.len());
     gantt.scale = GanttScale::Week;
     assert_eq!(gantt.scale.label(), "Week");
+    assert_eq!(gantt.scale.button_label(1.0), "Week");
     gantt.zoom_at(1.5, 40.0, 0.0);
     assert!(gantt.zoom > 1.0);
+    assert_eq!(
+        gantt.scale.button_label(gantt.zoom),
+        format!("Week ({:.0}%)", gantt.zoom * 100.0)
+    );
 }
 
 #[test]
@@ -148,6 +153,58 @@ async fn resize_end_patches_target_only() {
     assert_eq!(updated.start_date, original_start);
     let next_target = parse_iso_date(updated.target_date.as_deref()).unwrap();
     assert_eq!(next_target, original_target.saturating_add(3.days()));
+}
+
+#[tokio::test]
+async fn undo_after_a_bar_drag_restores_original_dates() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let original_start = node.start_date.clone();
+    let original_target = node.target_date.clone();
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(state.gantt.scale.pixels_per_day(state.gantt.zoom) * 3.0);
+    state.commit_gesture().await.expect("commit drag");
+    let moved = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_ne!(
+        moved.start_date, original_start,
+        "drag must save a new Start Date so undo has work to do"
+    );
+    assert!(
+        !state.history.undo.is_empty(),
+        "a bar drag must push an undo entry"
+    );
+    state.undo().await.expect("undo drag");
+    let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(restored.start_date, original_start);
+    assert_eq!(restored.target_date, original_target);
+}
+
+#[tokio::test]
+async fn undo_after_an_end_handle_drag_restores_original_target() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let original_start = node.start_date.clone();
+    let original_target = node.target_date.clone();
+    let _ = state.begin_bar_gesture(node.id, GestureKind::ResizeEnd, 0.0);
+    state.update_bar_gesture(state.gantt.scale.pixels_per_day(state.gantt.zoom) * 4.0);
+    state.commit_gesture().await.expect("commit resize");
+    let moved = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(moved.start_date, original_start);
+    assert_ne!(moved.target_date, original_target);
+    state.undo().await.expect("undo resize");
+    let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(restored.start_date, original_start);
+    assert_eq!(restored.target_date, original_target);
 }
 
 #[tokio::test]
