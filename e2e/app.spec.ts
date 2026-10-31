@@ -179,8 +179,27 @@ test('Work Item titles and types are not clipped', async ({ window }) => {
 })
 
 test('drag date PATCHes Start/Target and shows a success toast', async ({ window }) => {
-  const bar = window.locator('[data-slot="gantt-bar"]').first()
-  await expect(bar).toBeVisible()
+  const bar = window.locator('[data-gantt-row-id="1003"] [data-slot="gantt-bar"]')
+  await expect(bar).toBeAttached()
+  const pane = window.locator('[data-slot="gantt-timeline-pane"]')
+  await expect(pane).toBeVisible()
+  const barOnScreen = async () => {
+    const barBox = await bar.boundingBox()
+    const paneBox = await pane.boundingBox()
+    if (!barBox || !paneBox || barBox.width < 8) {
+      return false
+    }
+    return barBox.x + barBox.width > paneBox.x + 8 && barBox.x < paneBox.x + paneBox.width - 8
+  }
+  if (!(await barOnScreen())) {
+    await bar.evaluate((el) => el.scrollIntoView({ block: 'nearest', inline: 'center' }))
+  }
+  if (!(await barOnScreen())) {
+    const chip = window.locator('[data-slot="gantt-offscreen-chip"][data-side="start"]').first()
+    await expect(chip).toBeVisible()
+    await chip.click()
+  }
+  await expect.poll(barOnScreen).toBeTruthy()
   const box = await bar.boundingBox()
   if (!box) {
     throw new Error('missing bar')
