@@ -2526,9 +2526,10 @@ fn dates_picker_has_month_arrows_and_typed_input(cx: &mut gpui_kit::TestAppConte
     cx.simulate_click(prev.center(), gpui_kit::Modifiers::default());
     draw(cx);
     let after = view.update(cx, |view, cx| view.inline_calendar_month(cx));
-    assert_ne!(
-        before, after,
-        "clicking ‹ must change the visible month, {before:?} -> {after:?}"
+    let expected = before.map(|month| if month == 1 { 12 } else { month - 1 });
+    assert_eq!(
+        after, expected,
+        "clicking ‹ must move exactly one month, {before:?} -> {after:?}"
     );
     assert!(
         cx.debug_bounds("gantt-dates-month-label").is_some(),

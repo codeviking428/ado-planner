@@ -999,19 +999,12 @@ impl PlannerState {
                 if let Some(form) = self.form.as_ref() {
                     form.apply_saved(&mut self.nodes, rev);
                 }
-                if let (Some(before), Some(after)) = (
-                    before.as_ref(),
-                    self.nodes.iter().find(|node| node.id == id),
-                ) && (before.start_date != after.start_date
-                    || before.target_date != after.target_date)
-                {
-                    self.record_dates(
-                        id,
-                        before,
-                        after.start_date.clone(),
-                        after.target_date.clone(),
-                    );
-                }
+                let dates_changed = matches!(
+                    (before.as_ref(), self.nodes.iter().find(|node| node.id == id)),
+                    (Some(before), Some(after))
+                        if before.start_date != after.start_date
+                            || before.target_date != after.target_date
+                );
                 self.form = None;
                 self.persist_hierarchy_cache();
                 let names: Vec<String> = ops
@@ -1027,7 +1020,22 @@ impl PlannerState {
                         .iter()
                         .all(|name| name == "start date" || name == "target date");
                 let field_changes = field_changes_from_ops(&ops, &original_values);
-                if !field_changes.is_empty() {
+                let has_non_date = field_changes
+                    .iter()
+                    .any(|(reference, _, _)| !is_scheduling_date(reference));
+                if dates_changed && !has_non_date {
+                    if let (Some(before), Some(after)) = (
+                        before.as_ref(),
+                        self.nodes.iter().find(|node| node.id == id),
+                    ) {
+                        self.record_dates(
+                            id,
+                            before,
+                            after.start_date.clone(),
+                            after.target_date.clone(),
+                        );
+                    }
+                } else if !field_changes.is_empty() {
                     self.record(HistoryEntry::Fields {
                         id,
                         changes: field_changes.clone(),
@@ -2385,7 +2393,14 @@ impl PlannerState {
                 dst.predecessors = src.predecessors.clone();
                 dst.title = src.title.clone();
                 dst.assigned_to = src.assigned_to.clone();
+                dst.state = src.state.clone();
+                dst.iteration_path = src.iteration_path.clone();
+                dst.area_path = src.area_path.clone();
                 dst.fields = src.fields.clone();
+                if matches!(action, UndoAction::RestoreFields { .. }) {
+                    dst.start_date = src.start_date.clone();
+                    dst.target_date = src.target_date.clone();
+                }
                 if dst.start_date == src.start_date && dst.target_date == src.target_date {
                     dst.rev = src.rev;
                 }
@@ -2703,6 +2718,10 @@ pub(crate) fn dates_moved_message(
     }
 }
 
+fn is_scheduling_date(reference: &str) -> bool {
+    reference == ado_core::START_DATE_FIELD || reference == ado_core::TARGET_DATE_FIELD
+}
+
 fn field_changes_from_ops(
     ops: &[ado_core::JsonPatchOp],
     original: &serde_json::Map<String, Value>,
@@ -2710,9 +2729,6 @@ fn field_changes_from_ops(
     ops.iter()
         .filter_map(|op| {
             let reference = op.path.strip_prefix("/fields/")?;
-            if reference == ado_core::START_DATE_FIELD || reference == ado_core::TARGET_DATE_FIELD {
-                return None;
-            }
             let after = op.value.clone().unwrap_or(Value::Null);
             let before = original.get(reference).cloned().unwrap_or(Value::Null);
             if before == after {
@@ -2731,6 +2747,9 @@ fn node_field_json(node: &WorkItemNode, reference: &str) -> Value {
             .as_ref()
             .map(crate::form::identity_json)
             .unwrap_or(Value::Null),
+        "System.State" => json!(node.state),
+        "System.IterationPath" => json!(node.iteration_path),
+        "System.AreaPath" => json!(node.area_path),
         ado_core::START_DATE_FIELD => node
             .start_date
             .as_ref()
@@ -2745,19 +2764,56 @@ fn node_field_json(node: &WorkItemNode, reference: &str) -> Value {
     }
 }
 
+fn write_node_string(node: &mut WorkItemNode, reference: &str, value: &Value) {
+    let text = value.as_str().unwrap_or_default().to_string();
+    match reference {
+        "System.Title" => node.title = text,
+        "System.State" => node.state = text,
+        "System.IterationPath" => node.iteration_path = text,
+        "System.AreaPath" => node.area_path = text,
+        _ => {}
+    }
+    if value.is_null() {
+        node.fields.remove(reference);
+    } else {
+        node.fields.insert(reference.to_string(), value.clone());
+    }
+}
+
 fn apply_node_field(node: &mut WorkItemNode, reference: &str, value: &Value) {
     match reference {
-        "System.Title" => {
-            node.title = value.as_str().unwrap_or_default().to_string();
+        "System.Title" | "System.State" | "System.IterationPath" | "System.AreaPath" => {
+            write_node_string(node, reference, value);
         }
         "System.AssignedTo" => {
             node.assigned_to = identity_from_field(value);
+            if value.is_null() {
+                node.fields.remove(reference);
+            } else {
+                node.fields.insert(reference.to_string(), value.clone());
+            }
         }
         ado_core::START_DATE_FIELD => {
-            node.start_date = value.as_str().map(ToOwned::to_owned);
+            node.start_date = value
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(ToOwned::to_owned);
+            if value.is_null() || node.start_date.is_none() {
+                node.fields.remove(reference);
+            } else {
+                node.fields.insert(reference.to_string(), value.clone());
+            }
         }
         ado_core::TARGET_DATE_FIELD => {
-            node.target_date = value.as_str().map(ToOwned::to_owned);
+            node.target_date = value
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(ToOwned::to_owned);
+            if value.is_null() || node.target_date.is_none() {
+                node.fields.remove(reference);
+            } else {
+                node.fields.insert(reference.to_string(), value.clone());
+            }
         }
         other => {
             if value.is_null() {
@@ -2942,5 +2998,51 @@ mod child_type_tests {
         assert_eq!(child_work_item_type(Some("Requirement"), &types), "Task");
         assert_eq!(child_work_item_type(Some("Issue"), &types), "Task");
         assert_eq!(child_work_item_type(Some("Epic"), &types), "Feature");
+    }
+}
+
+#[cfg(test)]
+mod node_field_tests {
+    use super::{apply_node_field, node_field_json};
+    use ado_core::WorkItemNode;
+    use serde_json::json;
+
+    fn sample() -> WorkItemNode {
+        WorkItemNode {
+            id: 1,
+            rev: 1,
+            title: "Cart".into(),
+            work_item_type: "User Story".into(),
+            state: "New".into(),
+            assigned_to: None,
+            parent_id: None,
+            area_path: "Shop".into(),
+            iteration_path: "Shop\\Sprint 12".into(),
+            start_date: None,
+            target_date: None,
+            has_date_fields: true,
+            predecessors: Vec::new(),
+            fields: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn apply_node_field_writes_canonical_state_iteration_and_area() {
+        let mut node = sample();
+        apply_node_field(&mut node, "System.State", &json!("Active"));
+        apply_node_field(&mut node, "System.IterationPath", &json!("Shop\\Sprint 13"));
+        apply_node_field(&mut node, "System.AreaPath", &json!("Shop\\Platform"));
+        assert_eq!(node.state, "Active");
+        assert_eq!(node.iteration_path, "Shop\\Sprint 13");
+        assert_eq!(node.area_path, "Shop\\Platform");
+        assert_eq!(node_field_json(&node, "System.State"), json!("Active"));
+        assert_eq!(
+            node_field_json(&node, "System.IterationPath"),
+            json!("Shop\\Sprint 13")
+        );
+        assert_eq!(
+            node_field_json(&node, "System.AreaPath"),
+            json!("Shop\\Platform")
+        );
     }
 }

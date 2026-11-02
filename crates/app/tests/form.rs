@@ -1,6 +1,7 @@
 use ado_planner::form::FormDraft;
 use ado_planner::paths::AppPaths;
 use ado_planner::state::PlannerState;
+use ado_planner::toasts::{HistoryEntry, UndoAction};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 
 async fn signed_in() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
@@ -163,6 +164,68 @@ async fn save_toast_does_not_report_needs_review_when_only_dates_changed() {
     assert!(
         !message.contains("needs review"),
         "null vs false must not count as a Needs Review change: {message}"
+    );
+}
+
+#[tokio::test]
+async fn mixed_form_save_undo_restores_title_and_dates() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let before = state
+        .nodes
+        .iter()
+        .find(|node| node.id == 1003)
+        .cloned()
+        .expect("story");
+    state.open_form(1003).await.expect("open");
+    let form = state.form.as_mut().expect("form");
+    form.set_string("System.Title", "Cart with new dates".into());
+    form.values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-08-10T00:00:00Z"),
+    );
+    form.values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-08-21T00:00:00Z"),
+    );
+    state.save_form().await.expect("save");
+    let toast = state.toasts.items.last().expect("toast");
+    let Some(UndoAction::RestoreFields { id, fields }) = toast.undo.clone() else {
+        panic!("mixed save must offer RestoreFields, got {:?}", toast.undo);
+    };
+    assert_eq!(id, 1003);
+    assert!(
+        fields
+            .iter()
+            .any(|(reference, _)| reference == "System.Title"),
+        "RestoreFields must include the title: {fields:?}"
+    );
+    assert!(
+        fields.iter().any(|(reference, _)| {
+            reference == ado_core::START_DATE_FIELD || reference == ado_core::TARGET_DATE_FIELD
+        }),
+        "RestoreFields must include the dates so Undo does not skip them: {fields:?}"
+    );
+    assert!(
+        !state
+            .history
+            .undo
+            .iter()
+            .any(|entry| matches!(entry, HistoryEntry::Dates { id: 1003, .. })),
+        "mixed save must not also push a Dates entry that would undo twice"
+    );
+    state
+        .apply_undo(toast.undo.clone().expect("undo"))
+        .await
+        .expect("undo mixed save");
+    let after = state.nodes.iter().find(|node| node.id == 1003).unwrap();
+    assert_eq!(after.title, before.title, "Undo must restore the title");
+    assert_eq!(
+        after.start_date, before.start_date,
+        "Undo must restore the start date"
+    );
+    assert_eq!(
+        after.target_date, before.target_date,
+        "Undo must restore the target date"
     );
 }
 

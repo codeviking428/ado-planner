@@ -2797,17 +2797,7 @@ impl PlannerView {
                                             Button::new("dates-prev-month")
                                                 .ghost()
                                                 .label("‹")
-                                                .tooltip("Previous month")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    if let Some(picker) = this.inline_dates.clone()
-                                                    {
-                                                        picker.update(cx, |state, cx| {
-                                                            state.prev_month();
-                                                            cx.notify();
-                                                        });
-                                                    }
-                                                    cx.notify();
-                                                })),
+                                                .tooltip("Previous month"),
                                         ),
                                 )
                                 .child(
@@ -2847,17 +2837,7 @@ impl PlannerView {
                                             Button::new("dates-next-month")
                                                 .ghost()
                                                 .label("›")
-                                                .tooltip("Next month")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    if let Some(picker) = this.inline_dates.clone()
-                                                    {
-                                                        picker.update(cx, |state, cx| {
-                                                            state.next_month();
-                                                            cx.notify();
-                                                        });
-                                                    }
-                                                    cx.notify();
-                                                })),
+                                                .tooltip("Next month"),
                                         ),
                                 ),
                         )
