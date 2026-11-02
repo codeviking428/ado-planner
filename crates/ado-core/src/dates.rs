@@ -44,7 +44,11 @@ const MONTH_ABBREVS: [&str; 12] = [
 
 /// Parse a typed date. Display copy is compact (`Jul 6`); ISO `YYYY-MM-DD` is
 /// still accepted as input, with an optional year on compact forms.
-pub fn parse_user_date(value: Option<&str>) -> Option<Date> {
+///
+/// Year-less compact copy (`Jul 6`) uses `fallback_year` so confirming or
+/// editing a 2025/2027 bar does not PATCH today's year. `None` falls back to
+/// the current calendar year (new / unscheduled dates).
+pub fn parse_user_date(value: Option<&str>, fallback_year: Option<i16>) -> Option<Date> {
     let value = value?.trim();
     if value.is_empty() || value == "…" {
         return None;
@@ -52,10 +56,10 @@ pub fn parse_user_date(value: Option<&str>) -> Option<Date> {
     if let Some(date) = parse_iso_date(Some(value)) {
         return Some(date);
     }
-    parse_compact_date(value)
+    parse_compact_date(value, fallback_year)
 }
 
-fn parse_compact_date(value: &str) -> Option<Date> {
+fn parse_compact_date(value: &str, fallback_year: Option<i16>) -> Option<Date> {
     let mut parts = value.split_whitespace();
     let month_token = parts.next()?;
     let day_token = parts.next()?;
@@ -67,7 +71,7 @@ fn parse_compact_date(value: &str) -> Option<Date> {
     let day: i8 = day_token.trim_end_matches(',').parse().ok()?;
     let year: i16 = match year_token {
         Some(year) => year.trim_end_matches(',').parse().ok()?,
-        None => jiff::Zoned::now().date().year(),
+        None => fallback_year.unwrap_or_else(|| jiff::Zoned::now().date().year()),
     };
     Date::new(year, month, day).ok()
 }
@@ -449,15 +453,36 @@ mod tests {
     #[test]
     fn parse_user_date_accepts_iso_and_compact() {
         let july_6 = Date::new(2026, 7, 6).unwrap();
-        assert_eq!(parse_user_date(Some("2026-07-06")), Some(july_6));
-        assert_eq!(parse_user_date(Some("2026-07-06T00:00:00Z")), Some(july_6));
-        assert_eq!(parse_user_date(Some("Jul 6, 2026")), Some(july_6));
+        assert_eq!(parse_user_date(Some("2026-07-06"), None), Some(july_6));
+        assert_eq!(
+            parse_user_date(Some("2026-07-06T00:00:00Z"), None),
+            Some(july_6)
+        );
+        assert_eq!(parse_user_date(Some("Jul 6, 2026"), None), Some(july_6));
         let year = jiff::Zoned::now().date().year();
         assert_eq!(
-            parse_user_date(Some("Jul 6")),
+            parse_user_date(Some("Jul 6"), None),
             Some(Date::new(year, 7, 6).unwrap())
         );
-        assert_eq!(parse_user_date(Some("…")), None);
+        assert_eq!(parse_user_date(Some("…"), None), None);
+    }
+
+    #[test]
+    fn yearless_compact_keeps_the_fallback_year() {
+        assert_eq!(
+            parse_user_date(Some("Jul 6"), Some(2025)),
+            Some(Date::new(2025, 7, 6).unwrap()),
+            "confirming compact copy on a 2025 bar must not jump to this year"
+        );
+        assert_eq!(
+            parse_user_date(Some("Jul 6"), Some(2027)),
+            Some(Date::new(2027, 7, 6).unwrap())
+        );
+        assert_eq!(
+            parse_user_date(Some("Jul 6, 2024"), Some(2025)),
+            Some(Date::new(2024, 7, 6).unwrap()),
+            "an explicit year must win over the item year"
+        );
     }
 
     #[test]

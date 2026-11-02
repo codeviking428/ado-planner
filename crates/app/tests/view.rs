@@ -11,8 +11,8 @@ use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::toasts::HistoryEntry;
 use ado_planner::ui::PlannerView;
 use ado_planner::ui::{
-    date_field_text, dates_from_range_picker, format_picker_dates, looks_like_pat,
-    pending_range_typed, range_picker_is_complete,
+    date_field_text, dates_from_range_picker, dates_from_range_picker_in_years,
+    format_picker_dates, looks_like_pat, pending_range_typed, range_picker_is_complete,
 };
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use gpui_kit::component::calendar::Date as PickerDate;
@@ -355,6 +355,49 @@ fn typed_compact_range_does_not_split_on_comma() {
         .unwrap();
     assert_eq!(iso.0, Some(Date::new(2026, 8, 4).unwrap()));
     assert_eq!(iso.1, Some(Date::new(2026, 8, 21).unwrap()));
+}
+
+#[test]
+fn typed_compact_range_keeps_the_item_year() {
+    let start = chrono::NaiveDate::from_ymd_opt(2025, 7, 6).unwrap();
+    let end = chrono::NaiveDate::from_ymd_opt(2025, 7, 20).unwrap();
+    let calendar = PickerDate::Range(Some(start), Some(end));
+    let seed = "Jul 6 → Jul 20";
+    let confirmed = dates_from_range_picker(calendar, seed, seed).unwrap();
+    assert_eq!(
+        confirmed.0,
+        Some(Date::new(2025, 7, 6).unwrap()),
+        "confirming compact copy must keep 2025, not this year"
+    );
+    assert_eq!(confirmed.1, Some(Date::new(2025, 7, 20).unwrap()));
+    let typed = dates_from_range_picker(calendar, "Jul 6 → Aug 18", seed).unwrap();
+    assert_eq!(typed.0, Some(Date::new(2025, 7, 6).unwrap()));
+    assert_eq!(
+        typed.1,
+        Some(Date::new(2025, 8, 18).unwrap()),
+        "year-less typed compact must inherit the bar's year"
+    );
+    let empty = dates_from_range_picker_in_years(
+        PickerDate::Range(None, None),
+        "Jul 6 → Aug 18",
+        seed,
+        Some(2027),
+        Some(2027),
+    )
+    .unwrap();
+    assert_eq!(empty.0, Some(Date::new(2027, 7, 6).unwrap()));
+    assert_eq!(empty.1, Some(Date::new(2027, 8, 18).unwrap()));
+    let cross = PickerDate::Range(
+        Some(chrono::NaiveDate::from_ymd_opt(2025, 12, 1).unwrap()),
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
+    );
+    let crossed = dates_from_range_picker(cross, "Dec 2 → Jan 16", "Dec 1 → Jan 15").unwrap();
+    assert_eq!(crossed.0, Some(Date::new(2025, 12, 2).unwrap()));
+    assert_eq!(
+        crossed.1,
+        Some(Date::new(2026, 1, 16).unwrap()),
+        "each side of a cross-year range keeps its own year"
+    );
 }
 
 #[gpui_kit::test]

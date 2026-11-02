@@ -896,12 +896,18 @@ impl PlannerView {
         } else {
             self.inline_input.read(cx).value().to_string()
         };
-        let Some((start, target)) =
-            dates_from_range_picker(date, &typed, &self.inline_dates_typed_seed)
-        else {
+        let Some(node) = self.state.nodes.iter().find(|node| node.id == id) else {
             return;
         };
-        let Some(node) = self.state.nodes.iter().find(|node| node.id == id) else {
+        let start_year = parse_iso_date(node.start_date.as_deref()).map(jiff::civil::Date::year);
+        let target_year = parse_iso_date(node.target_date.as_deref()).map(jiff::civil::Date::year);
+        let Some((start, target)) = dates_from_range_picker_in_years(
+            date,
+            &typed,
+            &self.inline_dates_typed_seed,
+            start_year,
+            target_year,
+        ) else {
             return;
         };
         let next_start = start.map(iso_date_only).or_else(|| node.start_date.clone());
@@ -955,12 +961,26 @@ impl PlannerView {
                 self.inline_dates = None;
                 if let Some(date) = date {
                     self.commit_picker_dates(id, date, true, false, cx);
-                } else if let Some((start, target)) = dates_from_range_picker(
-                    PickerDate::Range(None, None),
-                    &value,
-                    &self.inline_dates_typed_seed,
-                ) {
-                    self.spawn_range_dates(id, start, target, cx);
+                } else {
+                    let node = self.state.nodes.iter().find(|node| node.id == id);
+                    let start_year = node
+                        .and_then(|node| parse_iso_date(node.start_date.as_deref()))
+                        .map(jiff::civil::Date::year);
+                    let target_year = node
+                        .and_then(|node| parse_iso_date(node.target_date.as_deref()))
+                        .map(jiff::civil::Date::year);
+                    let picker = node
+                        .map(picker_date_from_node)
+                        .unwrap_or(PickerDate::Range(None, None));
+                    if let Some((start, target)) = dates_from_range_picker_in_years(
+                        picker,
+                        &value,
+                        &self.inline_dates_typed_seed,
+                        start_year,
+                        target_year,
+                    ) {
+                        self.spawn_range_dates(id, start, target, cx);
+                    }
                 }
                 self.inline_dates_typed_seed.clear();
             }
@@ -5484,8 +5504,21 @@ pub fn dates_from_range_picker(
     typed: &str,
     typed_seed: &str,
 ) -> Option<(Option<jiff::civil::Date>, Option<jiff::civil::Date>)> {
+    dates_from_range_picker_in_years(date, typed, typed_seed, None, None)
+}
+
+pub fn dates_from_range_picker_in_years(
+    date: PickerDate,
+    typed: &str,
+    typed_seed: &str,
+    start_year: Option<i16>,
+    target_year: Option<i16>,
+) -> Option<(Option<jiff::civil::Date>, Option<jiff::civil::Date>)> {
+    let (picker_start_year, picker_target_year) = years_from_picker(date);
+    let start_year = picker_start_year.or(start_year).or(picker_target_year);
+    let target_year = picker_target_year.or(target_year).or(start_year);
     let typed_edit = typed_dates_changed(typed, typed_seed)
-        .then(|| parse_typed_dates(typed))
+        .then(|| parse_typed_dates(typed, start_year, target_year))
         .flatten();
     if typed_edit
         .as_ref()
@@ -5501,9 +5534,25 @@ pub fn dates_from_range_picker(
         PickerDate::Range(None, Some(end)) => typed_edit.or(Some((None, naive_to_jiff(end)))),
         PickerDate::Single(Some(day)) => typed_edit.or(Some((naive_to_jiff(day), None))),
         PickerDate::Single(None) | PickerDate::Range(None, None) => {
-            typed_edit.or_else(|| parse_typed_dates(typed))
+            typed_edit.or_else(|| parse_typed_dates(typed, start_year, target_year))
         }
     }
+}
+
+fn years_from_picker(date: PickerDate) -> (Option<i16>, Option<i16>) {
+    match date {
+        PickerDate::Range(start, end) => (
+            start.map(|day| day.year() as i16),
+            end.map(|day| day.year() as i16),
+        ),
+        PickerDate::Single(day) => (day.map(|day| day.year() as i16), None),
+    }
+}
+
+fn picker_date_from_node(node: &ado_core::WorkItemNode) -> PickerDate {
+    let start = parse_iso_date(node.start_date.as_deref()).and_then(jiff_to_naive);
+    let target = parse_iso_date(node.target_date.as_deref()).and_then(jiff_to_naive);
+    PickerDate::Range(start, target)
 }
 
 /// Auto-save from the calendar observer only once both ends of a range (or a
@@ -5566,6 +5615,8 @@ fn normalize_typed_dates(typed: &str) -> String {
 
 fn parse_typed_dates(
     typed: &str,
+    start_year: Option<i16>,
+    target_year: Option<i16>,
 ) -> Option<(Option<jiff::civil::Date>, Option<jiff::civil::Date>)> {
     let text = typed.trim();
     if text.is_empty() {
@@ -5581,8 +5632,11 @@ fn parse_typed_dates(
         .filter(|part| !part.is_empty() && *part != "…")
         .collect();
     match parts.as_slice() {
-        [start] => Some((parse_user_date(Some(start)), None)),
-        [start, target] => Some((parse_user_date(Some(start)), parse_user_date(Some(target)))),
+        [start] => Some((parse_user_date(Some(start), start_year), None)),
+        [start, target] => Some((
+            parse_user_date(Some(start), start_year),
+            parse_user_date(Some(target), target_year.or(start_year)),
+        )),
         _ => None,
     }
 }
