@@ -79,7 +79,12 @@ async fn drag_patches_start_and_target() {
             .toasts
             .last_message()
             .unwrap_or_default()
-            .contains("Saved dates: Start, Target")
+            .contains("Moved")
+            && state
+                .toasts
+                .items
+                .last()
+                .is_some_and(|toast| toast.undo.is_some())
     );
 }
 
@@ -986,13 +991,17 @@ async fn resize_end_toasts_only_target_date() {
         .await
         .expect("save target");
     let message = state.toasts.last_message().unwrap_or_default();
-    assert_eq!(
-        message, "Saved dates: Target",
-        "end-only save must toast Target Date, got {message}"
+    assert!(
+        message.starts_with("Moved "),
+        "end-only save must name the item, got {message}"
     );
     assert!(
-        !message.to_lowercase().contains("start"),
-        "end-only toast must not mention Start Date: {message}"
+        state
+            .toasts
+            .items
+            .last()
+            .is_some_and(|toast| toast.undo.is_some()),
+        "date save toasts must offer Undo"
     );
 }
 

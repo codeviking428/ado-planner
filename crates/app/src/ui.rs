@@ -82,6 +82,10 @@ pub struct PlannerView {
     /// Typed ISO text at picker open; used so a later calendar pick is not
     /// overwritten unless the user actually edited the field.
     inline_dates_typed_seed: String,
+    pending_typed_preview: Option<String>,
+    /// True after Enter commits an inline editor so the same key does not
+    /// also open the details dialog.
+    inline_enter_guard: bool,
     dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
     io_busy: bool,
@@ -236,6 +240,8 @@ impl PlannerView {
             inline_edit: None,
             inline_dates: None,
             inline_dates_typed_seed: String::new(),
+            pending_typed_preview: None,
+            inline_enter_guard: false,
             dates_anchor: None,
             banner_dismissed: false,
             io_busy: false,
@@ -402,6 +408,7 @@ impl PlannerView {
     fn bind_inline_input(&mut self, cx: &mut Context<Self>) {
         let enter = cx.subscribe(&self.inline_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) && this.inline_edit.is_some() {
+                this.inline_enter_guard = true;
                 this.commit_inline(cx);
             }
         });
@@ -428,9 +435,6 @@ impl PlannerView {
                     Ok((working, result)) => {
                         let shown_at = this.loading_shown_at;
                         this.state.adopt_spawned(working);
-                        if let Some(from) = this.pending_camera_from.take() {
-                            this.start_camera_anim(from, cx);
-                        }
                         if let Some(at) = shown_at
                             && !this.state.hierarchy_loading
                         {
@@ -448,6 +452,9 @@ impl PlannerView {
                                             }
                                             this.state.hierarchy_loading = false;
                                             this.loading_shown_at = None;
+                                            if let Some(from) = this.pending_camera_from.take() {
+                                                this.start_camera_anim(from, cx);
+                                            }
                                             cx.notify();
                                         });
                                     }
@@ -455,7 +462,12 @@ impl PlannerView {
                                 .detach();
                             } else {
                                 this.loading_shown_at = None;
+                                if let Some(from) = this.pending_camera_from.take() {
+                                    this.start_camera_anim(from, cx);
+                                }
                             }
+                        } else if let Some(from) = this.pending_camera_from.take() {
+                            this.start_camera_anim(from, cx);
                         }
                         if let Err(err) = result {
                             tracing::warn!("planner action failed: {err}");
@@ -702,6 +714,10 @@ impl PlannerView {
                     }
                     let date = picker.read(cx).date();
                     if !range_picker_is_complete(date) {
+                        if let Some(preview) = pending_range_typed(date) {
+                            this.pending_typed_preview = Some(preview);
+                            cx.notify();
+                        }
                         return;
                     }
                     this.commit_picker_dates(item_id, date, true, cx);
@@ -771,6 +787,7 @@ impl PlannerView {
         let Some(edit) = self.inline_edit.take() else {
             return;
         };
+        self.inline_enter_guard = true;
         let value = self.inline_input.read(cx).value().to_string();
         match edit {
             InlineEdit::Title(id) => {
@@ -2310,9 +2327,9 @@ impl PlannerView {
                 Button::new(("open-details", id as u64))
                     .ghost()
                     .compact()
-                    .with_size(Size::XSmall)
-                    .label("ⓘ")
-                    .tooltip("Open details (Enter)")
+                    .with_size(Size::Small)
+                    .label("ⓘ Details")
+                    .tooltip("Open details (Enter or double-click)")
                     .tooltip_placement(Placement::Bottom)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -2469,7 +2486,9 @@ impl PlannerView {
             .when(unscheduled, |el| el.text_color(muted))
             .when(editing, |el| el.bg(cx.theme().accent.opacity(0.35)))
             .child(display.clone())
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .when(!editing, |el| {
+                el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -3392,7 +3411,7 @@ impl PlannerView {
                 cx,
             ))
             .child(self.arrow_head_hit(arrow, min_x, min_y, color, cx))
-            .when(selected, |el| {
+            .when(selected || hovered, |el| {
                 el.child(self.link_remove_button(arrow, min_x, min_y, cx))
             })
             .into_any_element()
@@ -3455,7 +3474,7 @@ impl PlannerView {
         role: &'static str,
         cx: &Context<Self>,
     ) -> AnyElement {
-        const HIT: f32 = 8.0;
+        const HIT: f32 = 14.0;
         let hit_w = width.max(HIT);
         let hit_h = height.max(HIT);
         let segment_id = if role == "h" {
@@ -3475,6 +3494,10 @@ impl PlannerView {
             .items_center()
             .justify_center()
             .cursor_pointer()
+            .occlude()
+            .tooltip(move |window, cx| {
+                Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
+            })
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.state.gantt.hovered_link = if *hovered {
                     Some((from_id, to_id))
@@ -3494,6 +3517,12 @@ impl PlannerView {
                     cx.notify();
                 }),
             )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.state.gantt.selected_link = Some((from_id, to_id));
+                this.state.gantt.selected_id = Some(to_id);
+                cx.notify();
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -3537,9 +3566,13 @@ impl PlannerView {
             .w(px(18.))
             .h(px(20.))
             .cursor_pointer()
+            .occlude()
             .text_xl()
             .line_height(gpui_kit::relative(1.))
             .text_color(color)
+            .tooltip(move |window, cx| {
+                Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
+            })
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.state.gantt.hovered_link = if *hovered {
                     Some((from_id, to_id))
@@ -4002,7 +4035,7 @@ impl PlannerView {
                             el.child(
                                 DatePicker::new(&state)
                                     .w_full()
-                                    .placeholder("YYYY-MM-DD / YYYY-MM-DD"),
+                                    .placeholder("YYYY-MM-DD → YYYY-MM-DD"),
                             )
                         })
                         .into_any_element()
@@ -4317,9 +4350,15 @@ impl PlannerView {
                                     live.rev = rev;
                                 }
                                 if role == DateSaveRole::Commit
-                                    && let Some(msg) = working.toasts.last_message()
+                                    && let Some(toast) = working.toasts.items.last()
                                 {
-                                    this.state.toasts.push(ToastKind::Success, msg.to_string());
+                                    if let Some(undo) = toast.undo.clone() {
+                                        this.state.toasts.push_undo(toast.message.clone(), undo);
+                                    } else {
+                                        this.state
+                                            .toasts
+                                            .push(ToastKind::Success, toast.message.clone());
+                                    }
                                 }
                                 if role == DateSaveRole::Restore {
                                     this.state.complete_restore_date_save(&revert);
@@ -4368,7 +4407,7 @@ impl PlannerView {
             self.form_inputs_for = Some(form.model.id);
         }
         for control in crate::form::all_controls(&form.model) {
-            if control.read_only
+            if (control.read_only && control.kind != FormControlKind::DateTime)
                 || matches!(
                     control.kind,
                     FormControlKind::Picklist | FormControlKind::Boolean
@@ -4508,6 +4547,10 @@ impl PlannerView {
         }
         if key == "enter" && self.inline_edit.is_some() {
             self.commit_inline(cx);
+            return;
+        }
+        if key == "enter" && self.inline_enter_guard {
+            self.inline_enter_guard = false;
             return;
         }
         if self.inline_edit.is_some() {
@@ -4827,6 +4870,17 @@ pub fn range_picker_is_complete(date: PickerDate) -> bool {
     )
 }
 
+/// Typed-field preview while the user is still picking the other end.
+pub fn pending_range_typed(date: PickerDate) -> Option<String> {
+    match date {
+        PickerDate::Range(Some(start), None) => Some(format!("{start} / …")),
+        PickerDate::Range(None, Some(end)) => Some(format!("… / {end}")),
+        PickerDate::Range(Some(start), Some(end)) => Some(format!("{start} / {end}")),
+        PickerDate::Single(Some(day)) => Some(day.to_string()),
+        _ => None,
+    }
+}
+
 fn typed_dates_changed(typed: &str, seed: &str) -> bool {
     normalize_typed_dates(typed) != normalize_typed_dates(seed)
 }
@@ -4881,6 +4935,11 @@ impl Focusable for PlannerView {
 
 impl Render for PlannerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(preview) = self.pending_typed_preview.take() {
+            self.inline_input.update(cx, |input, cx| {
+                input.set_value(&preview, window, cx);
+            });
+        }
         let viewport_h = f32::from(window.viewport_size().height);
         let viewport_w = f32::from(window.viewport_size().width);
         self.state.gantt.viewport_h = (viewport_h - 200.0).max(120.0);
@@ -4955,8 +5014,10 @@ impl Render for PlannerView {
             }))
             .track_focus(&self.form_focus)
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let key = event.keystroke.key.as_str();
+                let consume_enter = this.inline_edit.is_some() || this.inline_enter_guard;
                 this.on_key(event, cx);
-                if event.keystroke.key.as_str() == "escape" {
+                if key == "escape" || (key == "enter" && consume_enter) {
                     cx.stop_propagation();
                 }
             }))
@@ -5025,9 +5086,19 @@ pub fn start_app(data_dir: Option<PathBuf>, ado_base: Option<String>, vssps_base
         let session = session;
         let ado_base = ado_base.clone();
         let vssps_base = vssps_base.clone();
-        gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, move |window, cx| {
-            cx.new(move |cx| PlannerView::new(window, cx, session, paths, ado_base, vssps_base))
-        })
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions {
+                titlebar: Some(gpui_kit::TitlebarOptions {
+                    title: Some("ADO Planner".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            cx,
+            move |window, cx| {
+                cx.new(move |cx| PlannerView::new(window, cx, session, paths, ado_base, vssps_base))
+            },
+        )
         .expect("failed to open window");
     });
 }

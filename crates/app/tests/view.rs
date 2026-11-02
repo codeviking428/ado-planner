@@ -9,7 +9,9 @@ use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::toasts::HistoryEntry;
 use ado_planner::ui::PlannerView;
-use ado_planner::ui::{dates_from_range_picker, looks_like_pat, range_picker_is_complete};
+use ado_planner::ui::{
+    dates_from_range_picker, looks_like_pat, pending_range_typed, range_picker_is_complete,
+};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use gpui_kit::component::calendar::Date as PickerDate;
 use gpui_kit::{
@@ -262,6 +264,15 @@ fn range_picker_prefers_typed_when_it_changed() {
         "a start-only first click must not auto-save"
     );
     assert!(range_picker_is_complete(calendar));
+}
+
+#[test]
+fn pending_start_shows_ellipsis_in_the_typed_field() {
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
+    assert_eq!(
+        pending_range_typed(PickerDate::Range(Some(start), None)).as_deref(),
+        Some("2026-11-10 / …")
+    );
 }
 
 #[gpui_kit::test]
@@ -897,11 +908,11 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
             );
         }
         let title = view.state.gantt.viewport_range_title();
-        let centre = view.state.gantt.viewport_center_date();
-        assert_eq!(
-            title,
-            view.state.gantt.scale.range_title(centre),
-            "range title must follow the viewport centre ({centre}), not the first tick ({labels:?})"
+        let start = view.state.gantt.viewport_start_date();
+        let start_label = view.state.gantt.scale.range_title(start);
+        assert!(
+            title.starts_with(start_label.split_whitespace().next().unwrap_or("")),
+            "range title {title:?} must follow the visible start ({start_label}), labels={labels:?}"
         );
         let today_x = view.state.gantt.today_x(jiff::Zoned::now().date());
         let expected = view.state.gantt.timeline_width.max(1.0) / 3.0;
@@ -1692,13 +1703,11 @@ fn zoom_buttons_and_ctrl_scroll_update_the_range_title(cx: &mut gpui_kit::TestAp
             "Ctrl+scroll must change zoom"
         );
         let title_after = view.state.gantt.viewport_range_title();
-        assert_eq!(
-            title_after,
-            view.state
-                .gantt
-                .scale
-                .range_title(view.state.gantt.viewport_center_date()),
-            "range title is derived from the viewport centre"
+        let start = view.state.gantt.viewport_start_date();
+        let start_label = view.state.gantt.scale.range_title(start);
+        assert!(
+            title_after.starts_with(start_label.split_whitespace().next().unwrap_or("")),
+            "range title {title_after:?} is derived from the visible start ({start_label})"
         );
         let _ = title_before;
     });

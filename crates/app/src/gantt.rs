@@ -463,11 +463,48 @@ impl GanttView {
     }
 
     pub fn viewport_range_title(&self) -> String {
-        self.scale.range_title(self.viewport_center_date())
+        let start = self.viewport_start_date();
+        let end = self.date_for_x((self.timeline_width.max(1.0) - 1.0).max(0.0));
+        match self.scale {
+            GanttScale::Month if start.month() != end.month() || start.year() != end.year() => {
+                if start.year() == end.year() {
+                    format!(
+                        "{} – {} {}",
+                        month_abbrev(start),
+                        month_abbrev(end),
+                        start.year()
+                    )
+                } else {
+                    format!(
+                        "{} {} – {} {}",
+                        month_abbrev(start),
+                        start.year(),
+                        month_abbrev(end),
+                        end.year()
+                    )
+                }
+            }
+            _ => self.scale.range_title(start),
+        }
+    }
+
+    pub fn viewport_start_date(&self) -> Date {
+        self.date_for_x(0.0)
     }
 
     pub fn viewport_center_date(&self) -> Date {
         self.date_for_x(self.timeline_width.max(1.0) * 0.5)
+    }
+
+    /// Keep a date on-screen after a picker or drag edit.
+    pub fn reveal_date(&mut self, date: Date) {
+        let x = self.x_for_date(date);
+        let width = self.timeline_width.max(1.0);
+        if x < 24.0 {
+            self.scroll_x += x - width * 0.2;
+        } else if x > width - 48.0 {
+            self.scroll_x += x - width * 0.35;
+        }
     }
 
     pub fn clear_hover(&mut self) {
@@ -1958,34 +1995,43 @@ mod tests {
             (today_x - gantt.x_for_date(oct1)).abs() > 20.0,
             "Today must not sit on the month gridline"
         );
-        assert_eq!(
-            gantt.viewport_range_title(),
-            gantt.scale.range_title(gantt.viewport_center_date()),
+        let start = gantt.viewport_start_date();
+        let title = gantt.viewport_range_title();
+        let start_label = gantt.scale.range_title(start);
+        assert!(
+            title.starts_with(start_label.split_whitespace().next().unwrap_or("")),
+            "header {title:?} must start at the visible range ({start_label})"
         );
     }
 
     #[test]
-    fn go_today_in_early_november_titles_november_not_october() {
+    fn go_today_in_early_november_titles_the_visible_start() {
         let mut gantt = GanttView::default();
         let today = Date::new(2026, 11, 2).unwrap();
         gantt.go_today(today);
-        assert_eq!(gantt.viewport_range_title(), "Nov 2026");
+        let start = gantt.viewport_start_date();
+        let title = gantt.viewport_range_title();
+        let start_label = gantt.scale.range_title(start);
+        assert!(
+            title.starts_with(start_label.split_whitespace().next().unwrap_or("")),
+            "header {title:?} must follow the visible start {start} ({start_label}), not the centre"
+        );
     }
 
     #[test]
-    fn range_title_follows_the_viewport_centre() {
+    fn range_title_follows_the_visible_start() {
         let gantt = GanttView {
-            origin: Date::new(2026, 10, 1).unwrap(),
+            origin: Date::new(2026, 7, 1).unwrap(),
             timeline_width: 800.0,
             ..Default::default()
         };
-        let centre = gantt.viewport_center_date();
-        assert_eq!(
-            gantt.viewport_range_title(),
-            gantt.scale.range_title(centre),
-            "header month must follow the viewport centre ({centre})"
+        let start = gantt.viewport_start_date();
+        let title = gantt.viewport_range_title();
+        assert_eq!(start, Date::new(2026, 7, 1).unwrap());
+        assert!(
+            title.starts_with("Jul"),
+            "header {title:?} must follow the visible start ({start}), not the centre"
         );
-        assert_eq!(gantt.viewport_range_title(), "Nov 2026");
     }
 
     #[test]

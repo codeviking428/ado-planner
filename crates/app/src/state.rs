@@ -1021,8 +1021,6 @@ impl PlannerState {
                         })
                     })
                     .collect();
-                let start_saved = names.iter().any(|name| name == "start date");
-                let target_saved = names.iter().any(|name| name == "target date");
                 let only_dates = !names.is_empty()
                     && names
                         .iter()
@@ -1030,11 +1028,39 @@ impl PlannerState {
                 let message = if names.is_empty() {
                     format!("Saved Work Item #{id}")
                 } else if only_dates {
-                    dates_saved_message(start_saved, target_saved).to_string()
+                    let title = self.item_title(id);
+                    let (start, target) = self
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == id)
+                        .map(|node| {
+                            (
+                                parse_iso_date(node.start_date.as_deref()),
+                                parse_iso_date(node.target_date.as_deref()),
+                            )
+                        })
+                        .unwrap_or((None, None));
+                    dates_moved_message(&title, start, target)
                 } else {
                     format!("Saved {}", names.join(", "))
                 };
-                self.toasts.push(ToastKind::Success, message);
+                if only_dates {
+                    if let Some(before) = before.as_ref() {
+                        self.toasts.push_undo(
+                            message,
+                            UndoAction::RestoreDates {
+                                id,
+                                start_date: before.start_date.clone(),
+                                target_date: before.target_date.clone(),
+                                rev: before.rev,
+                            },
+                        );
+                    } else {
+                        self.toasts.push(ToastKind::Success, message);
+                    }
+                } else {
+                    self.toasts.push(ToastKind::Success, message);
+                }
                 Ok(())
             }
             Err(err) if err.is_precondition_failed() => {
@@ -1269,6 +1295,9 @@ impl PlannerState {
             return None;
         }
         let _ = self.apply_optimistic_partial(id, start, target);
+        if let Some(date) = start.or(target) {
+            self.gantt.reveal_date(date);
+        }
         if self.history_recording {
             self.record_dates(id, &previous, after_start.clone(), after_target.clone());
         }
@@ -1308,6 +1337,9 @@ impl PlannerState {
             .map(iso_date_only)
             .or_else(|| previous.target_date.clone());
         let _ = self.apply_optimistic_partial(gesture.id, start, target);
+        if let Some(date) = start.or(target) {
+            self.gantt.reveal_date(date);
+        }
         if self.history_recording {
             self.record_dates(
                 gesture.id,
@@ -1447,9 +1479,11 @@ impl PlannerState {
                 }
                 self.persist_hierarchy_cache();
                 if pending.role == DateSaveRole::Commit {
-                    self.toasts.push(
-                        ToastKind::Success,
-                        dates_saved_message(pending.start.is_some(), pending.target.is_some()),
+                    self.push_dates_moved_toast(
+                        pending.id,
+                        parse_iso_date(pending.after_start.as_deref()),
+                        parse_iso_date(pending.after_target.as_deref()),
+                        &pending.previous,
                     );
                 }
                 self.complete_restore_date_save(&pending);
@@ -1510,8 +1544,7 @@ impl PlannerState {
                 }
                 self.persist_hierarchy_cache();
                 if self.history_recording {
-                    self.toasts
-                        .push(ToastKind::Success, dates_saved_message(true, true));
+                    self.push_dates_moved_toast(id, Some(start), Some(target), &previous);
                 }
                 Ok(())
             }
@@ -1584,9 +1617,11 @@ impl PlannerState {
                         }
                         self.persist_hierarchy_cache();
                         if self.history_recording {
-                            self.toasts.push(
-                                ToastKind::Success,
-                                dates_saved_message(start.is_some(), target.is_some()),
+                            self.push_dates_moved_toast(
+                                id,
+                                parse_iso_date(after_start.as_deref()),
+                                parse_iso_date(after_target.as_deref()),
+                                &previous,
                             );
                         }
                         Ok(())
@@ -1651,10 +1686,7 @@ impl PlannerState {
                 }
                 self.persist_hierarchy_cache();
                 if self.history_recording {
-                    self.toasts.push(
-                        ToastKind::Success,
-                        dates_saved_message(start.is_some(), target.is_some()),
-                    );
+                    self.push_dates_moved_toast(id, start, target, &previous);
                 }
                 Ok(())
             }
@@ -1943,14 +1975,26 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                let message = if reference == ado_core::START_DATE_FIELD {
-                    dates_saved_message(true, false).to_string()
-                } else if reference == ado_core::TARGET_DATE_FIELD {
-                    dates_saved_message(false, true).to_string()
+                if reference == ado_core::START_DATE_FIELD
+                    || reference == ado_core::TARGET_DATE_FIELD
+                {
+                    let start = self
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .and_then(|n| parse_iso_date(n.start_date.as_deref()));
+                    let target = self
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .and_then(|n| parse_iso_date(n.target_date.as_deref()));
+                    self.push_dates_moved_toast(id, start, target, &previous);
                 } else {
-                    format!("Saved {}", field_toast_name(reference, None))
-                };
-                self.toasts.push(ToastKind::Success, message);
+                    self.toasts.push(
+                        ToastKind::Success,
+                        format!("Saved {}", field_toast_name(reference, None)),
+                    );
+                }
                 Ok(())
             }
             Err(err) => {
@@ -2425,6 +2469,24 @@ impl PlannerState {
             .collect()
     }
 
+    fn push_dates_moved_toast(
+        &mut self,
+        id: i64,
+        start: Option<Date>,
+        target: Option<Date>,
+        previous: &WorkItemNode,
+    ) {
+        self.toasts.push_undo(
+            dates_moved_message(&self.item_title(id), start, target),
+            UndoAction::RestoreDates {
+                id,
+                start_date: previous.start_date.clone(),
+                target_date: previous.target_date.clone(),
+                rev: previous.rev,
+            },
+        );
+    }
+
     fn item_title(&self, id: i64) -> String {
         self.nodes
             .iter()
@@ -2449,12 +2511,29 @@ impl PlannerState {
     }
 }
 
-pub(crate) fn dates_saved_message(start: bool, target: bool) -> &'static str {
+pub(crate) fn dates_moved_message(
+    title: &str,
+    start: Option<Date>,
+    target: Option<Date>,
+) -> String {
     match (start, target) {
-        (true, false) => "Saved dates: Start",
-        (false, true) => "Saved dates: Target",
-        _ => "Saved dates: Start, Target",
+        (Some(start), Some(target)) => format!(
+            "Moved {title} to {} – {}",
+            short_month_day(start),
+            short_month_day(target)
+        ),
+        (Some(start), None) => format!("Moved {title} start to {}", short_month_day(start)),
+        (None, Some(target)) => format!("Moved {title} to {}", short_month_day(target)),
+        (None, None) => format!("Saved {title} dates"),
     }
+}
+
+fn short_month_day(date: Date) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS[(date.month() as u8).saturating_sub(1).min(11) as usize];
+    format!("{month} {}", date.day())
 }
 
 pub(crate) fn field_toast_name(reference: &str, label: Option<&str>) -> String {

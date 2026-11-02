@@ -139,9 +139,17 @@ async fn save_toast_does_not_report_needs_review_when_only_dates_changed() {
     );
     state.save_form().await.expect("save");
     let message = state.toasts.last_message().unwrap_or_default();
-    assert_eq!(
-        message, "Saved dates: Start, Target",
-        "toast should mention the dates that changed, got {message}"
+    assert!(
+        message.starts_with("Moved "),
+        "toast should name the item and the new dates, got {message}"
+    );
+    assert!(
+        state
+            .toasts
+            .items
+            .last()
+            .is_some_and(|toast| toast.undo.is_some()),
+        "date save toasts must offer Undo"
     );
     let message = message.to_lowercase();
     assert!(
