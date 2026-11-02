@@ -2497,3 +2497,143 @@ fn resize_starts_on_mouse_down_without_hover(cx: &mut gpui_kit::TestAppContext) 
         assert_eq!(gesture.id, 2);
     });
 }
+
+#[gpui_kit::test]
+fn second_zoom_mid_animation_starts_from_the_interpolated_camera(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let from = view.state.gantt.snapshot();
+        view.state.gantt.zoom = 2.0;
+        view.enable_camera_anim();
+        view.seed_camera_anim(from, 40);
+    });
+    let zoom_in = cx.debug_bounds("gantt-zoom-in").expect("zoom in");
+    cx.simulate_click(zoom_in.center(), Modifiers::default());
+    view.update(cx, |view, _| {
+        let (anim_from, anim_to) = view
+            .camera_anim_endpoints()
+            .expect("second + must start a new ease");
+        assert!(
+            anim_from.zoom > 1.1 && anim_from.zoom < 1.9,
+            "second + must start from the painted pose, not 1.0 or dest 2.0, got {}",
+            anim_from.zoom
+        );
+        assert!(
+            (anim_to.zoom - anim_from.zoom * 1.25).abs() < 0.08,
+            "destination must be 1.25× the interpolant ({:.2}), got {:.2}",
+            anim_from.zoom * 1.25,
+            anim_to.zoom
+        );
+        assert!(
+            (anim_to.zoom - 2.5).abs() > 0.1,
+            "must not zoom from the old dest 2.0 (that would land at 2.5), got {}",
+            anim_to.zoom
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn wheel_pan_cancels_in_flight_camera_anim(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let from = view.state.gantt.snapshot();
+        view.state.gantt.zoom = 2.0;
+        view.enable_camera_anim();
+        view.seed_camera_anim(from, 40);
+    });
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    cx.simulate_event(ScrollEvent {
+        position: timeline.center(),
+        delta: ScrollDelta::Pixels(point(px(80.), px(0.))),
+        ..Default::default()
+    });
+    view.update(cx, |view, _| {
+        assert!(
+            view.camera_anim_endpoints().is_none(),
+            "a pan must cancel the in-flight ease instead of snapping to its destination"
+        );
+        assert!(
+            (view.state.gantt.zoom - 2.0).abs() > 0.1,
+            "cancel must commit the painted zoom, not the destination 2.0, got {}",
+            view.state.gantt.zoom
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn scale_button_eases_from_the_current_camera(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        view.enable_camera_anim();
+    });
+    let day_btn = cx.debug_bounds("gantt-scale-Day").expect("Day scale");
+    cx.simulate_click(day_btn.center(), Modifiers::default());
+    view.update(cx, |view, _| {
+        let (_from, to) = view
+            .camera_anim_endpoints()
+            .expect("scale changes must ease, not snap");
+        assert_ne!(
+            to.scale,
+            GanttScale::Month,
+            "clicking another scale must animate toward it, got {:?}",
+            to.scale
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn inline_placeholder_resets_when_switching_edit_kind(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_dates(1, window, cx);
+            assert_eq!(
+                view.inline_placeholder(cx),
+                "YYYY-MM-DD / YYYY-MM-DD",
+                "date edits must hint at a range"
+            );
+            view.open_inline_title(1, window, cx);
+            assert_eq!(
+                view.inline_placeholder(cx),
+                "",
+                "title edits must not keep the date-range placeholder"
+            );
+            view.open_inline_assignee(1, window, cx);
+            assert_eq!(
+                view.inline_placeholder(cx),
+                "",
+                "assignee edits must not keep the date-range placeholder"
+            );
+        });
+    });
+}

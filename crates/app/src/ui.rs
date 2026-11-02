@@ -289,6 +289,33 @@ impl PlannerView {
         view
     }
 
+    /// Tests turn easing back on (`for_state` skips it so snapshots stay stable).
+    pub fn enable_camera_anim(&mut self) {
+        self.skip_camera_anim = false;
+    }
+
+    /// Seed an in-flight camera blend so tests can click again mid-ease.
+    pub fn seed_camera_anim(&mut self, from: SavedGanttView, elapsed_ms: u64) {
+        let to = self.state.gantt.snapshot();
+        self.camera_anim = Some(CameraAnim {
+            from,
+            to,
+            start: Instant::now() - Duration::from_millis(elapsed_ms),
+        });
+    }
+
+    pub fn camera_anim_endpoints(&self) -> Option<(SavedGanttView, SavedGanttView)> {
+        self.camera_anim.as_ref().map(|anim| (anim.from, anim.to))
+    }
+
+    pub fn inline_placeholder(&self, cx: &App) -> String {
+        self.inline_input
+            .read(cx)
+            .presentation()
+            .placeholder()
+            .to_string()
+    }
+
     /// Tests type into the org/team/assignee Search box.
     pub fn type_scope_search(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.scope_query.update(cx, |input, cx| {
@@ -515,19 +542,35 @@ impl PlannerView {
         .detach();
     }
 
+    fn visible_camera(&mut self) -> SavedGanttView {
+        self.animated_camera()
+            .unwrap_or_else(|| self.state.gantt.snapshot())
+    }
+
+    /// Commit the painted pose and drop any in-flight ease so a later mutation
+    /// cannot snap from a stale destination.
+    fn cancel_camera_anim(&mut self) {
+        if let Some(pose) = self.animated_camera() {
+            self.state.gantt.restore(pose);
+        }
+        self.camera_anim = None;
+        self.camera_anim_gen += 1;
+    }
+
     fn animate_gantt(&mut self, cx: &mut Context<Self>, apply: impl FnOnce(&mut GanttView)) {
-        let from = self.state.gantt.snapshot();
+        let from = self.visible_camera();
+        self.state.gantt.restore(from);
         apply(&mut self.state.gantt);
         self.start_camera_anim(from, cx);
     }
 
     fn start_camera_anim(&mut self, from: SavedGanttView, cx: &mut Context<Self>) {
         let to = self.state.gantt.snapshot();
+        self.camera_anim_gen += 1;
         if from == to || self.skip_camera_anim {
             self.camera_anim = None;
             return;
         }
-        self.camera_anim_gen += 1;
         let anim_gen = self.camera_anim_gen;
         self.camera_anim = Some(CameraAnim {
             from,
@@ -728,10 +771,13 @@ impl PlannerView {
             self.inline_dates_typed_seed.clear();
         }
         self.inline_edit = Some(edit);
+        let placeholder = match edit {
+            InlineEdit::Dates(_) => "YYYY-MM-DD / YYYY-MM-DD",
+            InlineEdit::Start(_) | InlineEdit::Target(_) => "YYYY-MM-DD",
+            InlineEdit::Title(_) | InlineEdit::Assignee(_) => "",
+        };
         self.inline_input.update(cx, |input, cx| {
-            if matches!(edit, InlineEdit::Dates(_)) {
-                input.set_placeholder("YYYY-MM-DD / YYYY-MM-DD", window, cx);
-            }
+            input.set_placeholder(placeholder, window, cx);
             input.set_value(&typed, window, cx);
             input.select_all(window, cx);
         });
@@ -1095,22 +1141,26 @@ impl PlannerView {
         // invert so the content moves the same way as the wheel.
         let dy = -f32::from(delta.y);
         let dx = -f32::from(delta.x);
+        let rows = self.state.visible_rows().len();
+        let viewport_h = self.state.gantt.viewport_h;
         if mods.control || mods.platform {
             // After invert, wheel-up (negative dy) zooms in, matching the + button.
             let factor = if dy < 0.0 { 1.25 } else { 0.8 };
             let pointer = f32::from(event.position.x) - self.state.gantt.timeline_origin_x;
-            if pointer >= 0.0 && pointer <= self.state.gantt.timeline_width {
-                self.state.gantt.zoom_at(factor, pointer, 0.0);
-            } else {
-                self.state.gantt.zoom_at_center(factor);
-            }
+            let timeline_width = self.state.gantt.timeline_width;
+            self.animate_gantt(cx, |gantt| {
+                if pointer >= 0.0 && pointer <= timeline_width {
+                    gantt.zoom_at(factor, pointer, 0.0);
+                } else {
+                    gantt.zoom_at_center(factor);
+                }
+                gantt.clamp_scroll(rows, viewport_h);
+            });
         } else {
+            self.cancel_camera_anim();
             self.state.gantt.apply_wheel(dx, dy, mods.shift);
+            self.state.gantt.clamp_scroll(rows, viewport_h);
         }
-        let rows = self.state.visible_rows().len();
-        self.state
-            .gantt
-            .clamp_scroll(rows, self.state.gantt.viewport_h);
         cx.notify();
     }
 
@@ -1440,6 +1490,7 @@ impl PlannerView {
     }
 
     fn start_team_switch(&mut self, team: String, cx: &mut Context<Self>) {
+        self.cancel_camera_anim();
         self.pending_camera_from = Some(self.state.gantt.snapshot());
         self.loading_hold_gen += 1;
         self.state.begin_team_switch(team.clone());
@@ -1674,7 +1725,11 @@ impl PlannerView {
         }
         let visible = self.state.visible_nodes();
         let empty_canvas = visible.is_empty();
-        if empty_canvas && !self.state.hierarchy_loading && !self.state.has_saved_gantt_view() {
+        if empty_canvas
+            && !self.state.hierarchy_loading
+            && !self.state.has_saved_gantt_view()
+            && self.camera_anim.is_none()
+        {
             let today = jiff::Zoned::now().date();
             let today_x = self.state.gantt.today_x(today);
             let width = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
@@ -1908,10 +1963,11 @@ impl PlannerView {
                     .tooltip_placement(Placement::Bottom)
                     .on_click(cx.listener(|this, _, _, cx| {
                         let nodes = this.state.visible_nodes();
+                        let iterations = this.state.iterations.clone();
                         let width = this.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
-                        this.state
-                            .gantt
-                            .auto_fit(&nodes, &this.state.iterations, width);
+                        this.animate_gantt(cx, |gantt| {
+                            gantt.auto_fit(&nodes, &iterations, width);
+                        });
                         cx.notify();
                     })),
             )
@@ -1921,7 +1977,9 @@ impl PlannerView {
                     .compact()
                     .label("‹")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.gantt.step_period(-1);
+                        this.animate_gantt(cx, |gantt| {
+                            gantt.step_period(-1);
+                        });
                         cx.notify();
                     })),
             )
@@ -1931,7 +1989,9 @@ impl PlannerView {
                     .compact()
                     .label("›")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.gantt.step_period(1);
+                        this.animate_gantt(cx, |gantt| {
+                            gantt.step_period(1);
+                        });
                         cx.notify();
                     })),
             )
@@ -1958,20 +2018,28 @@ impl PlannerView {
                         } else {
                             scale.label().to_string()
                         };
-                        div().w(px(SCALE_BUTTON_WIDTH)).flex_shrink_0().child(
-                            Button::new(scale.label())
-                                .label(label)
-                                .compact()
-                                .w(px(SCALE_BUTTON_WIDTH))
-                                .selected(selected)
-                                .when(selected, |btn| btn.primary())
-                                .when(!selected, |btn| btn.ghost())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.dismiss_overlays();
-                                    this.state.gantt.set_scale(scale);
-                                    cx.notify();
-                                })),
-                        )
+                        let selector = format!("gantt-scale-{}", scale.label());
+                        div()
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector(move || selector)
+                            .w(px(SCALE_BUTTON_WIDTH))
+                            .flex_shrink_0()
+                            .child(
+                                Button::new(scale.label())
+                                    .label(label)
+                                    .compact()
+                                    .w(px(SCALE_BUTTON_WIDTH))
+                                    .selected(selected)
+                                    .when(selected, |btn| btn.primary())
+                                    .when(!selected, |btn| btn.ghost())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.dismiss_overlays();
+                                        this.animate_gantt(cx, |gantt| {
+                                            gantt.set_scale(scale);
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
                     })),
             )
             .child(
@@ -4619,6 +4687,7 @@ impl PlannerView {
             return;
         }
         if key == "home" {
+            self.cancel_camera_anim();
             self.state.gantt.scroll_y = 0.0;
             if let Some(first) = self.state.visible_rows().first() {
                 self.state.gantt.selected_id = Some(first.id);
@@ -4627,6 +4696,7 @@ impl PlannerView {
             return;
         }
         if key == "end" {
+            self.cancel_camera_anim();
             self.state.gantt.scroll_y = f32::MAX;
             self.state.gantt.clamp_scroll(rows, viewport);
             if let Some(last) = self.state.visible_rows().last() {
@@ -4742,6 +4812,7 @@ impl PlannerView {
     }
 
     fn scroll_or_select(&mut self, rows: i32, cx: &mut Context<Self>) {
+        self.cancel_camera_anim();
         let before = self.state.gantt.scroll_y;
         let count = self.state.visible_rows().len();
         self.state

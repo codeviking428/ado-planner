@@ -24,7 +24,7 @@ pub const TODAY_MARGIN_PX: f32 = 80.0;
 /// Place the Today line about a third of the way across the timeline.
 pub const TODAY_ALIGN: f32 = 1.0 / 3.0;
 pub const SCALE_BUTTON_WIDTH: f32 = 132.0;
-/// Toolbar zoom, Today, and team-switch camera easing.
+/// Toolbar zoom, Today, scale, period, Auto Fit, and team-switch camera easing.
 pub const CAMERA_EASE_MS: u64 = 150;
 pub const PLACEHOLDER_MIN_WIDTH: f32 = 48.0;
 pub const MILESTONE_SIZE: f32 = 16.0;
