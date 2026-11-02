@@ -3164,12 +3164,6 @@ impl PlannerView {
                             .w(px(1.))
                             .bg(grid)
                     }))
-                    .children({
-                        let arrows = self.state.gantt.layout_dependency_arrows(bars);
-                        arrows
-                            .into_iter()
-                            .map(|arrow| self.render_dependency_arrow(&arrow, cx))
-                    })
                     .child(
                         v_flex()
                             .mt(px(-self.state.gantt.row_scroll_remainder()))
@@ -3300,6 +3294,12 @@ impl PlannerView {
                                 })
                             }),
                     )
+                    .children({
+                        let arrows = self.state.gantt.layout_dependency_arrows(bars);
+                        arrows
+                            .into_iter()
+                            .map(|arrow| self.render_dependency_arrow(&arrow, cx))
+                    })
                     .child(
                         div()
                             .id("gantt-today")
@@ -4113,6 +4113,7 @@ impl PlannerView {
             .flex()
             .items_center()
             .justify_center()
+            .occlude()
             .cursor_pointer()
             .when(self.state.form.is_none(), |el| {
                 el.tooltip(move |window, cx| {
@@ -4186,6 +4187,7 @@ impl PlannerView {
             .top(px(arrow.y2 - min_y - 10.0))
             .w(px(18.))
             .h(px(20.))
+            .occlude()
             .cursor_pointer()
             .text_xl()
             .line_height(gpui_kit::relative(1.))

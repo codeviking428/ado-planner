@@ -2082,6 +2082,37 @@ mod tests {
     }
 
     #[test]
+    fn unscheduled_marker_gesture_starts_at_today_not_origin() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        item.iteration_path.clear();
+        let origin = Date::new(2026, 7, 1).unwrap();
+        let mut gantt = GanttView {
+            origin,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&[item.clone()]);
+        let bars = gantt.layout_bars(&[item.clone()], &rows, &[], 720.0);
+        let bar = bars[0].clone();
+        assert!(bar.marker);
+        gantt
+            .begin_gesture(&bar, GestureKind::Move, bar.x, &[item], &[])
+            .expect("move");
+        let today = jiff::Zoned::now().date();
+        let gesture = gantt.gesture.expect("gesture");
+        assert_eq!(gesture.start, today);
+        assert_eq!(
+            gesture.target,
+            today.saturating_add((DEFAULT_BAR_DAYS - 1).days())
+        );
+        assert_ne!(
+            gesture.start, origin,
+            "dragging a Today marker must not jump to the timeline origin"
+        );
+    }
+
+    #[test]
     fn header_major_labels_do_not_stack_at_the_origin() {
         let gantt = GanttView {
             origin: Date::new(2026, 1, 1).unwrap(),
