@@ -289,7 +289,7 @@ mod tests {
     fn dismiss_undo_for_item_drops_create_toast() {
         let mut toasts = Toasts::default();
         toasts.push_undo(
-            "Created item on Cart",
+            "Created Cart",
             UndoAction::DeleteCreated {
                 id: 7,
                 title: "Cart".into(),

@@ -35,7 +35,12 @@ async fn open_and_save_work_item_form() {
             .toasts
             .last_message()
             .unwrap_or_default()
-            .contains("Saved title on")
+            .contains("Renamed")
+            && state
+                .toasts
+                .last_message()
+                .unwrap_or_default()
+                .contains("Persist cart (saved)")
     );
     assert!(
         state
@@ -84,7 +89,7 @@ async fn save_toast_uses_display_names_and_skips_unchanged_fields() {
     state.save_form().await.expect("save title");
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message.to_lowercase().contains("title"),
+        message.starts_with("Renamed ") && message.contains("Persist cart (named)"),
         "toast should use the display name, got {message}"
     );
     assert!(

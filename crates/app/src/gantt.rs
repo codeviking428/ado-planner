@@ -588,18 +588,27 @@ impl GanttView {
         }
     }
 
-    /// Date of the leftover sticky tick (the clipped column at x ≤ 0), not
-    /// `date_for_x(0)` which rounds past a partial day at the left edge.
+    /// Date of the leftover sticky tick when it is painted; otherwise the first
+    /// in-view tick. Must match `header_tick_labels` so the toolbar does not
+    /// name a month the axis dropped to keep Day 24 (or Jul) readable.
     pub fn viewport_axis_start_date(&self) -> Date {
         let width = self.timeline_width.max(1.0);
         let ticks = self.timeline_ticks(width);
-        ticks
+        let leftover = ticks
             .iter()
             .rev()
-            .find(|tick| tick.x <= 0.0 && !tick.label.is_empty())
-            .or_else(|| ticks.iter().find(|tick| !tick.label.is_empty()))
-            .map(|tick| tick.date)
-            .unwrap_or_else(|| self.viewport_start_date())
+            .find(|tick| tick.x <= 0.0 && !tick.label.is_empty());
+        let first_in_view = ticks
+            .iter()
+            .find(|tick| tick.x > 0.0 && !tick.label.is_empty());
+        let room = first_in_view.is_none_or(|tick| tick.x >= TICK_MIN_GAP);
+        if let Some(tick) = leftover.filter(|_| room) {
+            tick.date
+        } else if let Some(tick) = first_in_view.or(leftover) {
+            tick.date
+        } else {
+            self.viewport_start_date()
+        }
     }
 
     pub fn viewport_start_date(&self) -> Date {
@@ -690,6 +699,30 @@ impl GanttView {
         let x = self.x_for_date(today);
         let target = self.timeline_width.max(1.0) * TODAY_ALIGN;
         self.scroll_x = x - target;
+    }
+
+    /// Stay on Today when scheduled bars are in that viewport; otherwise Auto Fit
+    /// the item range so a July backlog is not hidden behind a November camera.
+    pub fn focus_work(
+        &mut self,
+        nodes: &[WorkItemNode],
+        iterations: &[IterationNode],
+        width: f32,
+        today: Date,
+    ) {
+        let width = width.max(MIN_TIMELINE_WIDTH);
+        let previous = self.snapshot();
+        self.go_today(today);
+        let rows = self.flatten(nodes);
+        let bars = self.layout_bars(nodes, &rows, iterations, self.viewport_h.max(720.0));
+        let visible = bars.iter().any(|bar| {
+            bar.kind == GanttBarKind::Scheduled && bar.x < width && bar.x + bar.width > 0.0
+        });
+        if visible {
+            return;
+        }
+        self.restore(previous);
+        self.auto_fit(nodes, iterations, width);
     }
 
     pub fn snapshot(&self) -> SavedGanttView {
@@ -861,13 +894,13 @@ impl GanttView {
                 let mut marker = false;
                 let (start, target) = if let Some(gesture) = live {
                     (gesture.live_start, gesture.live_target)
-                } else if let (Some(start), Some(target)) = (display.start, display.end) {
-                    (start, target)
                 } else if display.kind == GanttBarKind::Unscheduled {
-                    // No iteration/rollup span: a diamond at Today, not a fake week bar.
+                    // One treatment: a diamond at Today, never a fake iteration/rollup bar.
                     marker = true;
                     let today = jiff::Zoned::now().date();
                     (today, today)
+                } else if let (Some(start), Some(target)) = (display.start, display.end) {
+                    (start, target)
                 } else {
                     return None;
                 };
@@ -971,6 +1004,10 @@ impl GanttView {
     ) -> (Date, Date) {
         let hint = iteration_hint_for_path(&node.iteration_path, iterations);
         let display = gantt_bar_display(node, nodes, hint.as_ref());
+        if display.kind == GanttBarKind::Unscheduled {
+            let today = jiff::Zoned::now().date();
+            return (today, today.saturating_add((DEFAULT_BAR_DAYS - 1).days()));
+        }
         let start = display
             .start
             .or(display.end)
@@ -1149,7 +1186,7 @@ impl GanttView {
                 (x, tick.major_label)
             })
             .collect();
-        Self::sticky_header_labels(ticks, false)
+        Self::sticky_header_labels(ticks, false, 72.0)
     }
 
     /// Month (or day/week) tick labels, with the in-view period stuck at x = 0
@@ -1189,14 +1226,34 @@ impl GanttView {
         {
             ticks[index].0 = today + SHIFT;
         }
-        Self::space_header_labels(Self::sticky_header_labels(ticks, false), TICK_MIN_GAP)
+        let mut labels = Self::space_header_labels(
+            Self::sticky_header_labels(ticks, false, TICK_MIN_GAP),
+            TICK_MIN_GAP,
+        );
+        const TICK_W: f32 = 18.0;
+        if let Some((x, _)) = labels.last()
+            && *x + TICK_W > width
+        {
+            let shifted = (width - TICK_W).max(0.0);
+            let collision = labels
+                .len()
+                .checked_sub(2)
+                .and_then(|i| labels.get(i))
+                .is_some_and(|(prev, _)| shifted - *prev < TICK_MIN_GAP);
+            if collision {
+                labels.pop();
+            } else if let Some((x, _)) = labels.last_mut() {
+                *x = shifted;
+            }
+        }
+        labels
     }
 
     fn sticky_header_labels(
         ticks: impl IntoIterator<Item = (f32, String)>,
         skip_sticky: bool,
+        sticky_min: f32,
     ) -> Vec<(f32, String)> {
-        const STICKY_MIN: f32 = 72.0;
         let mut sticky: Option<String> = None;
         let mut out = Vec::new();
         for (x, label) in ticks {
@@ -1210,12 +1267,10 @@ impl GanttView {
             return out;
         }
         if let Some(label) = sticky {
-            if let Some((x, _)) = out.first_mut()
-                && *x < STICKY_MIN
-            {
-                *x = STICKY_MIN;
+            let room = out.first().is_none_or(|(x, _)| *x >= sticky_min);
+            if room {
+                out.insert(0, (0.0, label));
             }
-            out.insert(0, (0.0, label));
         }
         out
     }
@@ -2060,8 +2115,11 @@ mod tests {
         assert_eq!(bars.len(), 1);
         assert!(!bars[0].summary);
         assert_eq!(bars[0].kind, GanttBarKind::Unscheduled);
-        assert!(!bars[0].marker);
-        assert!(bars[0].width >= PLACEHOLDER_MIN_WIDTH);
+        assert!(
+            bars[0].marker,
+            "unscheduled items are a Today diamond, not an iteration ghost bar"
+        );
+        assert!((bars[0].width - MILESTONE_SIZE).abs() < 0.1);
     }
 
     #[test]
@@ -2480,11 +2538,16 @@ mod tests {
         let rows = gantt.flatten(&nodes);
         let bars = gantt.layout_bars(&nodes, &rows, &iterations, 720.0);
         let bar = bars.iter().find(|bar| bar.id == 1).expect("placeholder");
+        assert!(
+            bar.marker,
+            "unscheduled must paint at Today, not the sprint"
+        );
+        let origin_x = bar.x + bar.width / 2.0;
+        gantt
+            .begin_gesture(bar, GestureKind::Move, origin_x, &nodes, &iterations)
+            .expect("placeholder move");
         let drop = Date::new(2026, 8, 20).unwrap();
         let drop_x = gantt.x_for_date(drop);
-        gantt
-            .begin_gesture(bar, GestureKind::Move, drop_x, &nodes, &iterations)
-            .expect("placeholder move");
         gantt.update_gesture(drop_x);
         let gesture = gantt.gesture.clone().expect("live");
         let (start, target) = GanttView::gesture_patch_dates(&gesture);
@@ -2492,7 +2555,7 @@ mod tests {
         assert_eq!(
             start.month(),
             8,
-            "drop around Aug 20 must not save November (got {start}–{target:?})"
+            "dragging the Today marker to Aug 20 must not save November (got {start}–{target:?})"
         );
         assert!(
             start >= Date::new(2026, 8, 1).unwrap() && start <= Date::new(2026, 8, 31).unwrap(),
@@ -2890,6 +2953,63 @@ mod tests {
         assert!(
             nov.is_some_and(|(x, _)| *x > today_x + TODAY_PILL_W && *x > 8.0),
             "Nov 2026 must sit to the right of the Today pill, got {majors:?} today_x={today_x}"
+        );
+    }
+
+    #[test]
+    fn day_ticks_keep_the_first_in_view_day_and_the_right_edge() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 10, 24).unwrap(),
+            scale: GanttScale::Day,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            scroll_x: -10.0,
+            ..Default::default()
+        };
+        let labels = gantt.header_tick_labels_except(800.0, None);
+        let texts: Vec<&str> = labels.iter().map(|(_, label)| label.as_str()).collect();
+        assert!(
+            texts.contains(&"24"),
+            "Day 24 must stay on the axis, got {texts:?}"
+        );
+        if let Some((x, label)) = labels.last() {
+            assert!(
+                *x + 18.0 <= 800.1,
+                "rightmost tick {label} at {x} must not clip past the timeline"
+            );
+        }
+    }
+
+    #[test]
+    fn every_scale_button_label_includes_percent() {
+        for scale in GanttScale::ALL {
+            let label = scale.button_label(0.5);
+            assert!(
+                label.contains('%'),
+                "scale buttons must keep a percent after Auto Fit, got {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_work_auto_fits_when_today_has_no_scheduled_bars() {
+        let item = node(1, None);
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 11, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let today = Date::new(2026, 11, 2).unwrap();
+        gantt.focus_work(std::slice::from_ref(&item), &[], 800.0, today);
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(&[item], &rows, &[], 720.0);
+        assert!(
+            bars.iter().any(|bar| {
+                bar.kind == GanttBarKind::Scheduled && bar.x < 800.0 && bar.x + bar.width > 0.0
+            }),
+            "July work must be visible when Today has no nearby bars, origin={} scroll={}",
+            gantt.origin,
+            gantt.scroll_x
         );
     }
 

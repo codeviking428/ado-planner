@@ -13,6 +13,7 @@ use ado_planner::ui::PlannerView;
 use ado_planner::ui::{
     date_field_text, dates_from_range_picker, dates_from_range_picker_in_years,
     format_picker_dates, looks_like_pat, pending_range_typed, range_picker_is_complete,
+    typed_dates_error,
 };
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use gpui_kit::component::calendar::Date as PickerDate;
@@ -406,6 +407,56 @@ fn typed_compact_range_keeps_the_item_year() {
         Some(Date::new(2026, 1, 16).unwrap()),
         "each side of a cross-year range keeps its own year"
     );
+}
+
+#[test]
+fn typed_ascii_arrow_and_to_separators_parse_a_range() {
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+    let end = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+    let calendar = PickerDate::Range(Some(start), Some(end));
+    let seed = "Jul 6 → Jul 20";
+    for typed in [
+        "Jul 22 -> Jul 28",
+        "Jul 22 - Jul 28",
+        "Jul 22 to Jul 28",
+        "Jul 22 TO Jul 28",
+        "Jul 22 → Jul 28",
+    ] {
+        let picked = dates_from_range_picker(calendar, typed, seed)
+            .unwrap_or_else(|| panic!("{typed} must parse as a range"));
+        assert_eq!(
+            picked.0,
+            Some(Date::new(2026, 7, 22).unwrap()),
+            "start for {typed}"
+        );
+        assert_eq!(
+            picked.1,
+            Some(Date::new(2026, 7, 28).unwrap()),
+            "target for {typed}"
+        );
+        assert!(
+            typed_dates_error(typed).is_none(),
+            "{typed} must be valid Dates text"
+        );
+    }
+}
+
+#[test]
+fn typed_unparseable_dates_do_not_clear_the_range() {
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+    let end = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+    let calendar = PickerDate::Range(Some(start), Some(end));
+    let seed = "Jul 6 → Jul 20";
+    assert!(
+        dates_from_range_picker(calendar, "Jul 22 -> zz", seed).is_none(),
+        "a parse failure must not yield empty dates"
+    );
+    assert!(
+        dates_from_range_picker(PickerDate::Range(None, None), "not a date", "").is_none(),
+        "garbage must not become a cleared range"
+    );
+    assert!(typed_dates_error("Jul 22 -> zz").is_some());
+    assert!(typed_dates_error("").is_none());
 }
 
 #[gpui_kit::test]
@@ -1436,17 +1487,30 @@ fn placeholder_drop_on_august_keeps_august_dates(cx: &mut gpui_kit::TestAppConte
         finish_date: Some("2026-08-21T00:00:00Z".into()),
         children: Vec::new(),
     }];
-    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
-    state.gantt.scroll_x = 0.0;
+    let today = jiff::Zoned::now().date();
+    state.gantt.go_today(today);
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
         height: px(800.),
     });
     draw(cx);
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars =
+            view.state
+                .gantt
+                .layout_bars(&view.state.nodes, &rows, &view.state.iterations, 720.0);
+        assert!(
+            bars.iter()
+                .find(|bar| bar.id == 2)
+                .is_some_and(|bar| bar.marker),
+            "unscheduled items must be a Today diamond, not a sprint ghost"
+        );
+    });
     let bar = cx
         .debug_bounds("gantt-bar-2")
-        .expect("unscheduled placeholder should paint from the sprint hint");
+        .expect("unscheduled marker should paint at Today");
     cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
@@ -1455,9 +1519,8 @@ fn placeholder_drop_on_august_keeps_august_dates(cx: &mut gpui_kit::TestAppConte
         let (start, _) = GanttView::gesture_patch_dates(&gesture);
         let start = start.expect("start");
         assert_eq!(
-            start.month(),
-            8,
-            "placeholder must use the painted sprint dates, not the July origin, got {start}"
+            start, today,
+            "the marker gesture must start at Today, not the July origin, got {start}"
         );
         assert_ne!(
             start,
@@ -3677,6 +3740,211 @@ fn details_hides_empty_custom_fields_and_disables_clean_save(cx: &mut gpui_kit::
 }
 
 #[gpui_kit::test]
+fn ascii_arrow_dates_save_and_garbage_blocks_save(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-07-06T00:00:00Z"),
+    );
+    values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-07-20T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: vec![
+            ado_core::FormControl {
+                id: ado_core::START_DATE_FIELD.into(),
+                reference_name: ado_core::START_DATE_FIELD.into(),
+                label: "Start Date".into(),
+                kind: ado_core::FormControlKind::DateTime,
+                required: false,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+            ado_core::FormControl {
+                id: ado_core::TARGET_DATE_FIELD.into(),
+                reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                label: "Target Date".into(),
+                kind: ado_core::FormControlKind::DateTime,
+                required: false,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+        ],
+        pages: Vec::new(),
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_form_dates("Jul 22 -> Jul 28", window, cx);
+        });
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        let form = view.state.form.as_ref().expect("form");
+        let start = form
+            .values
+            .get(ado_core::START_DATE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.get(..10));
+        let target = form
+            .values
+            .get(ado_core::TARGET_DATE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.get(..10));
+        assert_eq!(
+            start,
+            Some("2026-07-22"),
+            "ASCII -> must keep Start, got {start:?}"
+        );
+        assert_eq!(
+            target,
+            Some("2026-07-28"),
+            "ASCII -> must keep Target, got {target:?}"
+        );
+        assert!(
+            view.form_save_is_enabled(cx),
+            "a parsed range must enable Save"
+        );
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_form_dates("Jul 22 -> zz", window, cx);
+        });
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert!(
+            view.form_dates_error_text(cx).is_some(),
+            "garbage dates must show a validation error"
+        );
+        assert!(
+            !view.form_save_is_enabled(cx),
+            "Save must stay off on a parse failure"
+        );
+        let form = view.state.form.as_ref().expect("form");
+        let start = form
+            .values
+            .get(ado_core::START_DATE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.get(..10));
+        assert_eq!(
+            start,
+            Some("2026-07-22"),
+            "a parse failure must not PATCH empty dates, got {start:?}"
+        );
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-dates-error").is_some(),
+        "the Dates field must show the parse error"
+    );
+}
+
+#[gpui_kit::test]
+fn calendar_pick_overwrites_typed_dates_in_the_field(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-07-06T00:00:00Z"),
+    );
+    values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-07-20T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: vec![
+            ado_core::FormControl {
+                id: ado_core::START_DATE_FIELD.into(),
+                reference_name: ado_core::START_DATE_FIELD.into(),
+                label: "Start Date".into(),
+                kind: ado_core::FormControlKind::DateTime,
+                required: false,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+            ado_core::FormControl {
+                id: ado_core::TARGET_DATE_FIELD.into(),
+                reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                label: "Target Date".into(),
+                kind: ado_core::FormControlKind::DateTime,
+                required: false,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+        ],
+        pages: Vec::new(),
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_form_dates("Jul 22 -> Jul 28", window, cx);
+        });
+    });
+    draw(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.click_form_calendar_day(chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(), cx);
+            view.click_form_calendar_day(chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(), cx);
+        });
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.sync_form_inputs_for_test(cx);
+        let form = view.state.form.as_ref().expect("form");
+        let start = form
+            .values
+            .get(ado_core::START_DATE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.get(..10));
+        let target = form
+            .values
+            .get(ado_core::TARGET_DATE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.get(..10));
+        assert_eq!(
+            start,
+            Some("2026-07-10"),
+            "a later calendar pick must win over typed dates, got {start:?}"
+        );
+        assert_eq!(
+            target,
+            Some("2026-07-17"),
+            "a later calendar pick must win over typed dates, got {target:?}"
+        );
+        let typed = view
+            .form_input_value(ado_core::START_DATE_FIELD, cx)
+            .unwrap_or_default();
+        assert!(
+            typed.contains("Jul 10") && typed.contains("Jul 17"),
+            "the Dates field must show the calendar range, got {typed:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn realistic_backlog_keeps_markers_badges_and_indent(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -3704,10 +3972,8 @@ fn realistic_backlog_keeps_markers_badges_and_indent(cx: &mut gpui_kit::TestAppC
             "realistic mock data must include a long unscheduled tail"
         );
         assert!(
-            unscheduled
-                .iter()
-                .all(|bar| bar.marker || bar.width >= 16.0),
-            "unscheduled items without an iteration span must be markers, not fake week bars"
+            unscheduled.iter().all(|bar| bar.marker),
+            "unscheduled items must be Today markers, not ghost bars"
         );
         let task = rows.iter().find(|row| row.id == 4).expect("task");
         let test_case = rows.iter().find(|row| row.id == 5).expect("test case");

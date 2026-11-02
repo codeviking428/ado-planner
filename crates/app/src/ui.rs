@@ -81,6 +81,8 @@ pub struct PlannerView {
     form_title_focused_for: Option<i64>,
     form_calendar_open: bool,
     form_dates_typed_seed: String,
+    /// Calendar picks write here, then Render copies into the Dates input and seed.
+    pending_form_dates_text: Option<String>,
     form_focus: FocusHandle,
     open_filter: Option<&'static str>,
     open_scope: Option<&'static str>,
@@ -104,6 +106,7 @@ pub struct PlannerView {
     pending_team: Option<String>,
     update_checked: bool,
     toast_expiry_armed: bool,
+    toast_expiry_gen: u64,
     loading_shown_at: Option<std::time::Instant>,
     loading_hold_gen: u64,
     last_undo_at: Option<Instant>,
@@ -279,6 +282,7 @@ impl PlannerView {
             form_title_focused_for: None,
             form_calendar_open: false,
             form_dates_typed_seed: String::new(),
+            pending_form_dates_text: None,
             form_focus: cx.focus_handle(),
             open_filter: None,
             open_scope: None,
@@ -298,6 +302,7 @@ impl PlannerView {
             pending_team: None,
             update_checked: false,
             toast_expiry_armed: false,
+            toast_expiry_gen: 0,
             loading_shown_at: None,
             loading_hold_gen: 0,
             last_undo_at: None,
@@ -504,6 +509,54 @@ impl PlannerView {
             .map(|input| input.read(cx).value().to_string())
     }
 
+    /// Tests type a range into the details Dates field and sync the draft.
+    pub fn type_form_dates(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self
+            .form_inputs
+            .get(ado_core::START_DATE_FIELD)
+            .cloned()
+            .or_else(|| self.form_inputs.get(ado_core::TARGET_DATE_FIELD).cloned())
+        else {
+            return;
+        };
+        input.update(cx, |input, cx| {
+            input.replace_all(text, window, cx);
+        });
+        self.sync_form_inputs(cx);
+        cx.notify();
+    }
+
+    pub fn form_dates_error_text(&self, cx: &App) -> Option<String> {
+        self.form_dates_error(cx)
+    }
+
+    pub fn form_save_is_enabled(&self, cx: &App) -> bool {
+        self.form_has_unsaved_edits(cx)
+            && self.form_dates_error(cx).is_none()
+            && self.state.form.as_ref().is_none_or(|form| !form.saving)
+    }
+
+    pub fn sync_form_inputs_for_test(&mut self, cx: &mut Context<Self>) {
+        self.sync_form_inputs(cx);
+    }
+
+    fn flush_pending_form_dates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.pending_form_dates_text.take() else {
+            return;
+        };
+        if let Some(input) = self
+            .form_inputs
+            .get(ado_core::START_DATE_FIELD)
+            .cloned()
+            .or_else(|| self.form_inputs.get(ado_core::TARGET_DATE_FIELD).cloned())
+        {
+            input.update(cx, |input, cx| {
+                input.set_value(&text, window, cx);
+            });
+        }
+        self.form_dates_typed_seed = text;
+    }
+
     fn form_date_picker_focused(&self, window: &Window, cx: &App) -> bool {
         self.form_dates
             .values()
@@ -660,6 +713,7 @@ impl PlannerView {
                     this.update_checked = true;
                     this.spawn_update_check(cx);
                 }
+                this.note_toasts_changed(cx);
                 cx.notify();
             });
         })
@@ -1272,15 +1326,22 @@ impl PlannerView {
     }
 
     fn apply_toast_undo(&mut self, toast_id: u64, action: UndoAction, cx: &mut Context<Self>) {
+        let original = self
+            .state
+            .toasts
+            .items
+            .iter()
+            .find(|toast| toast.id == toast_id)
+            .map(|toast| toast.message.clone())
+            .unwrap_or_else(|| self.state.history_action_message_for_undo(&action));
+        let undid = format!("Undid: {original}");
         if matches!(action, UndoAction::RestoreDates { .. }) {
             if let Some(pending) = self.state.apply_toast_restore_dates(action) {
                 self.state.toasts.dismiss_undo();
                 self.state.toasts.dismiss(toast_id);
-                let title = self.state.item_title(pending.id);
                 self.enqueue_date_save(cx, pending);
-                self.state
-                    .toasts
-                    .push(ToastKind::Success, format!("Undid dates on {title}"));
+                self.state.toasts.push(ToastKind::Success, undid);
+                self.note_toasts_changed(cx);
             }
             cx.notify();
             return;
@@ -1290,8 +1351,7 @@ impl PlannerView {
         if !self.spawn_state(cx, move |mut state| async move {
             let result = state.apply_undo(action.clone()).await;
             if result.is_ok() {
-                let message = state.undo_confirmation(&action);
-                state.toasts.push(ToastKind::Success, message);
+                state.toasts.push(ToastKind::Success, undid.clone());
             }
             (state, result)
         }) {
@@ -1308,6 +1368,7 @@ impl PlannerView {
         }
         if let Some(pending) = self.state.undo_dates_now() {
             self.enqueue_date_save(cx, pending);
+            self.note_toasts_changed(cx);
             cx.notify();
             return;
         }
@@ -1323,6 +1384,7 @@ impl PlannerView {
         }
         if let Some(pending) = self.state.redo_dates_now() {
             self.enqueue_date_save(cx, pending);
+            self.note_toasts_changed(cx);
             cx.notify();
             return;
         }
@@ -2307,11 +2369,7 @@ impl PlannerView {
                     .children(GanttScale::ALL.iter().map(|scale| {
                         let scale = *scale;
                         let selected = self.state.gantt.scale == scale;
-                        let label = if selected {
-                            scale.button_label(self.state.gantt.zoom)
-                        } else {
-                            scale.label().to_string()
-                        };
+                        let label = scale.button_label(self.state.gantt.zoom);
                         let selector = format!("gantt-scale-{}", scale.label());
                         div()
                             .id(SharedString::from(selector.clone()))
@@ -3935,6 +3993,8 @@ impl PlannerView {
                 .truncate()
                 .text_xs()
                 .text_color(muted_fg)
+                .px_1()
+                .bg(cx.theme().background)
                 .occlude()
                 .child(label)
                 .on_click(
@@ -4325,15 +4385,6 @@ impl PlannerView {
             .text_xl()
             .line_height(gpui_kit::relative(1.))
             .text_color(color)
-            .when(
-                self.state.form.is_none()
-                    && self.state.gantt.selected_link != Some((from_id, to_id)),
-                |el| {
-                    el.tooltip(move |window, cx| {
-                        Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
-                    })
-                },
-            )
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.state.gantt.hovered_link = if *hovered {
                     Some((from_id, to_id))
@@ -4569,6 +4620,7 @@ impl PlannerView {
         let extra_count = extra.len();
         let show_empty = form.show_empty;
         let dirty = self.form_has_unsaved_edits(cx);
+        let dates_error = self.form_dates_error(cx);
         let saving = form.saving;
         let dialog_h = (self.state.gantt.viewport_h + 80.0).clamp(360.0, 900.0);
         v_flex()
@@ -4603,7 +4655,6 @@ impl PlannerView {
                 v_flex()
                     .id("work-item-form-dialog")
                     .w(px(720.))
-                    .h(px(dialog_h))
                     .max_h(px(dialog_h))
                     .bg(cx.theme().popover)
                     .text_color(cx.theme().popover_foreground)
@@ -4684,7 +4735,7 @@ impl PlannerView {
                         v_flex()
                             .id("work-item-form-body")
                             .flex_1()
-                            .min_h(px(120.))
+                            .min_h(px(0.))
                             .px_6()
                             .py_3()
                             .overflow_y_scrollbar()
@@ -4752,8 +4803,10 @@ impl PlannerView {
                                 Button::new("save-work-item")
                                     .primary()
                                     .label("Save")
-                                    .disabled(!dirty || saving)
-                                    .on_click(cx.listener(|this, _, _, cx| this.save_form(cx))),
+                                    .disabled(!dirty || saving || dates_error.is_some())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_form(window, cx)
+                                    })),
                             )
                             .child(Button::new("cancel-form").label("Cancel").on_click(
                                 cx.listener(|this, _, _, cx| {
@@ -4912,6 +4965,7 @@ impl PlannerView {
                         .or_else(|| self.form_inputs.get(ado_core::START_DATE_FIELD).cloned())
                         .or_else(|| self.form_inputs.get(ado_core::TARGET_DATE_FIELD).cloned());
                     let calendar_open = self.form_calendar_open;
+                    let dates_error = self.form_dates_error(cx);
                     v_flex()
                         .id(SharedString::from(format!("form-date-{id}")))
                         .debug_selector(|| "form-date-picker".into())
@@ -4956,6 +5010,19 @@ impl PlannerView {
                             .when(calendar_open, |el| {
                                 el.child(self.render_calendar_chrome(&state, cx))
                             })
+                            .when_some(
+                                dates_error.clone(),
+                                |el, message| {
+                                    el.child(
+                                        div()
+                                            .id("form-dates-error")
+                                            .debug_selector(|| "form-dates-error".into())
+                                            .text_xs()
+                                            .text_color(cx.theme().danger)
+                                            .child(message),
+                                    )
+                                },
+                            )
                         })
                         .when(!has_picker, |el| {
                             let empty = fallback.is_empty();
@@ -5132,6 +5199,7 @@ impl PlannerView {
         self.form_inputs_for = None;
         self.form_calendar_open = false;
         self.form_dates_typed_seed.clear();
+        self.pending_form_dates_text = None;
         let title = self
             .state
             .nodes
@@ -5154,6 +5222,15 @@ impl PlannerView {
 
     pub fn toggle_form_calendar(&mut self) {
         self.form_calendar_open = !self.form_calendar_open;
+    }
+
+    fn form_dates_error(&self, cx: &App) -> Option<String> {
+        let typed = self
+            .form_inputs
+            .get(ado_core::START_DATE_FIELD)
+            .or_else(|| self.form_inputs.get(ado_core::TARGET_DATE_FIELD))
+            .map(|input| input.read(cx).value().to_string())?;
+        typed_dates_error(&typed).map(str::to_string)
     }
 
     fn form_has_unsaved_edits(&self, cx: &App) -> bool {
@@ -5268,7 +5345,11 @@ impl PlannerView {
         }
     }
 
-    fn save_form(&mut self, cx: &mut Context<Self>) {
+    fn save_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_pending_form_dates(window, cx);
+        if self.form_dates_error(cx).is_some() {
+            return;
+        }
         self.sync_form_inputs(cx);
         if self.state.form.as_ref().is_none_or(|form| !form.is_dirty()) {
             return;
@@ -5385,6 +5466,7 @@ impl PlannerView {
                                             .toasts
                                             .push(ToastKind::Success, toast.message.clone());
                                     }
+                                    this.note_toasts_changed(cx);
                                 }
                                 if role == DateSaveRole::Restore {
                                     this.state.complete_restore_date_save(&revert);
@@ -5425,6 +5507,7 @@ impl PlannerView {
             self.form_inputs.clear();
             self.form_dates.clear();
             self.form_dates_preview = None;
+            self.pending_form_dates_text = None;
             self.form_inputs_for = None;
             return;
         };
@@ -5432,6 +5515,7 @@ impl PlannerView {
             self.form_inputs.clear();
             self.form_dates.clear();
             self.form_dates_preview = None;
+            self.pending_form_dates_text = None;
             self.form_dates_typed_seed.clear();
             self.form_calendar_open = false;
             self.form_inputs_for = Some(form.model.id);
@@ -5571,6 +5655,7 @@ impl PlannerView {
                             }
                         }
                         this.form_dates_preview = pending_range_typed(*date);
+                        this.pending_form_dates_text = Some(format_picker_dates(*date));
                         cx.notify();
                     },
                 ));
@@ -5857,6 +5942,12 @@ impl PlannerView {
         }
     }
 
+    fn note_toasts_changed(&mut self, cx: &mut Context<Self>) {
+        self.toast_expiry_gen += 1;
+        self.toast_expiry_armed = false;
+        self.schedule_toast_expiry(cx);
+    }
+
     fn schedule_toast_expiry(&mut self, cx: &mut Context<Self>) {
         if self.toast_expiry_armed
             || self.state.toasts.items.is_empty()
@@ -5870,10 +5961,14 @@ impl PlannerView {
             return;
         }
         self.toast_expiry_armed = true;
+        let expiry_gen = self.toast_expiry_gen;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, cx| {
+                    if this.toast_expiry_gen != expiry_gen {
+                        return;
+                    }
                     this.state.toasts.expire();
                     this.toast_expiry_armed = false;
                     if !this.state.toasts.items.is_empty() {
@@ -6098,9 +6193,15 @@ pub fn dates_from_range_picker_in_years(
     let (picker_start_year, picker_target_year) = years_from_picker(date);
     let start_year = picker_start_year.or(start_year).or(picker_target_year);
     let target_year = picker_target_year.or(target_year).or(start_year);
-    let typed_edit = typed_dates_changed(typed, typed_seed)
-        .then(|| parse_typed_dates(typed, start_year, target_year))
-        .flatten();
+    let typed_changed = typed_dates_changed(typed, typed_seed);
+    let parsed = parse_typed_date_range(typed, start_year, target_year);
+    if typed_changed && matches!(parsed, TypedDateRange::Invalid) {
+        return None;
+    }
+    let typed_edit = match parsed {
+        TypedDateRange::Parsed(start, target) if typed_changed => Some((start, target)),
+        _ => None,
+    };
     if typed_edit
         .as_ref()
         .is_some_and(|(start, target)| start.is_some() && target.is_some())
@@ -6115,7 +6216,12 @@ pub fn dates_from_range_picker_in_years(
         PickerDate::Range(None, Some(end)) => typed_edit.or(Some((None, naive_to_jiff(end)))),
         PickerDate::Single(Some(day)) => typed_edit.or(Some((naive_to_jiff(day), None))),
         PickerDate::Single(None) | PickerDate::Range(None, None) => {
-            typed_edit.or_else(|| parse_typed_dates(typed, start_year, target_year))
+            typed_edit.or_else(
+                || match parse_typed_date_range(typed, start_year, target_year) {
+                    TypedDateRange::Parsed(start, target) => Some((start, target)),
+                    TypedDateRange::Empty | TypedDateRange::Invalid => None,
+                },
+            )
         }
     }
 }
@@ -6182,43 +6288,72 @@ fn typed_dates_changed(typed: &str, seed: &str) -> bool {
 }
 
 fn normalize_typed_dates(typed: &str) -> String {
-    typed
-        .trim()
-        .replace('→', "/")
-        .replace(" to ", "/")
-        .replace(" - ", "/")
-        .split('/')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" / ")
+    split_typed_date_parts(typed).join(" / ")
 }
 
-fn parse_typed_dates(
-    typed: &str,
-    start_year: Option<i16>,
-    target_year: Option<i16>,
-) -> Option<(Option<jiff::civil::Date>, Option<jiff::civil::Date>)> {
-    let text = typed.trim();
-    if text.is_empty() {
-        return None;
+/// Replace `→`, `->`, `to`, and ` - ` so compact ranges share one splitter.
+fn normalize_typed_date_separators(typed: &str) -> String {
+    let mut text = typed.replace(['→', '–', '—'], "/").replace("->", "/");
+    let mut lower = text.to_ascii_lowercase();
+    while let Some(index) = lower.find(" to ") {
+        text.replace_range(index..index + 4, " / ");
+        lower = text.to_ascii_lowercase();
     }
-    let normalized = text
-        .replace('→', "/")
-        .replace(" to ", "/")
-        .replace(" - ", "/");
-    let parts: Vec<&str> = normalized
+    text.replace(" - ", "/")
+}
+
+fn split_typed_date_parts(typed: &str) -> Vec<String> {
+    normalize_typed_date_separators(typed)
         .split('/')
         .map(str::trim)
         .filter(|part| !part.is_empty() && *part != "…")
-        .collect();
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypedDateRange {
+    Empty,
+    Parsed(Option<jiff::civil::Date>, Option<jiff::civil::Date>),
+    Invalid,
+}
+
+fn parse_typed_date_range(
+    typed: &str,
+    start_year: Option<i16>,
+    target_year: Option<i16>,
+) -> TypedDateRange {
+    let text = typed.trim();
+    if text.is_empty() {
+        return TypedDateRange::Empty;
+    }
+    let parts = split_typed_date_parts(text);
     match parts.as_slice() {
-        [start] => Some((parse_user_date(Some(start), start_year), None)),
-        [start, target] => Some((
-            parse_user_date(Some(start), start_year),
-            parse_user_date(Some(target), target_year.or(start_year)),
-        )),
-        _ => None,
+        [] => TypedDateRange::Empty,
+        [start] => match parse_user_date(Some(start), start_year) {
+            Some(start) => TypedDateRange::Parsed(Some(start), None),
+            None => TypedDateRange::Invalid,
+        },
+        [start, target] => {
+            match (
+                parse_user_date(Some(start), start_year),
+                parse_user_date(Some(target), target_year.or(start_year)),
+            ) {
+                (Some(start), Some(target)) => TypedDateRange::Parsed(Some(start), Some(target)),
+                _ => TypedDateRange::Invalid,
+            }
+        }
+        _ => TypedDateRange::Invalid,
+    }
+}
+
+/// `None` when the Dates field is empty or a recognised range.
+pub fn typed_dates_error(typed: &str) -> Option<&'static str> {
+    match parse_typed_date_range(typed, None, None) {
+        TypedDateRange::Invalid => Some(
+            "Could not parse dates. Use Jul 22 → Jul 28, Jul 22 -> Jul 28, or Jul 22 to Jul 28.",
+        ),
+        TypedDateRange::Empty | TypedDateRange::Parsed(_, _) => None,
     }
 }
 
@@ -6254,6 +6389,7 @@ impl Render for PlannerView {
         self.state.gantt.timeline_origin_y = (viewport_h - self.state.gantt.viewport_h).max(0.0);
         self.state.toasts.expire();
         self.ensure_form_inputs(window, cx);
+        self.flush_pending_form_dates(window, cx);
         window.set_window_title(&self.window_title());
         if let Some(form_id) = self.state.form.as_ref().map(|form| form.model.id) {
             if self.form_title_focused_for != Some(form_id) {

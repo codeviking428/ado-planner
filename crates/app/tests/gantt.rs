@@ -762,16 +762,16 @@ async fn undo_dates_pushes_a_named_toast() {
     let pending = state.commit_date_gesture_now().expect("drag");
     state.persist_pending_dates(pending).await.expect("persist");
     let _ = state.undo_dates_now().expect("undo");
-    assert_eq!(
-        state.toasts.last_message(),
-        Some("Undid dates on Cart UI"),
-        "undo must toast the work item title"
+    let undid = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        undid.starts_with("Undid: Moved Cart UI"),
+        "undo must repeat the original action, got {undid}"
     );
     let _ = state.redo_dates_now().expect("redo");
-    assert_eq!(
-        state.toasts.last_message(),
-        Some("Redid dates on Cart UI"),
-        "redo must toast the work item title"
+    let redid = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        redid.starts_with("Redid: Moved Cart UI"),
+        "redo must repeat the original action, got {redid}"
     );
 }
 
@@ -990,7 +990,7 @@ async fn toast_restore_link_action_puts_the_predecessor_back() {
         .expect("remove link");
     let removed = state.toasts.last_message().unwrap_or_default();
     assert!(
-        removed.contains("Removed link on") && !removed.contains('#'),
+        removed.contains("Removed link") && removed.contains('→') && !removed.contains('#'),
         "link toasts must use item titles, got {removed}"
     );
     let action = state
@@ -1074,7 +1074,7 @@ async fn add_item_creates_a_work_item_on_the_team() {
     );
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message.contains(&format!("Created item on {}", created.title)),
+        message == format!("Created {}", created.title),
         "create toast must name the item, got {message}"
     );
     assert!(
@@ -1344,8 +1344,8 @@ async fn save_title_patches_system_title() {
     state.undo().await.expect("undo title");
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message.to_lowercase().contains("title change"),
-        "field undo toast must name the field, got {message}"
+        message.starts_with("Undid: Renamed"),
+        "field undo toast must repeat the rename, got {message}"
     );
     let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();
     assert_ne!(

@@ -902,7 +902,13 @@ impl PlannerState {
         self.nodes = result.nodes.clone();
         self.hierarchy = Some(result);
         if !self.restore_gantt_view() {
-            self.gantt.go_today(jiff::Zoned::now().date());
+            let width = self.gantt.timeline_width.max(800.0);
+            self.gantt.focus_work(
+                &self.nodes,
+                &self.iterations,
+                width,
+                jiff::Zoned::now().date(),
+            );
             self.gantt.scroll_y = 0.0;
         }
     }
@@ -1061,6 +1067,14 @@ impl PlannerState {
                         })
                         .unwrap_or((None, None));
                     dates_moved_message(&title, start, target)
+                } else if names.len() == 1 && names[0] == "title" {
+                    let old = before
+                        .as_ref()
+                        .map(|node| node.title.trim())
+                        .filter(|title| !title.is_empty())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| format!("#{id}"));
+                    renamed_message(&old, &self.item_title(id))
                 } else {
                     format!("Saved {} on {}", names.join(", "), self.item_title(id))
                 };
@@ -1944,7 +1958,7 @@ impl PlannerState {
                     title: title.clone(),
                 });
                 self.toasts.push_undo(
-                    format!("Created item on {title}"),
+                    created_message(&title),
                     UndoAction::DeleteCreated { id, title },
                 );
                 Ok(())
@@ -2035,12 +2049,17 @@ impl PlannerState {
                         id,
                         changes: vec![(reference.to_string(), before_value.clone(), value.clone())],
                     });
-                    self.toasts.push_undo(
+                    let message = if reference == "System.Title" {
+                        renamed_message(&previous.title, &self.item_title(id))
+                    } else {
                         format!(
                             "Saved {} on {}",
                             field_toast_name(reference, None),
                             self.item_title(id)
-                        ),
+                        )
+                    };
+                    self.toasts.push_undo(
+                        message,
                         UndoAction::RestoreFields {
                             id,
                             fields: vec![(reference.to_string(), before_value)],
@@ -2191,7 +2210,7 @@ impl PlannerState {
                 if self.history_recording {
                     self.record_dates(id, &previous, None, None);
                     self.toasts.push_undo(
-                        "Cleared dates",
+                        format!("Cleared dates on {}", self.item_title(id)),
                         UndoAction::RestoreDates {
                             id,
                             start_date: previous.start_date,
@@ -2702,65 +2721,74 @@ impl PlannerState {
 
     fn link_changed_message(&self, verb: &str, predecessor_id: i64, successor_id: i64) -> String {
         format!(
-            "{verb} link on {} from {}",
-            self.item_title(successor_id),
-            self.item_title(predecessor_id)
+            "{verb} link {} → {}",
+            self.item_title(predecessor_id),
+            self.item_title(successor_id)
         )
     }
 
-    pub(crate) fn undo_confirmation(&self, action: &UndoAction) -> String {
+    pub(crate) fn history_action_message_for_undo(&self, action: &UndoAction) -> String {
         match action {
             UndoAction::RestoreDates { id, .. } => {
-                format!("Undid dates on {}", self.item_title(*id))
+                dates_moved_message(&self.item_title(*id), None, None)
             }
             UndoAction::RestoreFields { id, fields } => {
                 let title = self.item_title(*id);
                 match fields.as_slice() {
-                    [(reference, _)] => format!(
-                        "Undid {} change on {title}",
-                        field_toast_name(reference, None)
-                    ),
-                    _ => format!("Undid field changes on {title}"),
+                    [(reference, before)] if reference == "System.Title" => {
+                        renamed_message(&json_plain(before), &title)
+                    }
+                    [(reference, _)] => {
+                        format!("Saved {} on {title}", field_toast_name(reference, None))
+                    }
+                    _ => format!("Saved fields on {title}"),
                 }
             }
-            UndoAction::DeleteCreated { title, .. } => {
-                if title.is_empty() {
-                    "Undid create on item".into()
-                } else {
-                    format!("Undid create on {title}")
-                }
+            UndoAction::DeleteCreated { title, .. } => created_message(title),
+            UndoAction::RemoveLink {
+                successor_id,
+                predecessor_id,
+            } => self.link_changed_message("Added", *predecessor_id, *successor_id),
+            UndoAction::RestoreLink {
+                successor_id,
+                predecessor_id,
+            } => self.link_changed_message("Removed", *predecessor_id, *successor_id),
+        }
+    }
+
+    fn history_action_message(&self, entry: &HistoryEntry) -> String {
+        match entry {
+            HistoryEntry::Dates {
+                id,
+                after_start,
+                after_target,
+                ..
+            } => dates_moved_message(
+                &self.item_title(*id),
+                parse_iso_date(after_start.as_deref()),
+                parse_iso_date(after_target.as_deref()),
+            ),
+            HistoryEntry::Link {
+                successor_id,
+                predecessor_id,
+                linked,
+            } => {
+                let verb = if *linked { "Added" } else { "Removed" };
+                self.link_changed_message(verb, *predecessor_id, *successor_id)
             }
-            UndoAction::RemoveLink { successor_id, .. }
-            | UndoAction::RestoreLink { successor_id, .. } => {
-                format!("Undid link on {}", self.item_title(*successor_id))
+            HistoryEntry::Created { title, .. } => created_message(title),
+            HistoryEntry::Fields { id, changes } => {
+                field_changes_message(&self.item_title(*id), changes)
             }
         }
     }
 
     pub fn push_history_toast(&mut self, entry: &HistoryEntry, is_undo: bool) {
-        let verb = if is_undo { "Undid" } else { "Redid" };
-        let message = match entry {
-            HistoryEntry::Dates { id, .. } => {
-                format!("{verb} dates on {}", self.item_title(*id))
-            }
-            HistoryEntry::Link { successor_id, .. } => {
-                format!("{verb} link on {}", self.item_title(*successor_id))
-            }
-            HistoryEntry::Created { title, .. } => {
-                format!("{verb} create on {title}")
-            }
-            HistoryEntry::Fields { id, changes } => {
-                let title = self.item_title(*id);
-                match changes.as_slice() {
-                    [(reference, _, _)] => {
-                        format!(
-                            "{verb} {} change on {title}",
-                            field_toast_name(reference, None)
-                        )
-                    }
-                    _ => format!("{verb} field changes on {title}"),
-                }
-            }
+        let original = self.history_action_message(entry);
+        let message = if is_undo {
+            format!("Undid: {original}")
+        } else {
+            format!("Redid: {original}")
         };
         self.toasts.push(ToastKind::Success, message);
     }
@@ -2777,13 +2805,44 @@ pub(crate) fn dates_moved_message(
 ) -> String {
     match (start, target) {
         (Some(start), Some(target)) => format!(
-            "Moved dates on {title} to {} → {}",
+            "Moved {title} to {} → {}",
             toast_date(start),
             toast_date(target)
         ),
-        (Some(start), None) => format!("Moved start on {title} to {}", toast_date(start)),
-        (None, Some(target)) => format!("Moved dates on {title} to {}", toast_date(target)),
-        (None, None) => format!("Saved {title} dates"),
+        (Some(start), None) => format!("Moved {title} to {}", toast_date(start)),
+        (None, Some(target)) => format!("Moved {title} to {}", toast_date(target)),
+        (None, None) => format!("Cleared dates on {title}"),
+    }
+}
+
+fn created_message(title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        "Created item".into()
+    } else {
+        format!("Created {title}")
+    }
+}
+
+fn renamed_message(old: &str, new: &str) -> String {
+    format!("Renamed {old} to {new}")
+}
+
+fn field_changes_message(title: &str, changes: &[(String, Value, Value)]) -> String {
+    match changes {
+        [(reference, before, after)] if reference == "System.Title" => {
+            renamed_message(&json_plain(before), &json_plain(after))
+        }
+        [(reference, _, _)] => format!("Saved {} on {title}", field_toast_name(reference, None)),
+        _ => format!("Saved fields on {title}"),
+    }
+}
+
+fn json_plain(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -3184,8 +3243,8 @@ mod toast_copy_tests {
         let target = Date::new(2026, 8, 18).unwrap();
         let message = dates_moved_message("Cart", Some(start), Some(target));
         assert!(
-            message.starts_with("Moved dates on Cart"),
-            "move toasts must say 'dates on', got {message}"
+            message.starts_with("Moved Cart to"),
+            "move toasts must name the item then the range, got {message}"
         );
         assert!(
             message.contains('\u{00a0}'),
