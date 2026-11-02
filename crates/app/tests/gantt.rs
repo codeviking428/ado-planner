@@ -1,7 +1,7 @@
 use ado_core::parse_iso_date;
 use ado_planner::gantt::{GanttScale, GanttView, GestureKind, NudgeAxis};
 use ado_planner::paths::AppPaths;
-use ado_planner::state::{PlannerState, fake_hierarchy};
+use ado_planner::state::{DateSaveRole, PlannerState, fake_hierarchy};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use jiff::ToSpan;
 use jiff::civil::Date;
@@ -276,6 +276,43 @@ async fn two_optimistic_undos_revert_both_drags() {
 }
 
 #[tokio::test]
+async fn failed_undo_revert_keeps_the_sibling_undo_entry() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 2.0);
+    let pending1 = state.commit_date_gesture_now().expect("drag 1");
+    state
+        .persist_pending_dates(pending1)
+        .await
+        .expect("persist 1");
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 3.0);
+    let pending2 = state.commit_date_gesture_now().expect("drag 2");
+    state
+        .persist_pending_dates(pending2)
+        .await
+        .expect("persist 2");
+    assert_eq!(state.history.undo.len(), 2);
+    mock.fail_next(&format!("/workitems/{}", node.id), 503, "save failed");
+    let pending_undo = state.undo_dates_now().expect("undo last");
+    assert_eq!(pending_undo.role, DateSaveRole::Undo);
+    assert_eq!(state.history.undo.len(), 1);
+    let _ = state.persist_pending_dates(pending_undo).await;
+    assert_eq!(
+        state.history.undo.len(),
+        2,
+        "a failed undo persist must put the Dates entry back, not drop a sibling"
+    );
+}
+
+#[tokio::test]
 async fn end_handle_drop_records_undo_before_the_patch_returns() {
     let (_mock, mut state, _dir) = signed_in().await;
     let node = state
@@ -447,6 +484,7 @@ async fn changing_scope_reveals_timeline_content() {
 async fn switching_teams_restores_gantt_scroll() {
     let (_mock, mut state, _dir) = signed_in().await;
     let home = state.prefs.planner.team.clone();
+    state.gantt.viewport_h = 120.0;
     state.gantt.scroll_y = 80.0;
     state.gantt.scroll_x = 48.0;
     let origin = state.gantt.origin;
@@ -464,6 +502,32 @@ async fn switching_teams_restores_gantt_scroll() {
     assert_eq!(state.gantt.scroll_y, 80.0);
     assert_eq!(state.gantt.scroll_x, 48.0);
     assert_eq!(state.gantt.origin, origin);
+}
+
+#[tokio::test]
+async fn restored_team_scroll_is_clamped_to_the_new_rows() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let home = state.prefs.planner.team.clone();
+    state
+        .set_team("Growth".into())
+        .await
+        .expect("switch to Growth");
+    state.gantt.scroll_y = 10_000.0;
+    state.begin_team_switch(home.clone());
+    state.set_team(home).await.expect("switch home");
+    state.begin_team_switch("Growth".into());
+    state
+        .set_team("Growth".into())
+        .await
+        .expect("return to Growth");
+    let rows = state.visible_rows().len();
+    let content_h = (state.gantt.viewport_h - ado_planner::gantt::TIMELINE_HEADER_H).max(0.0);
+    let max_y = (rows as f32 * ado_planner::gantt::ROW_HEIGHT - content_h).max(0.0);
+    assert!(
+        state.gantt.scroll_y <= max_y + 0.5,
+        "restored scroll_y {} must fit {rows} rows (max {max_y})",
+        state.gantt.scroll_y
+    );
 }
 
 #[tokio::test]

@@ -674,6 +674,8 @@ impl PlannerState {
             return false;
         };
         self.gantt.restore(saved);
+        let rows = self.visible_rows().len();
+        self.gantt.clamp_scroll(rows, self.gantt.viewport_h);
         true
     }
 
@@ -1154,7 +1156,7 @@ impl PlannerState {
         }
     }
 
-    fn revert_date_save_history(&mut self, pending: &PendingDateSave) {
+    pub fn revert_date_save_history(&mut self, pending: &PendingDateSave) {
         match pending.role {
             DateSaveRole::Commit => {
                 self.discard_dates_after(pending.id, &pending.after_start, &pending.after_target);

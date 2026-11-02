@@ -3824,6 +3824,7 @@ impl PlannerView {
         let after_target = pending.after_target.clone();
         let previous = pending.previous.clone();
         let role = pending.role;
+        let revert = pending.clone();
         let rx = runtime.spawn_result(async move {
             let result = working.persist_pending_dates(pending).await;
             (working, result)
@@ -3860,21 +3861,7 @@ impl PlannerView {
                         Err(err) => {
                             if still_after {
                                 this.state.restore_node(previous);
-                                this.state
-                                    .discard_dates_after(id, &after_start, &after_target);
-                                match role {
-                                    DateSaveRole::Undo => {
-                                        if let Some(entry) = this.state.history.redo.pop() {
-                                            this.state.history.undo.push(entry);
-                                        }
-                                    }
-                                    DateSaveRole::Redo => {
-                                        if let Some(entry) = this.state.history.undo.pop() {
-                                            this.state.history.redo.push(entry);
-                                        }
-                                    }
-                                    DateSaveRole::Commit => {}
-                                }
+                                this.state.revert_date_save_history(&revert);
                             }
                             if let Some(msg) = working.toasts.last_error_message() {
                                 this.state.toasts.push(ToastKind::Error, msg.to_string());
