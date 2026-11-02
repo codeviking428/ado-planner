@@ -674,16 +674,6 @@ impl PlannerState {
         self.team_views.insert(team, self.gantt.snapshot());
     }
 
-    fn restore_gantt_view(&mut self) -> bool {
-        let Some(saved) = self.team_views.get(&self.prefs.planner.team).copied() else {
-            return false;
-        };
-        self.gantt.restore(saved);
-        let rows = self.visible_rows().len();
-        self.gantt.clamp_scroll(rows, self.gantt.viewport_h);
-        true
-    }
-
     pub fn has_saved_gantt_view(&self) -> bool {
         let team = self.prefs.planner.team.as_str();
         !team.is_empty() && self.team_views.contains_key(team)
@@ -901,11 +891,20 @@ impl PlannerState {
         self.team_settings_error = result.warning.clone();
         self.nodes = result.nodes.clone();
         self.hierarchy = Some(result);
-        if !self.restore_gantt_view() {
-            let width = self.gantt.timeline_width.max(800.0);
-            let nodes = self.visible_nodes();
-            self.gantt
-                .focus_work(&nodes, &self.iterations, width, jiff::Zoned::now().date());
+        let saved_y = self
+            .team_views
+            .get(&self.prefs.planner.team)
+            .map(|saved| saved.scroll_y);
+        let width = self.gantt.timeline_width.max(800.0);
+        let nodes = self.visible_nodes();
+        // Fit the new team's span. Restoring origin/zoom from another team
+        // (Platform Month 60% → Growth) left bars clipped off the left edge.
+        self.gantt.auto_fit(&nodes, &self.iterations, width);
+        if let Some(y) = saved_y {
+            self.gantt.scroll_y = y;
+            let rows = self.gantt.flatten(&nodes).len();
+            self.gantt.clamp_scroll(rows, self.gantt.viewport_h);
+        } else {
             self.gantt.scroll_y = 0.0;
         }
     }
@@ -2718,17 +2717,38 @@ impl PlannerState {
 
     fn link_changed_message(&self, verb: &str, predecessor_id: i64, successor_id: i64) -> String {
         format!(
-            "{verb} link {} → {}",
+            "{verb} link: {} → {}",
             self.item_title(predecessor_id),
             self.item_title(successor_id)
         )
     }
 
+    /// Toast Undo for dates: prefer the Ctrl+Z path so history and the toast
+    /// stay in sync. Fall back to a local restore when that stack entry is gone.
+    pub fn toast_restore_or_undo_dates(&mut self, action: UndoAction) -> Option<PendingDateSave> {
+        if let UndoAction::RestoreDates { id, .. } = &action
+            && matches!(
+                self.history.undo.last(),
+                Some(HistoryEntry::Dates { id: hid, .. }) if *hid == *id
+            )
+        {
+            return self.undo_dates_now();
+        }
+        self.apply_toast_restore_dates(action)
+    }
+
     pub(crate) fn history_action_message_for_undo(&self, action: &UndoAction) -> String {
         match action {
-            UndoAction::RestoreDates { id, .. } => {
-                dates_moved_message(&self.item_title(*id), None, None)
-            }
+            UndoAction::RestoreDates {
+                id,
+                start_date,
+                target_date,
+                ..
+            } => dates_moved_message(
+                &self.item_title(*id),
+                parse_iso_date(start_date.as_deref()),
+                parse_iso_date(target_date.as_deref()),
+            ),
             UndoAction::RestoreFields { id, fields } => {
                 let title = self.item_title(*id);
                 match fields.as_slice() {
@@ -2781,13 +2801,33 @@ impl PlannerState {
     }
 
     pub fn push_history_toast(&mut self, entry: &HistoryEntry, is_undo: bool) {
-        let original = self.history_action_message(entry);
+        let original = if is_undo {
+            self.history_undo_message(entry)
+        } else {
+            self.history_action_message(entry)
+        };
         let message = if is_undo {
-            format!("Undid: {original}")
+            format!("Undone: {original}")
         } else {
             format!("Redid: {original}")
         };
         self.toasts.push(ToastKind::Success, message);
+    }
+
+    fn history_undo_message(&self, entry: &HistoryEntry) -> String {
+        match entry {
+            HistoryEntry::Dates {
+                id,
+                before_start,
+                before_target,
+                ..
+            } => dates_moved_message(
+                &self.item_title(*id),
+                parse_iso_date(before_start.as_deref()),
+                parse_iso_date(before_target.as_deref()),
+            ),
+            other => self.history_action_message(other),
+        }
     }
 }
 

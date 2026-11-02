@@ -469,6 +469,51 @@ async fn picker_range_save_records_undo_before_persist() {
 }
 
 #[tokio::test]
+async fn toast_undo_after_picker_dates_restores_them() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let before_start = node.start_date.clone();
+    let before_target = node.target_date.clone();
+    let start = Date::new(2026, 8, 4).unwrap();
+    let target = Date::new(2026, 8, 21).unwrap();
+    let pending = state
+        .commit_range_dates_now(node.id, Some(start), Some(target))
+        .expect("picker save");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist picker dates");
+    let action = state
+        .toasts
+        .items
+        .iter()
+        .rev()
+        .find_map(|toast| toast.undo.clone())
+        .expect("picker save must offer Undo");
+    let pending = state
+        .toast_restore_or_undo_dates(action)
+        .expect("toast undo");
+    assert_eq!(pending.role, DateSaveRole::Undo);
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(live.start_date, before_start);
+    assert_eq!(live.target_date, before_target);
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.starts_with("Undone: Moved"),
+        "toast undo must describe the restored dates, got {message}"
+    );
+    assert!(
+        !message.contains("Aug\u{00a0}4") && !message.contains("Aug 4"),
+        "undo toast must not keep the forward dates, got {message}"
+    );
+}
+
+#[tokio::test]
 async fn failed_toast_restore_keeps_undo_history() {
     let (mock, mut state, _dir) = signed_in().await;
     let node = state
@@ -624,7 +669,6 @@ async fn switching_teams_restores_gantt_scroll() {
     state.gantt.viewport_h = 120.0;
     state.gantt.scroll_y = 80.0;
     state.gantt.scroll_x = 48.0;
-    let origin = state.gantt.origin;
     state.begin_team_switch("Growth".into());
     state
         .set_team("Growth".into())
@@ -637,8 +681,6 @@ async fn switching_teams_restores_gantt_scroll() {
     state.begin_team_switch(home.clone());
     state.set_team(home).await.expect("switch home");
     assert_eq!(state.gantt.scroll_y, 80.0);
-    assert_eq!(state.gantt.scroll_x, 48.0);
-    assert_eq!(state.gantt.origin, origin);
 }
 
 #[tokio::test]
@@ -648,7 +690,6 @@ async fn switching_teams_through_a_spawn_clone_restores_scroll() {
     state.gantt.viewport_h = 120.0;
     state.gantt.scroll_y = 80.0;
     state.gantt.scroll_x = 48.0;
-    let origin = state.gantt.origin;
     state.begin_team_switch("Growth".into());
     let mut working = state.clone();
     working
@@ -661,8 +702,6 @@ async fn switching_teams_through_a_spawn_clone_restores_scroll() {
     working.set_team(home).await.expect("switch home");
     state.adopt_spawned(working);
     assert_eq!(state.gantt.scroll_y, 80.0);
-    assert_eq!(state.gantt.scroll_x, 48.0);
-    assert_eq!(state.gantt.origin, origin);
 }
 
 #[tokio::test]
@@ -764,8 +803,8 @@ async fn undo_dates_pushes_a_named_toast() {
     let _ = state.undo_dates_now().expect("undo");
     let undid = state.toasts.last_message().unwrap_or_default();
     assert!(
-        undid.starts_with("Undid: Moved Cart UI"),
-        "undo must repeat the original action, got {undid}"
+        undid.starts_with("Undone: Moved Cart UI"),
+        "undo must name the restored dates, got {undid}"
     );
     let _ = state.redo_dates_now().expect("redo");
     let redid = state.toasts.last_message().unwrap_or_default();
@@ -836,6 +875,40 @@ async fn growth_team_loads_its_epic_and_empty_team_has_no_items() {
     assert!(
         state.visible_nodes().is_empty(),
         "Empty team should have no work items"
+    );
+}
+
+#[tokio::test]
+async fn switching_to_growth_fits_the_epic_on_screen() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.gantt.timeline_width = 800.0;
+    state.gantt.origin = Date::new(2026, 9, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 0.6;
+    state.begin_team_switch("Growth".into());
+    state
+        .set_team("Growth".into())
+        .await
+        .expect("switch to Growth");
+    let visible = state.visible_nodes();
+    let rows = state.gantt.flatten(&visible);
+    let bars = state
+        .gantt
+        .layout_bars(&visible, &rows, &state.iterations, 720.0);
+    let bar = bars.iter().find(|bar| bar.id == 1020).expect("Growth epic");
+    let width = state.gantt.timeline_width.max(800.0);
+    assert!(
+        bar.x >= -1.0 && bar.x + bar.width <= width + 1.0,
+        "team switch must fit Growth's Aug–Sep bar, origin={} x={} width={} zoom={}",
+        state.gantt.origin,
+        bar.x,
+        bar.width,
+        state.gantt.zoom
+    );
+    assert!(
+        (state.gantt.zoom - 0.6).abs() > 0.01
+            || state.gantt.origin != Date::new(2026, 9, 1).unwrap(),
+        "Growth must not keep Platform's Sep–Jan 60% camera"
     );
 }
 
@@ -1035,14 +1108,19 @@ async fn toast_restore_link_action_puts_the_predecessor_back() {
         .add_dependency(1005, 1003)
         .await
         .expect("link 1003 → 1005");
+    let added = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        added.starts_with("Added link:") && added.contains('→') && !added.contains('#'),
+        "link toasts must use 'Added link: A → B', got {added}"
+    );
     state
         .remove_dependency(1005, 1003)
         .await
         .expect("remove link");
     let removed = state.toasts.last_message().unwrap_or_default();
     assert!(
-        removed.contains("Removed link") && removed.contains('→') && !removed.contains('#'),
-        "link toasts must use item titles, got {removed}"
+        removed.starts_with("Removed link:") && removed.contains('→') && !removed.contains('#'),
+        "link toasts must use item titles and →, got {removed}"
     );
     let action = state
         .toasts
@@ -1395,7 +1473,7 @@ async fn save_title_patches_system_title() {
     state.undo().await.expect("undo title");
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message.starts_with("Undid: Renamed"),
+        message.starts_with("Undone: Renamed"),
         "field undo toast must repeat the rename, got {message}"
     );
     let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();

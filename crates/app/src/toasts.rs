@@ -244,7 +244,7 @@ mod tests {
                 rev: 1,
             },
         );
-        toasts.push(ToastKind::Success, "Undid: A dates");
+        toasts.push(ToastKind::Success, "Undone: A dates");
         toasts.push_undo(
             "Moved B",
             UndoAction::RestoreDates {

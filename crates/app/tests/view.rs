@@ -3269,6 +3269,58 @@ fn completing_a_picker_range_closes_the_popover(cx: &mut gpui_kit::TestAppContex
 }
 
 #[gpui_kit::test]
+fn invalid_typed_dates_keep_the_grid_picker_open(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_dates(1, window, cx);
+            view.type_inline_dates("foo", window, cx);
+        });
+    });
+    draw(cx);
+    let enter = KeyDownEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&enter, cx);
+        assert!(
+            view.inline_dates_error_text().is_some(),
+            "garbage dates must show an inline error"
+        );
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .expect("item 1");
+        assert_eq!(
+            node.start_date.as_deref(),
+            Some("2026-07-06T00:00:00Z"),
+            "a parse failure must not PATCH empty dates"
+        );
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-dates").is_some(),
+        "invalid typed dates must keep the picker open"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dates-error").is_some(),
+        "the grid picker must show the parse error"
+    );
+}
+
+#[gpui_kit::test]
 fn details_modal_reuses_the_grid_range_picker(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();

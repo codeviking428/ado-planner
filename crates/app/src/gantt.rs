@@ -76,6 +76,16 @@ impl GanttScale {
         format!("{} ({:.0}%)", self.label(), pct)
     }
 
+    /// Inactive scales stay unnamed-percent so the toolbar does not repeat the
+    /// same "(60%)" on every level; the selected scale tracks real zoom.
+    pub fn toolbar_label(self, zoom: f32, selected: bool) -> String {
+        if selected {
+            self.button_label(zoom)
+        } else {
+            self.label().to_string()
+        }
+    }
+
     pub fn base_pixels_per_day(self) -> f32 {
         match self {
             Self::Day => 48.0,
@@ -300,6 +310,8 @@ pub struct BarLayout {
     pub predecessors: Vec<i64>,
     /// Diamond at Today for unscheduled items with no iteration/rollup span.
     pub marker: bool,
+    /// Start-only: an open-ended ghost, not a fake 7-day scheduled bar.
+    pub open_ended: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -892,6 +904,10 @@ impl GanttView {
                     .as_ref()
                     .filter(|gesture| gesture.id == node.id && gesture.kind != GestureKind::Link);
                 let mut marker = false;
+                let had_start = parse_iso_date(node.start_date.as_deref()).is_some();
+                let had_target = parse_iso_date(node.target_date.as_deref()).is_some();
+                let open_ended =
+                    had_start && !had_target && display.kind == GanttBarKind::Scheduled;
                 let (start, target) = if let Some(gesture) = live {
                     (gesture.live_start, gesture.live_target)
                 } else if display.kind == GanttBarKind::Unscheduled {
@@ -928,6 +944,7 @@ impl GanttView {
                         .or_else(|| Some(state_progress(&node.state))),
                     predecessors: node.predecessors.clone(),
                     marker,
+                    open_ended,
                 })
             })
             .collect()
@@ -1230,20 +1247,27 @@ impl GanttView {
             Self::sticky_header_labels(ticks, false, TICK_MIN_GAP),
             TICK_MIN_GAP,
         );
-        const TICK_W: f32 = 18.0;
-        if let Some((x, _)) = labels.last()
-            && *x + TICK_W > width
+        if let Some((x, _)) = labels.first_mut()
+            && *x < 0.0
         {
-            let shifted = (width - TICK_W).max(0.0);
-            let collision = labels
-                .len()
-                .checked_sub(2)
-                .and_then(|i| labels.get(i))
-                .is_some_and(|(prev, _)| shifted - *prev < TICK_MIN_GAP);
-            if collision {
-                labels.pop();
-            } else if let Some((x, _)) = labels.last_mut() {
-                *x = shifted;
+            *x = 0.0;
+        }
+        if let Some((x, label)) = labels.last() {
+            let w = header_label_px(label);
+            if *x + w > width {
+                let shifted = (width - w).max(0.0);
+                let collision = labels
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|i| labels.get(i))
+                    .is_some_and(|(prev, prev_label)| {
+                        shifted - *prev < header_label_px(prev_label).max(TICK_MIN_GAP)
+                    });
+                if collision {
+                    labels.pop();
+                } else if let Some((x, _)) = labels.last_mut() {
+                    *x = shifted;
+                }
             }
         }
         labels
@@ -1434,12 +1458,13 @@ impl GanttView {
                 let y1 = pred.y + ROW_HEIGHT / 2.0;
                 let y2 = bar.y + ROW_HEIGHT / 2.0;
                 let far_apart = (pred.y - bar.y).abs() > ROW_HEIGHT + 1.0;
-                let x_out = pred.x + pred.width + STUB;
+                let pred_right = bar_label_right(pred);
+                let x_out = pred_right + STUB;
                 let x_head = bar.x;
                 if far_apart {
-                    // Route to the right of both bars so the long vertical does
-                    // not slice through intervening placeholder bars.
-                    let wrap_x = pred.x.max(bar.x) + pred.width.max(bar.width) + STUB;
+                    // Route past bars and their external titles so the vertical
+                    // does not run through a floating label.
+                    let wrap_x = pred_right.max(bar_label_right(bar)) + STUB;
                     out.push(DependencyArrow {
                         from_id: *pred_id,
                         to_id: bar.id,
@@ -1475,6 +1500,34 @@ impl GanttView {
 
 fn parse_type_color(hex: &str) -> u32 {
     u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0x89b4fa)
+}
+
+fn header_label_px(label: &str) -> f32 {
+    (label.chars().count() as f32 * 7.0 + 8.0).max(14.0)
+}
+
+fn bar_title_px(title: &str) -> f32 {
+    title.chars().count() as f32 * 6.5 + 16.0
+}
+
+/// Right edge of a bar including an external title, so arrows skip labels.
+pub fn bar_label_right(bar: &BarLayout) -> f32 {
+    let painted_w = if bar.milestone || bar.marker {
+        MILESTONE_SIZE
+    } else {
+        bar.width.max(8.0)
+    };
+    let title_w = bar_title_px(&bar.title);
+    let inside = !bar.marker
+        && !bar.milestone
+        && !bar.summary
+        && !bar.open_ended
+        && painted_w >= title_w.max(40.0);
+    if inside {
+        bar.x + painted_w
+    } else {
+        bar.x + painted_w + 10.0 + title_w
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1772,6 +1825,7 @@ mod tests {
             progress: None,
             predecessors: Vec::new(),
             marker: false,
+            open_ended: false,
         };
         let bars = [bar.clone()];
         assert_eq!(
@@ -2125,6 +2179,25 @@ mod tests {
             "unscheduled items are a Today diamond, not an iteration ghost bar"
         );
         assert!((bars[0].width - MILESTONE_SIZE).abs() < 0.1);
+    }
+
+    #[test]
+    fn start_only_item_is_an_open_ended_ghost() {
+        let mut item = node(1, None);
+        item.target_date = None;
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+        assert_eq!(bars.len(), 1);
+        assert!(
+            bars[0].open_ended,
+            "start-only must not look like a complete scheduled bar"
+        );
+        assert!(!bars[0].marker);
+        assert_eq!(bars[0].kind, GanttBarKind::Scheduled);
     }
 
     #[test]
@@ -3027,6 +3100,15 @@ mod tests {
                 label.contains('%'),
                 "scale buttons must keep a percent after Auto Fit, got {label}"
             );
+            assert_eq!(
+                scale.toolbar_label(0.5, false),
+                scale.label(),
+                "inactive scales must not repeat the selected zoom percent"
+            );
+            assert!(
+                scale.toolbar_label(0.5, true).contains('%'),
+                "the selected scale must show the real zoom"
+            );
         }
     }
 
@@ -3080,6 +3162,30 @@ mod tests {
             gantt.origin,
             gantt.scroll_x
         );
+    }
+
+    #[test]
+    fn week_tick_labels_stay_inside_the_timeline() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 10, 12).unwrap(),
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let labels = gantt.header_tick_labels(800.0);
+        assert!(!labels.is_empty());
+        for (x, label) in &labels {
+            let w = (label.chars().count() as f32 * 7.0 + 8.0).max(14.0);
+            assert!(
+                *x >= -0.1,
+                "week tick {label:?} at {x} must not clip the left edge"
+            );
+            assert!(
+                *x + w <= 800.1,
+                "week tick {label:?} at {x} width {w} must not clip the right edge"
+            );
+        }
     }
 
     #[test]
@@ -3277,11 +3383,11 @@ mod tests {
             "fixture must place the successor at least two rows below"
         );
         assert!(
-            arrows[0].x2 >= pred.x + pred.width && arrows[0].x2 >= succ.x + succ.width,
-            "the long vertical must sit to the right of both bars, got x2={} pred_right={} succ_right={}",
+            arrows[0].x2 >= bar_label_right(pred) && arrows[0].x2 >= bar_label_right(succ),
+            "the long vertical must sit to the right of bars and their titles, got x2={} pred_label={} succ_label={}",
             arrows[0].x2,
-            pred.x + pred.width,
-            succ.x + succ.width
+            bar_label_right(pred),
+            bar_label_right(succ)
         );
         assert!(
             arrows[0].wraps_around_successor(),

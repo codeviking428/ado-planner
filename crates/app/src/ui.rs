@@ -92,6 +92,7 @@ pub struct PlannerView {
     /// Typed ISO text at picker open; used so a later calendar pick is not
     /// overwritten unless the user actually edited the field.
     inline_dates_typed_seed: String,
+    inline_dates_error: Option<String>,
     pending_typed_preview: Option<String>,
     pending_delete: Option<(i64, String)>,
     /// True after Enter commits an inline editor so the same key does not
@@ -115,6 +116,9 @@ pub struct PlannerView {
     camera_anim_gen: u64,
     pending_camera_from: Option<SavedGanttView>,
     skip_camera_anim: bool,
+    /// True after a drag move with the left button down. A later move with
+    /// the button up then commits, covering mouse-up outside the window.
+    saw_pressed_drag: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -186,6 +190,12 @@ impl PlannerView {
                     && let Some(id) = this.state.gantt.selected_id
                 {
                     this.open_inline_title(id, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.form_loading.is_some() && key != "escape" {
+                    // Swallow keys while the modal is opening so they cannot
+                    // land as a stray character in the title field.
                     cx.stop_propagation();
                     return;
                 }
@@ -290,6 +300,7 @@ impl PlannerView {
             inline_edit: None,
             inline_dates: None,
             inline_dates_typed_seed: String::new(),
+            inline_dates_error: None,
             pending_typed_preview: None,
             pending_delete: None,
             inline_enter_guard: false,
@@ -311,6 +322,7 @@ impl PlannerView {
             camera_anim_gen: 0,
             pending_camera_from: None,
             skip_camera_anim: false,
+            saw_pressed_drag: false,
             _subscriptions: vec![keystrokes],
         };
         this.scope_query.update(cx, |input, cx| {
@@ -500,7 +512,12 @@ impl PlannerView {
         self.inline_input.update(cx, |input, cx| {
             input.replace_all(text, window, cx);
         });
+        self.inline_dates_error = typed_dates_error(text).map(str::to_string);
         cx.notify();
+    }
+
+    pub fn inline_dates_error_text(&self) -> Option<String> {
+        self.inline_dates_error.clone()
     }
 
     pub fn form_input_value(&self, field: &str, cx: &App) -> Option<String> {
@@ -632,13 +649,20 @@ impl PlannerView {
     }
 
     fn bind_inline_input(&mut self, cx: &mut Context<Self>) {
-        let enter = cx.subscribe(&self.inline_input, |this, _, event: &InputEvent, cx| {
+        let events = cx.subscribe(&self.inline_input, |this, input, event: &InputEvent, cx| {
+            if matches!(this.inline_edit, Some(InlineEdit::Dates(_)))
+                && matches!(event, InputEvent::Change)
+            {
+                let value = input.read(cx).value().to_string();
+                this.inline_dates_error = typed_dates_error(&value).map(str::to_string);
+                cx.notify();
+            }
             if matches!(event, InputEvent::PressEnter { .. }) && this.inline_edit.is_some() {
                 this.inline_enter_guard = true;
                 this.commit_inline(cx);
             }
         });
-        self._subscriptions.push(enter);
+        self._subscriptions.push(events);
     }
 
     fn spawn_state<F, Fut>(&mut self, cx: &mut Context<Self>, work: F) -> bool
@@ -860,6 +884,7 @@ impl PlannerView {
         self.inline_edit = None;
         self.inline_dates = None;
         self.inline_dates_typed_seed.clear();
+        self.inline_dates_error = None;
         self.pending_typed_preview = None;
         self.dates_anchor = None;
         self.pending_delete = None;
@@ -930,6 +955,7 @@ impl PlannerView {
         cx: &mut Context<Self>,
     ) {
         let mut typed = initial;
+        self.inline_dates_error = None;
         if let InlineEdit::Dates(id) = edit {
             let node = self.state.nodes.iter().find(|node| node.id == id);
             let start = node.and_then(|node| {
@@ -1069,11 +1095,51 @@ impl PlannerView {
     }
 
     fn commit_inline(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.inline_edit.take() else {
+        let Some(edit) = self.inline_edit else {
             return;
         };
         self.inline_enter_guard = true;
         let value = self.inline_input.read(cx).value().to_string();
+        if let InlineEdit::Dates(id) = edit {
+            if let Some(err) = typed_dates_error(&value) {
+                self.inline_dates_error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+            self.inline_dates_error = None;
+            self.inline_edit = None;
+            let date = self
+                .inline_dates
+                .as_ref()
+                .map(|picker| picker.read(cx).date());
+            self.inline_dates = None;
+            if let Some(date) = date {
+                self.commit_picker_dates(id, date, true, false, cx);
+            } else {
+                let node = self.state.nodes.iter().find(|node| node.id == id);
+                let start_year = node
+                    .and_then(|node| parse_iso_date(node.start_date.as_deref()))
+                    .map(jiff::civil::Date::year);
+                let target_year = node
+                    .and_then(|node| parse_iso_date(node.target_date.as_deref()))
+                    .map(jiff::civil::Date::year);
+                let picker = node
+                    .map(picker_date_from_node)
+                    .unwrap_or(PickerDate::Range(None, None));
+                if let Some((start, target)) = dates_from_range_picker_in_years(
+                    picker,
+                    &value,
+                    &self.inline_dates_typed_seed,
+                    start_year,
+                    target_year,
+                ) {
+                    self.spawn_range_dates(id, start, target, cx);
+                }
+            }
+            self.inline_dates_typed_seed.clear();
+            return;
+        }
+        self.inline_edit = None;
         match edit {
             InlineEdit::Title(id) => {
                 self.spawn_state(cx, move |mut state| async move {
@@ -1081,37 +1147,7 @@ impl PlannerView {
                     (state, result)
                 });
             }
-            InlineEdit::Dates(id) => {
-                let date = self
-                    .inline_dates
-                    .as_ref()
-                    .map(|picker| picker.read(cx).date());
-                self.inline_dates = None;
-                if let Some(date) = date {
-                    self.commit_picker_dates(id, date, true, false, cx);
-                } else {
-                    let node = self.state.nodes.iter().find(|node| node.id == id);
-                    let start_year = node
-                        .and_then(|node| parse_iso_date(node.start_date.as_deref()))
-                        .map(jiff::civil::Date::year);
-                    let target_year = node
-                        .and_then(|node| parse_iso_date(node.target_date.as_deref()))
-                        .map(jiff::civil::Date::year);
-                    let picker = node
-                        .map(picker_date_from_node)
-                        .unwrap_or(PickerDate::Range(None, None));
-                    if let Some((start, target)) = dates_from_range_picker_in_years(
-                        picker,
-                        &value,
-                        &self.inline_dates_typed_seed,
-                        start_year,
-                        target_year,
-                    ) {
-                        self.spawn_range_dates(id, start, target, cx);
-                    }
-                }
-                self.inline_dates_typed_seed.clear();
-            }
+            InlineEdit::Dates(_) => {}
             InlineEdit::Start(id) | InlineEdit::Target(id) => {
                 let parsed = ado_core::parse_iso_date(Some(value.trim()));
                 let node = self.state.nodes.iter().find(|n| n.id == id).cloned();
@@ -1326,21 +1362,17 @@ impl PlannerView {
     }
 
     fn apply_toast_undo(&mut self, toast_id: u64, action: UndoAction, cx: &mut Context<Self>) {
-        let original = self
-            .state
-            .toasts
-            .items
-            .iter()
-            .find(|toast| toast.id == toast_id)
-            .map(|toast| toast.message.clone())
-            .unwrap_or_else(|| self.state.history_action_message_for_undo(&action));
-        let undid = format!("Undid: {original}");
+        let original = self.state.history_action_message_for_undo(&action);
+        let undid = format!("Undone: {original}");
         if matches!(action, UndoAction::RestoreDates { .. }) {
-            if let Some(pending) = self.state.apply_toast_restore_dates(action) {
+            if let Some(pending) = self.state.toast_restore_or_undo_dates(action) {
                 self.state.toasts.dismiss_undo();
                 self.state.toasts.dismiss(toast_id);
+                let already_toasted = pending.role == DateSaveRole::Undo;
                 self.enqueue_date_save(cx, pending);
-                self.state.toasts.push(ToastKind::Success, undid);
+                if !already_toasted {
+                    self.state.toasts.push(ToastKind::Success, undid);
+                }
                 self.note_toasts_changed(cx);
             }
             cx.notify();
@@ -2369,7 +2401,7 @@ impl PlannerView {
                     .children(GanttScale::ALL.iter().map(|scale| {
                         let scale = *scale;
                         let selected = self.state.gantt.scale == scale;
-                        let label = scale.button_label(self.state.gantt.zoom);
+                        let label = scale.toolbar_label(self.state.gantt.zoom, selected);
                         let selector = format!("gantt-scale-{}", scale.label());
                         div()
                             .id(SharedString::from(selector.clone()))
@@ -2996,6 +3028,16 @@ impl PlannerView {
                                 .w_full()
                                 .child(Input::new(&self.inline_input).id("inline-date").w_full()),
                         )
+                        .when_some(self.inline_dates_error.clone(), |el, message| {
+                            el.child(
+                                div()
+                                    .id("gantt-dates-error")
+                                    .debug_selector(|| "gantt-dates-error".into())
+                                    .text_xs()
+                                    .text_color(cx.theme().danger)
+                                    .child(message),
+                            )
+                        })
                         .child(self.render_calendar_chrome(&state, cx)),
                 )
             })
@@ -3530,14 +3572,16 @@ impl PlannerView {
                             .text_color(muted_fg)
                             .child(label)
                     }))
-                    .children(tick_labels.into_iter().enumerate().filter(|(_, (x, _))| *x > -40.0 && *x < width - 8.0).map(|(index, (x, label))| {
+                    .children(tick_labels.into_iter().enumerate().filter(|(_, (x, _))| *x > -40.0 && *x < width).map(|(index, (x, label))| {
                         let selector = format!("gantt-tick-{index}");
+                        let max_w = (width - x).max(1.0);
                         div()
                             .id(("gantt-tick", index as u64))
                             .debug_selector(move || selector)
                             .absolute()
                             .left(px(x))
                             .top(px(22.))
+                            .max_w(px(max_w))
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_xs()
@@ -3602,12 +3646,7 @@ impl PlannerView {
                 })
             })
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if this.state.gantt.gesture.is_some() {
-                    let x: f32 = event.position.x.into();
-                    this.state
-                        .update_bar_gesture(x - this.state.gantt.timeline_origin_x);
-                    cx.notify();
-                }
+                this.on_bar_drag_move(event, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
@@ -3631,11 +3670,16 @@ impl PlannerView {
         let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
         let milestone = bar.milestone;
         let marker = bar.marker;
+        let open_ended = bar.open_ended;
         let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
         let clip_pad = (-bar.x).max(0.0);
         let visible_w = (bar.width - clip_pad).max(0.0);
-        let inside =
-            !unscheduled && !milestone && !marker && !summary && visible_w >= title_width.max(40.0);
+        let inside = !unscheduled
+            && !milestone
+            && !marker
+            && !summary
+            && !open_ended
+            && visible_w >= title_width.max(40.0);
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
         let show_handles =
@@ -3658,7 +3702,7 @@ impl PlannerView {
             6.0
         };
         let progress_value = bar.progress.unwrap_or(0.0);
-        let show_progress = summary || progress_value > 0.0;
+        let show_progress = !open_ended && (summary || progress_value > 0.0);
         let progress_w =
             (bar.width.max(8.0) * progress_value).max(if progress_value > 0.0 { 4.0 } else { 0.0 });
         let bar_selector = format!("gantt-bar-{id}");
@@ -3711,9 +3755,29 @@ impl PlannerView {
                 .when(summary && !milestone && !marker, |el| {
                     el.bg(rgb(bar.color).opacity(0.55)).rounded_sm()
                 })
-                .when(!summary && !milestone && !marker && !unscheduled, |el| {
-                    el.bg(rgb(bar.color))
-                        .when(hovered && !dragging, |el| el.opacity(0.92))
+                .when(
+                    !summary && !milestone && !marker && !unscheduled && !open_ended,
+                    |el| {
+                        el.bg(rgb(bar.color))
+                            .when(hovered && !dragging, |el| el.opacity(0.92))
+                    },
+                )
+                .when(open_ended && !summary && !marker, |el| {
+                    el.bg(rgb(bar.color).opacity(0.22))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(rgb(bar.color))
+                        .child(
+                            div()
+                                .absolute()
+                                .right(px(2.))
+                                .top_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
+                                .text_color(rgb(bar.color))
+                                .child("▸"),
+                        )
                 })
                 .when(unscheduled && !summary && !marker, |el| {
                     el.bg(cx.theme().muted.opacity(0.28))
@@ -3721,7 +3785,7 @@ impl PlannerView {
                         .border_color(cx.theme().muted_foreground)
                 })
                 .text_color(if summary { muted_fg } else { bar_label_fg })
-                .when(!milestone && !marker && !unscheduled, |el| {
+                .when(!milestone && !marker && !unscheduled && !open_ended, |el| {
                     el.border_1()
                         .border_color(if selected || (hovered && !dragging) {
                             cx.theme().primary
@@ -3763,12 +3827,9 @@ impl PlannerView {
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         this.state.gantt.selected_id = Some(id);
-                        if this.inline_edit.is_none() {
-                            window.focus(&this.form_focus, cx);
-                        }
                         if event.click_count >= 2 {
                             this.open_form(id, cx);
                             return;
@@ -3923,10 +3984,11 @@ impl PlannerView {
             && !bar.milestone
             && !bar.marker
             && !bar.summary
+            && !bar.open_ended
             && visible_w >= title_width.max(40.0)
     }
 
-    fn bar_external_label_frame(
+    pub(crate) fn bar_external_label_frame(
         bar: &crate::gantt::BarLayout,
         timeline_w: f32,
         show_link_handles: bool,
@@ -3945,16 +4007,16 @@ impl PlannerView {
         } else {
             bar.width.max(8.0)
         };
+        let bar_right = bar.x + painted_w;
+        if bar_right < 0.0 || bar.x > timeline_w {
+            return None;
+        }
         let estimated = title_width.max(24.0);
-        let right_x = bar.x + painted_w + label_gap;
+        let right_x = bar_right + label_gap;
         let left_x = bar.x - estimated - 6.0;
         let prefer_left = right_x + estimated > timeline_w - 4.0 && left_x >= 0.0;
-        let label_x = if prefer_left {
-            left_x
-        } else {
-            right_x.clamp(0.0, (timeline_w - 24.0).max(0.0))
-        };
-        if !(0.0..timeline_w).contains(&label_x) {
+        let label_x = if prefer_left { left_x } else { right_x };
+        if label_x >= timeline_w || label_x + 8.0 < 0.0 {
             return None;
         }
         let max_w = (timeline_w - label_x - 4.0).max(24.0);
@@ -5360,7 +5422,28 @@ impl PlannerView {
         });
     }
 
+    fn on_bar_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.state.gantt.gesture.is_none() {
+            return;
+        }
+        let x: f32 = event.position.x.into();
+        self.state
+            .update_bar_gesture(x - self.state.gantt.timeline_origin_x);
+        if event.dragging() {
+            self.saw_pressed_drag = true;
+            cx.notify();
+            return;
+        }
+        if self.saw_pressed_drag {
+            self.saw_pressed_drag = false;
+            self.commit_gesture(cx);
+            return;
+        }
+        cx.notify();
+    }
+
     fn commit_gesture(&mut self, cx: &mut Context<Self>) {
+        self.saw_pressed_drag = false;
         if self.state.gantt.gesture.is_none() {
             return;
         }
@@ -6393,7 +6476,11 @@ impl Render for PlannerView {
         window.set_window_title(&self.window_title());
         if let Some(form_id) = self.state.form.as_ref().map(|form| form.model.id) {
             if self.form_title_focused_for != Some(form_id) {
-                window.focus(&self.form_focus, cx);
+                if let Some(title) = self.form_inputs.get("System.Title").cloned() {
+                    Self::focus_input(&title, window, cx);
+                } else {
+                    window.focus(&self.form_focus, cx);
+                }
                 self.form_title_focused_for = Some(form_id);
             }
         } else {
@@ -6445,9 +6532,7 @@ impl Render for PlannerView {
                     return;
                 }
                 if this.state.gantt.gesture.is_some() {
-                    this.state
-                        .update_bar_gesture(x - this.state.gantt.timeline_origin_x);
-                    cx.notify();
+                    this.on_bar_drag_move(event, cx);
                     return;
                 }
                 if !this.state.gantt.pointer_in_rows(x, y) {
@@ -6457,6 +6542,10 @@ impl Render for PlannerView {
             .track_focus(&self.form_focus)
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
+                if this.form_loading.is_some() && key != "escape" {
+                    cx.stop_propagation();
+                    return;
+                }
                 if key == "f2"
                     && !this.details_overlay()
                     && this.inline_edit.is_none()
@@ -6580,4 +6669,35 @@ pub fn start_app(data_dir: Option<PathBuf>, ado_base: Option<String>, vssps_base
         )
         .expect("failed to open window");
     });
+}
+
+#[cfg(test)]
+mod bar_label_tests {
+    use super::*;
+    use crate::gantt::BarLayout;
+    use ado_core::GanttBarKind;
+
+    #[test]
+    fn off_screen_markers_do_not_pin_a_label_to_the_right_edge() {
+        let bar = BarLayout {
+            id: 1,
+            kind: GanttBarKind::Unscheduled,
+            x: -80.0,
+            width: 14.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Unscheduled item".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: true,
+            open_ended: false,
+        };
+        assert!(
+            PlannerView::bar_external_label_frame(&bar, 800.0, false).is_none(),
+            "an off-screen Today diamond must not float a title at the right edge"
+        );
+    }
 }
