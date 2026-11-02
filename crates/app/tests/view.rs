@@ -3290,8 +3290,8 @@ fn delete_confirm_warns_about_children(cx: &mut gpui_kit::TestAppContext) {
         view.handle_key(&delete, cx);
         let warning = view.pending_delete_warning().unwrap_or_default();
         assert!(
-            warning.contains("child"),
-            "deleting a parent must mention children, got {warning}"
+            warning.contains("child") && warning.contains("stay"),
+            "deleting a parent must warn that children stay in Azure DevOps, got {warning}"
         );
     });
 }
@@ -3522,6 +3522,15 @@ fn details_picker_previews_the_start_before_the_end(cx: &mut gpui_kit::TestAppCo
                 None,
             )),
             "the first click of a details range must keep the start visible"
+        );
+        let start = view
+            .state
+            .form
+            .as_ref()
+            .and_then(|form| form.values.get(ado_core::START_DATE_FIELD));
+        assert!(
+            start.is_none() || start.is_some_and(|value| value.is_null()),
+            "an incomplete range must not write Start Date into the form, got {start:?}"
         );
     });
 }

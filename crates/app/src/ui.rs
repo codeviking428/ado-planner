@@ -3738,14 +3738,20 @@ impl PlannerView {
             cx.theme().primary.opacity(0.7)
         };
         let stroke = if selected || hovered { 3.0 } else { 2.0 };
-        let min_x = arrow.x1.min(arrow.x2).min(arrow.x_head) - 16.0;
-        let min_y = arrow.y1.min(arrow.y2).min(arrow.lane_y) - 18.0;
+        let stub_start = arrow.stub_start();
+        let gutter_y = arrow.gutter_y();
+        let wrap = arrow.wraps_around_successor();
+        let min_x = arrow.x1.min(arrow.x2).min(arrow.x_head).min(stub_start) - 16.0;
+        let min_y = arrow.y1.min(arrow.y2).min(arrow.lane_y).min(gutter_y) - 18.0;
         let from_id = arrow.from_id;
         let to_id = arrow.to_id;
         let v1 = (arrow.lane_y - arrow.y1).abs().max(2.0);
         let h_len = (arrow.x2 - arrow.x1).abs().max(2.0);
-        let v2 = (arrow.y2 - arrow.lane_y).abs().max(2.0);
-        let stub_h = (arrow.x_head - arrow.x2).abs().max(2.0);
+        let v2_end = if wrap { gutter_y } else { arrow.y2 };
+        let v2 = (v2_end - arrow.lane_y).abs().max(2.0);
+        let stub_h = (arrow.x_head - stub_start).abs().max(2.0);
+        let gutter_h = (stub_start - arrow.x2).abs().max(2.0);
+        let drop = (arrow.y2 - gutter_y).abs().max(2.0);
         div()
             .absolute()
             .left(px(min_x))
@@ -3776,7 +3782,7 @@ impl PlannerView {
             ))
             .child(self.arrow_segment(
                 arrow.x2 - min_x,
-                arrow.lane_y.min(arrow.y2) - min_y,
+                arrow.lane_y.min(v2_end) - min_y,
                 stroke,
                 v2,
                 color,
@@ -3785,8 +3791,32 @@ impl PlannerView {
                 "inv",
                 cx,
             ))
+            .when(wrap, |el| {
+                el.child(self.arrow_segment(
+                    stub_start.min(arrow.x2) - min_x,
+                    gutter_y - min_y,
+                    gutter_h,
+                    stroke,
+                    color,
+                    from_id,
+                    to_id,
+                    "gutter",
+                    cx,
+                ))
+                .child(self.arrow_segment(
+                    stub_start - min_x,
+                    gutter_y.min(arrow.y2) - min_y,
+                    stroke,
+                    drop,
+                    color,
+                    from_id,
+                    to_id,
+                    "drop",
+                    cx,
+                ))
+            })
             .child(self.arrow_segment(
-                arrow.x2.min(arrow.x_head) - min_x,
+                stub_start.min(arrow.x_head) - min_x,
                 arrow.y2 - min_y,
                 stub_h,
                 stroke,
@@ -3914,20 +3944,9 @@ impl PlannerView {
                             .id("gantt-delete-warning")
                             .debug_selector(|| "gantt-delete-warning".into())
                             .child(
-                                Label::new({
-                                    let children =
-                                        crate::gantt::descendants(&self.state.nodes, id).len();
-                                    if children == 0 {
-                                        "This removes the work item from Azure DevOps.".to_string()
-                                    } else if children == 1 {
-                                        "This also removes 1 child work item from Azure DevOps."
-                                            .to_string()
-                                    } else {
-                                        format!(
-                                            "This also removes {children} child work items from Azure DevOps."
-                                        )
-                                    }
-                                })
+                                Label::new(self.pending_delete_warning().unwrap_or_else(|| {
+                                    "This removes the work item from Azure DevOps.".into()
+                                }))
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground),
                             ),
@@ -4806,10 +4825,12 @@ impl PlannerView {
                         .insert(reference.clone(), serde_json::Value::Null);
                 }
                 PickerDate::Range(start, end) => {
-                    form.set_range_dates(
-                        start.and_then(naive_to_jiff).map(iso_date_only),
-                        end.and_then(naive_to_jiff).map(iso_date_only),
-                    );
+                    if range_picker_is_complete(PickerDate::Range(start, end)) {
+                        form.set_range_dates(
+                            start.and_then(naive_to_jiff).map(iso_date_only),
+                            end.and_then(naive_to_jiff).map(iso_date_only),
+                        );
+                    }
                 }
             }
         }
@@ -5085,6 +5106,11 @@ impl PlannerView {
                     &picker,
                     move |this, _, event: &CalendarEvent, cx| {
                         let CalendarEvent::Selected(date) = event;
+                        this.form_dates_preview = pending_range_typed(*date);
+                        if !range_picker_is_complete(*date) {
+                            cx.notify();
+                            return;
+                        }
                         let Some(form) = this.state.form.as_mut() else {
                             return;
                         };
@@ -5200,9 +5226,11 @@ impl PlannerView {
         Some(if children == 0 {
             "This removes the work item from Azure DevOps.".into()
         } else if children == 1 {
-            "This also removes 1 child work item from Azure DevOps.".into()
+            "This item has 1 child, which stays in Azure DevOps without this parent.".into()
         } else {
-            format!("This also removes {children} child work items from Azure DevOps.")
+            format!(
+                "This item has {children} children, which stay in Azure DevOps without this parent."
+            )
         })
     }
 

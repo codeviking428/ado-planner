@@ -301,22 +301,57 @@ pub struct DependencyArrow {
 }
 
 impl DependencyArrow {
+    const WRAP_STUB: f32 = 12.0;
+
+    /// Wrap-around routing ends to the right of the successor; the last run
+    /// into the bar must stay a short inbound stub instead of crossing it.
+    pub fn wraps_around_successor(&self) -> bool {
+        self.x2 > self.x_head + Self::WRAP_STUB
+    }
+
+    pub fn stub_start(&self) -> f32 {
+        if self.wraps_around_successor() {
+            self.x_head - Self::WRAP_STUB
+        } else {
+            self.x2.min(self.x_head)
+        }
+    }
+
+    pub fn gutter_y(&self) -> f32 {
+        self.y2 - ROW_HEIGHT / 2.0
+    }
+
     /// Visual midpoint along the polyline (outgoing, lane, incoming, stub).
     pub fn midpoint(&self) -> (f32, f32) {
-        let pts = [
-            (self.x1, self.y1),
-            (self.x1, self.lane_y),
-            (self.x2, self.lane_y),
-            (self.x2, self.y2),
-            (self.x_head, self.y2),
-        ];
+        let inbound = self.stub_start();
+        let pts = if self.wraps_around_successor() {
+            let gutter = self.gutter_y();
+            vec![
+                (self.x1, self.y1),
+                (self.x1, self.lane_y),
+                (self.x2, self.lane_y),
+                (self.x2, gutter),
+                (inbound, gutter),
+                (inbound, self.y2),
+                (self.x_head, self.y2),
+            ]
+        } else {
+            vec![
+                (self.x1, self.y1),
+                (self.x1, self.lane_y),
+                (self.x2, self.lane_y),
+                (self.x2, self.y2),
+                (self.x_head, self.y2),
+            ]
+        };
         let mut total = 0.0;
-        let mut segs = [0.0; 4];
-        for (i, pair) in pts.windows(2).enumerate() {
+        let mut segs = Vec::new();
+        for pair in pts.windows(2) {
             let dx = pair[1].0 - pair[0].0;
             let dy = pair[1].1 - pair[0].1;
-            segs[i] = (dx * dx + dy * dy).sqrt();
-            total += segs[i];
+            let len = (dx * dx + dy * dy).sqrt();
+            segs.push(len);
+            total += len;
         }
         let mut remain = total * 0.5;
         for (i, len) in segs.iter().enumerate() {
@@ -2847,6 +2882,16 @@ mod tests {
             arrows[0].x2,
             pred.x + pred.width,
             succ.x + succ.width
+        );
+        assert!(
+            arrows[0].wraps_around_successor(),
+            "far-apart links must wrap around the successor instead of crossing it"
+        );
+        assert!(
+            (arrows[0].stub_start() - (succ.x - 12.0)).abs() < 0.5,
+            "the last run into the successor must be a short inbound stub, got stub_start={} succ.x={}",
+            arrows[0].stub_start(),
+            succ.x
         );
     }
 
