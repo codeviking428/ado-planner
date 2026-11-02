@@ -2985,6 +2985,63 @@ pub fn fake_hierarchy(count: usize) -> Vec<WorkItemNode> {
         .collect()
 }
 
+/// Backlog shaped like a real ADO team: a deep Epic → Feature → Story → Task/Test
+/// Case tree plus a long unscheduled tail and a truncated Product Backlog Item.
+pub fn fake_ado_shaped_backlog() -> Vec<WorkItemNode> {
+    fn item(id: i64, parent: Option<i64>, ty: &str, title: &str, scheduled: bool) -> WorkItemNode {
+        WorkItemNode {
+            id,
+            rev: 1,
+            title: title.into(),
+            work_item_type: ty.into(),
+            state: "New".into(),
+            assigned_to: None,
+            parent_id: parent,
+            area_path: "Shop".into(),
+            iteration_path: if scheduled {
+                "Shop\\Sprint 12".into()
+            } else {
+                "Shop".into()
+            },
+            start_date: scheduled.then(|| "2026-07-06T00:00:00Z".into()),
+            target_date: scheduled.then(|| "2026-07-20T00:00:00Z".into()),
+            has_date_fields: true,
+            predecessors: Vec::new(),
+            fields: serde_json::Map::new(),
+        }
+    }
+    let mut nodes = vec![
+        item(1, None, "Epic", "Shop modernization", true),
+        item(2, Some(1), "Feature", "Product Backlog Item catalog", true),
+        item(
+            3,
+            Some(2),
+            "User Story",
+            "Persist cart across sessions",
+            true,
+        ),
+        item(4, Some(3), "Task", "Wire Redis session store", true),
+        item(5, Some(3), "Test Case", "Cart survives refresh", false),
+        item(
+            6,
+            Some(2),
+            "Product Backlog Item",
+            "Product Backlog Item for checkout that is quite long",
+            false,
+        ),
+    ];
+    for i in 20..55 {
+        nodes.push(item(
+            i,
+            Some(2),
+            "User Story",
+            &format!("Unscheduled backlog {i}"),
+            false,
+        ));
+    }
+    nodes
+}
+
 pub fn json_scope(org: &str, project: &str, team: &str) -> Value {
     json!({ "org": org, "project": project, "team": team })
 }

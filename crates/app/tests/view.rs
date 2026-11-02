@@ -7,7 +7,7 @@ use ado_planner::gantt::{
     ROW_HEIGHT, TODAY_ALIGN,
 };
 use ado_planner::paths::AppPaths;
-use ado_planner::state::{PlannerState, fake_hierarchy};
+use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
 use ado_planner::toasts::HistoryEntry;
 use ado_planner::ui::PlannerView;
 use ado_planner::ui::{
@@ -568,7 +568,7 @@ fn down_arrow_moves_the_selection_by_one_row(cx: &mut gpui_kit::TestAppContext) 
 }
 
 #[gpui_kit::test]
-fn unscheduled_only_grid_paints_placeholder_bars(cx: &mut gpui_kit::TestAppContext) {
+fn unscheduled_only_grid_paints_today_markers(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
@@ -581,7 +581,7 @@ fn unscheduled_only_grid_paints_placeholder_bars(cx: &mut gpui_kit::TestAppConte
     draw(cx);
     assert!(
         cx.debug_bounds("gantt-bar-1").is_some(),
-        "unscheduled rows must still paint a placeholder bar so a new row is not blank"
+        "unscheduled rows must still paint a Today marker so a new row is not blank"
     );
     assert!(
         cx.debug_bounds("unscheduled-empty-hint").is_none(),
@@ -2696,8 +2696,8 @@ fn details_slot_is_reserved_when_the_pill_is_hidden(cx: &mut gpui_kit::TestAppCo
         "the ⓘ Details column must keep its width when the pill is hidden"
     );
     assert!(
-        cx.debug_bounds("gantt-open-details").is_none(),
-        "unhovered rows must not paint the pill over neighbouring columns"
+        cx.debug_bounds("gantt-open-details").is_some(),
+        "ⓘ must stay visible so details can open without a prior selection"
     );
 }
 
@@ -3533,4 +3533,219 @@ fn details_picker_previews_the_start_before_the_end(cx: &mut gpui_kit::TestAppCo
             "an incomplete range must not write Start Date into the form, got {start:?}"
         );
     });
+}
+
+#[gpui_kit::test]
+fn details_open_shows_a_loading_indicator(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, _| {
+        view.set_form_loading_for_test(1, "Persist cart");
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("work-item-form-loading").is_some(),
+        "opening details must show a dialog immediately, not wait on ADO"
+    );
+    assert!(
+        cx.debug_bounds("work-item-form-spinner").is_some(),
+        "the details dialog must show a loading indicator while fields fetch"
+    );
+}
+
+#[gpui_kit::test]
+fn details_hides_empty_custom_fields_and_disables_clean_save(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert("System.State".into(), serde_json::json!("New"));
+    values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-07-06T00:00:00Z"),
+    );
+    values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-07-20T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: vec![
+            ado_core::FormControl {
+                id: "System.Title".into(),
+                reference_name: "System.Title".into(),
+                label: "Title".into(),
+                kind: ado_core::FormControlKind::String,
+                required: true,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+            ado_core::FormControl {
+                id: "System.State".into(),
+                reference_name: "System.State".into(),
+                label: "State".into(),
+                kind: ado_core::FormControlKind::String,
+                required: true,
+                read_only: false,
+                visible: true,
+                options: None,
+            },
+        ],
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![
+                    ado_core::FormControl {
+                        id: "Custom.TShirtSize".into(),
+                        reference_name: "Custom.TShirtSize".into(),
+                        label: "T-Shirt Size".into(),
+                        kind: ado_core::FormControlKind::Picklist,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: Some(vec!["S".into(), "M".into(), "L".into()]),
+                    },
+                    ado_core::FormControl {
+                        id: ado_core::START_DATE_FIELD.into(),
+                        reference_name: ado_core::START_DATE_FIELD.into(),
+                        label: "Start Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                    ado_core::FormControl {
+                        id: ado_core::TARGET_DATE_FIELD.into(),
+                        reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                        label: "Target Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                ],
+            }],
+        }],
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-dates-label").is_some(),
+        "dates must sit near the top of the details dialog"
+    );
+    assert!(
+        cx.debug_bounds("form-label-Custom.TShirtSize").is_none(),
+        "empty custom fields must not lead the details dialog"
+    );
+    assert!(
+        cx.debug_bounds("form-more-fields").is_some(),
+        "empty fields should collapse under More"
+    );
+    view.update(cx, |view, _| {
+        let form = view.state.form.as_ref().expect("form");
+        assert!(!form.is_dirty(), "Save must stay disabled on a clean form");
+    });
+}
+
+#[gpui_kit::test]
+fn realistic_backlog_keeps_markers_badges_and_indent(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_ado_shaped_backlog();
+    state.gantt.set_tree_width(640.0);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars =
+            view.state
+                .gantt
+                .layout_bars(&view.state.nodes, &rows, &view.state.iterations, 720.0);
+        let unscheduled: Vec<_> = bars
+            .iter()
+            .filter(|bar| bar.kind == ado_core::GanttBarKind::Unscheduled)
+            .collect();
+        assert!(
+            unscheduled.len() > 10,
+            "realistic mock data must include a long unscheduled tail"
+        );
+        assert!(
+            unscheduled
+                .iter()
+                .all(|bar| bar.marker || bar.width >= 16.0),
+            "unscheduled items without an iteration span must be markers, not fake week bars"
+        );
+        let task = rows.iter().find(|row| row.id == 4).expect("task");
+        let test_case = rows.iter().find(|row| row.id == 5).expect("test case");
+        assert_eq!(
+            task.depth, test_case.depth,
+            "Task and Test Case under the same story must share indent depth"
+        );
+        assert_eq!(ado_planner::ui::type_abbrev("Product Backlog Item"), "PBI");
+        assert_eq!(ado_planner::ui::type_abbrev("User Story"), "US");
+        assert_eq!(ado_planner::ui::type_abbrev("Test Case"), "TC");
+    });
+    assert!(
+        cx.debug_bounds("gantt-expand-slot-4").is_some(),
+        "leaf tasks must keep an expander spacer so titles line up"
+    );
+    assert!(
+        cx.debug_bounds("gantt-expand-slot-5").is_some(),
+        "leaf test cases must keep the same expander spacer"
+    );
+    let task_slot = cx.debug_bounds("gantt-expand-slot-4").expect("task slot");
+    let test_slot = cx.debug_bounds("gantt-expand-slot-5").expect("test slot");
+    assert_eq!(
+        task_slot.size.width, test_slot.size.width,
+        "Task and Test Case expander slots must be the same width"
+    );
+    assert!(
+        cx.debug_bounds("gantt-type-badge").is_some(),
+        "type badges must paint so truncated names can show a tooltip"
+    );
+    assert!(
+        cx.debug_bounds("gantt-open-details").is_some(),
+        "details affordance must be visible on unselected rows"
+    );
+}
+
+#[gpui_kit::test]
+fn invalid_backlog_banner_does_not_replace_the_toolbar(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.team_settings_error =
+        Some("Team \"Amego Stakeholders\" has invalid backlog settings (TF400497).".into());
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("team-settings-error")
+            .is_some_and(|bounds| bounds.size.width > gpui_kit::px(200.)),
+        "team-settings errors should stay readable"
+    );
+    assert!(
+        cx.debug_bounds("gantt-nav").is_some(),
+        "the invalid-backlog banner must overlay, not push the Gantt toolbar down"
+    );
+    assert!(
+        cx.debug_bounds("gantt-range-title").is_some(),
+        "the visible range label must remain on the toolbar under the banner"
+    );
 }

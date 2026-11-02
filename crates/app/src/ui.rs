@@ -40,10 +40,10 @@ use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
     ASSIGNEE_COL_WIDTH, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH, DependencyArrow,
-    GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE,
-    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis,
+    EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H,
+    LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis,
     PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SPLITTER_WIDTH, SUMMARY_BAR_H,
-    SavedGanttView, TIMELINE_HEADER_H, TYPE_COL_WIDTH,
+    SavedGanttView, TIMELINE_HEADER_H, TODAY_PILL_GAP, TODAY_PILL_W, TYPE_COL_WIDTH,
 };
 use crate::paths::AppPaths;
 use crate::state::{DateSaveRole, PendingDateSave, PlannerState};
@@ -93,6 +93,7 @@ pub struct PlannerView {
     inline_enter_guard: bool,
     dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
+    form_loading: Option<(i64, String)>,
     io_busy: bool,
     date_save_busy: HashSet<i64>,
     date_save_queue: VecDeque<PendingDateSave>,
@@ -167,13 +168,13 @@ impl PlannerView {
                 return;
             };
             view.update(cx, |this, cx| {
-                let overlay = this.state.form.is_some()
+                let overlay = this.details_overlay()
                     || this.state.gantt.context_menu.is_some()
                     || this.popup_open()
                     || this.inline_edit.is_some()
                     || this.pending_delete.is_some();
                 if key == "f2"
-                    && this.state.form.is_none()
+                    && !this.details_overlay()
                     && this.inline_edit.is_none()
                     && let Some(id) = this.state.gantt.selected_id
                 {
@@ -182,7 +183,7 @@ impl PlannerView {
                     return;
                 }
                 if key == "escape" && overlay {
-                    if this.state.form.is_some() && this.form_date_picker_focused(window, cx) {
+                    if this.details_overlay() && this.form_date_picker_focused(window, cx) {
                         return;
                     }
                     this.on_key(
@@ -218,7 +219,7 @@ impl PlannerView {
                     && this.pending_delete.is_none()
                     && this.state.gantt.selected_link.is_none()
                     && this.state.gantt.selected_id.is_some()
-                    && this.state.form.is_none()
+                    && !this.details_overlay()
                     && this.inline_edit.is_none()
                     && !this.input_focused(window, cx);
                 // Enter confirms, Escape cancels. Delete/Backspace only open the
@@ -229,7 +230,7 @@ impl PlannerView {
                 let open_details = key == "enter"
                     && this.pending_delete.is_none()
                     && !this.io_busy
-                    && this.state.form.is_none()
+                    && !this.details_overlay()
                     && this.inline_edit.is_none()
                     && this.state.gantt.selected_id.is_some()
                     && !this.input_focused(window, cx);
@@ -283,6 +284,7 @@ impl PlannerView {
             inline_enter_guard: false,
             dates_anchor: None,
             banner_dismissed: false,
+            form_loading: None,
             io_busy: false,
             date_save_busy: HashSet::new(),
             date_save_queue: VecDeque::new(),
@@ -587,7 +589,11 @@ impl PlannerView {
                 match outcome {
                     Ok((working, result)) => {
                         let shown_at = this.loading_shown_at;
+                        let discard_form = this.form_loading.is_none() && this.state.form.is_none();
                         this.state.adopt_spawned(working);
+                        if discard_form {
+                            this.state.form = None;
+                        }
                         if let Some(at) = shown_at
                             && !this.state.hierarchy_loading
                         {
@@ -628,6 +634,7 @@ impl PlannerView {
                     }
                     Err(_) => tracing::warn!("planner action cancelled"),
                 }
+                this.form_loading = None;
                 if let Some(team) = this.pending_team.take() {
                     this.start_team_switch(team, cx);
                 }
@@ -788,11 +795,16 @@ impl PlannerView {
 
     fn dismiss_all_overlays(&mut self) {
         self.dismiss_overlays();
+        self.form_loading = None;
         self.state.close_form();
         self.state.cancel_gesture();
         self.state.gantt.schedule_drag = None;
         self.state.gantt.clear_hover();
         self.dates_anchor = None;
+    }
+
+    fn details_overlay(&self) -> bool {
+        self.state.form.is_some() || self.form_loading.is_some()
     }
 
     fn set_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
@@ -1118,7 +1130,7 @@ impl PlannerView {
     }
 
     fn render_error_banner(&self, cx: &Context<Self>) -> impl IntoElement {
-        if self.banner_dismissed || self.state.form.is_some() {
+        if self.banner_dismissed || self.details_overlay() {
             return div().into_any_element();
         }
         let Some(message) = self.state.team_settings_error.as_ref() else {
@@ -1127,18 +1139,21 @@ impl PlannerView {
         h_flex()
             .id("team-settings-error")
             .debug_selector(|| "team-settings-error".into())
-            .w_full()
-            .max_w(px(720.))
-            .flex_shrink_0()
+            .absolute()
+            .top(px(8.))
+            .left(px(12.))
+            .max_w(px(560.))
             .items_start()
             .px_3()
             .py_1()
             .gap_2()
-            .mx_3()
-            .mt_2()
             .rounded_md()
-            .bg(cx.theme().muted)
-            .text_color(cx.theme().foreground)
+            .shadow_md()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .occlude()
             .child(
                 div()
                     .flex_1()
@@ -1962,9 +1977,11 @@ impl PlannerView {
                             .w(px(SPLITTER_WIDTH))
                             .flex_shrink_0()
                             .h_full()
-                            .bg(cx.theme().muted)
+                            .items_center()
+                            .justify_center()
                             .cursor_col_resize()
-                            .hover(|el| el.bg(cx.theme().primary))
+                            .hover(|el| el.bg(cx.theme().muted.opacity(0.45)))
+                            .child(div().w(px(2.)).h_full().bg(cx.theme().border))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -2187,8 +2204,9 @@ impl PlannerView {
                 div()
                     .id("gantt-range-title")
                     .debug_selector(|| "gantt-range-title".into())
-                    .w(px(196.))
+                    .w(px(240.))
                     .flex_shrink_0()
+                    .truncate()
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child(self.state.gantt.viewport_range_title()),
             )
@@ -2391,7 +2409,7 @@ impl PlannerView {
                                     .unwrap_or_else(|| "Unassigned".into());
                                 let editing_title = self.inline_edit == Some(InlineEdit::Title(id));
                                 let hovered = hovered_id == Some(id);
-                                let dim_selection = self.state.form.is_some()
+                                let dim_selection = self.details_overlay()
                                     || self.pending_delete.is_some();
                                 let row_selector = format!("gantt-tree-row-{id}");
                                 div()
@@ -2491,23 +2509,36 @@ impl PlannerView {
                                             .gap_2()
                                             .pl(px(8.0 + depth as f32 * 16.))
                                             .child(
-                                                Button::new(("expand", id as u64))
-                                                    .ghost()
-                                                    .compact()
-                                                    .with_size(Size::XSmall)
-                                                    .label(if !has_children {
-                                                        " "
-                                                    } else if expanded {
-                                                        "▾"
-                                                    } else {
-                                                        "▸"
+                                                div()
+                                                    .id(("expand-slot", id as u64))
+                                                    .debug_selector(move || {
+                                                        format!("gantt-expand-slot-{id}")
                                                     })
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.state.gantt.toggle_expand(id);
-                                                            cx.notify();
-                                                        },
-                                                    )),
+                                                    .w(px(EXPANDER_SLOT))
+                                                    .min_w(px(EXPANDER_SLOT))
+                                                    .flex_shrink_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(
+                                                        Button::new(("expand", id as u64))
+                                                            .ghost()
+                                                            .compact()
+                                                            .with_size(Size::XSmall)
+                                                            .label(if !has_children {
+                                                                " "
+                                                            } else if expanded {
+                                                                "▾"
+                                                            } else {
+                                                                "▸"
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.state.gantt.toggle_expand(id);
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    ),
                                             )
                                             .child(
                                                 div()
@@ -2538,10 +2569,9 @@ impl PlannerView {
                                                     .h_full()
                                                     .flex()
                                                     .items_center()
-                                                    .when(
-                                                        (hovered || selected) && !editing_title,
-                                                        |el| el.child(self.open_details_icon(id, cx)),
-                                                    ),
+                                                    .when(!editing_title, |el| {
+                                                        el.child(self.open_details_icon(id, cx))
+                                                    }),
                                             )
                                             .when(show_type, |el| {
                                                 el.child(self.type_badge(&node.work_item_type, cx))
@@ -2593,7 +2623,7 @@ impl PlannerView {
                     .compact()
                     .with_size(Size::Small)
                     .label("ⓘ")
-                    .when(self.state.form.is_none(), |btn| {
+                    .when(!self.details_overlay(), |btn| {
                         btn.tooltip(Self::details_icon_hint())
                             .tooltip_placement(Placement::Bottom)
                     })
@@ -2607,7 +2637,12 @@ impl PlannerView {
     fn type_badge(&self, ty: &str, cx: &Context<Self>) -> impl IntoElement {
         let color = color_for_type(ty);
         let parsed = u32::from_str_radix(color.trim_start_matches('#'), 16).unwrap_or(0x89b4fa);
+        let abbrev = type_abbrev(ty);
+        let full = ty.to_string();
+        let show_tip = abbrev != full && !self.details_overlay();
         h_flex()
+            .id(SharedString::from(format!("gantt-type-{ty}")))
+            .debug_selector(|| "gantt-type-badge".into())
             .gap_1()
             .px_1()
             .max_w(px(TYPE_COL_WIDTH))
@@ -2615,6 +2650,10 @@ impl PlannerView {
             .overflow_hidden()
             .rounded_md()
             .bg(cx.theme().muted)
+            .when(show_tip, |el| {
+                let tip = full.clone();
+                el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            })
             .child(
                 div()
                     .size(px(8.))
@@ -2627,7 +2666,7 @@ impl PlannerView {
                     .text_xs()
                     .truncate()
                     .text_color(rgb(parsed))
-                    .child(ty.to_string()),
+                    .child(abbrev),
             )
     }
 
@@ -2655,7 +2694,7 @@ impl PlannerView {
         }
         let title_owned = title.to_string();
         let tip = format!("{title_owned} · Double-click or F2 to rename");
-        let form_open = self.state.form.is_some();
+        let form_open = self.details_overlay();
         div()
             .id(("title", id as u64))
             .debug_selector(move || format!("gantt-title-{id}"))
@@ -3040,6 +3079,35 @@ impl PlannerView {
             .state
             .gantt
             .header_tick_labels_except(width, hide_today);
+        let today_on_screen = today_x >= 0.0 && today_x <= width;
+        let today_label_x = if today_on_screen {
+            if today_x + TODAY_PILL_GAP + TODAY_PILL_W > width - 4.0 {
+                (today_x - TODAY_PILL_W - 4.0).max(4.0)
+            } else {
+                (today_x + TODAY_PILL_GAP).max(4.0)
+            }
+        } else {
+            f32::MAX
+        };
+        let major_painted: Vec<(f32, f32, String)> = {
+            let filtered: Vec<(f32, String)> = major_labels
+                .into_iter()
+                .filter(|(x, _)| *x < width)
+                .collect();
+            filtered
+                .iter()
+                .enumerate()
+                .map(|(index, (x, label))| {
+                    let next = filtered.get(index + 1).map(|(nx, _)| *nx).unwrap_or(width);
+                    let cap = if *x < today_label_x && today_label_x < next {
+                        today_label_x
+                    } else {
+                        next
+                    };
+                    (*x, (cap - *x).max(24.0), label.clone())
+                })
+                .collect()
+        };
         div()
             .id("gantt-timeline")
             .debug_selector(|| "gantt-timeline".into())
@@ -3109,7 +3177,7 @@ impl PlannerView {
                                 let id = row.id;
                                 let selected = selected_id == Some(id);
                                 let hovered = hovered_id == Some(id);
-                                let dim_selection = self.state.form.is_some()
+                                let dim_selection = self.details_overlay()
                                     || self.pending_delete.is_some();
                                 let striped = (first_row + offset) % 2 == 1;
                                 let bar = bars.iter().find(|bar| bar.id == id).cloned();
@@ -3308,12 +3376,12 @@ impl PlannerView {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
-                    .children(major_labels.into_iter().filter(|(x, _)| *x < width).map(|(x, label)| {
+                    .children(major_painted.into_iter().map(|(x, w, label)| {
                         div()
                             .absolute()
                             .left(px(x))
                             .top(px(2.))
-                            .w(px((width - x).max(24.0)))
+                            .w(px(w))
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_xs()
@@ -3336,13 +3404,7 @@ impl PlannerView {
                             .child(label)
                     })),
             )
-            .when(today_x >= 0.0 && today_x <= width, |el| {
-                let today_label_w = 44.0;
-                let today_label_x = if today_x + 6.0 + today_label_w > width - 4.0 {
-                    (today_x - today_label_w - 4.0).max(4.0)
-                } else {
-                    (today_x + 6.0).max(4.0)
-                };
+            .when(today_on_screen, |el| {
                 el.child(
                     div()
                         .id("gantt-today-label")
@@ -3427,15 +3489,19 @@ impl PlannerView {
         let summary = bar.summary;
         let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
         let milestone = bar.milestone;
+        let marker = bar.marker;
         let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
         let clip_pad = (-bar.x).max(0.0);
         let visible_w = (bar.width - clip_pad).max(0.0);
-        let inside = !unscheduled && !milestone && !summary && visible_w >= title_width.max(40.0);
+        let inside =
+            !unscheduled && !milestone && !marker && !summary && visible_w >= title_width.max(40.0);
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
-        let show_handles = !summary && !unscheduled && !milestone && hovered && !dragging;
-        let show_link_handles = !unscheduled && !dragging && (hovered || (summary && selected));
-        let bar_h = if milestone {
+        let show_handles =
+            !summary && !unscheduled && !milestone && !marker && hovered && !dragging;
+        let show_link_handles =
+            !unscheduled && !marker && !dragging && (hovered || (summary && selected));
+        let bar_h = if milestone || marker {
             MILESTONE_SIZE
         } else if summary {
             SUMMARY_BAR_H
@@ -3465,7 +3531,7 @@ impl PlannerView {
                 .absolute()
                 .left(px(bar.x))
                 .top(px(bar_top))
-                .w(px(if milestone {
+                .w(px(if milestone || marker {
                     MILESTONE_SIZE
                 } else {
                     bar.width.max(8.0)
@@ -3486,18 +3552,31 @@ impl PlannerView {
                                 .child("◆"),
                         )
                 })
-                .when(summary && !milestone, |el| {
+                .when(marker, |el| {
+                    el.bg(gpui_kit::transparent_white())
+                        .border_0()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_lg()
+                                .line_height(gpui_kit::relative(1.))
+                                .text_color(muted_fg)
+                                .child("◇"),
+                        )
+                })
+                .when(summary && !milestone && !marker, |el| {
                     el.bg(rgb(bar.color).opacity(0.55)).rounded_sm()
                 })
-                .when(!summary && !milestone, |el| {
+                .when(!summary && !milestone && !marker, |el| {
                     el.bg(rgb(bar.color))
                         .when(hovered && !dragging, |el| el.opacity(0.92))
                 })
-                .when(unscheduled && !summary, |el| {
+                .when(unscheduled && !summary && !marker, |el| {
                     el.bg(cx.theme().muted).opacity(0.7)
                 })
                 .text_color(if summary { muted_fg } else { bar_label_fg })
-                .when(!milestone && !unscheduled, |el| {
+                .when(!milestone && !marker && !unscheduled, |el| {
                     el.border_1()
                         .border_color(if selected || (hovered && !dragging) {
                             cx.theme().primary
@@ -3520,7 +3599,7 @@ impl PlannerView {
                             .when(!summary, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.22))),
                     )
                 })
-                .when(!milestone, |el| {
+                .when(!milestone && !marker, |el| {
                     el.child(
                         div()
                             .pl(px(label_pad + clip_pad))
@@ -3690,8 +3769,22 @@ impl PlannerView {
             } else {
                 10.0
             };
-            let label_x = bar.x + bar.width + label_gap;
-            if label_x >= 0.0 {
+            let timeline_w = self.state.gantt.timeline_width.max(1.0);
+            let painted_w = if milestone || marker {
+                MILESTONE_SIZE
+            } else {
+                bar.width.max(8.0)
+            };
+            let estimated = title_width.max(24.0);
+            let right_x = bar.x + painted_w + label_gap;
+            let left_x = bar.x - estimated - 6.0;
+            let label_x = if right_x + estimated > timeline_w - 4.0 && left_x >= 0.0 {
+                left_x
+            } else {
+                right_x.max(0.0)
+            };
+            let max_w = (timeline_w - label_x - 4.0).max(24.0);
+            if (0.0..timeline_w).contains(&label_x) {
                 items.push(
                     div()
                         .id(("gantt-bar-label", id as u64))
@@ -3700,9 +3793,11 @@ impl PlannerView {
                         .left(px(label_x))
                         .top(px(((ROW_HEIGHT - 16.0) / 2.0).max(2.0)))
                         .h(px(16.))
+                        .max_w(px(max_w))
                         .flex()
                         .items_center()
-                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .truncate()
                         .text_xs()
                         .text_color(muted_fg)
                         .child(label.clone())
@@ -4257,16 +4352,85 @@ impl PlannerView {
             .child(Button::new(label).label(label))
     }
 
+    fn render_form_skeleton(&self, id: i64, title: String, cx: &Context<Self>) -> AnyElement {
+        let dialog_h = (self.state.gantt.viewport_h + 80.0).clamp(360.0, 900.0);
+        v_flex()
+            .id("work-item-form")
+            .debug_selector(|| "work-item-form".into())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(cx.theme().overlay)
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.form_loading = None;
+                    this.state.close_form();
+                    cx.notify();
+                }),
+            )
+            .child(
+                v_flex()
+                    .id("work-item-form-loading")
+                    .debug_selector(|| "work-item-form-loading".into())
+                    .w(px(720.))
+                    .h(px(dialog_h.min(280.0)))
+                    .bg(cx.theme().popover)
+                    .text_color(cx.theme().popover_foreground)
+                    .rounded_xl()
+                    .shadow_md()
+                    .gap_3()
+                    .p_6()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("#{id}")),
+                    )
+                    .child(div().text_lg().child(if title.is_empty() {
+                        "Opening details…".to_string()
+                    } else {
+                        title
+                    }))
+                    .child(
+                        div()
+                            .id("work-item-form-spinner")
+                            .debug_selector(|| "work-item-form-spinner".into())
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Loading fields…"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_form(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(form) = self.state.form.as_ref() else {
+        if self.state.form.is_none() {
+            if let Some((id, title)) = self.form_loading.clone() {
+                return self.render_form_skeleton(id, title, cx);
+            }
             return div().into_any_element();
-        };
+        }
+        let form = self.state.form.as_ref().expect("form");
         let title = form.title();
         let heading = form.item_title();
         let work_item_type = form.model.work_item_type.clone();
         let pages = form.model.pages.clone();
-        let system = form.model.system_controls.clone();
         let active = form.active_page;
+        let layout = crate::form::form_dialog_layout(form);
+        let dates = layout.dates;
+        let primary = layout.primary;
+        let system_rest = layout.system_rest;
+        let groups = layout.groups;
+        let extra = layout.extra;
+        let extra_count = extra.len();
+        let show_empty = form.show_empty;
+        let dirty = form.is_dirty();
+        let saving = form.saving;
         let dialog_h = (self.state.gantt.viewport_h + 80.0).clamp(360.0, 900.0);
         v_flex()
             .id("work-item-form")
@@ -4291,6 +4455,7 @@ impl PlannerView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.form_loading = None;
                     this.state.close_form();
                     cx.notify();
                 }),
@@ -4352,6 +4517,7 @@ impl PlannerView {
                                 Button::new("close-form")
                                     .label("Close")
                                     .on_click(cx.listener(|this, _, _, cx| {
+                                        this.form_loading = None;
                                         this.state.close_form();
                                         cx.notify();
                                     })),
@@ -4384,28 +4550,56 @@ impl PlannerView {
                             .py_3()
                             .overflow_y_scrollbar()
                             .gap_3()
-                            .children(system.iter().map(|control| self.render_field(control, cx)))
-                            .when(active < pages.len(), |el| {
-                                el.child(v_flex().gap_3().children(
-                                    pages[active].groups.iter().map(|group| {
-                                        v_flex()
-                                            .gap_2()
-                                            .p_3()
-                                            .rounded_md()
-                                            .bg(cx.theme().muted)
-                                            .child(
-                                                Label::new(group.label.clone())
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground),
-                                            )
-                                            .children(
-                                                group
-                                                    .controls
-                                                    .iter()
-                                                    .map(|control| self.render_field(control, cx)),
-                                            )
-                                    }),
-                                ))
+                            .children(dates.iter().map(|control| self.render_field(control, cx)))
+                            .children(primary.iter().map(|control| self.render_field(control, cx)))
+                            .children(
+                                system_rest
+                                    .iter()
+                                    .map(|control| self.render_field(control, cx)),
+                            )
+                            .children(groups.iter().map(|(label, controls)| {
+                                v_flex()
+                                    .gap_2()
+                                    .p_3()
+                                    .rounded_md()
+                                    .bg(cx.theme().muted)
+                                    .child(
+                                        Label::new(label.clone())
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
+                                    .children(
+                                        controls
+                                            .iter()
+                                            .map(|control| self.render_field(control, cx)),
+                                    )
+                            }))
+                            .when(extra_count > 0, |el| {
+                                el.child(
+                                    div()
+                                        .id("form-more-fields")
+                                        .debug_selector(|| "form-more-fields".into())
+                                        .child(
+                                            Button::new("form-more-fields-btn")
+                                                .ghost()
+                                                .label(if show_empty {
+                                                    "Hide empty fields".into()
+                                                } else {
+                                                    format!("More ({extra_count})")
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(form) = this.state.form.as_mut() {
+                                                        form.show_empty = !form.show_empty;
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .when(show_empty, |el| {
+                                    el.children(
+                                        extra.iter().map(|control| self.render_field(control, cx)),
+                                    )
+                                })
                             }),
                     )
                     .child(
@@ -4419,10 +4613,12 @@ impl PlannerView {
                                 Button::new("save-work-item")
                                     .primary()
                                     .label("Save")
+                                    .disabled(!dirty || saving)
                                     .on_click(cx.listener(|this, _, _, cx| this.save_form(cx))),
                             )
                             .child(Button::new("cancel-form").label("Cancel").on_click(
                                 cx.listener(|this, _, _, cx| {
+                                    this.form_loading = None;
                                     this.state.close_form();
                                     cx.notify();
                                 }),
@@ -4763,10 +4959,20 @@ impl PlannerView {
         self.form_dates.clear();
         self.form_dates_preview = None;
         self.form_inputs_for = None;
-        self.spawn_state(cx, move |mut state| async move {
+        let title = self
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.title.clone())
+            .unwrap_or_default();
+        self.form_loading = Some((id, title));
+        if !self.spawn_state(cx, move |mut state| async move {
             let result = state.open_form(id).await;
             (state, result)
-        });
+        }) {
+            self.form_loading = None;
+        }
     }
 
     fn sync_form_inputs(&mut self, cx: &mut Context<Self>) {
@@ -4838,6 +5044,9 @@ impl PlannerView {
 
     fn save_form(&mut self, cx: &mut Context<Self>) {
         self.sync_form_inputs(cx);
+        if self.state.form.as_ref().is_none_or(|form| !form.is_dirty()) {
+            return;
+        }
         self.spawn_state(cx, |mut state| async move {
             let result = state.save_form().await;
             (state, result)
@@ -5187,6 +5396,10 @@ impl PlannerView {
         self.io_busy = busy;
     }
 
+    pub fn set_form_loading_for_test(&mut self, id: i64, title: impl Into<String>) {
+        self.form_loading = Some((id, title.into()));
+    }
+
     pub fn pending_delete_id(&self) -> Option<i64> {
         self.pending_delete.as_ref().map(|(id, _)| *id)
     }
@@ -5293,13 +5506,13 @@ impl PlannerView {
             return;
         }
         if matches!(key, "delete" | "backspace")
-            && self.state.form.is_none()
+            && !self.details_overlay()
             && let Some(id) = self.state.gantt.selected_id
         {
             self.request_delete(id, cx);
             return;
         }
-        if self.state.form.is_some() || self.popup_open() {
+        if self.details_overlay() || self.popup_open() {
             return;
         }
         if (event.keystroke.modifiers.control
@@ -5362,7 +5575,7 @@ impl PlannerView {
         }
         if key == "left" || key == "right" {
             let delta = if event.keystroke.key == "left" { -1 } else { 1 };
-            if self.state.gantt.context_menu.is_none() && self.state.form.is_none() {
+            if self.state.gantt.context_menu.is_none() && !self.details_overlay() {
                 if event.keystroke.modifiers.shift {
                     let _ = self.state.nudge(NudgeAxis::Target, delta);
                     self.schedule_nudge_flush(cx);
@@ -5848,7 +6061,7 @@ impl Render for PlannerView {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 if key == "f2"
-                    && this.state.form.is_none()
+                    && !this.details_overlay()
                     && this.inline_edit.is_none()
                     && let Some(id) = this.state.gantt.selected_id
                 {
@@ -5857,7 +6070,7 @@ impl Render for PlannerView {
                     return;
                 }
                 if key == "escape"
-                    && this.state.form.is_some()
+                    && this.details_overlay()
                     && this.form_date_picker_focused(window, cx)
                 {
                     return;
@@ -5866,7 +6079,7 @@ impl Render for PlannerView {
                     || this.inline_enter_guard
                     || this.pending_delete.is_some()
                     || (this.state.gantt.selected_id.is_some()
-                        && this.state.form.is_none()
+                        && !this.details_overlay()
                         && this.pending_delete.is_none());
                 this.on_key(event, cx);
                 if key == "escape" || (key == "enter" && consume_enter) {
@@ -5894,9 +6107,14 @@ impl Render for PlannerView {
                         v_flex()
                             .size_full()
                             .child(self.render_header(cx))
-                            .child(self.render_error_banner(cx))
                             .child(self.render_updater(cx))
-                            .child(div().flex_1().child(self.render_gantt(cx)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .relative()
+                                    .child(self.render_gantt(cx))
+                                    .child(self.render_error_banner(cx)),
+                            )
                             .when(self.state.gantt.context_menu.is_some(), |el| {
                                 el.child(
                                     div()
@@ -5925,6 +6143,17 @@ impl Render for PlannerView {
                     )
                 },
             )
+    }
+}
+
+pub fn type_abbrev(ty: &str) -> String {
+    match ty {
+        "Product Backlog Item" => "PBI".into(),
+        "User Story" => "US".into(),
+        "Test Case" => "TC".into(),
+        "Test Suite" => "TS".into(),
+        "Test Plan" => "TP".into(),
+        other => other.to_string(),
     }
 }
 

@@ -1,5 +1,7 @@
+use std::collections::HashSet;
+
 use ado_core::{
-    FormControl, FormControlKind, IdentityValue, WorkItemFormModel, WorkItemNode,
+    FormControl, FormControlKind, IdentityValue, PatchOp, WorkItemFormModel, WorkItemNode,
     all_editable_controls, build_form_patch, html_to_markdown, identity_from_field,
     is_plain_html_field, markdown_to_html, missing_required_fields,
 };
@@ -17,6 +19,7 @@ pub struct FormDraft {
     pub identity_results: Vec<IdentityValue>,
     pub active_page: usize,
     pub saving: bool,
+    pub show_empty: bool,
 }
 
 impl FormDraft {
@@ -50,7 +53,12 @@ impl FormDraft {
             identity_results: Vec::new(),
             active_page: 0,
             saving: false,
+            show_empty: false,
         }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.patch_ops().iter().any(|op| op.op != PatchOp::Test)
     }
 
     pub fn title(&self) -> String {
@@ -183,6 +191,112 @@ fn gantt_date_from_draft(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+const PRIMARY_FIELDS: [&str; 3] = ["System.Title", "System.State", "System.AssignedTo"];
+
+pub struct FormDialogLayout {
+    pub dates: Vec<FormControl>,
+    pub primary: Vec<FormControl>,
+    pub system_rest: Vec<FormControl>,
+    pub groups: Vec<(String, Vec<FormControl>)>,
+    pub extra: Vec<FormControl>,
+}
+
+pub fn control_is_empty(control: &FormControl, values: &serde_json::Map<String, Value>) -> bool {
+    let value = values.get(&control.reference_name).unwrap_or(&Value::Null);
+    match control.kind {
+        FormControlKind::Boolean => matches!(value, Value::Null),
+        FormControlKind::Identity => identity_from_field(value).is_none(),
+        FormControlKind::Integer | FormControlKind::Double => match value {
+            Value::Null => true,
+            Value::String(text) => text.trim().is_empty(),
+            _ => false,
+        },
+        _ => format_form_value(control.kind, value).trim().is_empty(),
+    }
+}
+
+fn is_date_control(control: &FormControl) -> bool {
+    control.kind == FormControlKind::DateTime
+        && (control.reference_name == ado_core::START_DATE_FIELD
+            || control.reference_name == ado_core::TARGET_DATE_FIELD)
+}
+
+fn classify_control(
+    control: &FormControl,
+    values: &serde_json::Map<String, Value>,
+    has_start: bool,
+) -> FieldSlot {
+    if control.reference_name == ado_core::TARGET_DATE_FIELD && has_start {
+        return FieldSlot::Skip;
+    }
+    if is_date_control(control) {
+        return FieldSlot::Date;
+    }
+    if PRIMARY_FIELDS.contains(&control.reference_name.as_str()) {
+        return FieldSlot::Primary;
+    }
+    if !control.required
+        && control.kind != FormControlKind::Boolean
+        && control_is_empty(control, values)
+    {
+        return FieldSlot::Extra;
+    }
+    FieldSlot::Keep
+}
+
+enum FieldSlot {
+    Date,
+    Primary,
+    Extra,
+    Keep,
+    Skip,
+}
+
+pub fn form_dialog_layout(form: &FormDraft) -> FormDialogLayout {
+    let has_start = all_controls(&form.model)
+        .iter()
+        .any(|control| control.reference_name == ado_core::START_DATE_FIELD);
+    let mut seen = HashSet::new();
+    let mut dates = Vec::new();
+    let mut primary = Vec::new();
+    let mut system_rest = Vec::new();
+    let mut extra = Vec::new();
+    let mut take = |control: &FormControl, keep: &mut Vec<FormControl>| {
+        if !control.visible || !seen.insert(control.reference_name.clone()) {
+            return;
+        }
+        match classify_control(control, &form.values, has_start) {
+            FieldSlot::Date => dates.push(control.clone()),
+            FieldSlot::Primary => primary.push(control.clone()),
+            FieldSlot::Extra => extra.push(control.clone()),
+            FieldSlot::Keep => keep.push(control.clone()),
+            FieldSlot::Skip => {}
+        }
+    };
+    for control in &form.model.system_controls {
+        take(control, &mut system_rest);
+    }
+    let mut groups = Vec::new();
+    if let Some(page) = form.model.pages.get(form.active_page) {
+        for group in &page.groups {
+            let mut kept = Vec::new();
+            for control in &group.controls {
+                take(control, &mut kept);
+            }
+            if !kept.is_empty() {
+                groups.push((group.label.clone(), kept));
+            }
+        }
+    }
+    FormDialogLayout {
+        dates,
+        primary,
+        system_rest,
+        groups,
+        extra,
+    }
 }
 
 pub fn all_controls(model: &WorkItemFormModel) -> Vec<FormControl> {
@@ -521,6 +635,117 @@ mod tests {
                 .html_markdown
                 .get("System.Description")
                 .is_some_and(|md| md.to_lowercase().contains("cart"))
+        );
+    }
+
+    fn control(reference: &str, label: &str, kind: FormControlKind) -> FormControl {
+        FormControl {
+            id: reference.into(),
+            reference_name: reference.into(),
+            label: label.into(),
+            kind,
+            required: false,
+            read_only: false,
+            visible: true,
+            options: None,
+        }
+    }
+
+    #[test]
+    fn unchanged_form_is_not_dirty() {
+        let mut values = serde_json::Map::new();
+        values.insert("System.Title".into(), json!("Persist cart"));
+        let draft = FormDraft::from_model(WorkItemFormModel {
+            id: 1,
+            rev: 1,
+            work_item_type: "User Story".into(),
+            system_controls: vec![control("System.Title", "Title", FormControlKind::String)],
+            pages: Vec::new(),
+            values,
+        });
+        assert!(!draft.is_dirty());
+    }
+
+    #[test]
+    fn dialog_layout_hoists_dates_and_hides_empty_custom_fields() {
+        let mut values = serde_json::Map::new();
+        values.insert("System.Title".into(), json!("Persist cart"));
+        values.insert("System.State".into(), json!("New"));
+        values.insert(
+            ado_core::START_DATE_FIELD.into(),
+            json!("2026-07-06T00:00:00Z"),
+        );
+        values.insert(
+            ado_core::TARGET_DATE_FIELD.into(),
+            json!("2026-07-20T00:00:00Z"),
+        );
+        let draft = FormDraft::from_model(WorkItemFormModel {
+            id: 1,
+            rev: 1,
+            work_item_type: "User Story".into(),
+            system_controls: vec![
+                control("System.Title", "Title", FormControlKind::String),
+                control("System.State", "State", FormControlKind::String),
+            ],
+            pages: vec![ado_core::FormPage {
+                id: "details".into(),
+                label: "Details".into(),
+                groups: vec![ado_core::FormGroup {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    controls: vec![
+                        control(
+                            "Custom.TShirtSize",
+                            "T-Shirt Size",
+                            FormControlKind::Picklist,
+                        ),
+                        control(
+                            ado_core::START_DATE_FIELD,
+                            "Start Date",
+                            FormControlKind::DateTime,
+                        ),
+                        control(
+                            ado_core::TARGET_DATE_FIELD,
+                            "Target Date",
+                            FormControlKind::DateTime,
+                        ),
+                        control(
+                            "Microsoft.VSTS.Scheduling.StoryPoints",
+                            "Story Points",
+                            FormControlKind::Double,
+                        ),
+                    ],
+                }],
+            }],
+            values,
+        });
+        let layout = form_dialog_layout(&draft);
+        assert_eq!(layout.dates.len(), 1);
+        assert_eq!(layout.dates[0].reference_name, ado_core::START_DATE_FIELD);
+        assert!(
+            layout
+                .primary
+                .iter()
+                .any(|control| control.reference_name == "System.Title")
+        );
+        assert!(
+            layout
+                .extra
+                .iter()
+                .any(|control| control.reference_name == "Custom.TShirtSize"),
+            "empty custom fields belong under More: {:?}",
+            layout
+                .extra
+                .iter()
+                .map(|c| &c.reference_name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !layout
+                .groups
+                .iter()
+                .flat_map(|(_, controls)| controls)
+                .any(|control| control.reference_name == "Custom.TShirtSize")
         );
     }
 }
