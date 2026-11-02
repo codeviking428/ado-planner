@@ -68,6 +68,8 @@ pub enum DateSaveRole {
     Commit,
     Undo,
     Redo,
+    /// Toast Undo already updated history; persist the restored dates.
+    Restore,
 }
 
 /// Date change already applied and recorded locally; persist over HTTP next.
@@ -1197,6 +1199,7 @@ impl PlannerState {
                     self.history.redo.push(entry);
                 }
             }
+            DateSaveRole::Restore => {}
         }
     }
 
@@ -1338,9 +1341,7 @@ impl PlannerState {
         else {
             return Ok(());
         };
-        if pending.role == DateSaveRole::Commit
-            && (node.start_date != pending.after_start || node.target_date != pending.after_target)
-        {
+        if node.start_date != pending.after_start || node.target_date != pending.after_target {
             return Ok(());
         }
         if !node.has_date_fields {
@@ -1348,12 +1349,6 @@ impl PlannerState {
         }
         let start = parse_iso_date(pending.after_start.as_deref());
         let target = parse_iso_date(pending.after_target.as_deref());
-        if pending.role != DateSaveRole::Commit
-            && let Some(live) = self.nodes.iter_mut().find(|node| node.id == pending.id)
-        {
-            live.start_date = pending.after_start.clone();
-            live.target_date = pending.after_target.clone();
-        }
         match self
             .client
             .patch_work_item_with_rev_retry(
@@ -2147,11 +2142,94 @@ impl PlannerState {
         result
     }
 
+    /// Apply a toast RestoreDates locally and queue a persist. Does not replace
+    /// the whole planner state, so a later drag on another item is kept.
+    pub fn apply_toast_restore_dates(&mut self, action: UndoAction) -> Option<PendingDateSave> {
+        let UndoAction::RestoreDates {
+            id,
+            start_date,
+            target_date,
+            ..
+        } = &action
+        else {
+            return None;
+        };
+        let id = *id;
+        let start_date = start_date.clone();
+        let target_date = target_date.clone();
+        let previous = self.nodes.iter().find(|node| node.id == id).cloned()?;
+        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
+            node.start_date = start_date.clone();
+            node.target_date = target_date.clone();
+        }
+        self.discard_history_for_undo(&action);
+        self.toasts
+            .items
+            .retain(|toast| toast.undo.as_ref() != Some(&action));
+        Some(PendingDateSave {
+            id,
+            start: parse_iso_date(start_date.as_deref()),
+            target: parse_iso_date(target_date.as_deref()),
+            after_start: start_date,
+            after_target: target_date,
+            rev: previous.rev,
+            previous,
+            role: DateSaveRole::Restore,
+        })
+    }
+
+    /// Copy only the work items touched by a toast Undo so live camera/date
+    /// edits on other rows survive the HTTP round-trip.
+    pub fn merge_undo_action(&mut self, working: &PlannerState, action: &UndoAction) {
+        let ids: Vec<i64> = match action {
+            UndoAction::RestoreDates { id, .. } => vec![*id],
+            UndoAction::RemoveLink {
+                successor_id,
+                predecessor_id,
+            }
+            | UndoAction::RestoreLink {
+                successor_id,
+                predecessor_id,
+            } => vec![*successor_id, *predecessor_id],
+        };
+        for id in ids {
+            let Some(src) = working.nodes.iter().find(|node| node.id == id) else {
+                continue;
+            };
+            if let Some(dst) = self.nodes.iter_mut().find(|node| node.id == id) {
+                dst.predecessors = src.predecessors.clone();
+                dst.start_date = src.start_date.clone();
+                dst.target_date = src.target_date.clone();
+                dst.rev = src.rev;
+            }
+        }
+        self.discard_history_for_undo(action);
+        self.persist_hierarchy_cache();
+        if let Some(msg) = working.toasts.last_error_message() {
+            self.toasts.push(ToastKind::Error, msg.to_string());
+        }
+    }
+
     fn discard_history_for_undo(&mut self, action: &UndoAction) {
         match action {
-            UndoAction::RestoreDates { id, .. } => {
-                if let Some(index) = self.history.undo.iter().rposition(|entry| {
-                    matches!(entry, HistoryEntry::Dates { id: entry_id, .. } if *entry_id == *id)
+            UndoAction::RestoreDates {
+                id,
+                start_date,
+                target_date,
+                ..
+            } => {
+                if let Some(index) = self.history.undo.iter().position(|entry| {
+                    matches!(
+                        entry,
+                        HistoryEntry::Dates {
+                            id: entry_id,
+                            before_start,
+                            before_target,
+                            ..
+                        } if *entry_id == *id
+                            && before_start == start_date
+                            && before_target == target_date
+                    )
                 }) {
                     self.history.undo.remove(index);
                 }

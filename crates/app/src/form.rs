@@ -96,6 +96,29 @@ impl FormDraft {
         Ok(())
     }
 
+    /// Write Start/Target from a range picker. A missing side is left as-is
+    /// unless both sides are empty (the user cleared the range).
+    pub fn set_range_dates(&mut self, start: Option<String>, end: Option<String>) {
+        match (start, end) {
+            (None, None) => {
+                self.values
+                    .insert(ado_core::START_DATE_FIELD.into(), Value::Null);
+                self.values
+                    .insert(ado_core::TARGET_DATE_FIELD.into(), Value::Null);
+            }
+            (start, end) => {
+                if let Some(start) = start {
+                    self.values
+                        .insert(ado_core::START_DATE_FIELD.into(), json!(start));
+                }
+                if let Some(end) = end {
+                    self.values
+                        .insert(ado_core::TARGET_DATE_FIELD.into(), json!(end));
+                }
+            }
+        }
+    }
+
     pub fn patch_ops(&self) -> Vec<ado_core::JsonPatchOp> {
         let editable: Vec<_> = all_editable_controls(&self.model)
             .into_iter()
@@ -389,6 +412,46 @@ mod tests {
         assert_eq!(nodes[0].rev, 2);
         assert!(nodes[0].start_date.is_none());
         assert!(nodes[0].target_date.is_none());
+    }
+
+    #[test]
+    fn range_picker_start_only_leaves_target() {
+        let mut values = serde_json::Map::new();
+        values.insert(
+            ado_core::START_DATE_FIELD.into(),
+            json!("2026-07-06T00:00:00Z"),
+        );
+        values.insert(
+            ado_core::TARGET_DATE_FIELD.into(),
+            json!("2026-07-20T00:00:00Z"),
+        );
+        let mut draft = FormDraft::from_model(WorkItemFormModel {
+            id: 1,
+            rev: 1,
+            work_item_type: "User Story".into(),
+            system_controls: Vec::new(),
+            pages: Vec::new(),
+            values,
+        });
+        draft.set_range_dates(Some("2026-08-10T00:00:00Z".into()), None);
+        assert_eq!(
+            draft.values.get(ado_core::START_DATE_FIELD),
+            Some(&json!("2026-08-10T00:00:00Z"))
+        );
+        assert_eq!(
+            draft.values.get(ado_core::TARGET_DATE_FIELD),
+            Some(&json!("2026-07-20T00:00:00Z")),
+            "picking only Start must not clear Target Date"
+        );
+        draft.set_range_dates(None, None);
+        assert_eq!(
+            draft.values.get(ado_core::START_DATE_FIELD),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            draft.values.get(ado_core::TARGET_DATE_FIELD),
+            Some(&Value::Null)
+        );
     }
 
     #[test]

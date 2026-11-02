@@ -313,6 +313,42 @@ async fn failed_undo_revert_keeps_the_sibling_undo_entry() {
 }
 
 #[tokio::test]
+async fn queued_undo_persist_skips_when_live_dates_moved() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let original_start = node.start_date.clone();
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 2.0);
+    let pending = state.commit_date_gesture_now().expect("drag");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist drag");
+    let pending_undo = state.undo_dates_now().expect("undo");
+    if let Some(live) = state.nodes.iter_mut().find(|n| n.id == node.id) {
+        live.start_date = Some("2026-09-01T00:00:00Z".into());
+        live.target_date = Some("2026-09-10T00:00:00Z".into());
+    }
+    state
+        .persist_pending_dates(pending_undo)
+        .await
+        .expect("stale undo persist is a no-op");
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(
+        live.start_date.as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "a queued undo must not overwrite a newer local edit"
+    );
+    assert_ne!(live.start_date, original_start);
+}
+
+#[tokio::test]
 async fn end_handle_drop_records_undo_before_the_patch_returns() {
     let (_mock, mut state, _dir) = signed_in().await;
     let node = state

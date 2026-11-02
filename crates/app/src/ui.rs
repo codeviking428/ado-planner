@@ -46,7 +46,7 @@ use crate::gantt::{
 };
 use crate::paths::AppPaths;
 use crate::state::{DateSaveRole, PendingDateSave, PlannerState};
-use crate::toasts::ToastKind;
+use crate::toasts::{ToastKind, UndoAction};
 
 actions!(
     ado_planner,
@@ -832,12 +832,7 @@ impl PlannerView {
                     .when_some(undo.clone(), |el, action| {
                         el.child(Button::new(("undo-toast", id)).label("Undo").on_click(
                             cx.listener(move |this, _, _, cx| {
-                                this.state.toasts.dismiss(id);
-                                let action = action.clone();
-                                this.spawn_state(cx, move |mut state| async move {
-                                    let result = state.apply_undo(action).await;
-                                    (state, result)
-                                });
+                                this.apply_toast_undo(id, action.clone(), cx);
                             }),
                         ))
                     })
@@ -850,6 +845,45 @@ impl PlannerView {
                             })),
                     )
             }))
+    }
+
+    fn apply_toast_undo(&mut self, toast_id: u64, action: UndoAction, cx: &mut Context<Self>) {
+        if matches!(action, UndoAction::RestoreDates { .. }) {
+            if let Some(pending) = self.state.apply_toast_restore_dates(action) {
+                self.state.toasts.dismiss(toast_id);
+                self.enqueue_date_save(cx, pending);
+            }
+            cx.notify();
+            return;
+        }
+        self.state.toasts.dismiss(toast_id);
+        let runtime = self.state.runtime.clone();
+        let mut working = self.state.clone();
+        let action_clone = action.clone();
+        let rx = runtime.spawn_result(async move {
+            let result = working.apply_undo(action_clone).await;
+            (working, result)
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok((working, Ok(()))) => {
+                        this.state.merge_undo_action(&working, &action);
+                    }
+                    Ok((working, Err(err))) => {
+                        if let Some(msg) = working.toasts.last_error_message() {
+                            this.state.toasts.push(ToastKind::Error, msg.to_string());
+                        }
+                        tracing::warn!("toast undo failed: {err}");
+                    }
+                    Err(_) => tracing::warn!("toast undo cancelled"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn undo_last(&mut self, cx: &mut Context<Self>) {
@@ -3840,18 +3874,9 @@ impl PlannerView {
                         .insert(reference.clone(), serde_json::Value::Null);
                 }
                 PickerDate::Range(start, end) => {
-                    form.values.insert(
-                        ado_core::START_DATE_FIELD.into(),
-                        start
-                            .and_then(naive_to_jiff)
-                            .map(|date| serde_json::json!(iso_date_only(date)))
-                            .unwrap_or(serde_json::Value::Null),
-                    );
-                    form.values.insert(
-                        ado_core::TARGET_DATE_FIELD.into(),
-                        end.and_then(naive_to_jiff)
-                            .map(|date| serde_json::json!(iso_date_only(date)))
-                            .unwrap_or(serde_json::Value::Null),
+                    form.set_range_dates(
+                        start.and_then(naive_to_jiff).map(iso_date_only),
+                        end.and_then(naive_to_jiff).map(iso_date_only),
                     );
                 }
             }
@@ -3917,10 +3942,7 @@ impl PlannerView {
             let Some(live) = self.state.nodes.iter().find(|node| node.id == pending.id) else {
                 continue;
             };
-            if pending.role == DateSaveRole::Commit
-                && (live.start_date != pending.after_start
-                    || live.target_date != pending.after_target)
-            {
+            if live.start_date != pending.after_start || live.target_date != pending.after_target {
                 continue;
             }
             pending.rev = live.rev;
@@ -3954,21 +3976,38 @@ impl PlannerView {
                     });
                     match result {
                         Ok(()) => {
-                            if let Some(rev) = working
-                                .nodes
-                                .iter()
-                                .find(|node| node.id == id)
-                                .map(|n| n.rev)
-                                && let Some(live) =
-                                    this.state.nodes.iter_mut().find(|node| node.id == id)
+                            if still_after {
+                                if let Some(rev) = working
+                                    .nodes
+                                    .iter()
+                                    .find(|node| node.id == id)
+                                    .map(|n| n.rev)
+                                    && let Some(live) =
+                                        this.state.nodes.iter_mut().find(|node| node.id == id)
+                                {
+                                    live.rev = rev;
+                                }
+                                if role == DateSaveRole::Commit
+                                    && let Some(msg) = working.toasts.last_message()
+                                {
+                                    this.state.toasts.push(ToastKind::Success, msg.to_string());
+                                }
+                            } else if let Some(live) =
+                                this.state.nodes.iter().find(|node| node.id == id).cloned()
                             {
-                                live.rev = rev;
-                            }
-                            if still_after
-                                && role == DateSaveRole::Commit
-                                && let Some(msg) = working.toasts.last_message()
-                            {
-                                this.state.toasts.push(ToastKind::Success, msg.to_string());
+                                this.enqueue_date_save(
+                                    cx,
+                                    PendingDateSave {
+                                        id,
+                                        start: parse_iso_date(live.start_date.as_deref()),
+                                        target: parse_iso_date(live.target_date.as_deref()),
+                                        after_start: live.start_date.clone(),
+                                        after_target: live.target_date.clone(),
+                                        rev: live.rev,
+                                        previous: live,
+                                        role: DateSaveRole::Commit,
+                                    },
+                                );
                             }
                         }
                         Err(err) => {

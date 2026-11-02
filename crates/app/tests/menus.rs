@@ -1,7 +1,8 @@
 use ado_planner::gantt::ContextTarget;
 use ado_planner::paths::AppPaths;
+use ado_planner::state::DateSaveRole;
 use ado_planner::state::PlannerState;
-use ado_planner::toasts::UndoAction;
+use ado_planner::toasts::{HistoryEntry, UndoAction};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 
 async fn signed_in() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
@@ -89,6 +90,57 @@ async fn clear_dates_has_undo() {
     state.undo_clear_dates(undo).await.expect("undo");
     let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
     assert_eq!(restored.start_date, original);
+}
+
+#[tokio::test]
+async fn toast_undo_keeps_a_later_dates_history_entry() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let original_start = node.start_date.clone();
+    let original_target = node.target_date.clone();
+    state.clear_dates(node.id).await.expect("clear");
+    let undo = state
+        .toasts
+        .items
+        .iter()
+        .rev()
+        .find_map(|t| t.undo.clone())
+        .expect("toast undo");
+    state.history.undo.push(HistoryEntry::Dates {
+        id: node.id,
+        before_start: None,
+        before_target: None,
+        after_start: Some("2026-09-01T00:00:00Z".into()),
+        after_target: Some("2026-09-10T00:00:00Z".into()),
+    });
+    let later_len = state.history.undo.len();
+    let pending = state
+        .apply_toast_restore_dates(undo)
+        .expect("toast restore");
+    assert_eq!(pending.role, DateSaveRole::Restore);
+    let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(restored.start_date, original_start);
+    assert_eq!(restored.target_date, original_target);
+    assert_eq!(
+        state.history.undo.len(),
+        later_len - 1,
+        "toast undo must drop the matching clear, not the later dates edit"
+    );
+    assert!(
+        matches!(
+            state.history.undo.last(),
+            Some(HistoryEntry::Dates {
+                after_start: Some(start),
+                ..
+            }) if start == "2026-09-01T00:00:00Z"
+        ),
+        "the later dates entry must remain on the Ctrl+Z stack"
+    );
 }
 
 #[tokio::test]
