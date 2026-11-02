@@ -1076,7 +1076,10 @@ impl GanttView {
         let bar = bars
             .iter()
             .find(|bar| {
-                y >= bar.y && y < bar.y + ROW_HEIGHT && x >= bar.x && x <= bar.x + bar.width
+                y >= bar.y
+                    && y < bar.y + ROW_HEIGHT
+                    && x >= bar.x - HANDLE_WIDTH
+                    && x <= bar.x + bar.width + HANDLE_WIDTH
             })?
             .clone();
         let kind = if bar.milestone {
@@ -1367,6 +1370,20 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(&bars, 140.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::Move)
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&bars, 96.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::ResizeStart),
+            "an 8px hit area must extend outside the start edge"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&bars, 184.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "an 8px hit area must extend outside the end edge"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&bars, 91.0, 4.0).map(|(_, kind)| kind),
+            None
         );
         let milestone = BarLayout {
             milestone: true,
@@ -2078,6 +2095,51 @@ mod tests {
             arrows[0].lane_y >= pred.y.min(succ.y) + ROW_HEIGHT - 1.0,
             "horizontal run must sit in the gap between rows, got lane {}",
             arrows[0].lane_y
+        );
+    }
+
+    #[test]
+    fn resize_end_moves_the_outgoing_dependency_stub() {
+        let pred_node = node(1, None);
+        let mut succ_node = node(2, None);
+        succ_node.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ_node.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ_node.predecessors = vec![1];
+        let nodes = vec![pred_node, succ_node];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let before = gantt.layout_dependency_arrows(&bars);
+        let old_x1 = before[0].x1;
+        let pred = bars.iter().find(|bar| bar.id == 1).unwrap().clone();
+        gantt
+            .begin_gesture(
+                &pred,
+                GestureKind::ResizeEnd,
+                pred.x + pred.width,
+                &nodes,
+                &[],
+            )
+            .expect("resize end");
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        gantt.update_gesture(pred.x + pred.width + ppd * 5.0);
+        let live = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let live_arrows = gantt.layout_dependency_arrows(&live);
+        let live_pred = live.iter().find(|bar| bar.id == 1).unwrap();
+        assert_eq!(live_arrows.len(), 1);
+        assert!(
+            (live_arrows[0].x1 - (live_pred.x + live_pred.width + 12.0)).abs() < 1.0,
+            "outgoing stub must follow the live end edge, got {} vs {}",
+            live_arrows[0].x1,
+            live_pred.x + live_pred.width + 12.0
+        );
+        assert!(
+            live_arrows[0].x1 > old_x1 + 4.0,
+            "the stub must leave the old attachment point {old_x1}, got {}",
+            live_arrows[0].x1
         );
     }
 

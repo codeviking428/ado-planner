@@ -250,6 +250,21 @@ impl PlannerView {
         view
     }
 
+    /// Tests type into the org/team/assignee Search box.
+    pub fn type_scope_search(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.scope_query.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn open_scope_menu(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        self.open_filter = None;
+        self.state.gantt.context_menu = None;
+        self.open_scope = Some(id);
+        cx.notify();
+    }
+
     /// Open the inline title editor. Tests use this to assert painted width.
     pub fn open_inline_title(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let title = self
@@ -337,6 +352,18 @@ impl PlannerView {
         );
         self._subscriptions.push(pat);
         self._subscriptions.push(org);
+        let filter = cx.subscribe(&self.filter_query, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let scope = cx.subscribe(&self.scope_query, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(filter);
+        self._subscriptions.push(scope);
     }
 
     fn spawn_state<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
@@ -358,7 +385,7 @@ impl PlannerView {
                 match outcome {
                     Ok((working, result)) => {
                         let shown_at = this.loading_shown_at;
-                        this.state = working;
+                        this.state.adopt_spawned(working);
                         if let Some(at) = shown_at
                             && !this.state.hierarchy_loading
                         {
@@ -418,7 +445,7 @@ impl PlannerView {
             let _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok((working, result)) => {
-                        this.state = working;
+                        this.state.adopt_spawned(working);
                         if let Err(err) = result {
                             tracing::warn!("planner action failed: {err}");
                         }
@@ -1109,16 +1136,11 @@ impl PlannerView {
                     })),
             );
         let option_buttons: Vec<AnyElement> = if open {
-            options
-                .iter()
-                .filter(|(val, lab)| {
-                    search.is_empty()
-                        || lab.to_lowercase().contains(&search.to_lowercase())
-                        || val.to_lowercase().contains(&search.to_lowercase())
-                })
+            crate::state::PlannerState::filter_scope_options(&options, &search)
+                .into_iter()
                 .map(|(val, lab)| {
                     let val_click = val.clone();
-                    let selected = val == &current;
+                    let selected = val == current;
                     let caption = if selected {
                         format!("✓ {lab}")
                     } else {
@@ -1127,6 +1149,10 @@ impl PlannerView {
                     div()
                         .id(SharedString::from(format!("{id}-option-{val}")))
                         .when(selected, |el| el.debug_selector(|| "scope-current".into()))
+                        .when(!selected, |el| {
+                            let key = format!("{id}-option-{val}");
+                            el.debug_selector(move || key.clone())
+                        })
                         .child(
                             Button::new(SharedString::from(format!("{id}-{val}")))
                                 .label(caption)
@@ -1441,7 +1467,7 @@ impl PlannerView {
         }
         let visible = self.state.visible_nodes();
         let empty_canvas = visible.is_empty();
-        if empty_canvas {
+        if empty_canvas && !self.state.hierarchy_loading && !self.state.has_saved_gantt_view() {
             let today = jiff::Zoned::now().date();
             let today_x = self.state.gantt.today_x(today);
             let width = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
@@ -1485,17 +1511,6 @@ impl PlannerView {
                             .bg(cx.theme().muted)
                             .cursor_col_resize()
                             .hover(|el| el.bg(cx.theme().primary))
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .id("gantt-splitter-grip")
-                                    .debug_selector(|| "gantt-splitter-grip".into())
-                                    .w(px(2.))
-                                    .h(px(28.))
-                                    .rounded_full()
-                                    .bg(cx.theme().muted_foreground),
-                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -2364,7 +2379,7 @@ impl PlannerView {
                                     .bg(weekend)
                             }),
                     )
-                    .children(ticks.iter().map(|tick| {
+                    .children(ticks.iter().filter(|tick| tick.x > 0.5).map(|tick| {
                         div()
                             .absolute()
                             .left(px(tick.x))
@@ -2518,36 +2533,6 @@ impl PlannerView {
                                 .bg(cx.theme().primary)
                         })
                     })
-                    .children({
-                        self.state.gantt.gesture.as_ref().and_then(|gesture| {
-                            if gesture.kind == GestureKind::Link {
-                                return None;
-                            }
-                            let text = crate::gantt::GanttView::drag_preview_text(gesture);
-                            let x = gesture.live_x.max(4.0);
-                            let y = bars
-                                .iter()
-                                .find(|bar| bar.id == gesture.id)
-                                .map(|bar| (bar.y - 22.0).max(2.0))
-                                .unwrap_or(4.0);
-                            Some(
-                                div()
-                                    .id("gantt-drag-preview")
-                                    .debug_selector(|| "gantt-drag-preview".into())
-                                    .absolute()
-                                    .left(px(x))
-                                    .top(px(y))
-                                    .px_2()
-                                    .py(px(2.))
-                                    .rounded_sm()
-                                    .bg(cx.theme().popover)
-                                    .text_color(cx.theme().popover_foreground)
-                                    .text_xs()
-                                    .shadow_md()
-                                    .child(text),
-                            )
-                        })
-                    })
                     .when(
                         bars.is_empty()
                             && !self.state.nodes.is_empty()
@@ -2635,6 +2620,47 @@ impl PlannerView {
                         .text_color(today_color)
                         .child("Today"),
                 )
+            })
+            .children({
+                self.state.gantt.gesture.as_ref().and_then(|gesture| {
+                    if gesture.kind == GestureKind::Link {
+                        return None;
+                    }
+                    let text = crate::gantt::GanttView::drag_preview_text(gesture);
+                    let bar = bars.iter().find(|bar| bar.id == gesture.id);
+                    let (x, y) = match bar {
+                        Some(bar) => {
+                            let x = match gesture.kind {
+                                GestureKind::ResizeEnd => bar.x + bar.width + 6.0,
+                                GestureKind::ResizeStart => (bar.x - 8.0).max(4.0),
+                                _ => bar.x.max(4.0),
+                            };
+                            let y = (TIMELINE_HEADER_H + bar.y - 24.0).max(2.0);
+                            (x, y)
+                        }
+                        None => (gesture.live_x.max(4.0), 4.0),
+                    };
+                    Some(
+                        div()
+                            .id("gantt-drag-preview")
+                            .debug_selector(|| "gantt-drag-preview".into())
+                            .occlude()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y))
+                            .px_2()
+                            .py(px(3.))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().popover)
+                            .text_color(cx.theme().popover_foreground)
+                            .text_xs()
+                            .whitespace_nowrap()
+                            .shadow_md()
+                            .child(text),
+                    )
+                })
             })
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.state.gantt.gesture.is_some() {
@@ -2779,30 +2805,6 @@ impl PlannerView {
                             }),
                     )
                 })
-                .when(show_handles, |el| {
-                    el.child(
-                        div()
-                            .id(("resize-start", id as u64))
-                            .debug_selector(move || format!("gantt-resize-handle-{id}-start"))
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .h_full()
-                            .w(px(HANDLE_WIDTH))
-                            .bg(cx.theme().primary),
-                    )
-                    .child(
-                        div()
-                            .id(("resize-end", id as u64))
-                            .debug_selector(move || format!("gantt-resize-handle-{id}-end"))
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .h_full()
-                            .w(px(HANDLE_WIDTH))
-                            .bg(cx.theme().primary),
-                    )
-                })
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.set_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
@@ -2903,6 +2905,57 @@ impl PlannerView {
                 );
             }
         }
+        if show_handles {
+            for (name, handle_id, handle_x, kind) in [
+                (
+                    "start",
+                    "resize-start",
+                    bar.x - HANDLE_WIDTH,
+                    GestureKind::ResizeStart,
+                ),
+                (
+                    "end",
+                    "resize-end",
+                    bar.x + bar.width,
+                    GestureKind::ResizeEnd,
+                ),
+            ] {
+                let selector = format!("gantt-resize-handle-{id}-{name}");
+                let origin = if kind == GestureKind::ResizeStart {
+                    bar.x
+                } else {
+                    bar.x + bar.width
+                };
+                items.push(
+                    div()
+                        .id((handle_id, id as u64))
+                        .debug_selector(move || selector.clone())
+                        .absolute()
+                        .left(px(handle_x))
+                        .top(px(bar_top))
+                        .h(px(bar_h))
+                        .w(px(HANDLE_WIDTH))
+                        .bg(cx.theme().primary)
+                        .cursor_col_resize()
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.set_hovered(Some(id), cx);
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.dismiss_overlays();
+                                this.state.gantt.selected_id = Some(id);
+                                let _ = this.state.begin_bar_gesture(id, kind, origin);
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
         if !inside {
             let label = bar.title.clone();
             let label_gap = if show_link_handles {
@@ -2962,7 +3015,6 @@ impl PlannerView {
         let max_x = arrow.x1.max(arrow.x2).max(arrow.x_head) + 18.0;
         let min_y = arrow.y1.min(arrow.y2).min(arrow.lane_y) - 10.0;
         let max_y = arrow.y1.max(arrow.y2).max(arrow.lane_y) + 10.0;
-        let selector = format!("gantt-dep-arrow-{}-{}", arrow.from_id, arrow.to_id);
         let from_id = arrow.from_id;
         let to_id = arrow.to_id;
         let v1 = (arrow.lane_y - arrow.y1).abs().max(2.0);
@@ -2970,6 +3022,7 @@ impl PlannerView {
         let v2 = (arrow.y2 - arrow.lane_y).abs().max(2.0);
         let stub_h = (arrow.x_head - arrow.x2).abs().max(2.0);
         div()
+            .id(SharedString::from(format!("gantt-dep-{from_id}-{to_id}")))
             .absolute()
             .left(px(min_x))
             .top(px(min_y))
@@ -2983,7 +3036,7 @@ impl PlannerView {
                 color,
                 from_id,
                 to_id,
-                None,
+                "out",
                 cx,
             ))
             .child(self.arrow_segment(
@@ -2994,7 +3047,7 @@ impl PlannerView {
                 color,
                 from_id,
                 to_id,
-                Some(selector),
+                "h",
                 cx,
             ))
             .child(self.arrow_segment(
@@ -3005,7 +3058,7 @@ impl PlannerView {
                 color,
                 from_id,
                 to_id,
-                None,
+                "inv",
                 cx,
             ))
             .child(self.arrow_segment(
@@ -3016,7 +3069,7 @@ impl PlannerView {
                 color,
                 from_id,
                 to_id,
-                None,
+                "stub",
                 cx,
             ))
             .child(self.arrow_head_hit(arrow, min_x, min_y, color, cx))
@@ -3033,15 +3086,17 @@ impl PlannerView {
         color: gpui_kit::Hsla,
         from_id: i64,
         to_id: i64,
-        selector: Option<String>,
+        role: &'static str,
         cx: &Context<Self>,
     ) -> AnyElement {
         const HIT: f32 = 8.0;
         let hit_w = width.max(HIT);
         let hit_h = height.max(HIT);
-        let segment_id = selector
-            .clone()
-            .unwrap_or_else(|| format!("gantt-dep-seg-{from_id}-{to_id}-{left:.0}-{top:.0}"));
+        let segment_id = if role == "h" {
+            format!("gantt-dep-arrow-{from_id}-{to_id}")
+        } else {
+            format!("gantt-dep-{role}-{from_id}-{to_id}")
+        };
         let el = div()
             .id(SharedString::from(segment_id.clone()))
             .debug_selector(move || segment_id.clone())

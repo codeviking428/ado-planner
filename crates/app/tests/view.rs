@@ -1,6 +1,6 @@
 //! Rendered `PlannerView` coverage for popups, the Gantt header, and the form.
 
-use ado_core::SessionInfo;
+use ado_core::{IdentityValue, SessionInfo};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, MIN_TIMELINE_WIDTH, ROW_HEIGHT,
@@ -1960,15 +1960,19 @@ fn few_rows_fill_the_timeline_with_grid_shading(cx: &mut gpui_kit::TestAppContex
 }
 
 #[gpui_kit::test]
-fn splitter_shows_a_resize_grip(cx: &mut gpui_kit::TestAppContext) {
+fn splitter_has_no_white_tick_on_the_divider(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let state = idle_state(&dir);
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
     assert!(
-        cx.debug_bounds("gantt-splitter-grip").is_some(),
-        "the tree splitter must show a visible resize grip"
+        cx.debug_bounds("gantt-splitter").is_some(),
+        "the tree splitter hit target must still paint"
+    );
+    assert!(
+        cx.debug_bounds("gantt-splitter-grip").is_none(),
+        "the list/timeline divider must not draw a white tick"
     );
 }
 
@@ -2115,6 +2119,21 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         (f32::from(link.size.width) - f32::from(resize.size.width)).abs() > 4.0,
         "link handles must not share the resize-handle size"
     );
+    let bar = cx.debug_bounds("gantt-bar-2").expect("hovered bar");
+    let start = cx
+        .debug_bounds("gantt-resize-handle-2-start")
+        .expect("hovered leaf bar must show a start resize handle");
+    assert!(
+        f32::from(start.origin.x) < f32::from(bar.origin.x) - 1.0,
+        "start resize grip must extend outside the bar, handle x {} vs bar x {}",
+        f32::from(start.origin.x),
+        f32::from(bar.origin.x)
+    );
+    assert!(
+        f32::from(resize.origin.x) + 1.0
+            >= f32::from(bar.origin.x) + f32::from(bar.size.width) - 1.0,
+        "end resize grip must sit on or outside the bar's right edge"
+    );
 }
 
 #[gpui_kit::test]
@@ -2152,4 +2171,77 @@ fn offscreen_bar_title_stays_on_the_timeline(cx: &mut gpui_kit::TestAppContext) 
             "outside title must not clip from the left (got {label_x}, timeline {left})"
         );
     }
+}
+
+#[gpui_kit::test]
+fn assignee_search_filters_members_by_name(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.members = vec![
+        IdentityValue {
+            display_name: "Alan Turing".into(),
+            unique_name: "alan@contoso.com".into(),
+            id: None,
+        },
+        IdentityValue {
+            display_name: "Ada Lovelace".into(),
+            unique_name: "ada@contoso.com".into(),
+            id: None,
+        },
+    ];
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let trigger = cx
+        .debug_bounds("assignee-trigger")
+        .expect("assignee trigger");
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("assignee-option-alan@contoso.com")
+            .is_some(),
+        "Alan should list before searching"
+    );
+    assert!(
+        cx.debug_bounds("assignee-option-ada@contoso.com").is_some(),
+        "Ada should list before searching"
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_scope_search("Alan", window, cx);
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("assignee-option-alan@contoso.com")
+            .is_some(),
+        "searching Alan must keep Alan Turing"
+    );
+    assert!(
+        cx.debug_bounds("assignee-option-ada@contoso.com").is_none(),
+        "searching Alan must hide Ada Lovelace"
+    );
+}
+
+#[gpui_kit::test]
+fn team_switch_loading_does_not_reset_the_timeline(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 5, 1).unwrap();
+    state.gantt.scroll_x = 96.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, _| {
+        view.state.begin_team_switch("Shop".into());
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.origin,
+            Date::new(2026, 5, 1).unwrap(),
+            "an in-flight team switch must not recentre the timeline"
+        );
+        assert_eq!(view.state.gantt.scroll_x, 96.0);
+    });
 }

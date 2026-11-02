@@ -518,6 +518,68 @@ async fn switching_teams_restores_gantt_scroll() {
 }
 
 #[tokio::test]
+async fn switching_teams_through_a_spawn_clone_restores_scroll() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let home = state.prefs.planner.team.clone();
+    state.gantt.viewport_h = 120.0;
+    state.gantt.scroll_y = 80.0;
+    state.gantt.scroll_x = 48.0;
+    let origin = state.gantt.origin;
+    state.begin_team_switch("Growth".into());
+    let mut working = state.clone();
+    working
+        .set_team("Growth".into())
+        .await
+        .expect("switch to Growth");
+    state.adopt_spawned(working);
+    state.begin_team_switch(home.clone());
+    let mut working = state.clone();
+    working.set_team(home).await.expect("switch home");
+    state.adopt_spawned(working);
+    assert_eq!(state.gantt.scroll_y, 80.0);
+    assert_eq!(state.gantt.scroll_x, 48.0);
+    assert_eq!(state.gantt.origin, origin);
+}
+
+#[tokio::test]
+async fn undo_dates_pushes_a_named_toast() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let id = 1012;
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == id) {
+        node.title = "Cart UI".into();
+    }
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+    let _ = state.begin_bar_gesture(id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 2.0);
+    let pending = state.commit_date_gesture_now().expect("drag");
+    state.persist_pending_dates(pending).await.expect("persist");
+    let _ = state.undo_dates_now().expect("undo");
+    assert_eq!(
+        state.toasts.last_message(),
+        Some("Undid: Cart UI dates"),
+        "undo must toast the work item title"
+    );
+    let _ = state.redo_dates_now().expect("redo");
+    assert_eq!(
+        state.toasts.last_message(),
+        Some("Redid: Cart UI dates"),
+        "redo must toast the work item title"
+    );
+}
+
+#[test]
+fn assignee_search_matches_display_name() {
+    let options = vec![
+        ("anyone".into(), "Anyone".into()),
+        ("alan@contoso.com".into(), "Alan Turing".into()),
+        ("ada@contoso.com".into(), "Ada Lovelace".into()),
+    ];
+    let hits = PlannerState::filter_scope_options(&options, "Alan");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].1, "Alan Turing");
+}
+
+#[tokio::test]
 async fn restored_team_scroll_is_clamped_to_the_new_rows() {
     let (_mock, mut state, _dir) = signed_in().await;
     let home = state.prefs.planner.team.clone();

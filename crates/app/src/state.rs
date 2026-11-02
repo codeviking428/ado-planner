@@ -679,6 +679,32 @@ impl PlannerState {
         true
     }
 
+    pub fn has_saved_gantt_view(&self) -> bool {
+        let team = self.prefs.planner.team.as_str();
+        !team.is_empty() && self.team_views.contains_key(team)
+    }
+
+    /// Replace this state with a spawned clone. Keep live per-team Gantt
+    /// snapshots, and keep the live camera when the team did not change so a
+    /// date persist cannot wipe a pan the user made while I/O was in flight.
+    pub fn adopt_spawned(&mut self, working: PlannerState) {
+        self.save_gantt_view();
+        let live_views = std::mem::take(&mut self.team_views);
+        let live_team = self.prefs.planner.team.clone();
+        let live_snap = (!self.nodes.is_empty()).then(|| self.gantt.snapshot());
+        let keep_live_gantt = live_snap.is_some() && working.prefs.planner.team == live_team;
+        *self = working;
+        for (team, snap) in live_views {
+            self.team_views.entry(team).or_insert(snap);
+        }
+        if let Some(snap) = live_snap {
+            self.team_views.entry(live_team).or_insert(snap);
+            if keep_live_gantt {
+                self.gantt.restore(snap);
+            }
+        }
+    }
+
     /// Drop stale rows and show the new team name before the hierarchy fetch returns.
     pub fn begin_team_switch(&mut self, team: String) {
         self.save_gantt_view();
@@ -1237,13 +1263,15 @@ impl PlannerState {
             node.start_date = before_start.clone();
             node.target_date = before_target.clone();
         }
-        self.history.redo.push(HistoryEntry::Dates {
+        let entry = HistoryEntry::Dates {
             id,
             before_start: before_start.clone(),
             before_target: before_target.clone(),
             after_start,
             after_target,
-        });
+        };
+        self.history.redo.push(entry.clone());
+        self.push_history_toast(&entry, true);
         Some(PendingDateSave {
             id,
             start: parse_iso_date(before_start.as_deref()),
@@ -1274,13 +1302,15 @@ impl PlannerState {
             node.start_date = after_start.clone();
             node.target_date = after_target.clone();
         }
-        self.history.undo.push(HistoryEntry::Dates {
+        let entry = HistoryEntry::Dates {
             id,
             before_start,
             before_target,
             after_start: after_start.clone(),
             after_target: after_target.clone(),
-        });
+        };
+        self.history.undo.push(entry.clone());
+        self.push_history_toast(&entry, false);
         Some(PendingDateSave {
             id,
             start: parse_iso_date(after_start.as_deref()),
@@ -2017,6 +2047,7 @@ impl PlannerState {
         let result = self.apply_history_entry(&entry, true).await;
         self.history_recording = true;
         if result.is_ok() {
+            self.push_history_toast(&entry, true);
             self.history.redo.push(entry);
             self.toasts.items.retain(|toast| toast.undo.is_none());
         } else {
@@ -2033,6 +2064,7 @@ impl PlannerState {
         let result = self.apply_history_entry(&entry, false).await;
         self.history_recording = true;
         if result.is_ok() {
+            self.push_history_toast(&entry, false);
             self.history.undo.push(entry);
         } else {
             self.history.redo.push(entry);
@@ -2220,6 +2252,45 @@ impl PlannerState {
             .filter(|item| needle.is_empty() || item.to_lowercase().contains(&needle))
             .cloned()
             .collect()
+    }
+
+    pub fn filter_scope_options(
+        options: &[(String, String)],
+        query: &str,
+    ) -> Vec<(String, String)> {
+        let needle = query.trim().to_lowercase();
+        options
+            .iter()
+            .filter(|(value, label)| {
+                needle.is_empty()
+                    || label.to_lowercase().contains(&needle)
+                    || value.to_lowercase().contains(&needle)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn item_title(&self, id: i64) -> String {
+        self.nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.title.trim())
+            .filter(|title| !title.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("#{id}"))
+    }
+
+    pub fn push_history_toast(&mut self, entry: &HistoryEntry, is_undo: bool) {
+        let verb = if is_undo { "Undid" } else { "Redid" };
+        let message = match entry {
+            HistoryEntry::Dates { id, .. } => {
+                format!("{verb}: {} dates", self.item_title(*id))
+            }
+            HistoryEntry::Link { successor_id, .. } => {
+                format!("{verb}: {} dependency", self.item_title(*successor_id))
+            }
+        };
+        self.toasts.push(ToastKind::Success, message);
     }
 }
 
