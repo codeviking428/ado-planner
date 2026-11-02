@@ -73,11 +73,7 @@ impl GanttScale {
 
     pub fn button_label(self, zoom: f32) -> String {
         let pct = (self.pixels_per_day(zoom) / self.base_pixels_per_day()) * 100.0;
-        if (pct - 100.0).abs() < 0.5 {
-            self.label().to_string()
-        } else {
-            format!("{} ({:.0}%)", self.label(), pct)
-        }
+        format!("{} ({:.0}%)", self.label(), pct)
     }
 
     pub fn base_pixels_per_day(self) -> f32 {
@@ -281,6 +277,7 @@ pub struct VisibleRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineTick {
     pub x: f32,
+    pub date: Date,
     pub label: String,
     pub major_label: String,
     pub major: bool,
@@ -564,15 +561,8 @@ impl GanttView {
     }
 
     pub fn viewport_range_title(&self) -> String {
+        let start = self.viewport_axis_start_date();
         let width = self.timeline_width.max(1.0);
-        // Follow the first painted axis tick so a leftover previous month that
-        // the sticky header skipped is not claimed in the toolbar.
-        let start = self
-            .header_tick_labels(width)
-            .into_iter()
-            .find(|(x, _)| *x >= 0.0)
-            .map(|(x, _)| self.date_for_x(x))
-            .unwrap_or_else(|| self.viewport_start_date());
         let end = self.date_for_x((width - 1.0).max(0.0));
         match self.scale {
             GanttScale::Month if start.month() != end.month() || start.year() != end.year() => {
@@ -593,9 +583,23 @@ impl GanttView {
                     )
                 }
             }
-            GanttScale::Day => compact_date_span(start, end),
+            GanttScale::Day | GanttScale::Week => compact_date_span(start, end),
             _ => self.scale.range_title(start),
         }
+    }
+
+    /// Date of the leftover sticky tick (the clipped column at x ≤ 0), not
+    /// `date_for_x(0)` which rounds past a partial day at the left edge.
+    pub fn viewport_axis_start_date(&self) -> Date {
+        let width = self.timeline_width.max(1.0);
+        let ticks = self.timeline_ticks(width);
+        ticks
+            .iter()
+            .rev()
+            .find(|tick| tick.x <= 0.0 && !tick.label.is_empty())
+            .or_else(|| ticks.iter().find(|tick| !tick.label.is_empty()))
+            .map(|tick| tick.date)
+            .unwrap_or_else(|| self.viewport_start_date())
     }
 
     pub fn viewport_start_date(&self) -> Date {
@@ -1095,6 +1099,7 @@ impl GanttView {
             }
             ticks.push(TimelineTick {
                 x,
+                date,
                 label: self.scale.tick_label(date),
                 major_label,
                 major,
@@ -1489,7 +1494,7 @@ pub fn flatten_visible(nodes: &[WorkItemNode], collapsed: &HashSet<i64>) -> Vec<
 /// it after the parent's existing descendants (last among siblings).
 pub fn insert_index_for_child(nodes: &[WorkItemNode], parent_id: Option<i64>) -> usize {
     let Some(pid) = parent_id else {
-        return 0;
+        return nodes.len();
     };
     let Some(parent_index) = nodes.iter().position(|node| node.id == pid) else {
         return 0;
@@ -2934,6 +2939,77 @@ mod tests {
     }
 
     #[test]
+    fn day_range_title_uses_the_clipped_leftover_tick() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 10, 24).unwrap(),
+            scale: GanttScale::Day,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        // Half a day into Oct 23's leftover column: the sticky "23" sits at
+        // x = 0 while date_for_x(0) still rounds to Oct 24.
+        gantt.scroll_x = -20.0;
+        let title = gantt.viewport_range_title();
+        assert!(
+            title.starts_with("Oct 23"),
+            "toolbar must follow the clipped leftover tick, not date_for_x(0), got {title:?}"
+        );
+        assert_eq!(
+            gantt.viewport_axis_start_date(),
+            Date::new(2026, 10, 23).unwrap()
+        );
+        assert_eq!(gantt.date_for_x(0.0), Date::new(2026, 10, 24).unwrap());
+    }
+
+    #[test]
+    fn week_range_title_matches_the_first_axis_tick() {
+        let origin = Date::new(2026, 10, 12).unwrap();
+        let gantt = GanttView {
+            origin,
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let title = gantt.viewport_range_title();
+        let start = gantt.viewport_axis_start_date();
+        assert!(
+            title.starts_with(&compact_date(start)),
+            "Week toolbar must follow the first tick ({start}), got {title:?}"
+        );
+        assert!(
+            !title.starts_with("Week of"),
+            "Week toolbar must show the visible span, not 'Week of …', got {title:?}"
+        );
+    }
+
+    #[test]
+    fn week_header_shifts_the_month_off_the_today_pill() {
+        let today = Date::new(2026, 11, 2).unwrap();
+        let gantt = GanttView {
+            origin: today,
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let today_x = gantt.today_x(today);
+        let majors = gantt.header_major_labels_except(800.0, Some(today_x));
+        assert!(
+            majors.iter().any(|(_, label)| label.contains("Nov")),
+            "Week zoom must keep the Nov month label, got {majors:?}"
+        );
+        assert!(
+            majors
+                .iter()
+                .filter(|(_, label)| label.contains("Nov"))
+                .all(|(x, _)| (x - today_x).abs() >= 14.0 || *x <= 1.0),
+            "Week month label must not sit on the Today flag: {majors:?} today_x={today_x}"
+        );
+    }
+
+    #[test]
     fn zoom_steps_use_a_fixed_ratio() {
         assert!((GanttView::next_zoom(1.0, 1) - 1.25).abs() < 0.0001);
         assert!((GanttView::next_zoom(1.25, 1) - 1.5625).abs() < 0.0001);
@@ -2954,7 +3030,7 @@ mod tests {
         ];
         assert_eq!(insert_index_for_child(&nodes, Some(1)), 4);
         assert_eq!(insert_index_for_child(&nodes, Some(2)), 3);
-        assert_eq!(insert_index_for_child(&nodes, None), 0);
+        assert_eq!(insert_index_for_child(&nodes, None), 4);
         assert_eq!(insert_index_for_child(&nodes, Some(4)), 4);
     }
 

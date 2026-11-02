@@ -38,7 +38,7 @@ fn expand_collapse_and_scale_change() {
     assert_eq!(gantt.flatten(&nodes).len(), rows.len());
     gantt.scale = GanttScale::Week;
     assert_eq!(gantt.scale.label(), "Week");
-    assert_eq!(gantt.scale.button_label(1.0), "Week");
+    assert_eq!(gantt.scale.button_label(1.0), "Week (100%)");
     gantt.zoom_at(1.5, 40.0, 0.0);
     assert!(gantt.zoom > 1.0);
     assert_eq!(
@@ -988,6 +988,11 @@ async fn toast_restore_link_action_puts_the_predecessor_back() {
         .remove_dependency(1005, 1003)
         .await
         .expect("remove link");
+    let removed = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        removed.contains("Removed link on") && !removed.contains('#'),
+        "link toasts must use item titles, got {removed}"
+    );
     let action = state
         .toasts
         .items
@@ -1063,13 +1068,13 @@ async fn add_item_creates_a_work_item_on_the_team() {
     assert_eq!(state.gantt.selected_id, Some(created.id));
     let rows = state.gantt.flatten(&state.nodes);
     assert_eq!(
-        rows.first().map(|row| row.id),
+        rows.last().map(|row| row.id),
         Some(created.id),
-        "a new root must appear at the top of the list, not mid-tree"
+        "a new root must appear at the end of the list, not the top"
     );
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message.contains(&format!("Created #{} {}", created.id, created.title)),
+        message.contains(&format!("Created item on {}", created.title)),
         "create toast must name the item, got {message}"
     );
     assert!(

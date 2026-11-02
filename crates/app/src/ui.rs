@@ -10,6 +10,7 @@ use ado_core::{
 };
 use ado_session::PlannerSession;
 use chrono::Datelike;
+use gpui_kit::assets::IconName;
 use gpui_kit::base::{Popup, Selectable};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Disableable;
@@ -78,9 +79,12 @@ pub struct PlannerView {
     form_dates_preview: Option<String>,
     form_inputs_for: Option<i64>,
     form_title_focused_for: Option<i64>,
+    form_calendar_open: bool,
+    form_dates_typed_seed: String,
     form_focus: FocusHandle,
     open_filter: Option<&'static str>,
     open_scope: Option<&'static str>,
+    open_flavor: bool,
     inline_edit: Option<InlineEdit>,
     inline_dates: Option<Entity<CalendarState>>,
     /// Typed ISO text at picker open; used so a later calendar pick is not
@@ -273,9 +277,12 @@ impl PlannerView {
             form_dates_preview: None,
             form_inputs_for: None,
             form_title_focused_for: None,
+            form_calendar_open: false,
+            form_dates_typed_seed: String::new(),
             form_focus: cx.focus_handle(),
             open_filter: None,
             open_scope: None,
+            open_flavor: false,
             inline_edit: None,
             inline_dates: None,
             inline_dates_typed_seed: String::new(),
@@ -364,7 +371,10 @@ impl PlannerView {
         self.camera_anim.as_ref().map(|anim| (anim.from, anim.to))
     }
 
-    fn window_title(&self) -> String {
+    pub fn window_title(&self) -> String {
+        if !self.state.session_info.signed_in {
+            return "ADO Planner".into();
+        }
         match self.state.scope() {
             Some(scope) => format!(
                 "ADO Planner — {} / {} / {}",
@@ -400,9 +410,17 @@ impl PlannerView {
 
     pub fn open_scope_menu(&mut self, id: &'static str, cx: &mut Context<Self>) {
         self.open_filter = None;
+        self.open_flavor = false;
         self.state.gantt.context_menu = None;
         self.open_scope = Some(id);
         cx.notify();
+    }
+
+    pub fn set_open_flavor(&mut self, open: bool) {
+        self.open_filter = None;
+        self.open_scope = None;
+        self.state.gantt.context_menu = None;
+        self.open_flavor = open;
     }
 
     /// Open the inline title editor. Tests use this to assert painted width.
@@ -784,6 +802,7 @@ impl PlannerView {
     pub fn dismiss_overlays(&mut self) {
         self.open_filter = None;
         self.open_scope = None;
+        self.open_flavor = false;
         self.inline_edit = None;
         self.inline_dates = None;
         self.inline_dates_typed_seed.clear();
@@ -1081,6 +1100,7 @@ impl PlannerView {
 
     pub fn set_open_filter(&mut self, id: Option<&'static str>) {
         self.open_scope = None;
+        self.open_flavor = false;
         self.state.gantt.context_menu = None;
         self.open_filter = id;
     }
@@ -1090,7 +1110,7 @@ impl PlannerView {
     }
 
     fn popup_open(&self) -> bool {
-        self.open_filter.is_some() || self.open_scope.is_some()
+        self.open_filter.is_some() || self.open_scope.is_some() || self.open_flavor
     }
 
     fn popup_panel(
@@ -1500,25 +1520,36 @@ impl PlannerView {
             .child(
                 div()
                     .id("header-filters")
+                    .debug_selector(|| "header-filters".into())
                     .flex_shrink_0()
                     .child(self.render_filters(cx)),
             )
-            .child(self.render_flavor(cx))
             .child(
-                div()
-                    .id("header-log-out")
-                    .debug_selector(|| "header-log-out".into())
+                h_flex()
+                    .id("header-account-actions")
+                    .debug_selector(|| "header-account-actions".into())
+                    .flex_shrink_0()
+                    .gap_1()
+                    .items_center()
+                    .child(self.render_flavor(cx))
                     .child(
-                        Button::new("log-out")
-                            .ghost()
-                            .compact()
-                            .label("Log out")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.spawn_state(cx, |mut state| async move {
-                                    let result = state.logout().await;
-                                    (state, result)
-                                });
-                            })),
+                        div()
+                            .id("header-log-out")
+                            .debug_selector(|| "header-log-out".into())
+                            .child(
+                                Button::new("log-out")
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::LogOut)
+                                    .tooltip("Log out")
+                                    .tooltip_placement(Placement::Bottom)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.spawn_state(cx, |mut state| async move {
+                                            let result = state.logout().await;
+                                            (state, result)
+                                        });
+                                    })),
+                            ),
                     ),
             )
     }
@@ -1561,6 +1592,7 @@ impl PlannerView {
                     .disabled(disabled)
                     .on_click(cx.listener(move |this, event, window, cx| {
                         this.open_filter = None;
+                        this.open_flavor = false;
                         this.state.gantt.context_menu = None;
                         this.open_scope = if this.open_scope == Some(id) {
                             None
@@ -1785,6 +1817,7 @@ impl PlannerView {
                 .when(open || hidden > 0, |btn| btn.primary())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_scope = None;
+                    this.open_flavor = false;
                     this.state.gantt.context_menu = None;
                     this.open_filter = if this.open_filter == Some(id) {
                         None
@@ -1883,30 +1916,68 @@ impl PlannerView {
     }
 
     fn render_flavor(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        h_flex()
-            .id("flavor")
-            .gap_1()
-            .items_center()
+        let open = self.open_flavor;
+        let current = self.state.flavor();
+        let trigger = div()
+            .id("header-theme-trigger")
+            .debug_selector(|| "header-theme-trigger".into())
             .child(
-                div()
-                    .id("header-theme-label")
-                    .debug_selector(|| "header-theme-label".into())
-                    .child(Label::new("Theme").text_xs().text_color(muted)),
-            )
-            .children(FLAVORS.iter().map(|flavor| {
-                let selected = self.state.flavor() == *flavor;
-                let flavor = *flavor;
-                Button::new(flavor.as_str())
-                    .label(flavor.label())
-                    .selected(selected)
-                    .when(selected, |btn| btn.primary())
+                Button::new("theme")
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Palette)
+                    .tooltip("Theme")
+                    .tooltip_placement(Placement::Bottom)
+                    .selected(open)
+                    .when(open, |btn| btn.primary())
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.state.set_flavor(flavor);
-                        apply_flavor(cx, flavor);
+                        this.open_filter = None;
+                        this.open_scope = None;
+                        this.state.gantt.context_menu = None;
+                        this.open_flavor = !this.open_flavor;
                         cx.notify();
-                    }))
-            }))
+                    })),
+            );
+        let mut popup = Popup::new("flavor-popup", trigger).offset(px(12.));
+        if open {
+            popup = popup.content(
+                self.popup_panel("flavor-panel", cx)
+                    .w(px(180.))
+                    .min_w(px(160.))
+                    .min_h(px(0.))
+                    .children(FLAVORS.iter().map(|flavor| {
+                        let selected = current == *flavor;
+                        let flavor = *flavor;
+                        let caption = if selected {
+                            format!("✓ {}", flavor.label())
+                        } else {
+                            flavor.label().to_string()
+                        };
+                        div()
+                            .id(SharedString::from(format!(
+                                "flavor-option-{}",
+                                flavor.as_str()
+                            )))
+                            .debug_selector(move || format!("flavor-option-{}", flavor.as_str()))
+                            .child(
+                                Button::new(flavor.as_str())
+                                    .label(caption)
+                                    .selected(selected)
+                                    .when(selected, |btn| btn.primary())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_flavor = false;
+                                        this.state.set_flavor(flavor);
+                                        apply_flavor(cx, flavor);
+                                        cx.notify();
+                                    })),
+                            )
+                    })),
+            );
+        }
+        div()
+            .id("flavor")
+            .debug_selector(|| "flavor".into())
+            .child(popup)
     }
 
     fn render_gantt(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1974,6 +2045,7 @@ impl PlannerView {
                         h_flex()
                             .id("gantt-splitter")
                             .debug_selector(|| "gantt-splitter".into())
+                            .relative()
                             .w(px(SPLITTER_WIDTH))
                             .flex_shrink_0()
                             .h_full()
@@ -1981,7 +2053,23 @@ impl PlannerView {
                             .justify_center()
                             .cursor_col_resize()
                             .hover(|el| el.bg(cx.theme().muted.opacity(0.45)))
-                            .child(div().w(px(2.)).h_full().bg(cx.theme().border))
+                            .child(
+                                div()
+                                    .id("gantt-splitter-line")
+                                    .w(px(2.))
+                                    .h_full()
+                                    .bg(cx.theme().border),
+                            )
+                            .child(
+                                div()
+                                    .id("gantt-splitter-grip")
+                                    .debug_selector(|| "gantt-splitter-grip".into())
+                                    .absolute()
+                                    .w(px(4.))
+                                    .h(px(36.))
+                                    .rounded_full()
+                                    .bg(cx.theme().muted_foreground.opacity(0.55)),
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -2447,6 +2535,7 @@ impl PlannerView {
                                         move |this, event: &gpui_kit::ClickEvent, window, cx| {
                                             this.open_filter = None;
                                             this.open_scope = None;
+                                            this.open_flavor = false;
                                             this.state.gantt.context_menu = None;
                                             if this
                                                 .state
@@ -2588,7 +2677,6 @@ impl PlannerView {
                                     .into_any_element()
                             }))
                             .children({
-                                let start = first_row + window.len();
                                 let fill = crate::gantt::GanttView::filler_row_count(
                                     window.len(),
                                     content_h,
@@ -2601,11 +2689,7 @@ impl PlannerView {
                                         .h(px(ROW_HEIGHT))
                                         .min_h(px(ROW_HEIGHT))
                                         .flex_shrink_0()
-                                        .bg(if (start + index) % 2 == 1 {
-                                            stripe
-                                        } else {
-                                            row_bg
-                                        })
+                                        .bg(row_bg)
                                 })
                             }),
                     ),
@@ -3070,7 +3154,8 @@ impl PlannerView {
         let dragging = self.state.gantt.gesture.is_some();
         let show_weekends = self.state.gantt.scale.shows_weekend_bands();
         let weekend_w = self.state.gantt.scale.pixels_per_day(self.state.gantt.zoom);
-        let hide_today = (self.state.gantt.scale == GanttScale::Day).then_some(today_x);
+        let hide_today =
+            matches!(self.state.gantt.scale, GanttScale::Day | GanttScale::Week).then_some(today_x);
         let major_labels = self
             .state
             .gantt
@@ -3273,7 +3358,6 @@ impl PlannerView {
                                     }))
                             }))
                             .children({
-                                let start = first_row + window.len();
                                 let fill = crate::gantt::GanttView::filler_row_count(
                                     window.len(),
                                     content_h,
@@ -3286,11 +3370,7 @@ impl PlannerView {
                                         .h(px(ROW_HEIGHT))
                                         .min_h(px(ROW_HEIGHT))
                                         .flex_shrink_0()
-                                        .bg(if (start + index) % 2 == 1 {
-                                            stripe
-                                        } else {
-                                            gpui_kit::hsla(0., 0., 0., 0.)
-                                        })
+                                        .bg(gpui_kit::hsla(0., 0., 0., 0.))
                                 })
                             }),
                     )
@@ -3300,6 +3380,9 @@ impl PlannerView {
                             .into_iter()
                             .map(|arrow| self.render_dependency_arrow(&arrow, cx))
                     })
+                    .children(bars.iter().filter_map(|bar| {
+                        self.render_gantt_bar_label(bar, dragging, muted_fg, cx)
+                    }))
                     .child(
                         div()
                             .id("gantt-today")
@@ -3554,7 +3637,9 @@ impl PlannerView {
                 })
                 .when(marker, |el| {
                     el.bg(gpui_kit::transparent_white())
-                        .border_0()
+                        .border_2()
+                        .border_color(muted_fg)
+                        .rounded_md()
                         .items_center()
                         .justify_center()
                         .child(
@@ -3568,12 +3653,14 @@ impl PlannerView {
                 .when(summary && !milestone && !marker, |el| {
                     el.bg(rgb(bar.color).opacity(0.55)).rounded_sm()
                 })
-                .when(!summary && !milestone && !marker, |el| {
+                .when(!summary && !milestone && !marker && !unscheduled, |el| {
                     el.bg(rgb(bar.color))
                         .when(hovered && !dragging, |el| el.opacity(0.92))
                 })
                 .when(unscheduled && !summary && !marker, |el| {
-                    el.bg(cx.theme().muted).opacity(0.7)
+                    el.bg(cx.theme().muted.opacity(0.28))
+                        .border_2()
+                        .border_color(cx.theme().muted_foreground)
                 })
                 .text_color(if summary { muted_fg } else { bar_label_fg })
                 .when(!milestone && !marker && !unscheduled, |el| {
@@ -3762,66 +3849,108 @@ impl PlannerView {
                 );
             }
         }
-        if !inside {
-            let label = bar.title.clone();
-            let label_gap = if show_link_handles {
-                LINK_HANDLE_HIT + 10.0
-            } else {
-                10.0
-            };
-            let timeline_w = self.state.gantt.timeline_width.max(1.0);
-            let painted_w = if milestone || marker {
-                MILESTONE_SIZE
-            } else {
-                bar.width.max(8.0)
-            };
-            let estimated = title_width.max(24.0);
-            let right_x = bar.x + painted_w + label_gap;
-            let left_x = bar.x - estimated - 6.0;
-            let label_x = if right_x + estimated > timeline_w - 4.0 && left_x >= 0.0 {
-                left_x
-            } else {
-                right_x.max(0.0)
-            };
-            let max_w = (timeline_w - label_x - 4.0).max(24.0);
-            if (0.0..timeline_w).contains(&label_x) {
-                items.push(
-                    div()
-                        .id(("gantt-bar-label", id as u64))
-                        .debug_selector(move || format!("gantt-bar-label-{id}"))
-                        .absolute()
-                        .left(px(label_x))
-                        .top(px(((ROW_HEIGHT - 16.0) / 2.0).max(2.0)))
-                        .h(px(16.))
-                        .max_w(px(max_w))
-                        .flex()
-                        .items_center()
-                        .overflow_hidden()
-                        .truncate()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(label.clone())
-                        .on_click(cx.listener(
-                            move |this, event: &gpui_kit::ClickEvent, window, cx| {
-                                this.state.gantt.selected_id = Some(id);
-                                if this.inline_edit.is_none() {
-                                    window.focus(&this.form_focus, cx);
-                                }
-                                if event.click_count() >= 2 {
-                                    this.open_form(id, cx);
-                                }
-                                cx.notify();
-                            },
-                        ))
-                        .into_any_element(),
-                );
-            }
-        }
         div()
             .relative()
             .size_full()
             .children(items)
             .into_any_element()
+    }
+
+    fn bar_title_fits_inside(bar: &crate::gantt::BarLayout) -> bool {
+        let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
+        let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
+        let clip_pad = (-bar.x).max(0.0);
+        let visible_w = (bar.width - clip_pad).max(0.0);
+        !unscheduled
+            && !bar.milestone
+            && !bar.marker
+            && !bar.summary
+            && visible_w >= title_width.max(40.0)
+    }
+
+    fn bar_external_label_frame(
+        bar: &crate::gantt::BarLayout,
+        timeline_w: f32,
+        show_link_handles: bool,
+    ) -> Option<(f32, f32)> {
+        if Self::bar_title_fits_inside(bar) {
+            return None;
+        }
+        let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
+        let label_gap = if show_link_handles {
+            LINK_HANDLE_HIT + 10.0
+        } else {
+            10.0
+        };
+        let painted_w = if bar.milestone || bar.marker {
+            MILESTONE_SIZE
+        } else {
+            bar.width.max(8.0)
+        };
+        let estimated = title_width.max(24.0);
+        let right_x = bar.x + painted_w + label_gap;
+        let left_x = bar.x - estimated - 6.0;
+        let prefer_left = right_x + estimated > timeline_w - 4.0 && left_x >= 0.0;
+        let label_x = if prefer_left {
+            left_x
+        } else {
+            right_x.clamp(0.0, (timeline_w - 24.0).max(0.0))
+        };
+        if !(0.0..timeline_w).contains(&label_x) {
+            return None;
+        }
+        let max_w = (timeline_w - label_x - 4.0).max(24.0);
+        Some((label_x, max_w))
+    }
+
+    fn render_gantt_bar_label(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        dragging: bool,
+        muted_fg: gpui_kit::Hsla,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let id = bar.id;
+        let selected = self.state.gantt.selected_id == Some(id);
+        let hovered = self.state.gantt.hovered_id == Some(id);
+        let show_link_handles = bar.kind != ado_core::GanttBarKind::Unscheduled
+            && !bar.marker
+            && !dragging
+            && (hovered || (bar.summary && selected));
+        let timeline_w = self.state.gantt.timeline_width.max(1.0);
+        let (label_x, max_w) = Self::bar_external_label_frame(bar, timeline_w, show_link_handles)?;
+        let label = bar.title.clone();
+        Some(
+            div()
+                .id(("gantt-bar-label", id as u64))
+                .debug_selector(move || format!("gantt-bar-label-{id}"))
+                .absolute()
+                .left(px(label_x))
+                .top(px(bar.y + ((ROW_HEIGHT - 16.0) / 2.0).max(2.0)))
+                .h(px(16.))
+                .max_w(px(max_w))
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .truncate()
+                .text_xs()
+                .text_color(muted_fg)
+                .occlude()
+                .child(label)
+                .on_click(
+                    cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                        this.state.gantt.selected_id = Some(id);
+                        if this.inline_edit.is_none() {
+                            window.focus(&this.form_focus, cx);
+                        }
+                        if event.click_count() >= 2 {
+                            this.open_form(id, cx);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_dependency_arrow(&self, arrow: &DependencyArrow, cx: &Context<Self>) -> AnyElement {
@@ -4115,11 +4244,15 @@ impl PlannerView {
             .justify_center()
             .occlude()
             .cursor_pointer()
-            .when(self.state.form.is_none(), |el| {
-                el.tooltip(move |window, cx| {
-                    Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
-                })
-            })
+            .when(
+                self.state.form.is_none()
+                    && self.state.gantt.selected_link != Some((from_id, to_id)),
+                |el| {
+                    el.tooltip(move |window, cx| {
+                        Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
+                    })
+                },
+            )
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.state.gantt.hovered_link = if *hovered {
                     Some((from_id, to_id))
@@ -4192,11 +4325,15 @@ impl PlannerView {
             .text_xl()
             .line_height(gpui_kit::relative(1.))
             .text_color(color)
-            .when(self.state.form.is_none(), |el| {
-                el.tooltip(move |window, cx| {
-                    Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
-                })
-            })
+            .when(
+                self.state.form.is_none()
+                    && self.state.gantt.selected_link != Some((from_id, to_id)),
+                |el| {
+                    el.tooltip(move |window, cx| {
+                        Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
+                    })
+                },
+            )
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.state.gantt.hovered_link = if *hovered {
                     Some((from_id, to_id))
@@ -4431,7 +4568,7 @@ impl PlannerView {
         let extra = layout.extra;
         let extra_count = extra.len();
         let show_empty = form.show_empty;
-        let dirty = form.is_dirty();
+        let dirty = self.form_has_unsaved_edits(cx);
         let saving = form.saving;
         let dialog_h = (self.state.gantt.viewport_h + 80.0).clamp(360.0, 900.0);
         v_flex()
@@ -4768,41 +4905,57 @@ impl PlannerView {
                     });
                     let has_picker = picker.is_some();
                     let fallback = date_field_text(&id, &value, &form.values);
+                    let editor = self
+                        .form_inputs
+                        .get(&id)
+                        .cloned()
+                        .or_else(|| self.form_inputs.get(ado_core::START_DATE_FIELD).cloned())
+                        .or_else(|| self.form_inputs.get(ado_core::TARGET_DATE_FIELD).cloned());
+                    let calendar_open = self.form_calendar_open;
                     v_flex()
                         .id(SharedString::from(format!("form-date-{id}")))
                         .debug_selector(|| "form-date-picker".into())
                         .w_full()
                         .gap_2()
                         .when_some(picker, |el, state| {
-                            let date = state.read(cx).date();
-                            let from_picker = format_picker_dates(date);
-                            let display = if !from_picker.is_empty() {
-                                from_picker
-                            } else {
-                                self.form_dates_preview.clone().unwrap_or_default()
-                            };
-                            let empty = display.is_empty();
                             el.child(
                                 h_flex()
                                     .id("form-dates-value")
                                     .debug_selector(|| "form-dates-value".into())
                                     .w_full()
-                                    .min_h(px(36.))
-                                    .px_3()
+                                    .gap_2()
                                     .items_center()
-                                    .border_1()
-                                    .border_color(cx.theme().input)
-                                    .rounded(cx.theme().radius)
-                                    .bg(cx.theme().background)
-                                    .text_sm()
-                                    .when(empty, |row| row.text_color(cx.theme().muted_foreground))
-                                    .child(if empty {
-                                        DATES_RANGE_HINT.to_string()
-                                    } else {
-                                        display
-                                    }),
+                                    .when_some(editor.clone(), |row, input| {
+                                        row.child(
+                                            div()
+                                                .id("form-dates-typed")
+                                                .debug_selector(|| "form-dates-typed".into())
+                                                .flex_1()
+                                                .child(
+                                                    Input::new(&input)
+                                                        .id("form-dates-input")
+                                                        .w_full(),
+                                                ),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new("form-dates-calendar-toggle")
+                                            .ghost()
+                                            .compact()
+                                            .label(if calendar_open {
+                                                "Hide calendar"
+                                            } else {
+                                                "Calendar"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.form_calendar_open = !this.form_calendar_open;
+                                                cx.notify();
+                                            })),
+                                    ),
                             )
-                            .child(self.render_calendar_chrome(&state, cx))
+                            .when(calendar_open, |el| {
+                                el.child(self.render_calendar_chrome(&state, cx))
+                            })
                         })
                         .when(!has_picker, |el| {
                             let empty = fallback.is_empty();
@@ -4955,12 +5108,30 @@ impl PlannerView {
             .into_any_element()
     }
 
-    fn open_form(&mut self, id: i64, cx: &mut Context<Self>) {
+    pub fn open_form(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self
+            .form_loading
+            .as_ref()
+            .is_some_and(|(open, _)| *open == id)
+        {
+            return;
+        }
+        if self
+            .state
+            .form
+            .as_ref()
+            .is_some_and(|form| form.model.id == id)
+            && self.form_loading.is_none()
+        {
+            return;
+        }
         self.dismiss_overlays();
         self.form_inputs.clear();
         self.form_dates.clear();
         self.form_dates_preview = None;
         self.form_inputs_for = None;
+        self.form_calendar_open = false;
+        self.form_dates_typed_seed.clear();
         let title = self
             .state
             .nodes
@@ -4975,6 +5146,56 @@ impl PlannerView {
         }) {
             self.form_loading = None;
         }
+    }
+
+    pub fn form_is_loading(&self) -> bool {
+        self.form_loading.is_some()
+    }
+
+    pub fn toggle_form_calendar(&mut self) {
+        self.form_calendar_open = !self.form_calendar_open;
+    }
+
+    fn form_has_unsaved_edits(&self, cx: &App) -> bool {
+        let Some(form) = self.state.form.as_ref() else {
+            return false;
+        };
+        if form.is_dirty() {
+            return true;
+        }
+        for control in crate::form::all_controls(&form.model) {
+            if matches!(
+                control.kind,
+                FormControlKind::Identity | FormControlKind::Picklist | FormControlKind::Boolean
+            ) {
+                continue;
+            }
+            let Some(input) = self.form_inputs.get(&control.reference_name) else {
+                continue;
+            };
+            let live = input.read(cx).value().to_string();
+            let stored = if control.kind == FormControlKind::Html {
+                form.html_markdown
+                    .get(&control.reference_name)
+                    .cloned()
+                    .unwrap_or_default()
+            } else if control.kind == FormControlKind::DateTime {
+                date_field_text(
+                    &control.reference_name,
+                    &serde_json::Value::Null,
+                    &form.values,
+                )
+            } else {
+                form.values
+                    .get(&control.reference_name)
+                    .map(|value| crate::form::format_form_value(control.kind, value))
+                    .unwrap_or_default()
+            };
+            if live.trim() != stored.trim() {
+                return true;
+            }
+        }
+        false
     }
 
     fn sync_form_inputs(&mut self, cx: &mut Context<Self>) {
@@ -5021,25 +5242,28 @@ impl PlannerView {
             }
         }
         for (reference, picker) in &self.form_dates {
-            match picker.read(cx).date() {
-                PickerDate::Single(Some(naive)) => {
-                    if let Some(date) = naive_to_jiff(naive) {
-                        form.values
-                            .insert(reference.clone(), serde_json::json!(iso_date_only(date)));
-                    }
-                }
-                PickerDate::Single(None) => {
-                    form.values
-                        .insert(reference.clone(), serde_json::Value::Null);
-                }
-                PickerDate::Range(start, end) => {
-                    if range_picker_is_complete(PickerDate::Range(start, end)) {
-                        form.set_range_dates(
-                            start.and_then(naive_to_jiff).map(iso_date_only),
-                            end.and_then(naive_to_jiff).map(iso_date_only),
-                        );
-                    }
-                }
+            let typed = self
+                .form_inputs
+                .get(reference)
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default();
+            let date = picker.read(cx).date();
+            let Some((start, target)) =
+                dates_from_range_picker(date, &typed, &self.form_dates_typed_seed)
+            else {
+                continue;
+            };
+            if matches!(date, PickerDate::Range(_, _))
+                || reference == ado_core::START_DATE_FIELD
+                || reference == ado_core::TARGET_DATE_FIELD
+            {
+                form.set_range_dates(start.map(iso_date_only), target.map(iso_date_only));
+            } else if let Some(day) = start.or(target) {
+                form.values
+                    .insert(reference.clone(), serde_json::json!(iso_date_only(day)));
+            } else {
+                form.values
+                    .insert(reference.clone(), serde_json::Value::Null);
             }
         }
     }
@@ -5208,6 +5432,8 @@ impl PlannerView {
             self.form_inputs.clear();
             self.form_dates.clear();
             self.form_dates_preview = None;
+            self.form_dates_typed_seed.clear();
+            self.form_calendar_open = false;
             self.form_inputs_for = Some(form.model.id);
         }
         let node_dates = self
@@ -5357,6 +5583,32 @@ impl PlannerView {
                         this.form_dates_preview = pending_range_typed(date);
                         cx.notify();
                     }));
+                let initial_dates = format_date_range(
+                    start.and_then(naive_to_jiff),
+                    target.and_then(naive_to_jiff),
+                );
+                if self.form_dates_typed_seed.is_empty() {
+                    self.form_dates_typed_seed = initial_dates.clone();
+                }
+                if !self.form_inputs.contains_key(&store_key) {
+                    let seed = initial_dates.clone();
+                    let input = cx.new(|cx| {
+                        let mut state = InputState::new(window, cx);
+                        state.set_placeholder(DATES_RANGE_HINT, window, cx);
+                        state.set_value(&seed, window, cx);
+                        state
+                    });
+                    self._subscriptions.push(cx.subscribe(
+                        &input,
+                        |this, _, event: &InputEvent, cx| {
+                            if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
+                                this.sync_form_inputs(cx);
+                                cx.notify();
+                            }
+                        },
+                    ));
+                    self.form_inputs.insert(store_key.clone(), input);
+                }
                 self.form_dates.insert(store_key, picker);
                 continue;
             }
@@ -5381,6 +5633,13 @@ impl PlannerView {
                 state.set_value(initial, window, cx);
                 state
             });
+            self._subscriptions
+                .push(cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
+                        this.sync_form_inputs(cx);
+                        cx.notify();
+                    }
+                }));
             self.form_inputs
                 .insert(control.reference_name.clone(), input);
         }

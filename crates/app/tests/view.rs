@@ -94,8 +94,16 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
         "Roots/Types/States must be grouped under a Filters label"
     );
     assert!(
-        cx.debug_bounds("header-theme-label").is_some(),
-        "theme chips must be grouped under a Theme label"
+        cx.debug_bounds("header-theme-trigger").is_some(),
+        "theme must be an icon button on the header"
+    );
+    assert!(
+        cx.debug_bounds("header-account-actions").is_some(),
+        "theme and log out must sit together on the right of the header"
+    );
+    assert!(
+        cx.debug_bounds("header-log-out").is_some(),
+        "log out must stay on the header as an icon button"
     );
 }
 
@@ -2281,8 +2289,8 @@ fn splitter_has_no_white_tick_on_the_divider(cx: &mut gpui_kit::TestAppContext) 
         "the tree splitter hit target must still paint"
     );
     assert!(
-        cx.debug_bounds("gantt-splitter-grip").is_none(),
-        "the list/timeline divider must not draw a white tick"
+        cx.debug_bounds("gantt-splitter-grip").is_some(),
+        "the list/timeline divider must show a visible grip"
     );
 }
 
@@ -3249,12 +3257,21 @@ fn details_modal_reuses_the_grid_range_picker(cx: &mut gpui_kit::TestAppContext)
         }],
         values,
     }));
-    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
     assert!(
         cx.debug_bounds("form-date-picker").is_some(),
         "details dates must paint the shared range picker"
     );
+    assert!(
+        cx.debug_bounds("form-dates-typed").is_some(),
+        "details Dates must be a typeable field"
+    );
+    view.update(cx, |view, cx| {
+        view.toggle_form_calendar();
+        cx.notify();
+    });
+    draw(cx);
     assert!(
         cx.debug_bounds("gantt-dates-prev-month").is_some(),
         "details must reuse the grid picker's month arrows"
@@ -3747,5 +3764,88 @@ fn invalid_backlog_banner_does_not_replace_the_toolbar(cx: &mut gpui_kit::TestAp
     assert!(
         cx.debug_bounds("gantt-range-title").is_some(),
         "the visible range label must remain on the toolbar under the banner"
+    );
+}
+
+#[gpui_kit::test]
+fn pre_sign_in_window_title_does_not_leak_the_last_org(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.session_info.signed_in = false;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.window_title(),
+            "ADO Planner",
+            "the window title must stay generic until sign-in, got {}",
+            view.window_title()
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn second_details_click_keeps_the_loading_dialog(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| {
+        view.set_form_loading_for_test(1, "Persist cart");
+        view.set_busy_for_test(true);
+        view.open_form(1, cx);
+        assert!(
+            view.form_is_loading(),
+            "a second details click must not drop the in-flight form"
+        );
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("work-item-form-loading").is_some(),
+        "the loading dialog must stay up while the first fetch is in flight"
+    );
+}
+
+#[gpui_kit::test]
+fn theme_icon_opens_a_flavor_menu(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("header-theme-trigger").is_some(),
+        "theme must paint as an icon trigger"
+    );
+    assert!(
+        cx.debug_bounds("flavor-option-mocha").is_none(),
+        "theme names must stay in the dropdown until it opens"
+    );
+    view.update(cx, |view, cx| {
+        view.set_open_flavor(true);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("flavor-option-latte").is_some(),
+        "the theme menu must list Latte"
+    );
+    assert!(
+        cx.debug_bounds("flavor-option-mocha").is_some(),
+        "the theme menu must list Mocha"
+    );
+    let theme = cx.debug_bounds("header-theme-trigger").expect("theme");
+    let logout = cx.debug_bounds("header-log-out").expect("log out");
+    let filters = cx.debug_bounds("header-filters").expect("filters");
+    assert!(
+        f32::from(theme.origin.x) >= f32::from(filters.origin.x),
+        "theme must sit on the right of the header, got theme x {} filters x {}",
+        f32::from(theme.origin.x),
+        f32::from(filters.origin.x)
+    );
+    assert!(
+        f32::from(logout.origin.x) > f32::from(theme.origin.x),
+        "log out must sit to the right of theme"
     );
 }

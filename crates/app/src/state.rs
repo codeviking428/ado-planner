@@ -902,7 +902,8 @@ impl PlannerState {
         self.nodes = result.nodes.clone();
         self.hierarchy = Some(result);
         if !self.restore_gantt_view() {
-            self.gantt.reveal_content(&self.nodes, &self.iterations);
+            self.gantt.go_today(jiff::Zoned::now().date());
+            self.gantt.scroll_y = 0.0;
         }
     }
 
@@ -1781,7 +1782,7 @@ impl PlannerState {
                         linked: true,
                     });
                     self.toasts.push_undo(
-                        format!("Linked #{predecessor_id} → #{successor_id}"),
+                        self.link_changed_message("Added", predecessor_id, successor_id),
                         UndoAction::RemoveLink {
                             successor_id,
                             predecessor_id,
@@ -1852,7 +1853,7 @@ impl PlannerState {
                         linked: false,
                     });
                     self.toasts.push_undo(
-                        format!("Removed link #{predecessor_id} → #{successor_id}"),
+                        self.link_changed_message("Removed", predecessor_id, successor_id),
                         UndoAction::RestoreLink {
                             successor_id,
                             predecessor_id,
@@ -1935,13 +1936,15 @@ impl PlannerState {
                 let insert_at = insert_index_for_child(&self.nodes, parent_id);
                 self.nodes.insert(insert_at, node);
                 self.gantt.selected_id = Some(id);
+                let rows = self.gantt.flatten(&self.nodes);
+                self.gantt.select_relative(&rows, 0);
                 self.persist_hierarchy_cache();
                 self.record(HistoryEntry::Created {
                     id,
                     title: title.clone(),
                 });
                 self.toasts.push_undo(
-                    format!("Created #{id} {title}"),
+                    format!("Created item on {title}"),
                     UndoAction::DeleteCreated { id, title },
                 );
                 Ok(())
@@ -2697,6 +2700,14 @@ impl PlannerState {
             .unwrap_or_else(|| format!("#{id}"))
     }
 
+    fn link_changed_message(&self, verb: &str, predecessor_id: i64, successor_id: i64) -> String {
+        format!(
+            "{verb} link on {} from {}",
+            self.item_title(successor_id),
+            self.item_title(predecessor_id)
+        )
+    }
+
     pub(crate) fn undo_confirmation(&self, action: &UndoAction) -> String {
         match action {
             UndoAction::RestoreDates { id, .. } => {
@@ -2721,7 +2732,7 @@ impl PlannerState {
             }
             UndoAction::RemoveLink { successor_id, .. }
             | UndoAction::RestoreLink { successor_id, .. } => {
-                format!("Undid dependency on {}", self.item_title(*successor_id))
+                format!("Undid link on {}", self.item_title(*successor_id))
             }
         }
     }
@@ -2733,7 +2744,7 @@ impl PlannerState {
                 format!("{verb} dates on {}", self.item_title(*id))
             }
             HistoryEntry::Link { successor_id, .. } => {
-                format!("{verb} dependency on {}", self.item_title(*successor_id))
+                format!("{verb} link on {}", self.item_title(*successor_id))
             }
             HistoryEntry::Created { title, .. } => {
                 format!("{verb} create on {title}")

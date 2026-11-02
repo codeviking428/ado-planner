@@ -223,12 +223,24 @@ fn is_date_control(control: &FormControl) -> bool {
             || control.reference_name == ado_core::TARGET_DATE_FIELD)
 }
 
+fn date_value_is_empty(values: &serde_json::Map<String, Value>, reference: &str) -> bool {
+    match values.get(reference) {
+        None | Some(Value::Null) => true,
+        Some(Value::String(text)) => text.trim().is_empty(),
+        _ => false,
+    }
+}
+
 fn classify_control(
     control: &FormControl,
     values: &serde_json::Map<String, Value>,
     has_start: bool,
+    target_only: bool,
 ) -> FieldSlot {
-    if control.reference_name == ado_core::TARGET_DATE_FIELD && has_start {
+    if control.reference_name == ado_core::TARGET_DATE_FIELD && has_start && !target_only {
+        return FieldSlot::Skip;
+    }
+    if control.reference_name == ado_core::START_DATE_FIELD && target_only {
         return FieldSlot::Skip;
     }
     if is_date_control(control) {
@@ -258,6 +270,9 @@ pub fn form_dialog_layout(form: &FormDraft) -> FormDialogLayout {
     let has_start = all_controls(&form.model)
         .iter()
         .any(|control| control.reference_name == ado_core::START_DATE_FIELD);
+    let target_only = has_start
+        && date_value_is_empty(&form.values, ado_core::START_DATE_FIELD)
+        && !date_value_is_empty(&form.values, ado_core::TARGET_DATE_FIELD);
     let mut seen = HashSet::new();
     let mut dates = Vec::new();
     let mut primary = Vec::new();
@@ -267,7 +282,7 @@ pub fn form_dialog_layout(form: &FormDraft) -> FormDialogLayout {
         if !control.visible || !seen.insert(control.reference_name.clone()) {
             return;
         }
-        match classify_control(control, &form.values, has_start) {
+        match classify_control(control, &form.values, has_start, target_only) {
             FieldSlot::Date => dates.push(control.clone()),
             FieldSlot::Primary => primary.push(control.clone()),
             FieldSlot::Extra => extra.push(control.clone()),
@@ -746,6 +761,55 @@ mod tests {
                 .iter()
                 .flat_map(|(_, controls)| controls)
                 .any(|control| control.reference_name == "Custom.TShirtSize")
+        );
+    }
+
+    #[test]
+    fn milestone_dialog_keeps_the_target_date_picker() {
+        let mut values = serde_json::Map::new();
+        values.insert("System.Title".into(), json!("Ship"));
+        values.insert(
+            ado_core::TARGET_DATE_FIELD.into(),
+            json!("2026-11-02T00:00:00Z"),
+        );
+        let draft = FormDraft::from_model(WorkItemFormModel {
+            id: 2,
+            rev: 1,
+            work_item_type: "Milestone".into(),
+            system_controls: vec![control("System.Title", "Title", FormControlKind::String)],
+            pages: vec![ado_core::FormPage {
+                id: "details".into(),
+                label: "Details".into(),
+                groups: vec![ado_core::FormGroup {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    controls: vec![
+                        control(
+                            ado_core::START_DATE_FIELD,
+                            "Start Date",
+                            FormControlKind::DateTime,
+                        ),
+                        control(
+                            ado_core::TARGET_DATE_FIELD,
+                            "Target Date",
+                            FormControlKind::DateTime,
+                        ),
+                    ],
+                }],
+            }],
+            values,
+        });
+        let layout = form_dialog_layout(&draft);
+        assert_eq!(layout.dates.len(), 1);
+        assert_eq!(
+            layout.dates[0].reference_name,
+            ado_core::TARGET_DATE_FIELD,
+            "a target-only item must keep the date picker, got {:?}",
+            layout
+                .dates
+                .iter()
+                .map(|c| &c.reference_name)
+                .collect::<Vec<_>>()
         );
     }
 }
