@@ -198,6 +198,42 @@ async fn merge_undo_action_keeps_live_dates() {
 }
 
 #[tokio::test]
+async fn merge_title_undo_does_not_clobber_live_dates() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let id = 1003;
+    let mut working = state.clone();
+    if let Some(node) = working.nodes.iter_mut().find(|n| n.id == id) {
+        node.title = "Spawned title".into();
+        node.start_date = Some("2026-01-01T00:00:00Z".into());
+        node.target_date = Some("2026-01-10T00:00:00Z".into());
+    }
+    if let Some(node) = state.nodes.iter_mut().find(|n| n.id == id) {
+        node.start_date = Some("2026-09-01T00:00:00Z".into());
+        node.target_date = Some("2026-09-10T00:00:00Z".into());
+    }
+    let live_start = state
+        .nodes
+        .iter()
+        .find(|n| n.id == id)
+        .unwrap()
+        .start_date
+        .clone();
+    state.merge_undo_action(
+        &working,
+        &UndoAction::RestoreFields {
+            id,
+            fields: vec![("System.Title".into(), serde_json::json!("Cart UI"))],
+        },
+    );
+    let live = state.nodes.iter().find(|n| n.id == id).unwrap();
+    assert_eq!(
+        live.start_date, live_start,
+        "a title toast undo must not overwrite a live bar drag"
+    );
+    assert_eq!(live.title, "Spawned title");
+}
+
+#[tokio::test]
 async fn schedule_to_iteration_sets_start_and_target() {
     let (_mock, mut state, _dir) = signed_in().await;
     let node = state

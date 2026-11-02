@@ -2007,8 +2007,9 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                if reference == ado_core::START_DATE_FIELD
-                    || reference == ado_core::TARGET_DATE_FIELD
+                if (reference == ado_core::START_DATE_FIELD
+                    || reference == ado_core::TARGET_DATE_FIELD)
+                    && self.history_recording
                 {
                     let start = self
                         .nodes
@@ -2397,7 +2398,12 @@ impl PlannerState {
                 dst.iteration_path = src.iteration_path.clone();
                 dst.area_path = src.area_path.clone();
                 dst.fields = src.fields.clone();
-                if matches!(action, UndoAction::RestoreFields { .. }) {
+                let copy_dates = matches!(
+                    action,
+                    UndoAction::RestoreFields { fields, .. }
+                        if fields.iter().any(|(reference, _)| is_scheduling_date(reference))
+                );
+                if copy_dates {
                     dst.start_date = src.start_date.clone();
                     dst.target_date = src.target_date.clone();
                 }
@@ -2502,9 +2508,29 @@ impl PlannerState {
         id: i64,
         fields: &[(String, Value)],
     ) -> Result<(), AppError> {
+        let mut start: Option<Option<Date>> = None;
+        let mut target: Option<Option<Date>> = None;
+        let mut others: Vec<(String, Value)> = Vec::new();
         for (reference, value) in fields {
-            let reference = reference.clone();
-            let value = value.clone();
+            if reference == ado_core::START_DATE_FIELD {
+                start = Some(parse_iso_date(value.as_str()));
+            } else if reference == ado_core::TARGET_DATE_FIELD {
+                target = Some(parse_iso_date(value.as_str()));
+            } else {
+                others.push((reference.clone(), value.clone()));
+            }
+        }
+        if start.is_some() || target.is_some() {
+            let node = self.nodes.iter().find(|node| node.id == id);
+            let next_start = start.unwrap_or_else(|| {
+                node.and_then(|node| parse_iso_date(node.start_date.as_deref()))
+            });
+            let next_target = target.unwrap_or_else(|| {
+                node.and_then(|node| parse_iso_date(node.target_date.as_deref()))
+            });
+            self.save_exact_dates(id, next_start, next_target).await?;
+        }
+        for (reference, value) in others {
             let apply_value = value.clone();
             let apply_reference = reference.clone();
             self.patch_node_field(id, &reference, value, move |node| {

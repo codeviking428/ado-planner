@@ -227,6 +227,20 @@ async fn mixed_form_save_undo_restores_title_and_dates() {
         after.target_date, before.target_date,
         "Undo must restore the target date"
     );
+    assert!(
+        !state
+            .toasts
+            .items
+            .iter()
+            .any(|toast| toast.message.starts_with("Moved ")),
+        "mixed RestoreFields must write dates in one patch, not emit a Moved toast per field: {:?}",
+        state
+            .toasts
+            .items
+            .iter()
+            .map(|toast| toast.message.as_str())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
