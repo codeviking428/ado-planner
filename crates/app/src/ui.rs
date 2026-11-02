@@ -327,6 +327,15 @@ impl PlannerView {
         });
     }
 
+    /// Same path as the +/− buttons, for tests that must zoom without
+    /// letting the 150 ms ease race the click.
+    pub fn zoom_at_center_animated(&mut self, factor: f32, cx: &mut Context<Self>) {
+        self.animate_gantt(cx, |gantt| {
+            gantt.zoom_at_center(factor);
+        });
+        cx.notify();
+    }
+
     pub fn camera_anim_endpoints(&self) -> Option<(SavedGanttView, SavedGanttView)> {
         self.camera_anim.as_ref().map(|anim| (anim.from, anim.to))
     }

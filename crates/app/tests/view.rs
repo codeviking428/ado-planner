@@ -2731,15 +2731,12 @@ fn second_zoom_mid_animation_starts_from_the_interpolated_camera(
         height: px(800.),
     });
     draw(cx);
-    view.update(cx, |view, _| {
+    view.update(cx, |view, cx| {
         let from = view.state.gantt.snapshot();
         view.state.gantt.zoom = 2.0;
         view.enable_camera_anim();
         view.seed_camera_anim(from, 40);
-    });
-    let zoom_in = cx.debug_bounds("gantt-zoom-in").expect("zoom in");
-    cx.simulate_click(zoom_in.center(), Modifiers::default());
-    view.update(cx, |view, _| {
+        view.zoom_at_center_animated(1.25, cx);
         let (anim_from, anim_to) = view
             .camera_anim_endpoints()
             .expect("second + must start a new ease");
