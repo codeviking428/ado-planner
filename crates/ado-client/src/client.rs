@@ -117,7 +117,7 @@ impl AdoClient {
                 .map_err(|err| ClientError::Message(err.to_string()))?;
         authorization.set_sensitive(true);
         headers.insert(AUTHORIZATION, authorization);
-        if method != Method::GET && method != Method::HEAD {
+        if !matches!(method, Method::GET | Method::HEAD | Method::DELETE) {
             let content_type = if method == Method::PATCH || url.contains("/workitems/$") {
                 "application/json-patch+json"
             } else {
@@ -699,6 +699,25 @@ impl AdoClient {
         let mut types_with_dates = HashSet::new();
         types_with_dates.insert(work_item_type.to_string());
         Ok(map_batch_work_item(&item, &types_with_dates))
+    }
+
+    pub async fn delete_work_item(
+        &self,
+        org: &str,
+        project: &str,
+        id: i64,
+    ) -> Result<(), ClientError> {
+        self.request(
+            Method::DELETE,
+            &format!(
+                "{}/{}/_apis/wit/workitems/{id}?api-version=7.1",
+                self.org_url(org),
+                urlencoding::encode(project)
+            ),
+            None,
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn load_form(

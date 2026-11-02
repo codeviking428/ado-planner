@@ -164,7 +164,8 @@ pub fn map_batch_work_item(
         assigned_to: fields
             .get("System.AssignedTo")
             .and_then(identity_from_field),
-        parent_id: parent_id_from_fields(fields),
+        parent_id: parent_id_from_fields(fields)
+            .or_else(|| parent_id_from_relations(item.relations.as_deref())),
         area_path: string_or(fields, "System.AreaPath", ""),
         iteration_path: string_or(fields, "System.IterationPath", ""),
         start_date: fields.get(START_DATE_FIELD).and_then(iso_date_from_field),
@@ -177,6 +178,21 @@ pub fn map_batch_work_item(
 
 const DEPENDENCY_REVERSE: &str = "System.LinkTypes.Dependency-Reverse";
 const DEPENDENCY: &str = "System.LinkTypes.Dependency";
+const HIERARCHY_REVERSE: &str = "System.LinkTypes.Hierarchy-Reverse";
+
+fn id_from_relation_url(url: &str) -> Option<i64> {
+    url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+}
+
+/// Parent ID from a Hierarchy-Reverse relation when `System.Parent` is absent.
+pub fn parent_id_from_relations(relations: Option<&[Value]>) -> Option<i64> {
+    relations?.iter().find_map(|relation| {
+        if relation.get("rel")?.as_str()? != HIERARCHY_REVERSE {
+            return None;
+        }
+        id_from_relation_url(relation.get("url")?.as_str()?)
+    })
+}
 
 /// Index of the dependency relation that points at `predecessor_id`.
 pub fn dependency_relation_index(
@@ -190,11 +206,7 @@ pub fn dependency_relation_index(
             return false;
         }
         let url = relation.get("url").and_then(Value::as_str).unwrap_or("");
-        url.trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .and_then(|id| id.parse::<i64>().ok())
-            == Some(predecessor_id)
+        id_from_relation_url(url) == Some(predecessor_id)
     })
 }
 
@@ -210,8 +222,7 @@ pub fn predecessor_ids(relations: Option<&[Value]>) -> Vec<i64> {
             if rel != DEPENDENCY_REVERSE && rel != DEPENDENCY {
                 return None;
             }
-            let url = relation.get("url")?.as_str()?;
-            url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+            id_from_relation_url(relation.get("url")?.as_str()?)
         })
         .collect()
 }
@@ -422,6 +433,26 @@ mod tests {
     }
 
     #[test]
+    fn maps_parent_from_hierarchy_reverse_when_system_parent_is_missing() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("System.Title".into(), json!("Child"));
+        fields.insert("System.WorkItemType".into(), json!("Task"));
+        let mapped = map_batch_work_item(
+            &BatchWorkItem {
+                id: 20,
+                rev: Some(1),
+                fields: Some(fields),
+                relations: Some(vec![json!({
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/contoso/Shop/_apis/wit/workItems/1005"
+                })]),
+            },
+            &HashSet::new(),
+        );
+        assert_eq!(mapped.parent_id, Some(1005));
+    }
+
+    #[test]
     fn identity_from_field_reads_name_and_mail_address() {
         let identity = identity_from_field(&json!({
             "name": "Ada Lovelace",
@@ -464,5 +495,7 @@ mod tests {
         ];
         assert_eq!(predecessor_ids(Some(&relations)), vec![1003, 1010]);
         assert!(predecessor_ids(None).is_empty());
+        assert_eq!(parent_id_from_relations(Some(&relations)), Some(1));
+        assert_eq!(parent_id_from_relations(None), None);
     }
 }

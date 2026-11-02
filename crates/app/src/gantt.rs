@@ -32,6 +32,7 @@ pub const SUMMARY_BAR_H: f32 = 14.0;
 pub const PLACEHOLDER_BAR_H: f32 = 24.0;
 pub const LEAF_BAR_H: f32 = 28.0;
 pub const DATES_COL_WIDTH: f32 = 200.0;
+pub const DETAILS_PILL_WIDTH: f32 = 92.0;
 pub const ID_COL_WIDTH: f32 = 64.0;
 pub const TYPE_COL_WIDTH: f32 = 88.0;
 pub const ASSIGNEE_COL_WIDTH: f32 = 88.0;

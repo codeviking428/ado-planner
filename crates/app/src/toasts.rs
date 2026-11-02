@@ -30,6 +30,10 @@ pub enum UndoAction {
         successor_id: i64,
         predecessor_id: i64,
     },
+    DeleteCreated {
+        id: i64,
+        title: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

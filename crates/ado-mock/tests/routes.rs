@@ -376,6 +376,58 @@ async fn create_work_item_assigns_the_next_id() {
 }
 
 #[tokio::test]
+async fn create_work_item_stores_parent_relation() {
+    let mock = ado_mock::start().await;
+    let client = reqwest::Client::new();
+    let (status, body) = post(
+        &client,
+        &mock.url,
+        "/contoso/Shop/_apis/wit/workitems/$User%20Story",
+        json!([
+            { "op": "add", "path": "/fields/System.Title", "value": "Child" },
+            { "op": "add", "path": "/relations/-", "value": {
+                "rel": "System.LinkTypes.Hierarchy-Reverse",
+                "url": "https://dev.azure.com/contoso/Shop/_apis/wit/workitems/1005"
+            }}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["fields"]["System.Parent"], 1005);
+    assert!(
+        body["relations"]
+            .as_array()
+            .is_some_and(|rels| rels.iter().any(|rel| {
+                rel["rel"] == "System.LinkTypes.Hierarchy-Reverse"
+                    && rel["url"]
+                        .as_str()
+                        .is_some_and(|url| url.ends_with("/1005"))
+            })),
+        "create must keep the Hierarchy-Reverse relation, got {}",
+        body["relations"]
+    );
+    let id = body["id"].as_i64().expect("id");
+    let stored = mock.work_item(id).await.expect("stored");
+    assert_eq!(stored["fields"]["System.Parent"], 1005);
+}
+
+#[tokio::test]
+async fn delete_work_item_removes_it() {
+    let mock = ado_mock::start().await;
+    let client = reqwest::Client::new();
+    let response = client
+        .delete(format!(
+            "{}/contoso/Shop/_apis/wit/workitems/1014?api-version=7.1",
+            mock.url
+        ))
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(response.status().as_u16(), 204);
+    assert!(mock.work_item(1014).await.is_none());
+}
+
+#[tokio::test]
 async fn fail_next_injects_error() {
     let mock = ado_mock::start().await;
     mock.fail_next("/fabrikam/_apis/projects", 503, "Projects unavailable");

@@ -339,13 +339,26 @@ async fn route(
         fields.insert("System.WorkItemType".into(), json!(ty));
         fields.insert("System.State".into(), json!("New"));
         fields.insert("System.Title".into(), json!("New work item"));
+        let mut relations = Vec::new();
         for op in ops {
             let is_add = op.get("op").and_then(Value::as_str) == Some("add");
-            let Some(field) = op
-                .get("path")
-                .and_then(Value::as_str)
-                .and_then(|path| path.strip_prefix("/fields/"))
-            else {
+            let path = op.get("path").and_then(Value::as_str).unwrap_or("");
+            if is_add && path == "/relations/-" {
+                if let Some(value) = op.get("value") {
+                    relations.push(value.clone());
+                    if value.get("rel").and_then(Value::as_str)
+                        == Some("System.LinkTypes.Hierarchy-Reverse")
+                        && let Some(parent_id) = value
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .and_then(id_from_work_item_url)
+                    {
+                        fields.insert("System.Parent".into(), json!(parent_id));
+                    }
+                }
+                continue;
+            }
+            let Some(field) = path.strip_prefix("/fields/") else {
                 continue;
             };
             if is_add {
@@ -355,11 +368,14 @@ async fn route(
                 );
             }
         }
-        let item = json!({
+        let mut item = json!({
             "id": new_id,
             "rev": 1,
             "fields": fields,
         });
+        if !relations.is_empty() {
+            item["relations"] = json!(relations);
+        }
         items.push(item.clone());
         return Ok(json_response(StatusCode::OK, item));
     }
@@ -374,6 +390,10 @@ async fn route(
                 json!({ "message": "not found" }),
             ));
         };
+        if *method == Method::DELETE {
+            items.remove(index);
+            return Ok(json_response(StatusCode::NO_CONTENT, Value::Null));
+        }
         if *method == Method::PATCH {
             state
                 .patches
@@ -564,6 +584,13 @@ fn work_item_id(path: &str) -> Option<i64> {
     let rest = path.split("/workitems/").nth(1)?;
     let id = rest.split(|ch: char| !ch.is_ascii_digit()).next()?;
     if id.is_empty() { None } else { id.parse().ok() }
+}
+
+fn id_from_work_item_url(url: &str) -> Option<i64> {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .and_then(|id| id.parse().ok())
 }
 
 async fn read_json(req: Request<Body>) -> Result<Value, String> {

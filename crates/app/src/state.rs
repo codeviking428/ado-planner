@@ -1847,16 +1847,16 @@ impl PlannerState {
             return Err(AppError::message("Choose a Team first"));
         };
         let types = self.types();
+        let parent = self
+            .gantt
+            .selected_id
+            .and_then(|id| self.nodes.iter().find(|node| node.id == id));
         let work_item_type = ["User Story", "Task", "Bug", "Feature", "Epic"]
             .into_iter()
             .find(|ty| types.iter().any(|item| item == ty))
             .map(ToString::to_string)
             .or_else(|| types.first().cloned())
             .unwrap_or_else(|| "User Story".into());
-        let parent = self
-            .gantt
-            .selected_id
-            .and_then(|id| self.nodes.iter().find(|node| node.id == id));
         let area = parent
             .map(|node| node.area_path.clone())
             .or_else(|| self.nodes.first().map(|node| node.area_path.clone()))
@@ -1901,13 +1901,18 @@ impl PlannerState {
             .await
         {
             Ok(mut node) => {
-                node.parent_id = parent_id;
+                if node.parent_id.is_none() {
+                    node.parent_id = parent_id;
+                }
                 let id = node.id;
+                let title = node.title.clone();
                 self.nodes.push(node);
                 self.gantt.selected_id = Some(id);
                 self.persist_hierarchy_cache();
-                self.toasts
-                    .push(ToastKind::Success, format!("Created #{id}"));
+                self.toasts.push_undo(
+                    format!("Created #{id} {title}"),
+                    UndoAction::DeleteCreated { id, title },
+                );
                 Ok(())
             }
             Err(err) => {
@@ -2256,6 +2261,7 @@ impl PlannerState {
                 successor_id,
                 predecessor_id,
             } => self.add_dependency(*successor_id, *predecessor_id).await,
+            UndoAction::DeleteCreated { id, .. } => self.delete_created_item(*id).await,
         };
         self.history_recording = true;
         if result.is_ok() {
@@ -2303,7 +2309,9 @@ impl PlannerState {
     /// link Undo so live date edits on those rows survive the HTTP round-trip.
     pub fn merge_undo_action(&mut self, working: &PlannerState, action: &UndoAction) {
         let ids: Vec<i64> = match action {
-            UndoAction::RestoreDates { id, .. } => vec![*id],
+            UndoAction::RestoreDates { id, .. } | UndoAction::DeleteCreated { id, .. } => {
+                vec![*id]
+            }
             UndoAction::RemoveLink {
                 successor_id,
                 predecessor_id,
@@ -2313,6 +2321,12 @@ impl PlannerState {
                 predecessor_id,
             } => vec![*successor_id, *predecessor_id],
         };
+        if let UndoAction::DeleteCreated { id, .. } = action {
+            self.nodes.retain(|node| node.id != *id);
+            if self.gantt.selected_id == Some(*id) {
+                self.gantt.selected_id = None;
+            }
+        }
         for id in ids {
             let Some(src) = working.nodes.iter().find(|node| node.id == id) else {
                 continue;
@@ -2376,7 +2390,23 @@ impl PlannerState {
                     self.history.undo.remove(index);
                 }
             }
+            UndoAction::DeleteCreated { .. } => {}
         }
+    }
+
+    async fn delete_created_item(&mut self, id: i64) -> Result<(), AppError> {
+        let Some(scope) = self.scope() else {
+            return Err(AppError::message("Choose a Team first"));
+        };
+        self.client
+            .delete_work_item(&scope.org, &scope.project, id)
+            .await?;
+        self.nodes.retain(|node| node.id != id);
+        if self.gantt.selected_id == Some(id) {
+            self.gantt.selected_id = None;
+        }
+        self.persist_hierarchy_cache();
+        Ok(())
     }
 
     pub async fn undo_clear_dates(&mut self, action: UndoAction) -> Result<(), AppError> {
@@ -2487,7 +2517,7 @@ impl PlannerState {
         );
     }
 
-    fn item_title(&self, id: i64) -> String {
+    pub(crate) fn item_title(&self, id: i64) -> String {
         self.nodes
             .iter()
             .find(|node| node.id == id)
@@ -2495,6 +2525,23 @@ impl PlannerState {
             .filter(|title| !title.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("#{id}"))
+    }
+
+    pub(crate) fn undo_confirmation(&self, action: &UndoAction) -> String {
+        match action {
+            UndoAction::RestoreDates { id, .. } => format!("Restored {}", self.item_title(*id)),
+            UndoAction::DeleteCreated { id, title } => {
+                if title.is_empty() {
+                    format!("Removed #{id}")
+                } else {
+                    format!("Removed #{id} {title}")
+                }
+            }
+            UndoAction::RemoveLink { successor_id, .. }
+            | UndoAction::RestoreLink { successor_id, .. } => {
+                format!("Restored {} dependency", self.item_title(*successor_id))
+            }
+        }
     }
 
     pub fn push_history_toast(&mut self, entry: &HistoryEntry, is_undo: bool) {
@@ -2533,7 +2580,7 @@ fn short_month_day(date: Date) -> String {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let month = MONTHS[(date.month() as u8).saturating_sub(1).min(11) as usize];
-    format!("{month} {}", date.day())
+    format!("{month} {}, {}", date.day(), date.year())
 }
 
 pub(crate) fn field_toast_name(reference: &str, label: Option<&str>) -> String {

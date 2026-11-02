@@ -267,11 +267,34 @@ fn range_picker_prefers_typed_when_it_changed() {
 }
 
 #[test]
+fn calendar_end_click_wins_over_pending_typed_start() {
+    let seed = "2026-07-10 → 2026-08-04";
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+    let end = chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+    let calendar = PickerDate::Range(Some(start), Some(end));
+    let pending_arrow = pending_range_typed(PickerDate::Range(Some(start), None)).unwrap();
+    assert_eq!(pending_arrow, "2026-07-10 → …");
+    for pending in [pending_arrow.as_str(), "2026-07-10 / …"] {
+        let picked = dates_from_range_picker(calendar, pending, seed).unwrap();
+        assert_eq!(
+            picked.0,
+            Some(Date::new(2026, 7, 10).unwrap()),
+            "start click must keep July 10"
+        );
+        assert_eq!(
+            picked.1,
+            Some(Date::new(2026, 7, 17).unwrap()),
+            "end click must save July 17, not keep the seeded August 4 from a start-only typed preview ({pending})"
+        );
+    }
+}
+
+#[test]
 fn pending_start_shows_ellipsis_in_the_typed_field() {
     let start = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
     assert_eq!(
         pending_range_typed(PickerDate::Range(Some(start), None)).as_deref(),
-        Some("2026-11-10 / …")
+        Some("2026-11-10 → …")
     );
 }
 
@@ -2414,6 +2437,27 @@ fn hovered_row_shows_open_details_icon(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn details_slot_is_reserved_when_the_pill_is_hidden(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-details-slot").is_some(),
+        "the ⓘ Details column must keep its width when the pill is hidden"
+    );
+    assert!(
+        cx.debug_bounds("gantt-open-details").is_none(),
+        "unhovered rows must not paint the pill over neighbouring columns"
+    );
+}
+
+#[gpui_kit::test]
 fn selected_link_shows_a_visible_remove_control(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -2433,6 +2477,26 @@ fn selected_link_shows_a_visible_remove_control(cx: &mut gpui_kit::TestAppContex
     assert!(
         cx.debug_bounds("gantt-link-remove").is_some(),
         "a selected dependency must show a × to remove it"
+    );
+}
+
+#[gpui_kit::test]
+fn f2_opens_inline_title_on_the_selected_row(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    cx.simulate_keystrokes("f2");
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_some(),
+        "F2 must start an inline title edit on the selected row"
     );
 }
 
@@ -2619,7 +2683,7 @@ fn inline_placeholder_resets_when_switching_edit_kind(cx: &mut gpui_kit::TestApp
             view.open_inline_dates(1, window, cx);
             assert_eq!(
                 view.inline_placeholder(cx),
-                "YYYY-MM-DD / YYYY-MM-DD",
+                "YYYY-MM-DD → YYYY-MM-DD",
                 "date edits must hint at a range"
             );
             view.open_inline_title(1, window, cx);

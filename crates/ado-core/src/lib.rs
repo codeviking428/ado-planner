@@ -35,7 +35,7 @@ pub use hierarchy::{
     AreaPathValue, BatchWorkItem, HIERARCHY_FIELDS, assemble_forest, build_hierarchy_wiql,
     build_untyped_hierarchy_wiql, chunk_ids, dependency_relation_index, escape_wiql,
     identity_from_field, iso_date_from_field, map_batch_work_item, parent_id_from_fields,
-    predecessor_ids,
+    parent_id_from_relations, predecessor_ids,
 };
 pub use html_field::{html_equivalent, html_to_markdown, is_plain_html_field, markdown_to_html};
 pub use organization_url::shorten_organization_url;

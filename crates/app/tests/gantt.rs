@@ -1014,6 +1014,61 @@ async fn add_item_creates_a_work_item_on_the_team() {
     let created = state.nodes.last().expect("created");
     assert_eq!(created.title, "New work item");
     assert_eq!(state.gantt.selected_id, Some(created.id));
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.contains(&format!("Created #{} {}", created.id, created.title)),
+        "create toast must name the item, got {message}"
+    );
+    assert!(
+        state
+            .toasts
+            .items
+            .last()
+            .is_some_and(|toast| toast.undo.is_some()),
+        "create toast must offer Undo"
+    );
+}
+
+#[tokio::test]
+async fn add_item_keeps_the_selected_parent_after_reload() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.gantt.selected_id = Some(1005);
+    state.add_item().await.expect("create");
+    let created = state.nodes.last().cloned().expect("created");
+    assert_eq!(
+        created.parent_id,
+        Some(1005),
+        "new items nest under the selected work item"
+    );
+    state.load_hierarchy().await.expect("reload");
+    let reloaded = state
+        .nodes
+        .iter()
+        .find(|node| node.id == created.id)
+        .expect("created item survives reload");
+    assert_eq!(
+        reloaded.parent_id,
+        Some(1005),
+        "Hierarchy-Reverse must persist System.Parent after refetch"
+    );
+}
+
+#[tokio::test]
+async fn undo_created_item_deletes_it() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.add_item().await.expect("create");
+    let created = state.nodes.last().cloned().expect("created");
+    let undo = state
+        .toasts
+        .items
+        .last()
+        .and_then(|toast| toast.undo.clone())
+        .expect("create undo");
+    state.apply_undo(undo).await.expect("delete created");
+    assert!(
+        state.nodes.iter().all(|node| node.id != created.id),
+        "Undo on Created must delete the new work item"
+    );
 }
 
 #[tokio::test]
