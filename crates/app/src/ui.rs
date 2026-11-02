@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -81,11 +81,13 @@ pub struct PlannerView {
     dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
     io_busy: bool,
-    date_save_busy: bool,
+    date_save_busy: HashSet<i64>,
     date_save_queue: VecDeque<PendingDateSave>,
+    pending_team: Option<String>,
     update_checked: bool,
     toast_expiry_armed: bool,
     loading_shown_at: Option<std::time::Instant>,
+    loading_hold_gen: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -208,11 +210,13 @@ impl PlannerView {
             dates_anchor: None,
             banner_dismissed: false,
             io_busy: false,
-            date_save_busy: false,
+            date_save_busy: HashSet::new(),
             date_save_queue: VecDeque::new(),
+            pending_team: None,
             update_checked: false,
             toast_expiry_armed: false,
             loading_shown_at: None,
+            loading_hold_gen: 0,
             _subscriptions: vec![keystrokes],
         };
         this.bind_sign_in_events(window, cx);
@@ -357,10 +361,15 @@ impl PlannerView {
                             let remain = Duration::from_millis(280).saturating_sub(at.elapsed());
                             if remain > Duration::ZERO {
                                 this.state.hierarchy_loading = true;
+                                this.loading_hold_gen += 1;
+                                let hold_gen = this.loading_hold_gen;
                                 cx.spawn(async move |this, cx| {
                                     cx.background_executor().timer(remain).await;
                                     if let Some(this) = this.upgrade() {
                                         this.update(cx, |this, cx| {
+                                            if this.loading_hold_gen != hold_gen {
+                                                return;
+                                            }
                                             this.state.hierarchy_loading = false;
                                             this.loading_shown_at = None;
                                             cx.notify();
@@ -377,6 +386,9 @@ impl PlannerView {
                         }
                     }
                     Err(_) => tracing::warn!("planner action cancelled"),
+                }
+                if let Some(team) = this.pending_team.take() {
+                    this.start_team_switch(team, cx);
                 }
                 if !this.update_checked && this.state.session_info.signed_in {
                     this.update_checked = true;
@@ -767,10 +779,15 @@ impl PlannerView {
                             }),
                         ))
                     })
-                    .when_some(undo.clone(), |el, _action| {
+                    .when_some(undo.clone(), |el, action| {
                         el.child(Button::new(("undo-toast", id)).label("Undo").on_click(
                             cx.listener(move |this, _, _, cx| {
-                                this.undo_last(cx);
+                                this.state.toasts.dismiss(id);
+                                let action = action.clone();
+                                this.spawn_state(cx, move |mut state| async move {
+                                    let result = state.apply_undo(action).await;
+                                    (state, result)
+                                });
                             }),
                         ))
                     })
@@ -1159,6 +1176,25 @@ impl PlannerView {
         }
     }
 
+    fn queue_team_switch(&mut self, team: String, cx: &mut Context<Self>) {
+        if self.io_busy {
+            self.pending_team = Some(team);
+            return;
+        }
+        self.start_team_switch(team, cx);
+    }
+
+    fn start_team_switch(&mut self, team: String, cx: &mut Context<Self>) {
+        self.loading_hold_gen += 1;
+        self.state.begin_team_switch(team.clone());
+        self.loading_shown_at = Some(std::time::Instant::now());
+        self.banner_dismissed = false;
+        self.spawn_state(cx, move |mut state| async move {
+            let result = state.set_team(team).await;
+            (state, result)
+        });
+    }
+
     fn choose_scope(&mut self, id: &str, value: String, cx: &mut Context<Self>) {
         self.open_scope = None;
         match id {
@@ -1174,17 +1210,7 @@ impl PlannerView {
                     (state, result)
                 });
             }
-            "team" => {
-                if !self.io_busy {
-                    self.state.begin_team_switch(value.clone());
-                    self.loading_shown_at = Some(std::time::Instant::now());
-                    self.banner_dismissed = false;
-                    self.spawn_state(cx, move |mut state| async move {
-                        let result = state.set_team(value).await;
-                        (state, result)
-                    });
-                }
-            }
+            "team" => self.queue_team_switch(value, cx),
             "iteration" => self.state.set_iteration(value),
             "assignee" => self.state.set_assignee(value),
             _ => {}
@@ -2608,7 +2634,7 @@ impl PlannerView {
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
         let show_handles = !summary && !unscheduled && !milestone && hovered && !dragging;
-        let show_link_handles = !unscheduled && hovered && !dragging;
+        let show_link_handles = !unscheduled && (hovered || selected) && !dragging;
         let bar_h = if milestone {
             MILESTONE_SIZE
         } else if summary {
@@ -2791,8 +2817,8 @@ impl PlannerView {
                 .into_any_element(),
         ];
         if show_link_handles {
-            let start_x = bar.x - LINK_HANDLE_HIT - 4.0;
-            let end_x = bar.x + bar.width + 4.0;
+            let start_x = bar.x - LINK_HANDLE_HIT;
+            let end_x = bar.x + bar.width;
             let handle_top = ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
             for (handle_id, handle_x) in [("link-start", start_x), ("link-end", end_x)] {
                 let selector = format!("gantt-link-handle-{id}-{handle_id}");
@@ -2903,103 +2929,170 @@ impl PlannerView {
             .top(px(min_y))
             .w(px((max_x - min_x).max(20.0)))
             .h(px((max_y - min_y).max(20.0)))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(arrow.x1 - min_x))
-                    .top(px(arrow.y1.min(arrow.lane_y) - min_y))
-                    .w(px(stroke))
-                    .h(px(v1))
-                    .bg(color),
+            .child(self.arrow_segment(
+                arrow.x1 - min_x,
+                arrow.y1.min(arrow.lane_y) - min_y,
+                stroke,
+                v1,
+                color,
+                from_id,
+                to_id,
+                None,
+                cx,
+            ))
+            .child(self.arrow_segment(
+                arrow.x1.min(arrow.x2) - min_x,
+                arrow.lane_y - min_y,
+                h_len,
+                stroke,
+                color,
+                from_id,
+                to_id,
+                Some(selector),
+                cx,
+            ))
+            .child(self.arrow_segment(
+                arrow.x2 - min_x,
+                arrow.lane_y.min(arrow.y2) - min_y,
+                stroke,
+                v2,
+                color,
+                from_id,
+                to_id,
+                None,
+                cx,
+            ))
+            .child(self.arrow_segment(
+                arrow.x2.min(arrow.x_head) - min_x,
+                arrow.y2 - min_y,
+                stub_h,
+                stroke,
+                color,
+                from_id,
+                to_id,
+                None,
+                cx,
+            ))
+            .child(self.arrow_head_hit(arrow, min_x, min_y, color, cx))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arrow_segment(
+        &self,
+        left: f32,
+        top: f32,
+        width: f32,
+        height: f32,
+        color: gpui_kit::Hsla,
+        from_id: i64,
+        to_id: i64,
+        selector: Option<String>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        const HIT: f32 = 8.0;
+        let hit_w = width.max(HIT);
+        let hit_h = height.max(HIT);
+        let segment_id = selector
+            .clone()
+            .unwrap_or_else(|| format!("gantt-dep-seg-{from_id}-{to_id}-{left:.0}-{top:.0}"));
+        let el = div()
+            .id(SharedString::from(segment_id.clone()))
+            .debug_selector(move || segment_id.clone())
+            .absolute()
+            .left(px(left - (hit_w - width) / 2.0))
+            .top(px(top - (hit_h - height) / 2.0))
+            .w(px(hit_w))
+            .h(px(hit_h))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.state.gantt.hovered_link = if *hovered {
+                    Some((from_id, to_id))
+                } else if this.state.gantt.hovered_link == Some((from_id, to_id)) {
+                    None
+                } else {
+                    this.state.gantt.hovered_link
+                };
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.state.gantt.selected_link = Some((from_id, to_id));
+                    this.state.gantt.selected_id = Some(to_id);
+                    cx.notify();
+                }),
             )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(arrow.x1.min(arrow.x2) - min_x))
-                    .top(px(arrow.lane_y - min_y))
-                    .w(px(h_len))
-                    .h(px(stroke))
-                    .bg(color),
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.state.gantt.selected_link = Some((from_id, to_id));
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    this.state.gantt.context_menu = Some(crate::gantt::ContextTarget {
+                        id: to_id,
+                        from_bar: false,
+                        x,
+                        y,
+                        link: Some((from_id, to_id)),
+                    });
+                    cx.notify();
+                }),
             )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(arrow.x2 - min_x))
-                    .top(px(arrow.lane_y.min(arrow.y2) - min_y))
-                    .w(px(stroke))
-                    .h(px(v2))
-                    .bg(color),
+            .child(div().w(px(width)).h(px(height)).bg(color));
+        el.into_any_element()
+    }
+
+    fn arrow_head_hit(
+        &self,
+        arrow: &DependencyArrow,
+        min_x: f32,
+        min_y: f32,
+        color: gpui_kit::Hsla,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let from_id = arrow.from_id;
+        let to_id = arrow.to_id;
+        div()
+            .id(SharedString::from(format!(
+                "gantt-dep-arrowhead-{}-{}",
+                arrow.from_id, arrow.to_id
+            )))
+            .debug_selector(|| "gantt-dep-arrowhead".into())
+            .absolute()
+            .left(px(arrow.x_head - min_x - 16.0))
+            .top(px(arrow.y2 - min_y - 10.0))
+            .w(px(18.))
+            .h(px(20.))
+            .cursor_pointer()
+            .text_xl()
+            .line_height(gpui_kit::relative(1.))
+            .text_color(color)
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.state.gantt.hovered_link = if *hovered {
+                    Some((from_id, to_id))
+                } else if this.state.gantt.hovered_link == Some((from_id, to_id)) {
+                    None
+                } else {
+                    this.state.gantt.hovered_link
+                };
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.state.gantt.selected_link = Some((from_id, to_id));
+                    this.state.gantt.selected_id = Some(to_id);
+                    cx.notify();
+                }),
             )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(arrow.x2.min(arrow.x_head) - min_x))
-                    .top(px(arrow.y2 - min_y))
-                    .w(px(stub_h))
-                    .h(px(stroke))
-                    .bg(color),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "gantt-dep-arrowhead-{}-{}",
-                        arrow.from_id, arrow.to_id
-                    )))
-                    .debug_selector(|| "gantt-dep-arrowhead".into())
-                    .absolute()
-                    .left(px(arrow.x_head - min_x - 16.0))
-                    .top(px(arrow.y2 - min_y - 10.0))
-                    .w(px(18.))
-                    .h(px(20.))
-                    .text_xl()
-                    .line_height(gpui_kit::relative(1.))
-                    .text_color(color)
-                    .child("▶"),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .absolute()
-                    .inset_0()
-                    .cursor_pointer()
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        this.state.gantt.hovered_link = if *hovered {
-                            Some((from_id, to_id))
-                        } else if this.state.gantt.hovered_link == Some((from_id, to_id)) {
-                            None
-                        } else {
-                            this.state.gantt.hovered_link
-                        };
-                        cx.notify();
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.state.gantt.selected_link = Some((from_id, to_id));
-                            this.state.gantt.selected_id = Some(to_id);
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.state.gantt.selected_link = Some((from_id, to_id));
-                            let x: f32 = event.position.x.into();
-                            let y: f32 = event.position.y.into();
-                            this.state.gantt.context_menu = Some(crate::gantt::ContextTarget {
-                                id: to_id,
-                                from_bar: false,
-                                x,
-                                y,
-                                link: Some((from_id, to_id)),
-                            });
-                            cx.notify();
-                        }),
-                    ),
-            )
+            .child("▶")
             .into_any_element()
     }
 
@@ -3426,23 +3519,21 @@ impl PlannerView {
                         .into_any_element()
                 }
                 FormControlKind::DateTime => {
-                    if id == ado_core::TARGET_DATE_FIELD
-                        && form
-                            .model
-                            .system_controls
-                            .iter()
-                            .chain(form.model.pages.iter().flat_map(|page| {
-                                page.groups.iter().flat_map(|group| group.controls.iter())
-                            }))
-                            .any(|control| control.reference_name == ado_core::START_DATE_FIELD)
-                    {
+                    let has_start_picker = self.form_dates.contains_key(ado_core::START_DATE_FIELD);
+                    let has_target_picker =
+                        self.form_dates.contains_key(ado_core::TARGET_DATE_FIELD);
+                    if id == ado_core::TARGET_DATE_FIELD && has_start_picker && !has_target_picker {
+                        return div().into_any_element();
+                    }
+                    if id == ado_core::START_DATE_FIELD && has_target_picker && !has_start_picker {
                         return div().into_any_element();
                     }
                     let picker = self
                         .form_dates
                         .get(&id)
                         .cloned()
-                        .or_else(|| self.form_dates.get(ado_core::START_DATE_FIELD).cloned());
+                        .or_else(|| self.form_dates.get(ado_core::START_DATE_FIELD).cloned())
+                        .or_else(|| self.form_dates.get(ado_core::TARGET_DATE_FIELD).cloned());
                     v_flex()
                         .id(SharedString::from(format!("form-date-{id}")))
                         .debug_selector(|| "form-date-picker".into())
@@ -3643,21 +3734,25 @@ impl PlannerView {
                             .insert(reference.clone(), serde_json::json!(iso_date_only(date)));
                     }
                 }
-                PickerDate::Range(start, end) => {
-                    if let Some(start) = start.and_then(naive_to_jiff) {
-                        form.values.insert(
-                            ado_core::START_DATE_FIELD.into(),
-                            serde_json::json!(iso_date_only(start)),
-                        );
-                    }
-                    if let Some(end) = end.and_then(naive_to_jiff) {
-                        form.values.insert(
-                            ado_core::TARGET_DATE_FIELD.into(),
-                            serde_json::json!(iso_date_only(end)),
-                        );
-                    }
+                PickerDate::Single(None) => {
+                    form.values
+                        .insert(reference.clone(), serde_json::Value::Null);
                 }
-                _ => {}
+                PickerDate::Range(start, end) => {
+                    form.values.insert(
+                        ado_core::START_DATE_FIELD.into(),
+                        start
+                            .and_then(naive_to_jiff)
+                            .map(|date| serde_json::json!(iso_date_only(date)))
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                    form.values.insert(
+                        ado_core::TARGET_DATE_FIELD.into(),
+                        end.and_then(naive_to_jiff)
+                            .map(|date| serde_json::json!(iso_date_only(date)))
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                }
             }
         }
     }
@@ -3701,16 +3796,30 @@ impl PlannerView {
     }
 
     fn drain_date_saves(&mut self, cx: &mut Context<Self>) {
-        if self.date_save_busy {
-            return;
+        let mut index = 0;
+        while index < self.date_save_queue.len() {
+            let id = self.date_save_queue[index].id;
+            if self.date_save_busy.contains(&id) {
+                index += 1;
+                continue;
+            }
+            let mut pending = self.date_save_queue.remove(index).expect("queued save");
+            let Some(live) = self.state.nodes.iter().find(|node| node.id == pending.id) else {
+                continue;
+            };
+            if live.start_date != pending.after_start || live.target_date != pending.after_target {
+                continue;
+            }
+            pending.rev = live.rev;
+            self.spawn_one_date_save(cx, pending);
         }
-        let Some(pending) = self.date_save_queue.pop_front() else {
-            return;
-        };
-        self.date_save_busy = true;
+    }
+
+    fn spawn_one_date_save(&mut self, cx: &mut Context<Self>, pending: PendingDateSave) {
         let runtime = self.state.runtime.clone();
         let mut working = self.state.clone();
         let id = pending.id;
+        self.date_save_busy.insert(id);
         let after_start = pending.after_start.clone();
         let after_target = pending.after_target.clone();
         let previous = pending.previous.clone();
@@ -3722,7 +3831,7 @@ impl PlannerView {
         cx.spawn(async move |this, cx| {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
-                this.date_save_busy = false;
+                this.date_save_busy.remove(&id);
                 if let Ok((working, result)) = outcome {
                     let still_after = this.state.nodes.iter().any(|node| {
                         node.id == id
@@ -3812,13 +3921,6 @@ impl PlannerView {
                 let has_target = controls
                     .iter()
                     .any(|item| item.reference_name == ado_core::TARGET_DATE_FIELD);
-                if control.reference_name == ado_core::TARGET_DATE_FIELD && has_start {
-                    continue;
-                }
-                if self.form_dates.contains_key(&control.reference_name) {
-                    continue;
-                }
-                let range = control.reference_name == ado_core::START_DATE_FIELD && has_target;
                 let start = form
                     .values
                     .get(ado_core::START_DATE_FIELD)
@@ -3831,9 +3933,28 @@ impl PlannerView {
                     .and_then(serde_json::Value::as_str)
                     .and_then(|text| parse_iso_date(Some(text)))
                     .and_then(jiff_to_naive);
+                let target_only = has_start && has_target && start.is_none() && target.is_some();
+                if control.reference_name == ado_core::TARGET_DATE_FIELD
+                    && has_start
+                    && !target_only
+                {
+                    continue;
+                }
+                if control.reference_name == ado_core::START_DATE_FIELD && target_only {
+                    continue;
+                }
+                let store_key = if target_only {
+                    ado_core::TARGET_DATE_FIELD.to_string()
+                } else {
+                    control.reference_name.clone()
+                };
+                if self.form_dates.contains_key(&store_key) {
+                    continue;
+                }
+                let range = store_key == ado_core::START_DATE_FIELD && has_target;
                 let initial = form
                     .values
-                    .get(&control.reference_name)
+                    .get(&store_key)
                     .and_then(serde_json::Value::as_str)
                     .and_then(|text| parse_iso_date(Some(text)))
                     .and_then(jiff_to_naive);
@@ -3864,8 +3985,7 @@ impl PlannerView {
                         state
                     }
                 });
-                self.form_dates
-                    .insert(control.reference_name.clone(), picker);
+                self.form_dates.insert(store_key, picker);
                 continue;
             }
             if self.form_inputs.contains_key(&control.reference_name) {
@@ -4202,7 +4322,7 @@ impl Render for PlannerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport_h = f32::from(window.viewport_size().height);
         let viewport_w = f32::from(window.viewport_size().width);
-        self.state.gantt.viewport_h = (viewport_h - 140.0).max(120.0);
+        self.state.gantt.viewport_h = (viewport_h - 200.0).max(120.0);
         self.state.gantt.viewport_w = viewport_w;
         self.state.gantt.clamp_tree_width();
         self.state.gantt.timeline_origin_x = self.state.gantt.tree_width + SPLITTER_WIDTH;

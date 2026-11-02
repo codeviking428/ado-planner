@@ -96,6 +96,14 @@ impl AdoClient {
         format!("{}/{org}", self.ado_base)
     }
 
+    pub fn work_item_api_url(&self, org: &str, project: &str, id: i64) -> String {
+        format!(
+            "{}/{}/_apis/wit/workitems/{id}",
+            self.org_url(org),
+            urlencoding::encode(project)
+        )
+    }
+
     async fn request(
         &self,
         method: Method,

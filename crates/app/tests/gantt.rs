@@ -326,6 +326,65 @@ async fn undo_after_an_end_handle_drag_restores_original_target() {
 }
 
 #[tokio::test]
+async fn failed_persist_pending_dates_pushes_an_error_toast() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    mock.fail_next(&format!("/workitems/{}", node.id), 503, "save failed");
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(state.gantt.scale.pixels_per_day(state.gantt.zoom) * 2.0);
+    let pending = state.commit_date_gesture_now().expect("pending");
+    let _ = state.persist_pending_dates(pending).await;
+    assert!(
+        state.toasts.last_error_message().is_some(),
+        "a failed date persist must surface an error toast on the live state"
+    );
+}
+
+#[tokio::test]
+async fn persist_pending_dates_rejects_a_stale_rev() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(state.gantt.scale.pixels_per_day(state.gantt.zoom) * 2.0);
+    let mut pending = state.commit_date_gesture_now().expect("pending");
+    pending.rev = 0;
+    let result = state.persist_pending_dates(pending).await;
+    assert!(result.is_err(), "PATCH with a stale rev must fail");
+}
+
+#[tokio::test]
+async fn undo_restores_a_cleared_target_date() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let original_target = node.target_date.clone();
+    let start = parse_iso_date(node.start_date.as_deref()).unwrap();
+    state
+        .save_exact_dates(node.id, Some(start), None)
+        .await
+        .expect("clear target");
+    let cleared = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert!(cleared.target_date.is_none() || cleared.target_date.as_deref() == Some("null"));
+    state.undo().await.expect("undo");
+    let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(restored.target_date, original_target);
+}
+
+#[tokio::test]
 async fn rollback_on_injected_failure() {
     let (mock, mut state, _dir) = signed_in().await;
     let node = state

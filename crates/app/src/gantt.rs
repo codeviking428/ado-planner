@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ado_core::{
-    GanttBarKind, IterationHint, IterationNode, WorkItemNode, dates_column_text,
-    from_gantt_exclusive_end, gantt_bar_display, iteration_hint_for_path, parse_iso_date,
+    GanttBarKind, IterationHint, IterationNode, WorkItemNode, dates_column_text, gantt_bar_display,
+    iteration_hint_for_path, parse_iso_date,
 };
 use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
@@ -601,10 +601,11 @@ impl GanttView {
         }
         self.selected_id = Some(rows[next].id);
         let y = next as f32 * ROW_HEIGHT;
+        let body_h = (self.viewport_h - TIMELINE_HEADER_H).max(0.0);
         if y < self.scroll_y {
             self.scroll_y = y;
-        } else if y + ROW_HEIGHT > self.scroll_y + self.viewport_h {
-            self.scroll_y = (y + ROW_HEIGHT - self.viewport_h).max(0.0);
+        } else if y + ROW_HEIGHT > self.scroll_y + body_h {
+            self.scroll_y = (y + ROW_HEIGHT - body_h).max(0.0);
         }
     }
 
@@ -687,6 +688,7 @@ impl GanttView {
         kind: GestureKind,
         origin_x: f32,
         nodes: &[WorkItemNode],
+        iterations: &[IterationNode],
     ) -> Result<(), &'static str> {
         if kind == GestureKind::Link {
             self.selected_id = Some(bar.id);
@@ -721,7 +723,7 @@ impl GanttView {
         }
         let had_start = parse_iso_date(node.start_date.as_deref()).is_some();
         let had_target = parse_iso_date(node.target_date.as_deref()).is_some();
-        let (start, target) = self.dates_from_painted_bar(bar, node, nodes);
+        let (start, target) = self.dates_from_painted_bar(bar, node, nodes, iterations);
         if bar.kind == GanttBarKind::Unscheduled && kind != GestureKind::Move {
             return Err("Unscheduled bars can be moved to set dates.");
         }
@@ -744,18 +746,15 @@ impl GanttView {
 
     fn dates_from_painted_bar(
         &self,
-        bar: &BarLayout,
+        _bar: &BarLayout,
         node: &WorkItemNode,
         nodes: &[WorkItemNode],
+        iterations: &[IterationNode],
     ) -> (Date, Date) {
-        let display = gantt_bar_display(node, nodes, None);
-        if bar.milestone {
-            let start = display.start.or(display.end).unwrap_or(self.origin);
-            return (start, display.end.unwrap_or(start));
-        }
-        let start = self.date_for_x(bar.x);
-        let end = self.date_for_x(bar.x + bar.width.max(1.0));
-        let target = from_gantt_exclusive_end(end);
+        let hint = iteration_hint_for_path(&node.iteration_path, iterations);
+        let display = gantt_bar_display(node, nodes, hint.as_ref());
+        let start = display.start.or(display.end).unwrap_or(self.origin);
+        let target = display.end.unwrap_or(start);
         (start, target.max(start))
     }
 
@@ -900,6 +899,7 @@ impl GanttView {
                 .into_iter()
                 .filter(|tick| tick.major)
                 .map(|tick| (tick.x, tick.major_label)),
+            false,
         )
     }
 
@@ -912,18 +912,30 @@ impl GanttView {
     /// Skip empty Year ticks and the Day number sitting under the Today line.
     pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 22.0;
-        Self::sticky_header_labels(self.timeline_ticks(width).into_iter().filter_map(|tick| {
-            if tick.label.is_empty() {
-                return None;
-            }
-            if hide_x.is_some_and(|x| (tick.x - x).abs() < HIDE_PAD) {
-                return None;
-            }
-            Some((tick.x, tick.label))
-        }))
+        let mut skip_sticky = false;
+        let ticks: Vec<(f32, String)> = self
+            .timeline_ticks(width)
+            .into_iter()
+            .filter_map(|tick| {
+                if tick.label.is_empty() {
+                    return None;
+                }
+                if hide_x.is_some_and(|x| (tick.x - x).abs() < HIDE_PAD) {
+                    if tick.x <= HIDE_PAD {
+                        skip_sticky = true;
+                    }
+                    return None;
+                }
+                Some((tick.x, tick.label))
+            })
+            .collect();
+        Self::sticky_header_labels(ticks, skip_sticky)
     }
 
-    fn sticky_header_labels(ticks: impl IntoIterator<Item = (f32, String)>) -> Vec<(f32, String)> {
+    fn sticky_header_labels(
+        ticks: impl IntoIterator<Item = (f32, String)>,
+        skip_sticky: bool,
+    ) -> Vec<(f32, String)> {
         const STICKY_MIN: f32 = 72.0;
         let mut sticky: Option<String> = None;
         let mut out = Vec::new();
@@ -933,6 +945,9 @@ impl GanttView {
             } else {
                 out.push((x, label));
             }
+        }
+        if skip_sticky {
+            return out;
         }
         if let Some(label) = sticky {
             let overlaps = out.first().is_some_and(|(x, _)| *x < STICKY_MIN);
@@ -1356,6 +1371,32 @@ mod tests {
     }
 
     #[test]
+    fn short_bar_gesture_uses_stored_dates_not_min_width() {
+        let mut item = node(1, None);
+        item.start_date = Some("2026-07-06T00:00:00Z".into());
+        item.target_date = Some("2026-07-06T00:00:00Z".into());
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&[item.clone()]);
+        let bars = gantt.layout_bars(&[item.clone()], &rows, &[], 720.0);
+        assert!(
+            bars[0].width >= 6.0,
+            "the painted bar is padded, got {}",
+            bars[0].width
+        );
+        gantt
+            .begin_gesture(&bars[0], GestureKind::Move, 0.0, &[item], &[])
+            .expect("move");
+        let gesture = gantt.gesture.expect("gesture");
+        assert_eq!(gesture.start.to_string(), "2026-07-06");
+        assert_eq!(gesture.target.to_string(), "2026-07-06");
+    }
+
+    #[test]
     fn start_only_and_milestone_bars_can_begin_a_move() {
         let mut start_only = node(1, None);
         start_only.target_date = None;
@@ -1372,7 +1413,7 @@ mod tests {
         let mile_bar = bars.iter().find(|bar| bar.id == 2).expect("milestone");
         assert!(mile_bar.milestone);
         gantt
-            .begin_gesture(start_bar, GestureKind::Move, 10.0, &nodes)
+            .begin_gesture(start_bar, GestureKind::Move, 10.0, &nodes, &[])
             .expect("start-only move");
         assert!(
             gantt
@@ -1382,7 +1423,7 @@ mod tests {
         );
         gantt.cancel_gesture();
         gantt
-            .begin_gesture(mile_bar, GestureKind::Move, 10.0, &nodes)
+            .begin_gesture(mile_bar, GestureKind::Move, 10.0, &nodes, &[])
             .expect("milestone move");
         assert!(
             gantt
@@ -1453,7 +1494,7 @@ mod tests {
         let rows = gantt.flatten(&nodes);
         let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
         gantt
-            .begin_gesture(&bars[0], GestureKind::Move, 10.0, &nodes)
+            .begin_gesture(&bars[0], GestureKind::Move, 10.0, &nodes, &[])
             .unwrap();
         assert!(gantt.finish_gesture().is_none());
     }
@@ -1866,6 +1907,7 @@ mod tests {
                 GestureKind::Link,
                 bars[0].x + bars[0].width + 6.0,
                 &nodes,
+                &[],
             )
             .expect("link");
         gantt.update_gesture(bars[1].x + 10.0);
@@ -1876,6 +1918,7 @@ mod tests {
                 GestureKind::Link,
                 bars[0].x + bars[0].width + 6.0,
                 &nodes,
+                &[],
             )
             .expect("link again");
         assert_eq!(gantt.take_link_gesture(), Some((1, None)));
@@ -1909,7 +1952,7 @@ mod tests {
         let drop = Date::new(2026, 8, 20).unwrap();
         let drop_x = gantt.x_for_date(drop);
         gantt
-            .begin_gesture(bar, GestureKind::Move, drop_x, &nodes)
+            .begin_gesture(bar, GestureKind::Move, drop_x, &nodes, &iterations)
             .expect("placeholder move");
         gantt.update_gesture(drop_x);
         let gesture = gantt.gesture.clone().expect("live");
@@ -1939,7 +1982,7 @@ mod tests {
         let rows = gantt.flatten(&nodes);
         let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
         gantt
-            .begin_gesture(&bars[0], GestureKind::Move, 10.0, &nodes)
+            .begin_gesture(&bars[0], GestureKind::Move, 10.0, &nodes, &[])
             .expect("start-only");
         let ppd = gantt.scale.pixels_per_day(gantt.zoom);
         gantt.update_gesture(10.0 + ppd * 3.0);
@@ -2034,7 +2077,7 @@ mod tests {
         let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
         let origin = bars[0].x + bars[0].width - 2.0;
         gantt
-            .begin_gesture(&bars[0], GestureKind::ResizeEnd, origin, &nodes)
+            .begin_gesture(&bars[0], GestureKind::ResizeEnd, origin, &nodes, &[])
             .expect("resize end");
         let ppd = gantt.scale.pixels_per_day(gantt.zoom);
         gantt.update_gesture(origin + ppd * 2.0);
@@ -2062,7 +2105,7 @@ mod tests {
         let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
         let origin = bars[0].x + bars[0].width / 2.0;
         gantt
-            .begin_gesture(&bars[0], GestureKind::Move, origin, &nodes)
+            .begin_gesture(&bars[0], GestureKind::Move, origin, &nodes, &[])
             .expect("move");
         let ppd = gantt.scale.pixels_per_day(gantt.zoom);
         gantt.update_gesture(origin + ppd * 2.4);
@@ -2105,6 +2148,12 @@ mod tests {
         gantt.select_relative(&rows, 5);
         assert_eq!(gantt.selected_id, Some(6));
         assert!(gantt.scroll_y > 0.0);
+        let body_h = (gantt.viewport_h - TIMELINE_HEADER_H).max(0.0);
+        let y = 5.0 * ROW_HEIGHT;
+        assert!(
+            (gantt.scroll_y - (y + ROW_HEIGHT - body_h).max(0.0)).abs() < 0.5,
+            "PageDown must scroll by the body under the axis, not the full viewport_h"
+        );
     }
 
     #[test]

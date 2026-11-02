@@ -316,7 +316,9 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     if let (Some(left), Some(right)) = (date_prefix(a), date_prefix(b)) {
         return left == right;
     }
-    if let (Some(left), Some(right)) = (identity_key(a), identity_key(b)) {
+    if matches!((a, b), (Value::Object(_), Value::Object(_)))
+        && let (Some(left), Some(right)) = (identity_key(a), identity_key(b))
+    {
         return left.eq_ignore_ascii_case(&right);
     }
     false
@@ -331,10 +333,14 @@ fn as_f64(value: &Value) -> Option<f64> {
 }
 
 fn date_prefix(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .filter(|text| text.len() >= 10 && text.as_bytes()[4] == b'-' && text.as_bytes()[7] == b'-')
-        .map(|text| &text[..10])
+    let text = value.as_str()?;
+    if text.len() < 10 || text.as_bytes()[4] != b'-' || text.as_bytes()[7] != b'-' {
+        return None;
+    }
+    if text.len() > 10 && text.as_bytes()[10] != b'T' {
+        return None;
+    }
+    Some(&text[..10])
 }
 
 fn identity_key(value: &Value) -> Option<String> {
@@ -893,6 +899,56 @@ mod tests {
                     value: Some(json!("Persist cart (saved)")),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn case_only_title_edit_is_patched() {
+        let mut original = serde_json::Map::new();
+        original.insert("System.Title".into(), json!("Cart"));
+        let mut draft = original.clone();
+        draft.insert("System.Title".into(), json!("cart"));
+        let document = build_form_patch(3, &original, &draft, &[title_control()]);
+        assert!(
+            document
+                .iter()
+                .any(|op| op.path == "/fields/System.Title" && op.value == Some(json!("cart"))),
+            "case-only string edits must PATCH, got {document:?}"
+        );
+    }
+
+    #[test]
+    fn iso_date_prefix_skips_equivalent_calendar_days() {
+        let mut original = serde_json::Map::new();
+        original.insert(
+            "Microsoft.VSTS.Scheduling.StartDate".into(),
+            json!("2026-07-06T12:00:00Z"),
+        );
+        let mut draft = original.clone();
+        draft.insert(
+            "Microsoft.VSTS.Scheduling.StartDate".into(),
+            json!("2026-07-06T00:00:00Z"),
+        );
+        let document = build_form_patch(
+            3,
+            &original,
+            &draft,
+            &[FormControl {
+                id: "Microsoft.VSTS.Scheduling.StartDate".into(),
+                reference_name: "Microsoft.VSTS.Scheduling.StartDate".into(),
+                label: "Start Date".into(),
+                kind: FormControlKind::DateTime,
+                required: false,
+                read_only: false,
+                visible: true,
+                options: None,
+            }],
+        );
+        assert!(
+            document
+                .iter()
+                .all(|op| op.path != "/fields/Microsoft.VSTS.Scheduling.StartDate"),
+            "same calendar day must not PATCH: {document:?}"
         );
     }
 

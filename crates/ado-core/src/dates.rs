@@ -231,6 +231,51 @@ pub fn build_dates_patch(
     ops
 }
 
+/// Write both date fields, using JSON null to clear a side. History undo/redo
+/// needs this so a start-only item can lose a Target Date again.
+pub fn build_replace_dates_patch(
+    rev: i64,
+    start_date: Option<Date>,
+    target_date: Option<Date>,
+) -> Vec<JsonPatchOp> {
+    vec![
+        JsonPatchOp {
+            op: PatchOp::Test,
+            path: "/rev".into(),
+            value: Some(json!(rev)),
+        },
+        JsonPatchOp {
+            op: PatchOp::Add,
+            path: format!("/fields/{START_DATE_FIELD}"),
+            value: Some(
+                start_date
+                    .map(|date| json!(iso_date_only(date)))
+                    .unwrap_or(Value::Null),
+            ),
+        },
+        JsonPatchOp {
+            op: PatchOp::Add,
+            path: format!("/fields/{TARGET_DATE_FIELD}"),
+            value: Some(
+                target_date
+                    .map(|date| json!(iso_date_only(date)))
+                    .unwrap_or(Value::Null),
+            ),
+        },
+    ]
+}
+
+pub fn parent_relation_op(parent_url: &str) -> JsonPatchOp {
+    JsonPatchOp {
+        op: PatchOp::Add,
+        path: "/relations/-".into(),
+        value: Some(json!({
+            "rel": "System.LinkTypes.Hierarchy-Reverse",
+            "url": parent_url,
+        })),
+    }
+}
+
 pub fn build_add_dependency_patch(rev: i64, predecessor_url: &str) -> Vec<JsonPatchOp> {
     vec![
         JsonPatchOp {
@@ -470,6 +515,20 @@ mod tests {
         let (start, target) = client_rollup(&nodes, 1).unwrap();
         assert_eq!(iso_date_only(start), "2026-07-01T00:00:00Z");
         assert_eq!(iso_date_only(target), "2026-08-01T00:00:00Z");
+    }
+
+    #[test]
+    fn replace_dates_patch_writes_null_to_clear_a_side() {
+        let document = build_replace_dates_patch(4, Some("2026-07-06".parse().unwrap()), None);
+        assert_eq!(document[0].path, "/rev");
+        assert_eq!(document[1].value, Some(json!("2026-07-06T00:00:00Z")));
+        assert_eq!(document[2].value, Some(Value::Null));
+        let parent = parent_relation_op("https://example/_apis/wit/workitems/1");
+        assert_eq!(parent.path, "/relations/-");
+        assert_eq!(
+            parent.value.as_ref().unwrap()["rel"],
+            "System.LinkTypes.Hierarchy-Reverse"
+        );
     }
 
     #[test]

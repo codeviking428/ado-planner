@@ -6,9 +6,9 @@ use ado_client::{AdoClient, AdoRuntime, TokenSource};
 use ado_core::{
     AssigneeFilter, Flavor, HierarchyResult, IdentityValue, IterationNode, Organization,
     OverlayFilter, Project, ScopeSelection, SessionInfo, Team, WorkItemNode, apply_overlays,
-    build_clear_dates_patch, build_dates_patch, build_field_patch, choose_available,
-    is_assignee_special, iso_date_only, parse_iso_date, resolve_root_types,
-    schedule_from_iteration,
+    build_clear_dates_patch, build_dates_patch, build_field_patch, build_replace_dates_patch,
+    choose_available, is_assignee_special, iso_date_only, parent_relation_op, parse_iso_date,
+    resolve_root_types, schedule_from_iteration,
 };
 use ado_session::{LoginCreds, PlannerSession, SharedSession};
 use jiff::ToSpan;
@@ -80,6 +80,7 @@ pub struct PendingDateSave {
     pub after_target: Option<String>,
     pub previous: WorkItemNode,
     pub role: DateSaveRole,
+    pub rev: i64,
 }
 
 impl PlannerState {
@@ -1209,6 +1210,7 @@ impl PlannerState {
             target,
             after_start,
             after_target,
+            rev: previous.rev,
             previous,
             role: DateSaveRole::Commit,
         })
@@ -1246,6 +1248,7 @@ impl PlannerState {
             target: parse_iso_date(before_target.as_deref()),
             after_start: before_start,
             after_target: before_target,
+            rev: previous.rev,
             previous,
             role: DateSaveRole::Undo,
         })
@@ -1282,6 +1285,7 @@ impl PlannerState {
             target: parse_iso_date(after_target.as_deref()),
             after_start,
             after_target,
+            rev: previous.rev,
             previous,
             role: DateSaveRole::Redo,
         })
@@ -1308,11 +1312,9 @@ impl PlannerState {
         if !node.has_date_fields {
             return Err(AppError::message("no date fields"));
         }
-        let ops = if pending.start.is_none() && pending.target.is_none() {
-            build_clear_dates_patch(node.rev)
-        } else {
-            build_dates_patch(node.rev, pending.start, pending.target)
-        };
+        let start = parse_iso_date(pending.after_start.as_deref());
+        let target = parse_iso_date(pending.after_target.as_deref());
+        let ops = build_replace_dates_patch(pending.rev, start, target);
         match self
             .client
             .patch_work_item(&scope.org, &scope.project, pending.id, &ops)
@@ -1474,6 +1476,72 @@ impl PlannerState {
                         Err(err.into())
                     }
                 }
+            }
+        }
+    }
+
+    /// Write both date fields, using JSON null to clear a side.
+    pub async fn save_exact_dates(
+        &mut self,
+        id: i64,
+        start: Option<Date>,
+        target: Option<Date>,
+    ) -> Result<(), AppError> {
+        if start.is_none() && target.is_none() {
+            return self.clear_dates(id).await;
+        }
+        let Some(scope) = self.scope() else {
+            return Ok(());
+        };
+        let Some(node) = self.nodes.iter().find(|node| node.id == id).cloned() else {
+            return Err(AppError::message("Work Item not found"));
+        };
+        if !node.has_date_fields {
+            self.toasts.push(
+                ToastKind::Error,
+                "This Work Item has no Start Date and Target Date fields.",
+            );
+            return Err(AppError::message("no date fields"));
+        }
+        let previous = node.clone();
+        if let Some(live) = self.nodes.iter_mut().find(|item| item.id == id) {
+            live.start_date = start.map(iso_date_only);
+            live.target_date = target.map(iso_date_only);
+        }
+        let after_start = start.map(iso_date_only);
+        let after_target = target.map(iso_date_only);
+        if self.history_recording {
+            self.record_dates(id, &previous, after_start.clone(), after_target.clone());
+        }
+        let ops = build_replace_dates_patch(node.rev, start, target);
+        match self
+            .client
+            .patch_work_item(&scope.org, &scope.project, id, &ops)
+            .await
+        {
+            Ok(rev) => {
+                if let Some(live) = self.nodes.iter_mut().find(|item| item.id == id) {
+                    live.rev = rev;
+                }
+                self.persist_hierarchy_cache();
+                if self.history_recording {
+                    let message = match (start, target) {
+                        (Some(_), None) => "Saved Start Date",
+                        (None, Some(_)) => "Saved Target Date",
+                        _ => "Saved Start Date and Target Date",
+                    };
+                    self.toasts.push(ToastKind::Success, message);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.restore_node(previous);
+                if self.history_recording {
+                    self.discard_last_dates(id);
+                }
+                self.toasts
+                    .push(ToastKind::Error, error_text(&err, "Could not save dates"));
+                Err(err.into())
             }
         }
     }
@@ -1666,11 +1734,10 @@ impl PlannerState {
             });
         }
         if let Some(parent_id) = parent_id {
-            ops.push(ado_core::JsonPatchOp {
-                op: ado_core::PatchOp::Add,
-                path: "/fields/System.Parent".into(),
-                value: Some(json!(parent_id)),
-            });
+            let url = self
+                .client
+                .work_item_api_url(&scope.org, &scope.project, parent_id);
+            ops.push(parent_relation_op(&url));
         }
         match self
             .client
@@ -1780,7 +1847,10 @@ impl PlannerState {
         let Some(bar) = bars.into_iter().find(|bar| bar.id == bar_id) else {
             return Err(AppError::message("bar not found"));
         };
-        if let Err(message) = self.gantt.begin_gesture(&bar, kind, origin_x, &visible) {
+        if let Err(message) =
+            self.gantt
+                .begin_gesture(&bar, kind, origin_x, &visible, &self.iterations)
+        {
             self.toasts.push(ToastKind::Error, message);
             return Err(AppError::message(message));
         }
@@ -1964,13 +2034,12 @@ impl PlannerState {
                 } else {
                     (after_start, after_target)
                 };
-                match (
+                self.save_exact_dates(
+                    *id,
                     parse_iso_date(start.as_deref()),
                     parse_iso_date(target.as_deref()),
-                ) {
-                    (None, None) => self.clear_dates(*id).await,
-                    (start, target) => self.save_partial_dates(*id, start, target).await,
-                }
+                )
+                .await
             }
             HistoryEntry::Link {
                 successor_id,
@@ -1987,12 +2056,76 @@ impl PlannerState {
         }
     }
 
-    pub async fn apply_undo(&mut self, _action: UndoAction) -> Result<(), AppError> {
-        self.undo().await
+    pub async fn apply_undo(&mut self, action: UndoAction) -> Result<(), AppError> {
+        self.history_recording = false;
+        let result = match &action {
+            UndoAction::RestoreDates {
+                id,
+                start_date,
+                target_date,
+                ..
+            } => {
+                self.save_exact_dates(
+                    *id,
+                    parse_iso_date(start_date.as_deref()),
+                    parse_iso_date(target_date.as_deref()),
+                )
+                .await
+            }
+            UndoAction::RemoveLink {
+                successor_id,
+                predecessor_id,
+            } => self.remove_dependency(*successor_id, *predecessor_id).await,
+            UndoAction::RestoreLink {
+                successor_id,
+                predecessor_id,
+            } => self.add_dependency(*successor_id, *predecessor_id).await,
+        };
+        self.history_recording = true;
+        if result.is_ok() {
+            self.discard_history_for_undo(&action);
+            self.toasts
+                .items
+                .retain(|toast| toast.undo.as_ref() != Some(&action));
+        }
+        result
     }
 
-    pub async fn undo_clear_dates(&mut self, _action: UndoAction) -> Result<(), AppError> {
-        self.undo().await
+    fn discard_history_for_undo(&mut self, action: &UndoAction) {
+        match action {
+            UndoAction::RestoreDates { id, .. } => {
+                if let Some(index) = self.history.undo.iter().rposition(|entry| {
+                    matches!(entry, HistoryEntry::Dates { id: entry_id, .. } if *entry_id == *id)
+                }) {
+                    self.history.undo.remove(index);
+                }
+            }
+            UndoAction::RemoveLink {
+                successor_id,
+                predecessor_id,
+            }
+            | UndoAction::RestoreLink {
+                successor_id,
+                predecessor_id,
+            } => {
+                if let Some(index) = self.history.undo.iter().rposition(|entry| {
+                    matches!(
+                        entry,
+                        HistoryEntry::Link {
+                            successor_id: sid,
+                            predecessor_id: pid,
+                            ..
+                        } if *sid == *successor_id && *pid == *predecessor_id
+                    )
+                }) {
+                    self.history.undo.remove(index);
+                }
+            }
+        }
+    }
+
+    pub async fn undo_clear_dates(&mut self, action: UndoAction) -> Result<(), AppError> {
+        self.apply_undo(action).await
     }
 
     pub async fn schedule_to_iteration(&mut self, id: i64) -> Result<(), AppError> {
