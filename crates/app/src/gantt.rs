@@ -1297,6 +1297,11 @@ impl GanttView {
         for node in nodes {
             let hint = iteration_hint_for_path(&node.iteration_path, iterations);
             let display = gantt_bar_display(node, nodes, hint.as_ref());
+            if display.kind == GanttBarKind::Unscheduled {
+                // Diamonds sit at Today. Iteration/rollup hints are display
+                // copy only and must not pull Auto Fit onto a ghost span.
+                continue;
+            }
             if let Some(start) = display.start {
                 earliest = Some(match earliest {
                     Some(current) if start < current => start,
@@ -2237,6 +2242,40 @@ mod tests {
     }
 
     #[test]
+    fn auto_fit_unscheduled_iteration_goes_to_today() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        let iterations = vec![ado_core::IterationNode {
+            path: "Shop\\Sprint 12".into(),
+            name: "Sprint 12".into(),
+            start_date: Some("2026-07-01T00:00:00Z".into()),
+            finish_date: Some("2026-07-14T00:00:00Z".into()),
+            children: Vec::new(),
+        }];
+        let mut gantt = GanttView {
+            origin: Date::new(2025, 1, 1).unwrap(),
+            zoom: 0.4,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.auto_fit(std::slice::from_ref(&item), &iterations, 800.0);
+        let today = jiff::Zoned::now().date();
+        assert_eq!(
+            gantt.origin, today,
+            "unscheduled iteration hints must not frame Auto Fit away from Today diamonds"
+        );
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &iterations, 720.0);
+        assert!(
+            bars.iter()
+                .any(|bar| { bar.marker && bar.x < 800.0 && bar.x + bar.width > 0.0 }),
+            "Today diamonds must land on screen, origin={} bars={bars:?}",
+            gantt.origin
+        );
+    }
+
+    #[test]
     fn auto_fit_without_dates_goes_to_today() {
         let mut item = node(1, None);
         item.start_date = None;
@@ -2989,6 +3028,36 @@ mod tests {
                 "scale buttons must keep a percent after Auto Fit, got {label}"
             );
         }
+    }
+
+    #[test]
+    fn focus_work_keeps_unscheduled_diamonds_on_today() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        let iterations = vec![ado_core::IterationNode {
+            path: "Shop\\Sprint 12".into(),
+            name: "Sprint 12".into(),
+            start_date: Some("2026-07-01T00:00:00Z".into()),
+            finish_date: Some("2026-07-14T00:00:00Z".into()),
+            children: Vec::new(),
+        }];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 11, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let today = Date::new(2026, 11, 2).unwrap();
+        gantt.focus_work(std::slice::from_ref(&item), &iterations, 800.0, today);
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &iterations, 720.0);
+        assert!(
+            bars.iter()
+                .any(|bar| { bar.marker && bar.x < 800.0 && bar.x + bar.width > 0.0 }),
+            "unscheduled-only load must keep Today diamonds on screen, origin={} scroll={}",
+            gantt.origin,
+            gantt.scroll_x
+        );
     }
 
     #[test]

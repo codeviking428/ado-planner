@@ -865,6 +865,57 @@ async fn filters_that_hide_every_item_are_counted() {
 }
 
 #[tokio::test]
+async fn load_camera_ignores_hidden_scheduled_items() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let hidden: Vec<String> = state
+        .types()
+        .into_iter()
+        .filter(|ty| ty != "Task")
+        .collect();
+    state.set_hidden_roots(hidden);
+    let scheduled: Vec<i64> = state
+        .visible_nodes()
+        .iter()
+        .filter(|node| node.start_date.is_some() || node.target_date.is_some())
+        .map(|node| node.id)
+        .collect();
+    for id in scheduled {
+        state.clear_dates(id).await.expect("clear visible dates");
+    }
+    assert!(
+        state
+            .visible_nodes()
+            .iter()
+            .all(|node| node.start_date.is_none() && node.target_date.is_none()),
+        "visible rows must be unscheduled diamonds"
+    );
+    assert!(
+        state.nodes.iter().any(|node| node.start_date.is_some()),
+        "hidden scheduled items must still be in the full node list"
+    );
+    state.gantt.origin = Date::new(2025, 1, 1).unwrap();
+    state.gantt.timeline_width = 800.0;
+    state.load_hierarchy().await.expect("reload");
+    let today = jiff::Zoned::now().date();
+    assert_eq!(
+        state.gantt.origin, today,
+        "load must not Auto Fit to hidden July bars, origin={}",
+        state.gantt.origin
+    );
+    let visible = state.visible_nodes();
+    let rows = state.gantt.flatten(&visible);
+    let bars = state
+        .gantt
+        .layout_bars(&visible, &rows, &state.iterations, 720.0);
+    assert!(
+        bars.iter()
+            .any(|bar| bar.marker && bar.x < 800.0 && bar.x + bar.width > 0.0),
+        "filtered load must keep Today diamonds on screen, origin={} bars={bars:?}",
+        state.gantt.origin
+    );
+}
+
+#[tokio::test]
 async fn removing_a_dependency_clears_the_predecessor() {
     let (_mock, mut state, _dir) = signed_in().await;
     state

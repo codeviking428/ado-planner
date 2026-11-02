@@ -903,12 +903,9 @@ impl PlannerState {
         self.hierarchy = Some(result);
         if !self.restore_gantt_view() {
             let width = self.gantt.timeline_width.max(800.0);
-            self.gantt.focus_work(
-                &self.nodes,
-                &self.iterations,
-                width,
-                jiff::Zoned::now().date(),
-            );
+            let nodes = self.visible_nodes();
+            self.gantt
+                .focus_work(&nodes, &self.iterations, width, jiff::Zoned::now().date());
             self.gantt.scroll_y = 0.0;
         }
     }
