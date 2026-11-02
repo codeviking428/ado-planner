@@ -64,6 +64,14 @@ impl AdoMock {
             .clone()
     }
 
+    pub async fn work_item(&self, id: i64) -> Option<Value> {
+        let items = self.state.items.lock().await;
+        items
+            .iter()
+            .find(|item| item.get("id") == Some(&json!(id)))
+            .cloned()
+    }
+
     pub async fn close(mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());

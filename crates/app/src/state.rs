@@ -1308,7 +1308,9 @@ impl PlannerState {
         else {
             return Ok(());
         };
-        if node.start_date != pending.after_start || node.target_date != pending.after_target {
+        if pending.role == DateSaveRole::Commit
+            && (node.start_date != pending.after_start || node.target_date != pending.after_target)
+        {
             return Ok(());
         }
         if !node.has_date_fields {
@@ -1316,10 +1318,21 @@ impl PlannerState {
         }
         let start = parse_iso_date(pending.after_start.as_deref());
         let target = parse_iso_date(pending.after_target.as_deref());
-        let ops = build_replace_dates_patch(pending.rev, start, target);
+        if pending.role != DateSaveRole::Commit
+            && let Some(live) = self.nodes.iter_mut().find(|node| node.id == pending.id)
+        {
+            live.start_date = pending.after_start.clone();
+            live.target_date = pending.after_target.clone();
+        }
         match self
             .client
-            .patch_work_item(&scope.org, &scope.project, pending.id, &ops)
+            .patch_work_item_with_rev_retry(
+                &scope.org,
+                &scope.project,
+                pending.id,
+                pending.rev,
+                |rev| build_replace_dates_patch(rev, start, target),
+            )
             .await
         {
             Ok(rev) => {
@@ -1378,10 +1391,11 @@ impl PlannerState {
                 Some(iso_date_only(target)),
             );
         }
-        let ops = build_dates_patch(node.rev, Some(start), Some(target));
         match self
             .client
-            .patch_work_item(&scope.org, &scope.project, id, &ops)
+            .patch_work_item_with_rev_retry(&scope.org, &scope.project, id, node.rev, |rev| {
+                build_dates_patch(rev, Some(start), Some(target))
+            })
             .await
         {
             Ok(rev) => {
@@ -1447,10 +1461,15 @@ impl PlannerState {
                 if self.history_recording {
                     self.record_dates(id, &previous, after_start.clone(), after_target.clone());
                 }
-                let ops = build_dates_patch(node.rev, start, target);
                 match self
                     .client
-                    .patch_work_item(&scope.org, &scope.project, id, &ops)
+                    .patch_work_item_with_rev_retry(
+                        &scope.org,
+                        &scope.project,
+                        id,
+                        node.rev,
+                        |rev| build_dates_patch(rev, start, target),
+                    )
                     .await
                 {
                     Ok(rev) => {
@@ -1515,10 +1534,11 @@ impl PlannerState {
         if self.history_recording {
             self.record_dates(id, &previous, after_start.clone(), after_target.clone());
         }
-        let ops = build_replace_dates_patch(node.rev, start, target);
         match self
             .client
-            .patch_work_item(&scope.org, &scope.project, id, &ops)
+            .patch_work_item_with_rev_retry(&scope.org, &scope.project, id, node.rev, |rev| {
+                build_replace_dates_patch(rev, start, target)
+            })
             .await
         {
             Ok(rev) => {
@@ -1809,10 +1829,11 @@ impl PlannerState {
         if let Some(live) = self.nodes.iter_mut().find(|n| n.id == id) {
             apply(live);
         }
-        let ops = build_field_patch(node.rev, reference, value);
         match self
             .client
-            .patch_work_item(&scope.org, &scope.project, id, &ops)
+            .patch_work_item_with_rev_retry(&scope.org, &scope.project, id, node.rev, |rev| {
+                build_field_patch(rev, reference, value.clone())
+            })
             .await
         {
             Ok(rev) => {
@@ -1953,10 +1974,11 @@ impl PlannerState {
             live.start_date = None;
             live.target_date = None;
         }
-        let ops = build_clear_dates_patch(node.rev);
         match self
             .client
-            .patch_work_item(&scope.org, &scope.project, id, &ops)
+            .patch_work_item_with_rev_retry(&scope.org, &scope.project, id, node.rev, |rev| {
+                build_clear_dates_patch(rev)
+            })
             .await
         {
             Ok(rev) => {

@@ -88,6 +88,8 @@ pub struct PlannerView {
     toast_expiry_armed: bool,
     loading_shown_at: Option<std::time::Instant>,
     loading_hold_gen: u64,
+    last_undo_at: Option<std::time::Instant>,
+    last_redo_at: Option<std::time::Instant>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -217,6 +219,8 @@ impl PlannerView {
             toast_expiry_armed: false,
             loading_shown_at: None,
             loading_hold_gen: 0,
+            last_undo_at: None,
+            last_redo_at: None,
             _subscriptions: vec![keystrokes],
         };
         this.bind_sign_in_events(window, cx);
@@ -492,12 +496,31 @@ impl PlannerView {
             return;
         }
         if self.state.gantt.hover_locked {
-            return;
+            if id.is_none() {
+                return;
+            }
+            self.state.gantt.hover_locked = false;
         }
         if self.state.gantt.hovered_id != id {
             self.state.gantt.hovered_id = id;
             cx.notify();
         }
+    }
+
+    fn history_hotkey_is_duplicate(&mut self, undo: bool) -> bool {
+        let now = std::time::Instant::now();
+        let slot = if undo {
+            &mut self.last_undo_at
+        } else {
+            &mut self.last_redo_at
+        };
+        if let Some(previous) = *slot
+            && now.saturating_duration_since(previous) < Duration::from_millis(16)
+        {
+            return true;
+        }
+        *slot = Some(now);
+        false
     }
 
     fn begin_inline(
@@ -803,7 +826,7 @@ impl PlannerView {
     }
 
     fn undo_last(&mut self, cx: &mut Context<Self>) {
-        if self.state.history.undo.is_empty() {
+        if self.history_hotkey_is_duplicate(true) || self.state.history.undo.is_empty() {
             return;
         }
         if let Some(pending) = self.state.undo_dates_now() {
@@ -818,7 +841,7 @@ impl PlannerView {
     }
 
     fn redo_last(&mut self, cx: &mut Context<Self>) {
-        if self.state.history.redo.is_empty() {
+        if self.history_hotkey_is_duplicate(false) || self.state.history.redo.is_empty() {
             return;
         }
         if let Some(pending) = self.state.redo_dates_now() {
@@ -1791,6 +1814,7 @@ impl PlannerView {
         let selected_bg = cx.theme().list_active;
         let stripe = cx.theme().muted;
         let row_bg = cx.theme().background;
+        let hovered_id = self.state.gantt.hovered_id;
         let first_row = self.state.gantt.first_visible_row_index();
         let remainder = self.state.gantt.row_scroll_remainder();
         let show_type = self.state.gantt.show_type_column();
@@ -1876,6 +1900,7 @@ impl PlannerView {
                                     .map(|a| a.display_name.clone())
                                     .unwrap_or_else(|| "Unassigned".into());
                                 let editing_title = self.inline_edit == Some(InlineEdit::Title(id));
+                                let hovered = hovered_id == Some(id);
                                 let row_selector = format!("gantt-tree-row-{id}");
                                 div()
                                     .id(("work-item", id as u64))
@@ -1891,12 +1916,23 @@ impl PlannerView {
                                     .overflow_hidden()
                                     .bg(if selected {
                                         selected_bg
+                                    } else if hovered {
+                                        hover_bg
                                     } else if striped {
                                         stripe
                                     } else {
                                         row_bg
                                     })
-                                    .when(!selected, |el| el.hover(|el| el.bg(hover_bg)))
+                                    .when(!selected && !hovered, |el| el.hover(|el| el.bg(hover_bg)))
+                                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                        this.set_hovered(
+                                            if *hovered { Some(id) } else { None },
+                                            cx,
+                                        );
+                                    }))
+                                    .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                                        this.set_hovered(Some(id), cx);
+                                    }))
                                     .on_click(cx.listener(
                                         move |this, event: &gpui_kit::ClickEvent, window, cx| {
                                             this.open_filter = None;
@@ -2373,6 +2409,7 @@ impl PlannerView {
                                         );
                                     }))
                                     .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                                        this.set_hovered(Some(id), cx);
                                         if this
                                             .state
                                             .gantt
@@ -2630,11 +2667,13 @@ impl PlannerView {
         let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
         let milestone = bar.milestone;
         let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
-        let inside = !unscheduled && !milestone && !summary && bar.width >= title_width.max(40.0);
+        let clip_pad = (-bar.x).max(0.0);
+        let visible_w = (bar.width - clip_pad).max(0.0);
+        let inside = !unscheduled && !milestone && !summary && visible_w >= title_width.max(40.0);
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
         let show_handles = !summary && !unscheduled && !milestone && hovered && !dragging;
-        let show_link_handles = !unscheduled && (hovered || selected) && !dragging;
+        let show_link_handles = !unscheduled && hovered && !dragging;
         let bar_h = if milestone {
             MILESTONE_SIZE
         } else if summary {
@@ -2729,7 +2768,7 @@ impl PlannerView {
                 .when(!milestone, |el| {
                     el.child(
                         div()
-                            .pl(px(label_pad))
+                            .pl(px(label_pad + clip_pad))
                             .pr(px(label_pad))
                             .truncate()
                             .text_xs()
@@ -2743,6 +2782,8 @@ impl PlannerView {
                 .when(show_handles, |el| {
                     el.child(
                         div()
+                            .id(("resize-start", id as u64))
+                            .debug_selector(move || format!("gantt-resize-handle-{id}-start"))
                             .absolute()
                             .left_0()
                             .top_0()
@@ -2752,6 +2793,8 @@ impl PlannerView {
                     )
                     .child(
                         div()
+                            .id(("resize-end", id as u64))
+                            .debug_selector(move || format!("gantt-resize-handle-{id}-end"))
                             .absolute()
                             .right_0()
                             .top_0()
@@ -2817,8 +2860,8 @@ impl PlannerView {
                 .into_any_element(),
         ];
         if show_link_handles {
-            let start_x = bar.x - LINK_HANDLE_HIT;
-            let end_x = bar.x + bar.width;
+            let start_x = bar.x - LINK_HANDLE_HIT - 4.0;
+            let end_x = bar.x + bar.width + 4.0;
             let handle_top = ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
             for (handle_id, handle_x) in [("link-start", start_x), ("link-end", end_x)] {
                 let selector = format!("gantt-link-handle-{id}-{handle_id}");
@@ -2854,7 +2897,7 @@ impl PlannerView {
                                 .rounded_full()
                                 .bg(cx.theme().background)
                                 .border_2()
-                                .border_color(cx.theme().primary),
+                                .border_color(cx.theme().danger),
                         )
                         .into_any_element(),
                 );
@@ -2867,34 +2910,37 @@ impl PlannerView {
             } else {
                 10.0
             };
-            items.push(
-                div()
-                    .id(("gantt-bar-label", id as u64))
-                    .debug_selector(|| "gantt-bar-label".into())
-                    .absolute()
-                    .left(px(bar.x + bar.width + label_gap))
-                    .top(px(((ROW_HEIGHT - 16.0) / 2.0).max(2.0)))
-                    .h(px(16.))
-                    .flex()
-                    .items_center()
-                    .whitespace_nowrap()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child(label.clone())
-                    .on_click(
-                        cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
-                            this.state.gantt.selected_id = Some(id);
-                            if this.inline_edit.is_none() {
-                                window.focus(&this.form_focus, cx);
-                            }
-                            if event.click_count() >= 2 {
-                                this.open_form(id, cx);
-                            }
-                            cx.notify();
-                        }),
-                    )
-                    .into_any_element(),
-            );
+            let label_x = bar.x + bar.width + label_gap;
+            if label_x >= 0.0 {
+                items.push(
+                    div()
+                        .id(("gantt-bar-label", id as u64))
+                        .debug_selector(move || format!("gantt-bar-label-{id}"))
+                        .absolute()
+                        .left(px(label_x))
+                        .top(px(((ROW_HEIGHT - 16.0) / 2.0).max(2.0)))
+                        .h(px(16.))
+                        .flex()
+                        .items_center()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(label.clone())
+                        .on_click(cx.listener(
+                            move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                                this.state.gantt.selected_id = Some(id);
+                                if this.inline_edit.is_none() {
+                                    window.focus(&this.form_focus, cx);
+                                }
+                                if event.click_count() >= 2 {
+                                    this.open_form(id, cx);
+                                }
+                                cx.notify();
+                            },
+                        ))
+                        .into_any_element(),
+                );
+            }
         }
         div()
             .relative()
@@ -3803,11 +3849,23 @@ impl PlannerView {
                 index += 1;
                 continue;
             }
+            let has_later = self
+                .date_save_queue
+                .iter()
+                .skip(index + 1)
+                .any(|pending| pending.id == id);
+            if has_later {
+                self.date_save_queue.remove(index);
+                continue;
+            }
             let mut pending = self.date_save_queue.remove(index).expect("queued save");
             let Some(live) = self.state.nodes.iter().find(|node| node.id == pending.id) else {
                 continue;
             };
-            if live.start_date != pending.after_start || live.target_date != pending.after_target {
+            if pending.role == DateSaveRole::Commit
+                && (live.start_date != pending.after_start
+                    || live.target_date != pending.after_target)
+            {
                 continue;
             }
             pending.rev = live.rev;
@@ -4007,6 +4065,12 @@ impl PlannerView {
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        if event.is_held
+            && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+            && (key == "z" || key == "y")
+        {
+            return;
+        }
         if key == "escape" {
             if self.inline_edit.take().is_some() {
                 cx.notify();
@@ -4375,7 +4439,7 @@ impl Render for PlannerView {
                     cx.notify();
                     return;
                 }
-                if !this.state.gantt.pointer_in_canvas(x, y) {
+                if !this.state.gantt.pointer_in_rows(x, y) {
                     this.clear_canvas_hover(cx);
                 }
             }))

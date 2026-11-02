@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ado_client::{AdoClient, AuthScheme, StaticTokens};
-use ado_core::{ScopeSelection, build_start_target_patch};
+use ado_core::{ScopeSelection, build_replace_dates_patch, build_start_target_patch};
 
 fn tokens(scheme: AuthScheme, org: Option<&str>) -> Arc<StaticTokens> {
     Arc::new(StaticTokens {
@@ -122,6 +122,47 @@ async fn patch_rev_conflict() {
         .await
         .expect_err("conflict");
     assert!(err.is_precondition_failed());
+}
+
+#[tokio::test]
+async fn patch_with_rev_retry_recovers_from_stale_rev() {
+    let mock = ado_mock::start().await;
+    let ado = AdoClient::with_base_urls(
+        tokens(AuthScheme::Pat, Some("contoso")),
+        &mock.url,
+        &mock.url,
+    );
+    let start = "2026-07-07".parse().unwrap();
+    let target = "2026-07-21".parse().unwrap();
+    let rev = ado
+        .patch_work_item_with_rev_retry("contoso", "Shop", 1003, 0, |rev| {
+            build_replace_dates_patch(rev, Some(start), Some(target))
+        })
+        .await
+        .expect("retry");
+    assert!(rev > 0);
+}
+
+#[tokio::test]
+async fn remove_dependency_uses_the_server_rev() {
+    let mock = ado_mock::start().await;
+    let ado = AdoClient::with_base_urls(
+        tokens(AuthScheme::Pat, Some("contoso")),
+        &mock.url,
+        &mock.url,
+    );
+    ado.add_dependency("contoso", "Shop", 1005, 1003, 1)
+        .await
+        .expect("link");
+    let start = "2026-07-22".parse().unwrap();
+    ado.patch_work_item_with_rev_retry("contoso", "Shop", 1005, 1, |rev| {
+        build_replace_dates_patch(rev, Some(start), None)
+    })
+    .await
+    .expect("bump rev");
+    ado.remove_dependency("contoso", "Shop", 1005, 1003, 1)
+        .await
+        .expect("stale caller rev must not 412");
 }
 
 #[tokio::test]

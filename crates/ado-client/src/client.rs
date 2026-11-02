@@ -589,6 +589,41 @@ impl AdoClient {
         Ok(updated.get("rev").and_then(Value::as_i64).unwrap_or(0))
     }
 
+    pub async fn get_work_item_rev(
+        &self,
+        org: &str,
+        project: &str,
+        id: i64,
+    ) -> Result<i64, ClientError> {
+        let item = self
+            .get(&format!(
+                "{}/{}/_apis/wit/workitems/{id}?api-version=7.1",
+                self.org_url(org),
+                urlencoding::encode(project)
+            ))
+            .await?;
+        Ok(item.get("rev").and_then(Value::as_i64).unwrap_or(0))
+    }
+
+    /// PATCH a work item, refetching `/rev` and retrying once on 412.
+    pub async fn patch_work_item_with_rev_retry(
+        &self,
+        org: &str,
+        project: &str,
+        id: i64,
+        rev: i64,
+        build: impl Fn(i64) -> Vec<JsonPatchOp>,
+    ) -> Result<i64, ClientError> {
+        match self.patch_work_item(org, project, id, &build(rev)).await {
+            Ok(new_rev) => Ok(new_rev),
+            Err(err) if err.is_precondition_failed() => {
+                let fresh = self.get_work_item_rev(org, project, id).await?;
+                self.patch_work_item(org, project, id, &build(fresh)).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn add_dependency(
         &self,
         org: &str,
@@ -602,12 +637,9 @@ impl AdoClient {
             self.org_url(org),
             urlencoding::encode(project)
         );
-        self.patch_work_item(
-            org,
-            project,
-            successor_id,
-            &ado_core::build_add_dependency_patch(rev, &url),
-        )
+        self.patch_work_item_with_rev_retry(org, project, successor_id, rev, |rev| {
+            ado_core::build_add_dependency_patch(rev, &url)
+        })
         .await
     }
 
@@ -626,18 +658,16 @@ impl AdoClient {
                 urlencoding::encode(project)
             ))
             .await?;
+        let current_rev = item.get("rev").and_then(Value::as_i64).unwrap_or(rev);
         let relations = item.get("relations").and_then(Value::as_array);
         let Some(index) =
             ado_core::dependency_relation_index(relations.map(|v| v.as_slice()), predecessor_id)
         else {
             return Err(ClientError::Message("dependency not found".into()));
         };
-        self.patch_work_item(
-            org,
-            project,
-            successor_id,
-            &ado_core::build_remove_dependency_patch(rev, index),
-        )
+        self.patch_work_item_with_rev_retry(org, project, successor_id, current_rev, |rev| {
+            ado_core::build_remove_dependency_patch(rev, index)
+        })
         .await
     }
 

@@ -429,6 +429,13 @@ impl GanttView {
         x >= left && x <= right && y >= top && y <= bottom
     }
 
+    pub fn pointer_in_rows(&self, x: f32, y: f32) -> bool {
+        let right = self.timeline_origin_x + self.timeline_width.max(1.0);
+        let top = self.timeline_origin_y + TIMELINE_HEADER_H;
+        let bottom = self.timeline_origin_y + self.viewport_h;
+        x >= 0.0 && x <= right && y >= top && y <= bottom
+    }
+
     pub fn step_period(&mut self, direction: i32) {
         if direction == 0 {
             return;
@@ -1305,6 +1312,14 @@ mod tests {
         assert!(
             !gantt.pointer_in_canvas(500.0, 40.0),
             "the toolbar is not the canvas"
+        );
+        assert!(
+            gantt.pointer_in_rows(120.0, 200.0),
+            "the left grid is part of the row hover area"
+        );
+        assert!(
+            !gantt.pointer_in_rows(500.0, 40.0),
+            "the toolbar is not a row"
         );
     }
 

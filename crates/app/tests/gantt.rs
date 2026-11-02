@@ -383,8 +383,8 @@ async fn failed_persist_pending_dates_pushes_an_error_toast() {
 }
 
 #[tokio::test]
-async fn persist_pending_dates_rejects_a_stale_rev() {
-    let (_mock, mut state, _dir) = signed_in().await;
+async fn persist_pending_dates_retries_a_stale_rev() {
+    let (mock, mut state, _dir) = signed_in().await;
     let node = state
         .nodes
         .iter()
@@ -395,8 +395,21 @@ async fn persist_pending_dates_rejects_a_stale_rev() {
     state.update_bar_gesture(state.gantt.scale.pixels_per_day(state.gantt.zoom) * 2.0);
     let mut pending = state.commit_date_gesture_now().expect("pending");
     pending.rev = 0;
-    let result = state.persist_pending_dates(pending).await;
-    assert!(result.is_err(), "PATCH with a stale rev must fail");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("stale rev must refetch and retry");
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    let server = mock.work_item(node.id).await.expect("server item");
+    let fields = server.get("fields").cloned().unwrap_or_default();
+    assert_eq!(
+        parse_iso_date(live.start_date.as_deref()),
+        parse_iso_date(
+            fields
+                .get(ado_core::START_DATE_FIELD)
+                .and_then(|value| value.as_str())
+        )
+    );
 }
 
 #[tokio::test]
@@ -739,6 +752,157 @@ async fn save_title_patches_system_title() {
         .expect("title");
     let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();
     assert_eq!(node.title, "Inline title");
+}
+
+async fn server_dates(mock: &ado_mock::AdoMock, id: i64) -> (Option<Date>, Option<Date>) {
+    let item = mock.work_item(id).await.expect("server work item");
+    let fields = item.get("fields").cloned().unwrap_or_default();
+    (
+        parse_iso_date(
+            fields
+                .get(ado_core::START_DATE_FIELD)
+                .and_then(|value| value.as_str()),
+        ),
+        parse_iso_date(
+            fields
+                .get(ado_core::TARGET_DATE_FIELD)
+                .and_then(|value| value.as_str()),
+        ),
+    )
+}
+
+fn live_dates(state: &PlannerState, id: i64) -> (Option<Date>, Option<Date>) {
+    let node = state.nodes.iter().find(|node| node.id == id).expect("live");
+    (
+        parse_iso_date(node.start_date.as_deref()),
+        parse_iso_date(node.target_date.as_deref()),
+    )
+}
+
+#[tokio::test]
+async fn three_gestures_three_undos_match_the_server_after_each() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let id = 1003;
+    let original = live_dates(&state, id);
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+
+    let _ = state.begin_bar_gesture(id, GestureKind::ResizeEnd, 0.0);
+    state.update_bar_gesture(step * 2.0);
+    let pending = state.commit_date_gesture_now().expect("A");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist A");
+    let after_a = live_dates(&state, id);
+    assert_ne!(after_a, original);
+    assert_eq!(after_a, server_dates(&mock, id).await);
+
+    let _ = state.begin_bar_gesture(id, GestureKind::ResizeEnd, 0.0);
+    state.update_bar_gesture(step * 3.0);
+    let pending = state.commit_date_gesture_now().expect("B");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist B");
+    let after_b = live_dates(&state, id);
+    assert_ne!(after_b, after_a);
+    assert_eq!(after_b, server_dates(&mock, id).await);
+
+    let _ = state.begin_bar_gesture(id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 2.0);
+    let pending = state.commit_date_gesture_now().expect("C");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist C");
+    let after_c = live_dates(&state, id);
+    assert_ne!(after_c, after_b);
+    assert_eq!(after_c, server_dates(&mock, id).await);
+    assert_eq!(state.history.undo.len(), 3);
+
+    let pending = state.undo_dates_now().expect("undo C");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist undo C");
+    assert_eq!(live_dates(&state, id), after_b);
+    assert_eq!(
+        server_dates(&mock, id).await,
+        after_b,
+        "first undo must PATCH C back to B on the server"
+    );
+
+    let pending = state.undo_dates_now().expect("undo B");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist undo B");
+    assert_eq!(live_dates(&state, id), after_a);
+    assert_eq!(
+        server_dates(&mock, id).await,
+        after_a,
+        "second undo must PATCH B back to A on the server"
+    );
+
+    let pending = state.undo_dates_now().expect("undo A");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist undo A");
+    assert_eq!(live_dates(&state, id), original);
+    assert_eq!(
+        server_dates(&mock, id).await,
+        original,
+        "third undo must PATCH A back to the original dates on the server"
+    );
+}
+
+#[tokio::test]
+async fn remove_link_after_undo_succeeds() {
+    let (mock, mut state, _dir) = signed_in().await;
+    state
+        .add_dependency(1005, 1003)
+        .await
+        .expect("link 1003 → 1005");
+    let id = 1005;
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+    let _ = state.begin_bar_gesture(id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 4.0);
+    let pending = state.commit_date_gesture_now().expect("move");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist move");
+    let pending = state.undo_dates_now().expect("undo move");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist undo");
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == id) {
+        node.rev = 1;
+    }
+    state
+        .remove_dependency(1005, 1003)
+        .await
+        .expect("remove link after undo must refetch rev instead of 412");
+    let cleared = state.nodes.iter().find(|node| node.id == 1005).unwrap();
+    assert!(
+        !cleared.predecessors.contains(&1003),
+        "the predecessor must be dropped locally"
+    );
+    let server = mock.work_item(1005).await.expect("server 1005");
+    let relations = server
+        .get("relations")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !relations.iter().any(|rel| rel
+            .get("url")
+            .and_then(|value| value.as_str())
+            .is_some_and(|url| url.ends_with("/1003"))),
+        "the server must no longer hold the dependency after Remove link"
+    );
 }
 
 #[gpui_kit::test]

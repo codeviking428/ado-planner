@@ -123,7 +123,7 @@ pub fn theme_color(flavor: Flavor) -> ThemeColor {
     colors.title_bar_border = border;
     colors.window_border = border;
     colors.list = bg;
-    colors.list_hover = muted;
+    colors.list_hover = primary.opacity(0.14);
     colors.list_active = primary.opacity(0.32);
     colors.tab = bg;
     colors.tab_active = muted;
@@ -162,8 +162,16 @@ mod tests {
             "selection must not use the same wash as hover"
         );
         assert_ne!(
+            mocha.list_hover, mocha.muted,
+            "hover must not use the zebra stripe colour"
+        );
+        assert_ne!(
             latte.list_active, latte.list_hover,
             "selection must not use the same wash as hover"
+        );
+        assert_ne!(
+            latte.list_hover, latte.muted,
+            "hover must not use the zebra stripe colour"
         );
     }
 }

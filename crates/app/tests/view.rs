@@ -3,10 +3,11 @@
 use ado_core::SessionInfo;
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
-    ContextTarget, GanttScale, GanttView, GestureKind, MIN_TIMELINE_WIDTH, ROW_HEIGHT,
+    ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, MIN_TIMELINE_WIDTH, ROW_HEIGHT,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
+use ado_planner::toasts::HistoryEntry;
 use ado_planner::ui::PlannerView;
 use ado_planner::ui::looks_like_pat;
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
@@ -147,7 +148,9 @@ fn painted_rows_are_monday_height_at_1280x800(cx: &mut gpui_kit::TestAppContext)
         (height - ROW_HEIGHT).abs() < 2.0 && height >= 36.0,
         "tree row painted {height}px; expected ~{ROW_HEIGHT}"
     );
-    let label = cx.debug_bounds("gantt-bar-label");
+    let label = cx
+        .debug_bounds("gantt-bar-label-1")
+        .or_else(|| cx.debug_bounds("gantt-bar-label"));
     if let Some(label) = label {
         let label_h = f32::from(label.size.height);
         assert!(
@@ -1330,7 +1333,8 @@ fn short_bar_paints_its_title_outside(cx: &mut gpui_kit::TestAppContext) {
     });
     draw(cx);
     assert!(
-        cx.debug_bounds("gantt-bar-label").is_some(),
+        cx.debug_bounds("gantt-bar-label-2").is_some()
+            || cx.debug_bounds("gantt-bar-label").is_some(),
         "a title that does not fit the bar must paint outside instead of truncating"
     );
 }
@@ -1506,21 +1510,6 @@ fn drag_end_clears_row_hover_and_link_handles(cx: &mut gpui_kit::TestAppContext)
         assert_eq!(
             view.state.gantt.hovered_id, None,
             "moving off the canvas must not restore hover"
-        );
-    });
-    let tree = cx.debug_bounds("gantt-tree").expect("left grid");
-    cx.simulate_mouse_move(tree.center(), None, Modifiers::default());
-    draw(cx);
-    view.update(cx, |view, _| {
-        assert_eq!(
-            view.state.gantt.hovered_id, None,
-            "moving to the left grid must not restore the canvas hover"
-        );
-    });
-    view.update(cx, |view, _| {
-        assert_eq!(
-            view.state.gantt.hovered_id, None,
-            "a non-canvas hover must not restore the row highlight"
         );
     });
 }
@@ -1843,9 +1832,22 @@ fn mouse_up_clears_hover_even_when_the_pointer_stays_on_the_bar(cx: &mut gpui_ki
         assert_eq!(
             view.state.gantt.selected_id,
             Some(1),
-            "a click selects the bar so link handles stay available"
+            "a click must still select the bar"
         );
     });
+    cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_id,
+            Some(1),
+            "moving on the bar after mouse-up must restore hover so link handles return"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-handle-1-link-end").is_some(),
+        "a hovered bar must show a link handle"
+    );
 }
 
 #[gpui_kit::test]
@@ -1994,4 +1996,160 @@ fn current_team_shows_a_checkmark_in_the_picker(cx: &mut gpui_kit::TestAppContex
         cx.debug_bounds("scope-current").is_some(),
         "the current team must show a checkmark in the picker"
     );
+}
+
+#[gpui_kit::test]
+fn one_ctrl_z_reverts_exactly_one_dates_entry(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    for after in [
+        "2026-07-08T00:00:00Z",
+        "2026-07-10T00:00:00Z",
+        "2026-07-12T00:00:00Z",
+    ] {
+        state.history.undo.push(HistoryEntry::Dates {
+            id: 1,
+            before_start: Some("2026-07-06T00:00:00Z".into()),
+            before_target: Some("2026-07-20T00:00:00Z".into()),
+            after_start: Some(after.into()),
+            after_target: Some("2026-07-20T00:00:00Z".into()),
+        });
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let undo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&undo, cx);
+        view.handle_key(&undo, cx);
+        assert_eq!(
+            view.state.history.undo.len(),
+            2,
+            "intercept+capture of one Ctrl+Z must pop exactly one Dates entry, got {}",
+            view.state.history.undo.len()
+        );
+        assert_eq!(view.state.history.redo.len(), 1);
+    });
+}
+
+#[gpui_kit::test]
+fn held_ctrl_z_does_not_repeat_undo(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.history.undo.push(HistoryEntry::Dates {
+        id: 1,
+        before_start: Some("2026-07-06T00:00:00Z".into()),
+        before_target: Some("2026-07-20T00:00:00Z".into()),
+        after_start: Some("2026-07-08T00:00:00Z".into()),
+        after_target: Some("2026-07-20T00:00:00Z".into()),
+    });
+    state.history.undo.push(HistoryEntry::Dates {
+        id: 1,
+        before_start: Some("2026-07-08T00:00:00Z".into()),
+        before_target: Some("2026-07-20T00:00:00Z".into()),
+        after_start: Some("2026-07-10T00:00:00Z".into()),
+        after_target: Some("2026-07-20T00:00:00Z".into()),
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let held = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-z").unwrap(),
+        is_held: true,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&held, cx);
+        assert_eq!(
+            view.state.history.undo.len(),
+            2,
+            "key-repeat Ctrl+Z must not pop a second undo entry"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(2);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-handle-2-link-end").is_none(),
+        "selection alone must not show link handles"
+    );
+    view.update(cx, |view, cx| {
+        view.state.gantt.hovered_id = Some(2);
+        cx.notify();
+    });
+    draw(cx);
+    let link = cx
+        .debug_bounds("gantt-link-handle-2-link-end")
+        .expect("hovered bar must show a link handle");
+    let resize = cx
+        .debug_bounds("gantt-resize-handle-2-end")
+        .expect("hovered leaf bar must show a resize handle");
+    assert!(
+        (f32::from(link.size.width) - f32::from(link.size.height)).abs() < 0.5,
+        "link handle hit area must be square/circular, got {}×{}",
+        f32::from(link.size.width),
+        f32::from(link.size.height)
+    );
+    assert!(
+        (f32::from(resize.size.width) - HANDLE_WIDTH).abs() < 0.5,
+        "resize handle must stay a {}px end cap, got {}",
+        HANDLE_WIDTH,
+        f32::from(resize.size.width)
+    );
+    assert!(
+        (f32::from(link.size.width) - f32::from(resize.size.width)).abs() > 4.0,
+        "link handles must not share the resize-handle size"
+    );
+}
+
+#[gpui_kit::test]
+fn offscreen_bar_title_stays_on_the_timeline(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 1) {
+        node.title = "Checkout rewrite".into();
+        node.start_date = Some("2026-07-01T00:00:00Z".into());
+        node.target_date = Some("2026-09-30T00:00:00Z".into());
+    }
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        view.state.gantt.go_today(Date::new(2026, 11, 2).unwrap());
+    });
+    draw(cx);
+    let body = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let left = f32::from(body.origin.x);
+    if let Some(label) = cx
+        .debug_bounds("gantt-bar-label-1")
+        .or_else(|| cx.debug_bounds("gantt-bar-label"))
+    {
+        let label_x = f32::from(label.origin.x);
+        assert!(
+            label_x + 1.0 >= left,
+            "outside title must not clip from the left (got {label_x}, timeline {left})"
+        );
+    }
 }
