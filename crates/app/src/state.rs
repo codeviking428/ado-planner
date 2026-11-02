@@ -7,8 +7,8 @@ use ado_core::{
     AssigneeFilter, Flavor, HierarchyResult, IdentityValue, IterationNode, Organization,
     OverlayFilter, Project, ScopeSelection, SessionInfo, Team, WorkItemNode, apply_overlays,
     build_clear_dates_patch, build_dates_patch, build_field_patch, build_replace_dates_patch,
-    choose_available, is_assignee_special, iso_date_only, parent_relation_op, parse_iso_date,
-    resolve_root_types, schedule_from_iteration,
+    choose_available, compact_date, identity_from_field, is_assignee_special, iso_date_only,
+    parent_relation_op, parse_iso_date, resolve_root_types, schedule_from_iteration,
 };
 use ado_session::{LoginCreds, PlannerSession, SharedSession};
 use jiff::ToSpan;
@@ -978,6 +978,7 @@ impl PlannerState {
         form.validate()?;
         form.saving = true;
         let ops = form.patch_ops();
+        let original_values = form.model.values.clone();
         let id = form.model.id;
         let before = self.nodes.iter().find(|node| node.id == id).cloned();
         match self
@@ -1025,6 +1026,13 @@ impl PlannerState {
                     && names
                         .iter()
                         .all(|name| name == "start date" || name == "target date");
+                let field_changes = field_changes_from_ops(&ops, &original_values);
+                if !field_changes.is_empty() {
+                    self.record(HistoryEntry::Fields {
+                        id,
+                        changes: field_changes.clone(),
+                    });
+                }
                 let message = if names.is_empty() {
                     format!("Saved Work Item #{id}")
                 } else if only_dates {
@@ -1058,6 +1066,17 @@ impl PlannerState {
                     } else {
                         self.toasts.push(ToastKind::Success, message);
                     }
+                } else if !field_changes.is_empty() {
+                    self.toasts.push_undo(
+                        message,
+                        UndoAction::RestoreFields {
+                            id,
+                            fields: field_changes
+                                .into_iter()
+                                .map(|(reference, before, _)| (reference, before))
+                                .collect(),
+                        },
+                    );
                 } else {
                     self.toasts.push(ToastKind::Success, message);
                 }
@@ -1994,10 +2013,18 @@ impl PlannerState {
                         .find(|n| n.id == id)
                         .and_then(|n| parse_iso_date(n.target_date.as_deref()));
                     self.push_dates_moved_toast(id, start, target, &previous);
-                } else {
-                    self.toasts.push(
-                        ToastKind::Success,
+                } else if self.history_recording {
+                    let before_value = node_field_json(&previous, reference);
+                    self.record(HistoryEntry::Fields {
+                        id,
+                        changes: vec![(reference.to_string(), before_value.clone(), value.clone())],
+                    });
+                    self.toasts.push_undo(
                         format!("Saved {}", field_toast_name(reference, None)),
+                        UndoAction::RestoreFields {
+                            id,
+                            fields: vec![(reference.to_string(), before_value)],
+                        },
                     );
                 }
                 Ok(())
@@ -2243,6 +2270,19 @@ impl PlannerState {
                     Ok(())
                 }
             }
+            HistoryEntry::Fields { id, changes } => {
+                let fields: Vec<(String, Value)> = changes
+                    .iter()
+                    .map(|(reference, before, after)| {
+                        if is_undo {
+                            (reference.clone(), before.clone())
+                        } else {
+                            (reference.clone(), after.clone())
+                        }
+                    })
+                    .collect();
+                self.restore_fields(*id, &fields).await
+            }
         }
     }
 
@@ -2271,13 +2311,12 @@ impl PlannerState {
                 predecessor_id,
             } => self.add_dependency(*successor_id, *predecessor_id).await,
             UndoAction::DeleteCreated { id, .. } => self.delete_item(*id).await,
+            UndoAction::RestoreFields { id, fields } => self.restore_fields(*id, fields).await,
         };
         self.history_recording = true;
         if result.is_ok() {
             self.discard_history_for_undo(&action);
-            self.toasts
-                .items
-                .retain(|toast| toast.undo.as_ref() != Some(&action));
+            self.toasts.dismiss_undo();
         }
         result
     }
@@ -2318,7 +2357,9 @@ impl PlannerState {
     /// link Undo so live date edits on those rows survive the HTTP round-trip.
     pub fn merge_undo_action(&mut self, working: &PlannerState, action: &UndoAction) {
         let ids: Vec<i64> = match action {
-            UndoAction::RestoreDates { id, .. } | UndoAction::DeleteCreated { id, .. } => {
+            UndoAction::RestoreDates { id, .. }
+            | UndoAction::DeleteCreated { id, .. }
+            | UndoAction::RestoreFields { id, .. } => {
                 vec![*id]
             }
             UndoAction::RemoveLink {
@@ -2342,6 +2383,9 @@ impl PlannerState {
             };
             if let Some(dst) = self.nodes.iter_mut().find(|node| node.id == id) {
                 dst.predecessors = src.predecessors.clone();
+                dst.title = src.title.clone();
+                dst.assigned_to = src.assigned_to.clone();
+                dst.fields = src.fields.clone();
                 if dst.start_date == src.start_date && dst.target_date == src.target_date {
                     dst.rev = src.rev;
                 }
@@ -2402,13 +2446,32 @@ impl PlannerState {
             UndoAction::DeleteCreated { id, .. } => {
                 self.drop_history_for_item(*id);
             }
+            UndoAction::RestoreFields { id, fields } => {
+                if let Some(index) = self.history.undo.iter().rposition(|entry| {
+                    matches!(
+                        entry,
+                        HistoryEntry::Fields {
+                            id: entry_id,
+                            changes,
+                        } if *entry_id == *id
+                            && changes.iter().all(|(reference, before, _)| {
+                                fields.iter().any(|(name, value)| {
+                                    name == reference && value == before
+                                })
+                            })
+                    )
+                }) {
+                    self.history.undo.remove(index);
+                }
+            }
         }
     }
 
     fn drop_history_for_item(&mut self, id: i64) {
         let keep = |entry: &HistoryEntry| match entry {
             HistoryEntry::Created { id: entry_id, .. }
-            | HistoryEntry::Dates { id: entry_id, .. } => *entry_id != id,
+            | HistoryEntry::Dates { id: entry_id, .. }
+            | HistoryEntry::Fields { id: entry_id, .. } => *entry_id != id,
             HistoryEntry::Link {
                 successor_id,
                 predecessor_id,
@@ -2417,6 +2480,24 @@ impl PlannerState {
         };
         self.history.undo.retain(keep);
         self.history.redo.retain(keep);
+    }
+
+    async fn restore_fields(
+        &mut self,
+        id: i64,
+        fields: &[(String, Value)],
+    ) -> Result<(), AppError> {
+        for (reference, value) in fields {
+            let reference = reference.clone();
+            let value = value.clone();
+            let apply_value = value.clone();
+            let apply_reference = reference.clone();
+            self.patch_node_field(id, &reference, value, move |node| {
+                apply_node_field(node, &apply_reference, &apply_value);
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn delete_item(&mut self, id: i64) -> Result<(), AppError> {
@@ -2569,6 +2650,7 @@ impl PlannerState {
     pub(crate) fn undo_confirmation(&self, action: &UndoAction) -> String {
         match action {
             UndoAction::RestoreDates { id, .. } => format!("Restored {}", self.item_title(*id)),
+            UndoAction::RestoreFields { id, .. } => format!("Restored {}", self.item_title(*id)),
             UndoAction::DeleteCreated { id, title } => {
                 if title.is_empty() {
                     format!("Removed #{id}")
@@ -2595,6 +2677,9 @@ impl PlannerState {
             HistoryEntry::Created { title, .. } => {
                 format!("{verb}: created {title}")
             }
+            HistoryEntry::Fields { id, .. } => {
+                format!("{verb}: {} fields", self.item_title(*id))
+            }
         };
         self.toasts.push(ToastKind::Success, message);
     }
@@ -2608,21 +2693,79 @@ pub(crate) fn dates_moved_message(
     match (start, target) {
         (Some(start), Some(target)) => format!(
             "Moved {title} to {} → {}",
-            short_month_day(start),
-            short_month_day(target)
+            compact_date(start),
+            compact_date(target)
         ),
-        (Some(start), None) => format!("Moved {title} start to {}", short_month_day(start)),
-        (None, Some(target)) => format!("Moved {title} to {}", short_month_day(target)),
+        (Some(start), None) => format!("Moved {title} start to {}", compact_date(start)),
+        (None, Some(target)) => format!("Moved {title} to {}", compact_date(target)),
         (None, None) => format!("Saved {title} dates"),
     }
 }
 
-fn short_month_day(date: Date) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let month = MONTHS[(date.month() as u8).saturating_sub(1).min(11) as usize];
-    format!("{month} {}, {}", date.day(), date.year())
+fn field_changes_from_ops(
+    ops: &[ado_core::JsonPatchOp],
+    original: &serde_json::Map<String, Value>,
+) -> Vec<(String, Value, Value)> {
+    ops.iter()
+        .filter_map(|op| {
+            let reference = op.path.strip_prefix("/fields/")?;
+            if reference == ado_core::START_DATE_FIELD || reference == ado_core::TARGET_DATE_FIELD {
+                return None;
+            }
+            let after = op.value.clone().unwrap_or(Value::Null);
+            let before = original.get(reference).cloned().unwrap_or(Value::Null);
+            if before == after {
+                return None;
+            }
+            Some((reference.to_string(), before, after))
+        })
+        .collect()
+}
+
+fn node_field_json(node: &WorkItemNode, reference: &str) -> Value {
+    match reference {
+        "System.Title" => json!(node.title),
+        "System.AssignedTo" => node
+            .assigned_to
+            .as_ref()
+            .map(crate::form::identity_json)
+            .unwrap_or(Value::Null),
+        ado_core::START_DATE_FIELD => node
+            .start_date
+            .as_ref()
+            .map(|text| json!(text))
+            .unwrap_or(Value::Null),
+        ado_core::TARGET_DATE_FIELD => node
+            .target_date
+            .as_ref()
+            .map(|text| json!(text))
+            .unwrap_or(Value::Null),
+        other => node.fields.get(other).cloned().unwrap_or(Value::Null),
+    }
+}
+
+fn apply_node_field(node: &mut WorkItemNode, reference: &str, value: &Value) {
+    match reference {
+        "System.Title" => {
+            node.title = value.as_str().unwrap_or_default().to_string();
+        }
+        "System.AssignedTo" => {
+            node.assigned_to = identity_from_field(value);
+        }
+        ado_core::START_DATE_FIELD => {
+            node.start_date = value.as_str().map(ToOwned::to_owned);
+        }
+        ado_core::TARGET_DATE_FIELD => {
+            node.target_date = value.as_str().map(ToOwned::to_owned);
+        }
+        other => {
+            if value.is_null() {
+                node.fields.remove(other);
+            } else {
+                node.fields.insert(other.to_string(), value.clone());
+            }
+        }
+    }
 }
 
 pub(crate) fn field_toast_name(reference: &str, label: Option<&str>) -> String {
@@ -2654,7 +2797,7 @@ pub(crate) fn child_work_item_type(parent_type: Option<&str>, types: &[String]) 
         Some("Feature") => &["User Story", "Task", "Bug"],
         Some("User Story") => &["Task", "Bug"],
         Some("Task") | Some("Bug") => &["Task", "Bug"],
-        _ => &["User Story", "Task", "Bug", "Feature", "Epic"],
+        _ => &["Epic", "Feature", "User Story", "Task", "Bug"],
     };
     preferred
         .iter()
@@ -2714,4 +2857,23 @@ fn team_settings_banner(team: &str, raw: &str) -> String {
 #[allow(dead_code)]
 pub(crate) fn pending_nudge_rev(pending: &PendingNudge) -> i64 {
     pending.original_rev
+}
+
+#[cfg(test)]
+mod child_type_tests {
+    use super::child_work_item_type;
+
+    #[test]
+    fn root_add_item_prefers_epic() {
+        let types = vec![
+            "Bug".into(),
+            "Epic".into(),
+            "Feature".into(),
+            "Task".into(),
+            "User Story".into(),
+        ];
+        assert_eq!(child_work_item_type(None, &types), "Epic");
+        assert_eq!(child_work_item_type(Some("Epic"), &types), "Feature");
+        assert_eq!(child_work_item_type(Some("User Story"), &types), "Task");
+    }
 }

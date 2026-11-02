@@ -16,7 +16,7 @@ use gpui_kit::component::Sizable;
 use gpui_kit::component::Size;
 use gpui_kit::component::avatar::Avatar;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::calendar::{Calendar, CalendarState, Date as PickerDate};
+use gpui_kit::component::calendar::{CalendarEvent, CalendarState, Date as PickerDate};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::date_picker::{DatePicker, DatePickerState};
 use gpui_kit::component::h_flex;
@@ -218,8 +218,14 @@ impl PlannerView {
                     && !this.input_focused(window, cx);
                 let confirm_delete = this.pending_delete.is_some()
                     && matches!(key, "enter" | "escape" | "delete" | "backspace");
+                let open_details = key == "enter"
+                    && this.pending_delete.is_none()
+                    && this.state.form.is_none()
+                    && this.inline_edit.is_none()
+                    && this.state.gantt.selected_id.is_some()
+                    && !this.input_focused(window, cx);
                 let nav = matches!(key, "up" | "down" | "pageup" | "pagedown" | "home" | "end");
-                if undo || redo || delete_link || delete_item || confirm_delete {
+                if undo || redo || delete_link || delete_item || confirm_delete || open_details {
                     this.on_key(
                         &KeyDownEvent {
                             keystroke: event.keystroke.clone(),
@@ -810,20 +816,31 @@ impl PlannerView {
                 state
             });
             let item_id = id;
+            self._subscriptions.push(cx.subscribe(
+                &picker,
+                move |this, _, event: &CalendarEvent, cx| {
+                    if this.inline_edit != Some(InlineEdit::Dates(item_id)) {
+                        return;
+                    }
+                    let CalendarEvent::Selected(date) = event;
+                    if range_picker_is_complete(*date) {
+                        this.commit_picker_dates(item_id, *date, true, true, cx);
+                    }
+                },
+            ));
             self._subscriptions
                 .push(cx.observe(&picker, move |this, picker, cx| {
                     if this.inline_edit != Some(InlineEdit::Dates(item_id)) {
                         return;
                     }
                     let date = picker.read(cx).date();
-                    if !range_picker_is_complete(date) {
-                        if let Some(preview) = pending_range_typed(date) {
-                            this.pending_typed_preview = Some(preview);
-                            cx.notify();
-                        }
+                    if range_picker_is_complete(date) {
                         return;
                     }
-                    this.commit_picker_dates(item_id, date, true, true, cx);
+                    if let Some(preview) = pending_range_typed(date) {
+                        this.pending_typed_preview = Some(preview);
+                        cx.notify();
+                    }
                 }));
             self.inline_dates = Some(picker);
         } else {
@@ -1062,9 +1079,10 @@ impl PlannerView {
         v_flex()
             .id("toasts")
             .absolute()
-            .top(px(216.))
-            .right_4()
-            .w(px(360.))
+            .bottom_6()
+            .left_0()
+            .right_0()
+            .items_center()
             .gap_2()
             .children(self.state.toasts.items.iter().map(|toast| {
                 let id = toast.id;
@@ -1075,6 +1093,7 @@ impl PlannerView {
                 h_flex()
                     .id(("toast", id))
                     .debug_selector(|| "planner-toast".into())
+                    .w(px(360.))
                     .gap_2()
                     .px_3()
                     .py_2()
@@ -1135,6 +1154,7 @@ impl PlannerView {
     fn apply_toast_undo(&mut self, toast_id: u64, action: UndoAction, cx: &mut Context<Self>) {
         if matches!(action, UndoAction::RestoreDates { .. }) {
             if let Some(pending) = self.state.apply_toast_restore_dates(action) {
+                self.state.toasts.dismiss_undo();
                 self.state.toasts.dismiss(toast_id);
                 let title = self.state.item_title(pending.id);
                 self.enqueue_date_save(cx, pending);
@@ -1145,6 +1165,7 @@ impl PlannerView {
             cx.notify();
             return;
         }
+        self.state.toasts.dismiss_undo();
         self.state.toasts.dismiss(toast_id);
         let runtime = self.state.runtime.clone();
         let mut working = self.state.clone();
@@ -1442,6 +1463,8 @@ impl PlannerView {
         let trigger = div()
             .id(SharedString::from(format!("{id}-trigger")))
             .debug_selector(move || format!("{id}-trigger"))
+            .w_full()
+            .overflow_hidden()
             .child(
                 Button::new(id)
                     .label(if current.is_empty() {
@@ -1505,7 +1528,7 @@ impl PlannerView {
             "assignee" => "No team members loaded",
             _ => "No options",
         };
-        let mut popup = Popup::new(format!("{id}-popup"), trigger).offset(px(4.));
+        let mut popup = Popup::new(format!("{id}-popup"), trigger).offset(px(12.));
         if open {
             popup = popup.content(
                 self.popup_panel(format!("{id}-panel"), cx)
@@ -1522,6 +1545,8 @@ impl PlannerView {
         }
         v_flex()
             .gap_1()
+            .w(px(148.))
+            .min_w(px(132.))
             .max_w(px(180.))
             .overflow_hidden()
             .child(Label::new(label).text_xs().text_color(muted))
@@ -1603,30 +1628,41 @@ impl PlannerView {
     }
 
     fn render_filters(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .id("filters")
-            .gap_2()
-            .child(self.filter_button(
-                "root-filter",
-                "Roots",
-                self.state.hidden_root_count(),
-                "Top-level types shown on the Gantt. Defaults to every loaded type.",
-                cx,
-            ))
-            .child(self.filter_button(
-                "type-filter",
-                "Types",
-                self.state.prefs.planner.hidden_types.len(),
-                "Hide work item types from the tree and timeline.",
-                cx,
-            ))
-            .child(self.filter_button(
-                "state-filter",
-                "States",
-                self.state.prefs.planner.hidden_states.len(),
-                "Hide work item states from the tree and timeline.",
-                cx,
-            ))
+        let muted = cx.theme().muted_foreground;
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .id("header-filters-label")
+                    .debug_selector(|| "header-filters-label".into())
+                    .child(Label::new("Filters").text_xs().text_color(muted)),
+            )
+            .child(
+                h_flex()
+                    .id("filters")
+                    .gap_2()
+                    .child(self.filter_button(
+                        "root-filter",
+                        "Roots",
+                        self.state.hidden_root_count(),
+                        "Top-level types shown on the Gantt. Defaults to every loaded type.",
+                        cx,
+                    ))
+                    .child(self.filter_button(
+                        "type-filter",
+                        "Types",
+                        self.state.prefs.planner.hidden_types.len(),
+                        "Hide work item types from the tree and timeline.",
+                        cx,
+                    ))
+                    .child(self.filter_button(
+                        "state-filter",
+                        "States",
+                        self.state.prefs.planner.hidden_states.len(),
+                        "Hide work item states from the tree and timeline.",
+                        cx,
+                    )),
+            )
     }
 
     fn filter_button(
@@ -1682,7 +1718,7 @@ impl PlannerView {
                     cx.notify();
                 })),
         );
-        let mut popup = Popup::new(format!("{id}-popup"), trigger).offset(px(4.));
+        let mut popup = Popup::new(format!("{id}-popup"), trigger).offset(px(12.));
         if open {
             popup = popup.content(self.filter_menu(id, items, hidden_set, cx));
         }
@@ -1765,22 +1801,33 @@ impl PlannerView {
     }
 
     fn render_flavor(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .id("flavor")
+        let muted = cx.theme().muted_foreground;
+        v_flex()
             .gap_1()
-            .children(FLAVORS.iter().map(|flavor| {
-                let selected = self.state.flavor() == *flavor;
-                let flavor = *flavor;
-                Button::new(flavor.as_str())
-                    .label(flavor.label())
-                    .selected(selected)
-                    .when(selected, |btn| btn.primary())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.state.set_flavor(flavor);
-                        apply_flavor(cx, flavor);
-                        cx.notify();
-                    }))
-            }))
+            .child(
+                div()
+                    .id("header-theme-label")
+                    .debug_selector(|| "header-theme-label".into())
+                    .child(Label::new("Theme").text_xs().text_color(muted)),
+            )
+            .child(
+                h_flex()
+                    .id("flavor")
+                    .gap_1()
+                    .children(FLAVORS.iter().map(|flavor| {
+                        let selected = self.state.flavor() == *flavor;
+                        let flavor = *flavor;
+                        Button::new(flavor.as_str())
+                            .label(flavor.label())
+                            .selected(selected)
+                            .when(selected, |btn| btn.primary())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.state.set_flavor(flavor);
+                                apply_flavor(cx, flavor);
+                                cx.notify();
+                            }))
+                    })),
+            )
     }
 
     fn render_gantt(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2036,7 +2083,7 @@ impl PlannerView {
                 Button::new("auto-fit")
                     .primary()
                     .label("Auto Fit")
-                    .tooltip("Fit every bar into the visible timeline.")
+                    .tooltip("Fit scheduled items into the visible timeline.")
                     .tooltip_placement(Placement::Bottom)
                     .on_click(cx.listener(|this, _, _, cx| {
                         let nodes = this.state.visible_nodes();
@@ -2430,20 +2477,16 @@ impl PlannerView {
                                                         |el| el.child(self.open_details_icon(id, cx)),
                                                     ),
                                             )
-                                            .when(!editing_title, |el| {
-                                                el.when(show_type, |el| {
-                                                    el.child(
-                                                        self.type_badge(&node.work_item_type, cx),
-                                                    )
-                                                })
-                                                .when(show_assignee, |el| {
-                                                    el.child(self.assignee_cell(
-                                                        id, &assigned, selected, cx,
-                                                    ))
-                                                })
-                                                .when(show_dates, |el| {
-                                                    el.child(self.dates_cell(id, dates, cx))
-                                                })
+                                            .when(show_type, |el| {
+                                                el.child(self.type_badge(&node.work_item_type, cx))
+                                            })
+                                            .when(show_assignee, |el| {
+                                                el.child(self.assignee_cell(
+                                                    id, &assigned, selected, cx,
+                                                ))
+                                            })
+                                            .when(show_dates, |el| {
+                                                el.child(self.dates_cell(id, dates, cx))
                                             }),
                                     )
                                     .into_any_element()
@@ -2532,8 +2575,9 @@ impl PlannerView {
                 .id(("inline-title-wrap", id as u64))
                 .debug_selector(|| "gantt-inline-title".into())
                 .flex_1()
-                .w_full()
-                .min_w(px(180.))
+                .min_w(px(0.))
+                .max_w_full()
+                .overflow_hidden()
                 .child(
                     Input::new(&self.inline_input)
                         .id(("inline-title", id as u64))
@@ -2671,7 +2715,15 @@ impl PlannerView {
         if !editing_dates {
             return div().into_any_element();
         }
-        let (x, y) = self.dates_anchor.unwrap_or((320.0, 160.0));
+        let (x, mut y) = self.dates_anchor.unwrap_or((320.0, 160.0));
+        let window_h = self.state.gantt.viewport_h + 200.0;
+        let window_w = self.state.gantt.viewport_w.max(320.0);
+        let popover_h = 340.0;
+        let popover_w = 280.0;
+        if y + popover_h > window_h {
+            y = (y - popover_h).max(8.0);
+        }
+        let x = x.clamp(8.0, (window_w - popover_w).max(8.0));
         let month_title = self.inline_dates.as_ref().map(|picker| {
             let state = picker.read(cx);
             format!(
@@ -2709,6 +2761,7 @@ impl PlannerView {
                         .child(
                             h_flex()
                                 .w_full()
+                                .flex_shrink_0()
                                 .items_center()
                                 .justify_between()
                                 .gap_2()
@@ -2716,6 +2769,24 @@ impl PlannerView {
                                     div()
                                         .id("gantt-dates-prev-month")
                                         .debug_selector(|| "gantt-dates-prev-month".into())
+                                        .min_w(px(32.))
+                                        .min_h(px(32.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(picker) = this.inline_dates.clone() {
+                                                picker.update(cx, |state, cx| {
+                                                    state.prev_month();
+                                                    cx.notify();
+                                                });
+                                            }
+                                            cx.notify();
+                                        }))
                                         .child(
                                             Button::new("dates-prev-month")
                                                 .ghost()
@@ -2748,6 +2819,24 @@ impl PlannerView {
                                     div()
                                         .id("gantt-dates-next-month")
                                         .debug_selector(|| "gantt-dates-next-month".into())
+                                        .min_w(px(32.))
+                                        .min_h(px(32.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(picker) = this.inline_dates.clone() {
+                                                picker.update(cx, |state, cx| {
+                                                    state.next_month();
+                                                    cx.notify();
+                                                });
+                                            }
+                                            cx.notify();
+                                        }))
                                         .child(
                                             Button::new("dates-next-month")
                                                 .ghost()
@@ -2766,7 +2855,7 @@ impl PlannerView {
                                         ),
                                 ),
                         )
-                        .child(Calendar::new(&state).number_of_months(1)),
+                        .child(self.render_inline_month_grid(&state, cx)),
                 )
             })
             .when(self.inline_dates.is_none(), |el| {
@@ -2779,6 +2868,88 @@ impl PlannerView {
                 )
             })
             .into_any_element()
+    }
+
+    fn render_inline_month_grid(
+        &self,
+        state: &Entity<CalendarState>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let picker = state.read(cx);
+        let weeks = picker.month_days().into_iter().next().unwrap_or_default();
+        let selected = picker.date();
+        let current_month = u32::from(picker.current_month());
+        let muted = cx.theme().muted_foreground;
+        let weekdays = ["S", "M", "T", "W", "T", "F", "S"];
+        v_flex()
+            .id("gantt-dates-grid")
+            .debug_selector(|| "gantt-dates-grid".into())
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .w_full()
+                    .children(weekdays.iter().copied().enumerate().map(|(index, label)| {
+                        div()
+                            .id(("gantt-dates-weekday", index))
+                            .flex_1()
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(label)
+                    })),
+            )
+            .children(weeks.into_iter().enumerate().map(|(week_index, week)| {
+                h_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .children(week.into_iter().map(move |day| {
+                        let active = selected.is_active(&day);
+                        let in_range = selected.is_in_range(&day);
+                        let other_month = day.month() != current_month;
+                        let day_key = day.to_string();
+                        let selector = if active {
+                            "gantt-dates-range-end".to_string()
+                        } else if in_range {
+                            "gantt-dates-in-range".to_string()
+                        } else {
+                            format!("gantt-dates-day-{day_key}")
+                        };
+                        div()
+                            .id(SharedString::from(format!(
+                                "gantt-dates-day-{day_key}-{week_index}"
+                            )))
+                            .debug_selector(move || selector.clone())
+                            .flex_1()
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .text_xs()
+                            .when(other_month, |el| el.text_color(muted))
+                            .when(in_range && !active, |el| {
+                                el.bg(cx.theme().accent)
+                                    .text_color(cx.theme().accent_foreground)
+                            })
+                            .when(active, |el| {
+                                el.bg(cx.theme().primary)
+                                    .text_color(cx.theme().primary_foreground)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(picker) = this.inline_dates.clone() {
+                                    picker.update(cx, |state, cx| {
+                                        state.activate_date(day, cx);
+                                    });
+                                }
+                                cx.notify();
+                            }))
+                            .child(day.day().to_string())
+                    }))
+            }))
     }
 
     fn render_timeline(
@@ -3218,7 +3389,7 @@ impl PlannerView {
         let progress_value = bar.progress.unwrap_or(0.0);
         let show_progress = summary || progress_value > 0.0;
         let progress_w =
-            (bar.width.max(8.0) * progress_value).max(if progress_value > 0.0 { 2.0 } else { 0.0 });
+            (bar.width.max(8.0) * progress_value).max(if progress_value > 0.0 { 4.0 } else { 0.0 });
         let bar_selector = format!("gantt-bar-{id}");
         let progress_selector = format!("gantt-bar-progress-{id}");
         let mut items = vec![
@@ -4856,6 +5027,10 @@ impl PlannerView {
         self.on_key(event, cx);
     }
 
+    pub fn is_busy(&self) -> bool {
+        self.io_busy
+    }
+
     pub fn inline_calendar_month(&self, cx: &gpui_kit::App) -> Option<u8> {
         self.inline_dates
             .as_ref()
@@ -5433,7 +5608,11 @@ impl Render for PlannerView {
                 {
                     return;
                 }
-                let consume_enter = this.inline_edit.is_some() || this.inline_enter_guard;
+                let consume_enter = this.inline_edit.is_some()
+                    || this.inline_enter_guard
+                    || (this.state.gantt.selected_id.is_some()
+                        && this.state.form.is_none()
+                        && this.pending_delete.is_none());
                 this.on_key(event, cx);
                 if key == "escape" || (key == "enter" && consume_enter) {
                     cx.stop_propagation();

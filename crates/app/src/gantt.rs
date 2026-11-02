@@ -21,8 +21,8 @@ pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
 pub const TODAY_MARGIN_PX: f32 = 80.0;
-/// Place the Today line about a third of the way across the timeline.
-pub const TODAY_ALIGN: f32 = 1.0 / 3.0;
+/// Place the Today line in the middle of the timeline.
+pub const TODAY_ALIGN: f32 = 0.5;
 pub const SCALE_BUTTON_WIDTH: f32 = 132.0;
 /// Toolbar zoom, Today, scale, period, Auto Fit, and team-switch camera easing.
 pub const CAMERA_EASE_MS: u64 = 150;
@@ -1113,21 +1113,18 @@ impl GanttView {
             }
         }
         let today = jiff::Zoned::now().date();
-        let Some(start) = earliest else {
+        let Some(earliest) = earliest else {
             self.go_today(today);
             self.zoom = 1.0;
             return;
         };
-        let start = if today < start { today } else { start };
-        let end = match latest {
-            Some(current) if today > current => today,
-            Some(current) => current,
-            None => today,
-        };
-        self.origin = start;
+        // Fit the item span only. Pulling Today into a July cluster in November
+        // squeezed bars into slivers against the left edge.
+        let end = latest.unwrap_or(earliest);
+        self.origin = earliest.saturating_sub(2.days());
         self.scroll_x = 0.0;
         let days = end
-            .since((Unit::Day, start))
+            .since((Unit::Day, self.origin))
             .map(|span| span.get_days())
             .unwrap_or(1)
             .max(7) as f32
@@ -1769,13 +1766,47 @@ mod tests {
             ..Default::default()
         };
         gantt.auto_fit(&nodes, &[], 800.0);
-        assert_eq!(gantt.origin, Date::new(2026, 7, 6).unwrap());
+        assert_eq!(gantt.origin, Date::new(2026, 7, 4).unwrap());
         let rows = gantt.flatten(&nodes);
         let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
         assert!(!bars.is_empty());
         assert!(bars[0].x >= -1.0);
         assert!(bars[0].x + bars[0].width <= 800.0 + 1.0);
+        assert!(
+            bars[0].width > 40.0,
+            "Auto Fit must not squeeze a two-week bar into a sliver, width={}",
+            bars[0].width
+        );
         assert!(!bars[0].title.is_empty());
+    }
+
+    #[test]
+    fn auto_fit_ignores_today_outside_the_item_span() {
+        let nodes = vec![node(1, None)];
+        let mut gantt = GanttView {
+            origin: Date::new(2025, 1, 1).unwrap(),
+            zoom: 0.4,
+            ..Default::default()
+        };
+        gantt.auto_fit(&nodes, &[], 800.0);
+        let today = jiff::Zoned::now().date();
+        let latest = Date::new(2026, 7, 20).unwrap();
+        if today > latest {
+            let today_x = gantt.x_for_date(today);
+            assert!(
+                today_x > 800.0,
+                "Today outside the item span must not be pulled into the viewport, today_x={today_x}"
+            );
+        }
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert!(
+            bars[0].width > 40.0,
+            "July bars must stay readable when Today is months later, width={}",
+            bars[0].width
+        );
+        assert!(bars[0].x >= -1.0);
+        assert!(bars[0].x + bars[0].width <= 800.0 + 1.0);
     }
 
     #[test]
@@ -2023,7 +2054,7 @@ mod tests {
         let expected = gantt.timeline_width.max(1.0) * TODAY_ALIGN;
         assert!(
             (today_x - expected).abs() < 1.5,
-            "Today line at {today_x} should sit about a third in, expected {expected}"
+            "Today line at {today_x} should sit near the timeline center, expected {expected}"
         );
         let oct1 = Date::new(2026, 10, 1).unwrap();
         assert!(

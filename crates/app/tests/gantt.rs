@@ -1014,6 +1014,11 @@ async fn add_item_creates_a_work_item_on_the_team() {
     assert_eq!(state.nodes.len(), before + 1);
     let created = state.nodes.last().expect("created");
     assert_eq!(created.title, "New work item");
+    assert_eq!(
+        created.work_item_type, "Epic",
+        "a root Add item should be an Epic when that type is available, got {}",
+        created.work_item_type
+    );
     assert_eq!(state.gantt.selected_id, Some(created.id));
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
@@ -1136,7 +1141,9 @@ async fn undo_create_drops_date_history_for_that_item() {
     };
     state.apply_undo(undo).await.expect("delete created");
     let leftover = |entry: &HistoryEntry| match entry {
-        HistoryEntry::Created { id, .. } | HistoryEntry::Dates { id, .. } => *id == created.id,
+        HistoryEntry::Created { id, .. }
+        | HistoryEntry::Dates { id, .. }
+        | HistoryEntry::Fields { id, .. } => *id == created.id,
         HistoryEntry::Link {
             successor_id,
             predecessor_id,
@@ -1179,6 +1186,28 @@ async fn save_title_patches_system_title() {
         .expect("title");
     let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();
     assert_eq!(node.title, "Inline title");
+    assert!(
+        matches!(
+            state.history.undo.last(),
+            Some(HistoryEntry::Fields { id: 1003, .. })
+        ),
+        "title edits must land on the undo stack, got {:?}",
+        state.history.undo.last()
+    );
+    assert!(
+        state
+            .toasts
+            .items
+            .last()
+            .is_some_and(|toast| toast.undo.is_some()),
+        "Saved title must offer Undo"
+    );
+    state.undo().await.expect("undo title");
+    let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();
+    assert_ne!(
+        node.title, "Inline title",
+        "Ctrl+Z must restore the previous title"
+    );
 }
 
 async fn server_dates(mock: &ado_mock::AdoMock, id: i64) -> (Option<Date>, Option<Date>) {

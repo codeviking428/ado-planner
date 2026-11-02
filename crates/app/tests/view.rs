@@ -3,7 +3,8 @@
 use ado_core::{IdentityValue, SessionInfo};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
-    ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, MIN_TIMELINE_WIDTH, ROW_HEIGHT,
+    ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, MIN_TIMELINE_WIDTH,
+    ROW_HEIGHT, TODAY_ALIGN,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
@@ -87,6 +88,14 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
     assert!(
         cx.debug_bounds("gantt-bar-1").is_some(),
         "at least one Gantt bar should be painted"
+    );
+    assert!(
+        cx.debug_bounds("header-filters-label").is_some(),
+        "Roots/Types/States must be grouped under a Filters label"
+    );
+    assert!(
+        cx.debug_bounds("header-theme-label").is_some(),
+        "theme chips must be grouped under a Theme label"
     );
 }
 
@@ -802,6 +811,10 @@ fn inline_title_editor_is_wide_enough_to_show_the_title(cx: &mut gpui_kit::TestA
     let dir = tempfile::tempdir().unwrap();
     let state = idle_state(&dir);
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
     draw(cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -812,8 +825,17 @@ fn inline_title_editor_is_wide_enough_to_show_the_title(cx: &mut gpui_kit::TestA
     let editor = cx
         .debug_bounds("gantt-inline-title")
         .expect("inline title editor should paint");
+    let dates = cx
+        .debug_bounds("gantt-dates-cell")
+        .expect("Dates column must stay visible while F2 editing the title");
+    let editor_right = f32::from(editor.origin.x) + f32::from(editor.size.width);
+    let dates_left = f32::from(dates.origin.x);
     assert!(
-        f32::from(editor.size.width) >= 160.0,
+        editor_right <= dates_left + 2.0,
+        "F2 title field at right={editor_right} must stay inside the title column, Dates starts at {dates_left}"
+    );
+    assert!(
+        f32::from(editor.size.width) >= 80.0,
         "inline editor was only {}px wide",
         f32::from(editor.size.width)
     );
@@ -969,17 +991,20 @@ fn lighter_toasts_and_today_label_paint(cx: &mut gpui_kit::TestAppContext) {
         "today marker should paint"
     );
     let toast = cx.debug_bounds("planner-toast").expect("toast");
-    let nav = cx.debug_bounds("gantt-nav").expect("toolbar");
     let toast_top = f32::from(toast.origin.y);
     let toast_bottom = toast_top + f32::from(toast.size.height);
-    let nav_bottom = f32::from(nav.origin.y) + f32::from(nav.size.height);
+    let toast_center = f32::from(toast.origin.x) + f32::from(toast.size.width) / 2.0;
     assert!(
-        toast_top >= nav_bottom - 2.0,
-        "toasts at y={toast_top} must sit below the toolbar bottom {nav_bottom}"
+        toast_top > 400.0,
+        "toasts at y={toast_top} must sit in the bottom half, not over Month bar labels"
     );
     assert!(
-        toast_bottom < 800.0 - 80.0,
-        "toasts at bottom={toast_bottom} must not cover the Gantt bars"
+        toast_bottom <= 800.0 + 8.0,
+        "toasts at bottom={toast_bottom} must stay on screen"
+    );
+    assert!(
+        (toast_center - 640.0).abs() < 220.0,
+        "toasts should sit near the horizontal center, center={toast_center}"
     );
 }
 
@@ -1019,10 +1044,10 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
             "range title {title:?} must follow the visible start ({start_label}), labels={labels:?}"
         );
         let today_x = view.state.gantt.today_x(jiff::Zoned::now().date());
-        let expected = view.state.gantt.timeline_width.max(1.0) / 3.0;
+        let expected = view.state.gantt.timeline_width.max(1.0) * TODAY_ALIGN;
         assert!(
             (today_x - expected).abs() < 8.0,
-            "Today line at {today_x} should sit about a third in, expected {expected}"
+            "Today line at {today_x} should sit near the timeline center, expected {expected}"
         );
     });
 }
@@ -1054,10 +1079,10 @@ fn day_zoom_shows_today_label_and_year_in_the_header(cx: &mut gpui_kit::TestAppC
         );
         let today = jiff::Zoned::now().date();
         let today_x = view.state.gantt.today_x(today);
-        let expected = view.state.gantt.timeline_width.max(1.0) / 3.0;
+        let expected = view.state.gantt.timeline_width.max(1.0) * TODAY_ALIGN;
         assert!(
             (today_x - expected).abs() < 8.0,
-            "Day zoom Today line at {today_x} should sit about a third in, expected {expected}"
+            "Day zoom Today line at {today_x} should sit near the timeline center, expected {expected}"
         );
     });
 }
@@ -2013,6 +2038,10 @@ fn single_click_selects_a_bar_and_enter_opens_details(cx: &mut gpui_kit::TestApp
     };
     view.update(cx, |view, cx| {
         view.handle_key(&enter, cx);
+        assert!(
+            view.is_busy() || view.state.form.is_some(),
+            "Enter on a selected bar must open details"
+        );
     });
 }
 
@@ -2481,6 +2510,14 @@ fn dates_picker_has_month_arrows_and_typed_input(cx: &mut gpui_kit::TestAppConte
     assert!(
         cx.debug_bounds("gantt-dates-typed").is_some(),
         "range picker must allow typed dates"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dates-range-end").is_some(),
+        "a complete range must highlight the start and end days"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dates-in-range").is_some(),
+        "a complete range must fill the days between start and end"
     );
     let before = view.update(cx, |view, cx| view.inline_calendar_month(cx));
     let prev = cx

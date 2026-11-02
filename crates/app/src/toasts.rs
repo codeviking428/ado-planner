@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-const TOAST_CAP: usize = 5;
+const TOAST_CAP: usize = 2;
 const SUCCESS_TTL: Duration = Duration::from_secs(5);
 const UNDO_TTL: Duration = Duration::from_secs(8);
 const WARNING_TTL: Duration = Duration::from_secs(8);
@@ -34,6 +34,10 @@ pub enum UndoAction {
         id: i64,
         title: String,
     },
+    RestoreFields {
+        id: i64,
+        fields: Vec<(String, Value)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +57,10 @@ pub enum HistoryEntry {
     Created {
         id: i64,
         title: String,
+    },
+    Fields {
+        id: i64,
+        changes: Vec<(String, Value, Value)>,
     },
 }
 
@@ -115,7 +123,12 @@ impl Toasts {
         self.next_id
     }
 
+    pub fn dismiss_undo(&mut self) {
+        self.items.retain(|toast| toast.undo.is_none());
+    }
+
     pub fn push_undo(&mut self, message: impl Into<String>, undo: UndoAction) -> u64 {
+        self.dismiss_undo();
         self.next_id += 1;
         self.items.push(Toast {
             id: self.next_id,
@@ -194,6 +207,45 @@ pub fn json_error_message(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_undo_toast_replaces_the_previous_one() {
+        let mut toasts = Toasts::default();
+        toasts.push_undo(
+            "Moved A",
+            UndoAction::RestoreDates {
+                id: 1,
+                start_date: None,
+                target_date: None,
+                rev: 1,
+            },
+        );
+        toasts.push(ToastKind::Success, "Undid: A dates");
+        toasts.push_undo(
+            "Moved B",
+            UndoAction::RestoreDates {
+                id: 2,
+                start_date: None,
+                target_date: None,
+                rev: 1,
+            },
+        );
+        assert_eq!(toasts.items.len(), 2);
+        assert!(
+            toasts
+                .items
+                .iter()
+                .filter(|toast| toast.undo.is_some())
+                .count()
+                == 1
+        );
+        assert!(
+            toasts
+                .items
+                .iter()
+                .any(|toast| toast.message == "Undid: A dates")
+        );
+    }
 
     #[test]
     fn undo_toasts_expire_after_ttl() {

@@ -36,6 +36,14 @@ async fn open_and_save_work_item_form() {
             .unwrap_or_default()
             .contains("Saved title")
     );
+    assert!(
+        state
+            .toasts
+            .items
+            .last()
+            .is_some_and(|toast| toast.undo.is_some()),
+        "saving a title must offer Undo"
+    );
     let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();
     assert_eq!(node.title, "Persist cart (saved)");
 }
