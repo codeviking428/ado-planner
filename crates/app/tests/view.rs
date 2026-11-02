@@ -2674,6 +2674,87 @@ fn delete_on_a_selected_item_asks_for_confirm(cx: &mut gpui_kit::TestAppContext)
 }
 
 #[gpui_kit::test]
+fn held_delete_does_not_confirm_the_dialog(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let delete = KeyDownEvent {
+        keystroke: Keystroke::parse("delete").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    let held = KeyDownEvent {
+        keystroke: Keystroke::parse("delete").unwrap(),
+        is_held: true,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&delete, cx);
+        view.handle_key(&held, cx);
+        view.handle_key(&delete, cx);
+        assert_eq!(
+            view.pending_delete_id(),
+            Some(1),
+            "Delete must only open the confirm dialog; repeats must not confirm it"
+        );
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-delete-confirm").is_some(),
+        "the confirm dialog must stay until Enter or the Delete button"
+    );
+}
+
+#[gpui_kit::test]
+fn enter_confirms_delete_and_busy_io_keeps_the_dialog(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let delete = KeyDownEvent {
+        keystroke: Keystroke::parse("delete").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    let enter = KeyDownEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&delete, cx);
+        view.set_busy_for_test(true);
+        view.handle_key(&enter, cx);
+        assert_eq!(
+            view.pending_delete_id(),
+            Some(1),
+            "confirm must wait until planner I/O is idle"
+        );
+        view.set_busy_for_test(false);
+        view.handle_key(&enter, cx);
+        assert_eq!(
+            view.pending_delete_id(),
+            None,
+            "Enter on an idle confirm dialog must start the delete"
+        );
+        assert!(view.is_busy(), "confirming delete must take the I/O slot");
+    });
+}
+
+#[gpui_kit::test]
 fn f2_opens_inline_title_on_the_selected_row(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();

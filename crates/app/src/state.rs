@@ -2521,6 +2521,7 @@ impl PlannerState {
             self.gantt.selected_id = None;
         }
         self.drop_history_for_item(id);
+        self.toasts.dismiss_undo_for_item(id);
         if self.history_recording {
             self.toasts
                 .push(ToastKind::Success, format!("Deleted #{id} {title}"));
@@ -2793,11 +2794,41 @@ pub(crate) fn field_toast_name(reference: &str, label: Option<&str>) -> String {
 
 pub(crate) fn child_work_item_type(parent_type: Option<&str>, types: &[String]) -> String {
     let preferred: &[&str] = match parent_type {
-        Some("Epic") => &["Feature", "User Story", "Task"],
-        Some("Feature") => &["User Story", "Task", "Bug"],
-        Some("User Story") => &["Task", "Bug"],
+        Some("Epic") => &[
+            "Feature",
+            "User Story",
+            "Product Backlog Item",
+            "Requirement",
+            "Issue",
+            "Story",
+            "Task",
+        ],
+        Some("Feature") => &[
+            "User Story",
+            "Product Backlog Item",
+            "Requirement",
+            "Issue",
+            "Story",
+            "Task",
+            "Bug",
+        ],
+        Some("User Story")
+        | Some("Product Backlog Item")
+        | Some("Requirement")
+        | Some("Issue")
+        | Some("Story") => &["Task", "Bug"],
         Some("Task") | Some("Bug") => &["Task", "Bug"],
-        _ => &["Epic", "Feature", "User Story", "Task", "Bug"],
+        _ => &[
+            "Epic",
+            "Feature",
+            "User Story",
+            "Product Backlog Item",
+            "Requirement",
+            "Issue",
+            "Story",
+            "Task",
+            "Bug",
+        ],
     };
     preferred
         .iter()
@@ -2875,5 +2906,41 @@ mod child_type_tests {
         assert_eq!(child_work_item_type(None, &types), "Epic");
         assert_eq!(child_work_item_type(Some("Epic"), &types), "Feature");
         assert_eq!(child_work_item_type(Some("User Story"), &types), "Task");
+    }
+
+    #[test]
+    fn scrum_feature_prefers_product_backlog_item() {
+        let types = vec![
+            "Bug".into(),
+            "Epic".into(),
+            "Feature".into(),
+            "Product Backlog Item".into(),
+            "Task".into(),
+        ];
+        assert_eq!(
+            child_work_item_type(Some("Feature"), &types),
+            "Product Backlog Item"
+        );
+        assert_eq!(
+            child_work_item_type(Some("Product Backlog Item"), &types),
+            "Task"
+        );
+        assert_eq!(child_work_item_type(None, &types), "Epic");
+    }
+
+    #[test]
+    fn cmmi_feature_prefers_requirement() {
+        let types = vec![
+            "Bug".into(),
+            "Epic".into(),
+            "Feature".into(),
+            "Issue".into(),
+            "Requirement".into(),
+            "Task".into(),
+        ];
+        assert_eq!(child_work_item_type(Some("Feature"), &types), "Requirement");
+        assert_eq!(child_work_item_type(Some("Requirement"), &types), "Task");
+        assert_eq!(child_work_item_type(Some("Issue"), &types), "Task");
+        assert_eq!(child_work_item_type(Some("Epic"), &types), "Feature");
     }
 }

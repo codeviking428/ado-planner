@@ -1117,6 +1117,36 @@ async fn failed_delete_surfaces_an_error_toast() {
 }
 
 #[tokio::test]
+async fn delete_item_dismisses_create_undo_toast() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.add_item().await.expect("create");
+    let created = state.nodes.last().cloned().expect("created");
+    assert!(
+        state.toasts.items.iter().any(|toast| {
+            matches!(
+                toast.undo,
+                Some(UndoAction::DeleteCreated { id, .. }) if id == created.id
+            )
+        }),
+        "creating a work item must offer Undo"
+    );
+    state.delete_item(created.id).await.expect("delete");
+    assert!(
+        state.toasts.items.iter().all(|toast| {
+            !matches!(
+                toast.undo,
+                Some(UndoAction::DeleteCreated { id, .. }) if id == created.id
+            )
+        }),
+        "deleting the item must drop its create-Undo toast"
+    );
+    assert!(
+        state.nodes.iter().all(|node| node.id != created.id),
+        "the deleted work item must leave the tree"
+    );
+}
+
+#[tokio::test]
 async fn undo_create_drops_date_history_for_that_item() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.add_item().await.expect("create");

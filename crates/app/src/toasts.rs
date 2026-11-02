@@ -127,6 +127,23 @@ impl Toasts {
         self.items.retain(|toast| toast.undo.is_none());
     }
 
+    pub fn dismiss_undo_for_item(&mut self, id: i64) {
+        self.items.retain(|toast| match &toast.undo {
+            Some(UndoAction::DeleteCreated { id: item, .. })
+            | Some(UndoAction::RestoreDates { id: item, .. })
+            | Some(UndoAction::RestoreFields { id: item, .. }) => *item != id,
+            Some(UndoAction::RemoveLink {
+                successor_id,
+                predecessor_id,
+            })
+            | Some(UndoAction::RestoreLink {
+                successor_id,
+                predecessor_id,
+            }) => *successor_id != id && *predecessor_id != id,
+            None => true,
+        });
+    }
+
     pub fn push_undo(&mut self, message: impl Into<String>, undo: UndoAction) -> u64 {
         self.dismiss_undo();
         self.next_id += 1;
@@ -262,5 +279,30 @@ mod tests {
         toasts.items[0].created_at = Instant::now() - Duration::from_secs(20);
         toasts.expire();
         assert!(toasts.items.is_empty());
+    }
+
+    #[test]
+    fn dismiss_undo_for_item_drops_create_toast() {
+        let mut toasts = Toasts::default();
+        toasts.push_undo(
+            "Created #7 Cart",
+            UndoAction::DeleteCreated {
+                id: 7,
+                title: "Cart".into(),
+            },
+        );
+        toasts.push(ToastKind::Success, "Saved");
+        toasts.dismiss_undo_for_item(7);
+        assert!(
+            toasts
+                .items
+                .iter()
+                .all(|toast| !matches!(toast.undo, Some(UndoAction::DeleteCreated { .. }))),
+            "deleting an item must drop its create-Undo toast"
+        );
+        assert!(
+            toasts.items.iter().any(|toast| toast.message == "Saved"),
+            "unrelated toasts must stay"
+        );
     }
 }

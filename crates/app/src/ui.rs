@@ -211,15 +211,20 @@ impl PlannerView {
                 let delete_link = matches!(key, "delete" | "backspace")
                     && this.state.gantt.selected_link.is_some();
                 let delete_item = matches!(key, "delete" | "backspace")
+                    && this.pending_delete.is_none()
                     && this.state.gantt.selected_link.is_none()
                     && this.state.gantt.selected_id.is_some()
                     && this.state.form.is_none()
                     && this.inline_edit.is_none()
                     && !this.input_focused(window, cx);
+                // Enter confirms, Escape cancels. Delete/Backspace only open the
+                // dialog — key-repeat has no is_held on intercept, so treating
+                // them as confirm would delete on the first hold.
                 let confirm_delete = this.pending_delete.is_some()
                     && matches!(key, "enter" | "escape" | "delete" | "backspace");
                 let open_details = key == "enter"
                     && this.pending_delete.is_none()
+                    && !this.io_busy
                     && this.state.form.is_none()
                     && this.inline_edit.is_none()
                     && this.state.gantt.selected_id.is_some()
@@ -507,13 +512,13 @@ impl PlannerView {
         self._subscriptions.push(enter);
     }
 
-    fn spawn_state<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
+    fn spawn_state<F, Fut>(&mut self, cx: &mut Context<Self>, work: F) -> bool
     where
         F: FnOnce(PlannerState) -> Fut + Send + 'static,
         Fut: Future<Output = (PlannerState, Result<(), AppError>)> + Send + 'static,
     {
         if self.io_busy {
-            return;
+            return false;
         }
         self.io_busy = true;
         let runtime = self.state.runtime.clone();
@@ -579,6 +584,7 @@ impl PlannerView {
         })
         .detach();
         cx.notify();
+        true
     }
 
     fn spawn_unbounded<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
@@ -3799,13 +3805,16 @@ impl PlannerView {
     }
 
     fn confirm_delete(&mut self, cx: &mut Context<Self>) {
-        let Some((id, _)) = self.pending_delete.take() else {
+        let Some((id, _)) = self.pending_delete.clone() else {
             return;
         };
-        self.spawn_state(cx, move |mut state| async move {
+        if !self.spawn_state(cx, move |mut state| async move {
             let result = state.delete_item(id).await;
             (state, result)
-        });
+        }) {
+            return;
+        }
+        self.pending_delete = None;
         cx.notify();
     }
 
@@ -5031,6 +5040,14 @@ impl PlannerView {
         self.io_busy
     }
 
+    pub fn set_busy_for_test(&mut self, busy: bool) {
+        self.io_busy = busy;
+    }
+
+    pub fn pending_delete_id(&self) -> Option<i64> {
+        self.pending_delete.as_ref().map(|(id, _)| *id)
+    }
+
     pub fn inline_calendar_month(&self, cx: &gpui_kit::App) -> Option<u8> {
         self.inline_dates
             .as_ref()
@@ -5058,8 +5075,10 @@ impl PlannerView {
             cx.notify();
             return;
         }
-        if self.pending_delete.is_some() && matches!(key, "enter" | "delete" | "backspace") {
-            self.confirm_delete(cx);
+        if self.pending_delete.is_some() {
+            if key == "enter" && !event.is_held {
+                self.confirm_delete(cx);
+            }
             return;
         }
         if key == "enter" && self.inline_edit.is_some() {
@@ -5610,6 +5629,7 @@ impl Render for PlannerView {
                 }
                 let consume_enter = this.inline_edit.is_some()
                     || this.inline_enter_guard
+                    || this.pending_delete.is_some()
                     || (this.state.gantt.selected_id.is_some()
                         && this.state.form.is_none()
                         && this.pending_delete.is_none());
