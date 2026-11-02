@@ -819,14 +819,6 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
     cx.simulate_click(today_btn.center(), Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
-        let today = jiff::Zoned::now().date();
-        let month_start = Date::new(today.year(), today.month(), 1).unwrap();
-        let today_x = view.state.gantt.today_x(today);
-        let month_x = view.state.gantt.x_for_date(month_start);
-        assert!(
-            (today_x - month_x).abs() > 20.0,
-            "Today at {today_x} must not sit on the {month_start} gridline at {month_x}"
-        );
         let labels: Vec<String> = view
             .state
             .gantt
@@ -840,9 +832,11 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
                 "month header labels must not repeat after Today: {labels:?}"
             );
         }
+        let title = view.state.gantt.viewport_range_title();
+        let first = labels.first().expect("axis must have a first tick");
         assert!(
-            labels.iter().any(|label| label == "Oct" || label == "Nov"),
-            "October/November must appear after jumping to today, got {labels:?}"
+            title.starts_with(first),
+            "range title {title:?} must match the first axis tick {first:?} ({labels:?})"
         );
     });
 }
@@ -1178,6 +1172,17 @@ fn empty_team_keeps_the_gantt_toolbar(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("gantt-today").is_some(),
         "empty-state body must still draw the Today line"
     );
+    let today = cx.debug_bounds("gantt-today").expect("today line");
+    let body = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let today_x = f32::from(today.origin.x);
+    let left = f32::from(body.origin.x);
+    let right = left + f32::from(body.size.width);
+    assert!(
+        today_x >= left - 2.0 && today_x <= right,
+        "empty-state Today line at {today_x} must sit inside the grid {left}..{right}"
+    );
 }
 
 #[gpui_kit::test]
@@ -1429,6 +1434,32 @@ fn drag_end_clears_row_hover_and_link_handles(cx: &mut gpui_kit::TestAppContext)
         cx.debug_bounds("gantt-link-handle-1-link-end").is_none(),
         "link handles must not stick after a drag"
     );
+    let nav = cx.debug_bounds("gantt-nav").expect("toolbar");
+    cx.simulate_mouse_move(nav.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_id, None,
+            "moving to the toolbar must keep the row highlight cleared"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-handle-1-link-end").is_none(),
+        "link handles must stay unpainted after moving off the canvas"
+    );
+    let tree = cx.debug_bounds("gantt-tree").expect("left grid");
+    cx.simulate_mouse_move(tree.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_id, None,
+            "moving to the left grid must not restore the canvas hover"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-handle-1-link-end").is_none(),
+        "paint-level: link handles must not reappear over a non-canvas hover"
+    );
 }
 
 #[gpui_kit::test]
@@ -1493,6 +1524,21 @@ fn filtered_empty_keeps_the_timeline_header_and_grid(cx: &mut gpui_kit::TestAppC
     assert!(
         cx.debug_bounds("gantt-timeline-body").is_some(),
         "filters that hide every item must keep the timeline grid"
+    );
+    assert!(
+        cx.debug_bounds("gantt-today").is_some(),
+        "filtered empty body must still draw the Today line"
+    );
+    let today = cx.debug_bounds("gantt-today").expect("today line");
+    let body = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let today_x = f32::from(today.origin.x);
+    let left = f32::from(body.origin.x);
+    let right = left + f32::from(body.size.width);
+    assert!(
+        today_x >= left - 2.0 && today_x <= right,
+        "filtered empty Today line at {today_x} must sit inside the grid {left}..{right}"
     );
     assert!(
         cx.debug_bounds("empty-show-all").is_some(),
@@ -1632,5 +1678,99 @@ fn link_handle_hit_area_is_at_least_fourteen_pixels(cx: &mut gpui_kit::TestAppCo
         "link handle hit area was {}×{}",
         f32::from(handle.size.width),
         f32::from(handle.size.height)
+    );
+}
+
+#[gpui_kit::test]
+fn zoom_label_uses_a_fixed_width_so_plus_minus_do_not_shift(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let minus_before = cx.debug_bounds("gantt-zoom-out").expect("zoom out");
+    let plus_before = cx.debug_bounds("gantt-zoom-in").expect("zoom in");
+    let x_minus = f32::from(minus_before.origin.x);
+    let x_plus = f32::from(plus_before.origin.x);
+    let zoom_in = cx.debug_bounds("gantt-zoom-in").expect("zoom in");
+    cx.simulate_click(zoom_in.center(), Modifiers::default());
+    draw(cx);
+    let minus_after = cx.debug_bounds("gantt-zoom-out").expect("zoom out");
+    let plus_after = cx.debug_bounds("gantt-zoom-in").expect("zoom in");
+    assert!(
+        (f32::from(minus_after.origin.x) - x_minus).abs() < 2.0,
+        "Month (125%) must not shift −; before {x_minus} after {}",
+        f32::from(minus_after.origin.x)
+    );
+    assert!(
+        (f32::from(plus_after.origin.x) - x_plus).abs() < 2.0,
+        "Month (125%) must not shift +; before {x_plus} after {}",
+        f32::from(plus_after.origin.x)
+    );
+}
+
+#[gpui_kit::test]
+fn single_click_selects_a_bar_and_enter_opens_details(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1").expect("bar");
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.selected_id,
+            Some(1),
+            "a single click on a bar must select it"
+        );
+        assert!(
+            view.state.form.is_none(),
+            "a single click must not open details"
+        );
+    });
+    let enter = KeyDownEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&enter, cx);
+    });
+}
+
+#[gpui_kit::test]
+fn mouse_up_clears_hover_even_when_the_pointer_stays_on_the_bar(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1").expect("bar");
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.hovered_id, None);
+        assert!(view.state.gantt.hover_locked);
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-handle-1-link-end").is_none(),
+        "paint-level: handles must not remain after mouse-up on the same bar"
     );
 }

@@ -185,6 +185,33 @@ async fn undo_after_a_bar_drag_restores_original_dates() {
 }
 
 #[tokio::test]
+async fn end_handle_drop_records_undo_before_the_patch_returns() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let original_target = node.target_date.clone();
+    let _ = state.begin_bar_gesture(node.id, GestureKind::ResizeEnd, 0.0);
+    state.update_bar_gesture(state.gantt.scale.pixels_per_day(state.gantt.zoom) * 4.0);
+    let pending = state
+        .commit_date_gesture_now()
+        .expect("drop must produce a pending save");
+    assert!(
+        !state.history.undo.is_empty(),
+        "Ctrl+Z must see the drag on the undo stack before PATCH returns"
+    );
+    let moved = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_ne!(moved.target_date, original_target);
+    state.persist_pending_dates(pending).await.expect("persist");
+    state.undo().await.expect("undo");
+    let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(restored.target_date, original_target);
+}
+
+#[tokio::test]
 async fn undo_after_an_end_handle_drag_restores_original_target() {
     let (_mock, mut state, _dir) = signed_in().await;
     let node = state

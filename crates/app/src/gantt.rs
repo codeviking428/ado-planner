@@ -20,6 +20,7 @@ pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
 pub const TODAY_MARGIN_PX: f32 = 80.0;
+pub const SCALE_BUTTON_WIDTH: f32 = 132.0;
 pub const PLACEHOLDER_MIN_WIDTH: f32 = 48.0;
 pub const MILESTONE_SIZE: f32 = 16.0;
 pub const SUMMARY_BAR_H: f32 = 14.0;
@@ -266,6 +267,7 @@ pub struct GanttView {
     pub viewport_h: f32,
     pub viewport_w: f32,
     pub timeline_origin_x: f32,
+    pub timeline_origin_y: f32,
     pub timeline_width: f32,
     pub selected_id: Option<i64>,
     pub hovered_id: Option<i64>,
@@ -277,6 +279,9 @@ pub struct GanttView {
     pub context_menu: Option<ContextTarget>,
     pub splitter_drag: Option<(f32, f32)>,
     pub schedule_drag: Option<i64>,
+    /// After mouse-up, ignore hover until the pointer moves so a bar drag
+    /// does not leave a stuck row highlight under a stationary cursor.
+    pub hover_locked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -300,6 +305,7 @@ impl Default for GanttView {
             viewport_h: 720.0,
             viewport_w: 1280.0,
             timeline_origin_x: 0.0,
+            timeline_origin_y: 140.0,
             timeline_width: 800.0,
             selected_id: None,
             hovered_id: None,
@@ -311,6 +317,7 @@ impl Default for GanttView {
             context_menu: None,
             splitter_drag: None,
             schedule_drag: None,
+            hover_locked: false,
         }
     }
 }
@@ -374,13 +381,41 @@ impl GanttView {
         }
     }
 
+    /// Keep the date under the visible timeline centre still while zooming.
+    pub fn zoom_at_center(&mut self, factor: f32) {
+        let pointer = self.timeline_width.max(1.0) * 0.5;
+        self.zoom_at(factor, pointer, 0.0);
+    }
+
     pub fn viewport_range_title(&self) -> String {
-        self.scale.range_title(self.date_for_x(0.0))
+        self.scale.range_title(self.first_visible_period_date())
+    }
+
+    /// Month/week/day of the first on-screen tick, not the (possibly
+    /// off-screen) period that contains the left pixel. After Today in early
+    /// November the left edge can still sit in October while the axis starts
+    /// at Nov 1 — the title must match the axis.
+    pub fn first_visible_period_date(&self) -> Date {
+        let left = self.date_for_x(0.0);
+        let start = self.scale.floor_date(left);
+        if self.x_for_date(start) < -0.5 {
+            self.scale.next_date(start)
+        } else {
+            start
+        }
     }
 
     pub fn clear_hover(&mut self) {
         self.hovered_id = None;
         self.hovered_link = None;
+    }
+
+    pub fn pointer_in_canvas(&self, x: f32, y: f32) -> bool {
+        let left = self.timeline_origin_x;
+        let right = left + self.timeline_width.max(1.0);
+        let top = self.timeline_origin_y + TIMELINE_HEADER_H;
+        let bottom = self.timeline_origin_y + self.viewport_h;
+        x >= left && x <= right && y >= top && y <= bottom
     }
 
     pub fn step_period(&mut self, direction: i32) {
@@ -409,8 +444,8 @@ impl GanttView {
     }
 
     pub fn go_today(&mut self, today: Date) {
-        self.origin = today;
-        self.scroll_x = -TODAY_MARGIN_PX;
+        self.origin = self.scale.floor_date(today);
+        self.scroll_x = 0.0;
     }
 
     pub fn scroll_rows(&mut self, rows: i32, viewport_h: f32, row_count: usize) {
@@ -1166,8 +1201,50 @@ mod tests {
             scroll_x: 120.0,
             ..Default::default()
         };
+        let before = gantt.date_for_x(200.0);
         gantt.zoom_at(2.0, 200.0, 0.0);
         assert!((gantt.zoom - 2.0).abs() < f32::EPSILON);
+        assert_eq!(
+            gantt.date_for_x(200.0),
+            before,
+            "the date under the pointer must stay put"
+        );
+    }
+
+    #[test]
+    fn pointer_in_canvas_excludes_the_tree_and_toolbar() {
+        let gantt = GanttView {
+            timeline_origin_x: 480.0,
+            timeline_origin_y: 140.0,
+            timeline_width: 800.0,
+            viewport_h: 660.0,
+            ..Default::default()
+        };
+        assert!(gantt.pointer_in_canvas(500.0, 200.0));
+        assert!(
+            !gantt.pointer_in_canvas(120.0, 200.0),
+            "the left grid is not the canvas"
+        );
+        assert!(
+            !gantt.pointer_in_canvas(500.0, 40.0),
+            "the toolbar is not the canvas"
+        );
+    }
+
+    #[test]
+    fn zoom_at_center_keeps_the_viewport_midpoint() {
+        let mut gantt = GanttView {
+            scroll_x: 120.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let before = gantt.date_for_x(400.0);
+        gantt.zoom_at_center(2.0);
+        assert_eq!(
+            gantt.date_for_x(400.0),
+            before,
+            "the +/− buttons must zoom around the viewport centre"
+        );
     }
 
     #[test]
@@ -1491,7 +1568,8 @@ mod tests {
             ..Default::default()
         };
         gantt.auto_fit(&[item], &[], 800.0);
-        assert_eq!(gantt.origin, jiff::Zoned::now().date());
+        let today = jiff::Zoned::now().date();
+        assert_eq!(gantt.origin, gantt.scale.floor_date(today));
         assert!((gantt.zoom - 1.0).abs() < f32::EPSILON);
     }
 
@@ -1608,14 +1686,63 @@ mod tests {
     }
 
     #[test]
-    fn go_today_leaves_a_margin_from_the_splitter() {
+    fn go_today_aligns_the_current_period_to_the_axis() {
         let mut gantt = GanttView::default();
         let today = Date::new(2026, 10, 30).unwrap();
         gantt.go_today(today);
-        let x = gantt.today_x(today);
+        let start = gantt.scale.floor_date(today);
+        let start_x = gantt.x_for_date(start);
         assert!(
-            (x - TODAY_MARGIN_PX).abs() < 0.5,
-            "today marker at {x}, expected ~{TODAY_MARGIN_PX}px from the splitter"
+            start_x.abs() < 0.5,
+            "Today must put the current month at the axis start, got {start_x}"
+        );
+        let today_x = gantt.today_x(today);
+        assert!(
+            today_x > 20.0,
+            "Today marker at {today_x} must sit after the month gridline"
+        );
+        assert_eq!(gantt.viewport_range_title(), "Oct 2026");
+        let labels: Vec<_> = gantt
+            .header_tick_labels(800.0)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(
+            labels.first().map(String::as_str),
+            Some("Oct"),
+            "axis must start with October after Today, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn go_today_in_early_november_titles_november_not_october() {
+        let mut gantt = GanttView::default();
+        let today = Date::new(2026, 11, 2).unwrap();
+        gantt.go_today(today);
+        assert_eq!(gantt.viewport_range_title(), "Nov 2026");
+        let labels: Vec<_> = gantt
+            .header_tick_labels(800.0)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(
+            labels.first().map(String::as_str),
+            Some("Nov"),
+            "axis must start with November after Today, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn range_title_follows_the_first_visible_tick() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 11, 2).unwrap(),
+            scroll_x: -TODAY_MARGIN_PX,
+            ..Default::default()
+        };
+        assert_eq!(
+            gantt.viewport_range_title(),
+            "Nov 2026",
+            "left edge can sit in late October while the first tick is Nov 1"
         );
     }
 

@@ -61,6 +61,17 @@ pub struct PlannerState {
     history_recording: bool,
 }
 
+/// Date change already applied and recorded locally; persist over HTTP next.
+#[derive(Clone)]
+pub struct PendingDateSave {
+    pub id: i64,
+    pub start: Option<Date>,
+    pub target: Option<Date>,
+    pub after_start: Option<String>,
+    pub after_target: Option<String>,
+    pub previous: WorkItemNode,
+}
+
 impl PlannerState {
     pub fn new(
         paths: AppPaths,
@@ -628,6 +639,7 @@ impl PlannerState {
         self.prefs.planner.team = team;
         self.prefs.planner.iteration_path.clear();
         self.prefs.planner.root_types = Some(None);
+        self.gantt.clear_hover();
         self.persist_prefs();
         self.heal_and_load_iterations().await?;
         self.load_members().await?;
@@ -1057,6 +1069,116 @@ impl PlannerState {
         });
     }
 
+    pub fn discard_last_dates(&mut self, id: i64) {
+        if matches!(
+            self.history.undo.last(),
+            Some(HistoryEntry::Dates { id: entry_id, .. }) if *entry_id == id
+        ) {
+            self.history.undo.pop();
+        }
+    }
+
+    /// Apply the live gesture dates and push undo immediately, before PATCH.
+    pub fn commit_date_gesture_now(&mut self) -> Option<PendingDateSave> {
+        let gesture = self.gantt.gesture.take()?;
+        if gesture.kind == GestureKind::Link {
+            self.gantt.gesture = Some(gesture);
+            return None;
+        }
+        self.gantt.clear_hover();
+        if gesture.live_start == gesture.start && gesture.live_target == gesture.target {
+            return None;
+        }
+        let (start, target) = crate::gantt::GanttView::gesture_patch_dates(&gesture);
+        let previous = self
+            .nodes
+            .iter()
+            .find(|node| node.id == gesture.id)
+            .cloned()?;
+        let after_start = start
+            .map(iso_date_only)
+            .or_else(|| previous.start_date.clone());
+        let after_target = target
+            .map(iso_date_only)
+            .or_else(|| previous.target_date.clone());
+        let _ = self.apply_optimistic_partial(gesture.id, start, target);
+        if self.history_recording {
+            self.record_dates(
+                gesture.id,
+                &previous,
+                after_start.clone(),
+                after_target.clone(),
+            );
+        }
+        Some(PendingDateSave {
+            id: gesture.id,
+            start,
+            target,
+            after_start,
+            after_target,
+            previous,
+        })
+    }
+
+    pub async fn persist_pending_dates(
+        &mut self,
+        pending: PendingDateSave,
+    ) -> Result<(), AppError> {
+        let Some(scope) = self.scope() else {
+            return Ok(());
+        };
+        let Some(node) = self
+            .nodes
+            .iter()
+            .find(|node| node.id == pending.id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if node.start_date != pending.after_start || node.target_date != pending.after_target {
+            return Ok(());
+        }
+        if !node.has_date_fields {
+            return Err(AppError::message("no date fields"));
+        }
+        let ops = build_dates_patch(node.rev, pending.start, pending.target);
+        match self
+            .client
+            .patch_work_item(&scope.org, &scope.project, pending.id, &ops)
+            .await
+        {
+            Ok(rev) => {
+                if let Some(live) = self.nodes.iter_mut().find(|node| node.id == pending.id)
+                    && live.start_date == pending.after_start
+                    && live.target_date == pending.after_target
+                {
+                    live.rev = rev;
+                }
+                self.persist_hierarchy_cache();
+                let message = match (pending.start, pending.target) {
+                    (Some(_), None) => "Saved Start Date",
+                    (None, Some(_)) => "Saved Target Date",
+                    _ => "Saved Start Date and Target Date",
+                };
+                self.toasts.push(ToastKind::Success, message);
+                Ok(())
+            }
+            Err(err) => {
+                if self.nodes.iter().any(|node| {
+                    node.id == pending.id
+                        && node.start_date == pending.after_start
+                        && node.target_date == pending.after_target
+                }) {
+                    self.restore_node(pending.previous);
+                    self.discard_last_dates(pending.id);
+                }
+                self.toasts
+                    .push(ToastKind::Error, error_text(&err, "Could not save dates"));
+                Err(err.into())
+            }
+        }
+    }
+
     pub async fn save_dates(&mut self, id: i64, start: Date, target: Date) -> Result<(), AppError> {
         let Some(scope) = self.scope() else {
             return Ok(());
@@ -1074,6 +1196,14 @@ impl PlannerState {
         let Some(previous) = self.apply_optimistic_dates(id, start, target) else {
             return Ok(());
         };
+        if self.history_recording {
+            self.record_dates(
+                id,
+                &previous,
+                Some(iso_date_only(start)),
+                Some(iso_date_only(target)),
+            );
+        }
         let ops = build_dates_patch(node.rev, Some(start), Some(target));
         match self
             .client
@@ -1086,12 +1216,6 @@ impl PlannerState {
                 }
                 self.persist_hierarchy_cache();
                 if self.history_recording {
-                    self.record_dates(
-                        id,
-                        &previous,
-                        Some(iso_date_only(start)),
-                        Some(iso_date_only(target)),
-                    );
                     self.toasts
                         .push(ToastKind::Success, "Saved Start Date and Target Date");
                 }
@@ -1099,6 +1223,9 @@ impl PlannerState {
             }
             Err(err) => {
                 self.restore_node(previous);
+                if self.history_recording {
+                    self.discard_last_dates(id);
+                }
                 self.toasts
                     .push(ToastKind::Error, error_text(&err, "Could not save dates"));
                 Err(err.into())
@@ -1137,6 +1264,15 @@ impl PlannerState {
                 let Some(previous) = self.apply_optimistic_partial(id, start, target) else {
                     return Ok(());
                 };
+                let after_start = start
+                    .map(iso_date_only)
+                    .or_else(|| previous.start_date.clone());
+                let after_target = target
+                    .map(iso_date_only)
+                    .or_else(|| previous.target_date.clone());
+                if self.history_recording {
+                    self.record_dates(id, &previous, after_start.clone(), after_target.clone());
+                }
                 let ops = build_dates_patch(node.rev, start, target);
                 match self
                     .client
@@ -1148,25 +1284,21 @@ impl PlannerState {
                             node.rev = rev;
                         }
                         self.persist_hierarchy_cache();
-                        let after_start = start
-                            .map(iso_date_only)
-                            .or_else(|| previous.start_date.clone());
-                        let after_target = target
-                            .map(iso_date_only)
-                            .or_else(|| previous.target_date.clone());
                         let message = match (start, target) {
                             (Some(_), None) => "Saved Start Date",
                             (None, Some(_)) => "Saved Target Date",
                             _ => "Saved Start Date and Target Date",
                         };
                         if self.history_recording {
-                            self.record_dates(id, &previous, after_start, after_target);
                             self.toasts.push(ToastKind::Success, message);
                         }
                         Ok(())
                     }
                     Err(err) => {
                         self.restore_node(previous);
+                        if self.history_recording {
+                            self.discard_last_dates(id);
+                        }
                         self.toasts
                             .push(ToastKind::Error, error_text(&err, "Could not save dates"));
                         Err(err.into())
@@ -1287,6 +1419,7 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.gantt.selected_link = None;
+                self.gantt.clear_hover();
                 self.persist_hierarchy_cache();
                 if self.history_recording {
                     self.record(HistoryEntry::Link {
@@ -1512,16 +1645,8 @@ impl PlannerState {
             }
             return Ok(());
         }
-        if let Some(gesture) = self.gantt.gesture.clone() {
-            if gesture.live_start == gesture.start && gesture.live_target == gesture.target {
-                self.gantt.gesture = None;
-                self.gantt.clear_hover();
-                return Ok(());
-            }
-            let (start, target) = crate::gantt::GanttView::gesture_patch_dates(&gesture);
-            self.gantt.gesture = None;
-            self.gantt.clear_hover();
-            return self.save_partial_dates(gesture.id, start, target).await;
+        if let Some(pending) = self.commit_date_gesture_now() {
+            return self.persist_pending_dates(pending).await;
         }
         self.gantt.clear_hover();
         Ok(())
