@@ -319,10 +319,25 @@ pub fn type_has_start_and_target(field_reference_names: &[impl AsRef<str>]) -> b
     has_start && has_target
 }
 
-fn ymd(value: Option<&str>) -> String {
-    parse_iso_date(value)
-        .map(|date| date.to_string())
-        .unwrap_or_default()
+/// Short month-and-day copy for tree cells and form fields (`Jul 6`).
+pub fn compact_date(date: Date) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS[(date.month() as u8).saturating_sub(1).min(11) as usize];
+    format!("{month} {}", date.day())
+}
+
+/// Start/target copy using `→`, matching toasts and the Gantt Dates column.
+pub fn format_date_range(start: Option<Date>, target: Option<Date>) -> String {
+    match (start, target) {
+        (Some(start), Some(target)) => {
+            format!("{} → {}", compact_date(start), compact_date(target))
+        }
+        (Some(start), None) => format!("{} → …", compact_date(start)),
+        (None, Some(target)) => format!("◆ {}", compact_date(target)),
+        (None, None) => String::new(),
+    }
 }
 
 /// Tree-column copy. Iteration/rollup hints are display-only — never PATCHed.
@@ -336,26 +351,27 @@ pub fn dates_column_text(
     }
     let start = parse_iso_date(node.start_date.as_deref());
     let target = parse_iso_date(node.target_date.as_deref());
-    if let (Some(start), Some(target)) = (start, target) {
-        return format!("{start} → {target}");
-    }
-    if let Some(start) = start {
-        return format!("{start} → …");
-    }
-    if let Some(target) = target {
-        return format!("◆ {target}");
+    let scheduled = format_date_range(start, target);
+    if !scheduled.is_empty() {
+        return scheduled;
     }
     if let Some((start, target)) = client_rollup(nodes, node.id) {
-        return format!("Unscheduled · rollup {start}–{target}");
+        return format!(
+            "Unscheduled · rollup {} → {}",
+            compact_date(start),
+            compact_date(target)
+        );
     }
     if let Some(iteration) = iteration
-        && iteration.start_date.is_some()
-        && iteration.finish_date.is_some()
+        && let (Some(start), Some(target)) = (
+            parse_iso_date(iteration.start_date.as_deref()),
+            parse_iso_date(iteration.finish_date.as_deref()),
+        )
     {
         return format!(
-            "Unscheduled · iteration {}–{}",
-            ymd(iteration.start_date.as_deref()),
-            ymd(iteration.finish_date.as_deref())
+            "Unscheduled · iteration {} → {}",
+            compact_date(start),
+            compact_date(target)
         );
     }
     "Unscheduled".into()
@@ -425,10 +441,7 @@ mod tests {
             display.end.map(|d| d.to_string()).as_deref(),
             Some("2026-07-12")
         );
-        assert_eq!(
-            dates_column_text(&item, &[item.clone()], None),
-            "2026-07-06 → …"
-        );
+        assert_eq!(dates_column_text(&item, &[item.clone()], None), "Jul 6 → …");
     }
 
     #[test]
@@ -438,10 +451,7 @@ mod tests {
         let display = gantt_bar_display(&item, &[item.clone()], None);
         assert!(display.milestone);
         assert_eq!(display.start, display.end);
-        assert_eq!(
-            dates_column_text(&item, &[item.clone()], None),
-            "◆ 2026-07-20"
-        );
+        assert_eq!(dates_column_text(&item, &[item.clone()], None), "◆ Jul 20");
     }
 
     #[test]
@@ -552,7 +562,7 @@ mod tests {
         child.target_date = Some("2026-09-04T00:00:00Z".into());
         assert_eq!(
             dates_column_text(&parent, &[parent.clone(), child], None),
-            "Unscheduled · rollup 2026-08-17–2026-09-04"
+            "Unscheduled · rollup Aug 17 → Sep 4"
         );
     }
 
@@ -570,7 +580,7 @@ mod tests {
                     finish_date: Some("2026-08-21T00:00:00Z".into()),
                 })
             ),
-            "Unscheduled · iteration 2026-08-10–2026-08-21"
+            "Unscheduled · iteration Aug 10 → Aug 21"
         );
     }
 
@@ -588,7 +598,7 @@ mod tests {
                     finish_date: Some("2026-07-24T00:00:00Z".into()),
                 })
             ),
-            "2026-07-06 → 2026-07-20"
+            "Jul 6 → Jul 20"
         );
     }
 

@@ -31,8 +31,8 @@ pub const MILESTONE_SIZE: f32 = 16.0;
 pub const SUMMARY_BAR_H: f32 = 14.0;
 pub const PLACEHOLDER_BAR_H: f32 = 24.0;
 pub const LEAF_BAR_H: f32 = 28.0;
-pub const DATES_COL_WIDTH: f32 = 200.0;
-pub const DETAILS_PILL_WIDTH: f32 = 92.0;
+pub const DATES_COL_WIDTH: f32 = 140.0;
+pub const DETAILS_PILL_WIDTH: f32 = 80.0;
 pub const ID_COL_WIDTH: f32 = 64.0;
 pub const TYPE_COL_WIDTH: f32 = 88.0;
 pub const ASSIGNEE_COL_WIDTH: f32 = 88.0;
@@ -303,6 +303,39 @@ pub struct DependencyArrow {
     pub y2: f32,
     pub x_head: f32,
     pub lane_y: f32,
+}
+
+impl DependencyArrow {
+    /// Visual midpoint along the polyline (outgoing, lane, incoming, stub).
+    pub fn midpoint(&self) -> (f32, f32) {
+        let pts = [
+            (self.x1, self.y1),
+            (self.x1, self.lane_y),
+            (self.x2, self.lane_y),
+            (self.x2, self.y2),
+            (self.x_head, self.y2),
+        ];
+        let mut total = 0.0;
+        let mut segs = [0.0; 4];
+        for (i, pair) in pts.windows(2).enumerate() {
+            let dx = pair[1].0 - pair[0].0;
+            let dy = pair[1].1 - pair[0].1;
+            segs[i] = (dx * dx + dy * dy).sqrt();
+            total += segs[i];
+        }
+        let mut remain = total * 0.5;
+        for (i, len) in segs.iter().enumerate() {
+            if remain <= *len {
+                let t = if *len > 0.0 { remain / *len } else { 0.0 };
+                return (
+                    pts[i].0 + (pts[i + 1].0 - pts[i].0) * t,
+                    pts[i].1 + (pts[i + 1].1 - pts[i].1) * t,
+                );
+            }
+            remain -= len;
+        }
+        (self.x_head, self.y2)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1097,8 +1130,9 @@ impl GanttView {
             .since((Unit::Day, start))
             .map(|span| span.get_days())
             .unwrap_or(1)
-            .max(7) as f32;
-        let target_ppd = ((width * 0.88) / days).clamp(0.4, 96.0);
+            .max(7) as f32
+            + 4.0;
+        let target_ppd = ((width * 0.78) / days).clamp(0.4, 96.0);
         let base = match self.scale {
             GanttScale::Day => 48.0,
             GanttScale::Week => 24.0,
@@ -2256,6 +2290,30 @@ mod tests {
             arrows[0].lane_y >= pred.y.min(succ.y) + ROW_HEIGHT - 1.0,
             "horizontal run must sit in the gap between rows, got lane {}",
             arrows[0].lane_y
+        );
+    }
+
+    #[test]
+    fn link_remove_sits_at_the_polyline_midpoint() {
+        let arrow = DependencyArrow {
+            from_id: 1,
+            to_id: 2,
+            x1: 50.0,
+            y1: 20.0,
+            x2: 400.0,
+            y2: 220.0,
+            x_head: 412.0,
+            lane_y: 200.0,
+        };
+        let mid = arrow.midpoint();
+        let last_run = ((arrow.x1 + arrow.x2) * 0.5, arrow.lane_y);
+        assert!(
+            (mid.0 - last_run.0).abs() > 40.0,
+            "× must follow path length, not the last horizontal; got {mid:?} vs {last_run:?}"
+        );
+        assert!(
+            (mid.1 - arrow.lane_y).abs() < 1.0,
+            "a long lane should own the midpoint, got {mid:?}"
         );
     }
 

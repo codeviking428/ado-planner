@@ -10,7 +10,8 @@ use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::toasts::HistoryEntry;
 use ado_planner::ui::PlannerView;
 use ado_planner::ui::{
-    dates_from_range_picker, looks_like_pat, pending_range_typed, range_picker_is_complete,
+    date_field_text, dates_from_range_picker, format_picker_dates, looks_like_pat,
+    pending_range_typed, range_picker_is_complete,
 };
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use gpui_kit::component::calendar::Date as PickerDate;
@@ -287,6 +288,39 @@ fn calendar_end_click_wins_over_pending_typed_start() {
             "end click must save July 17, not keep the seeded August 4 from a start-only typed preview ({pending})"
         );
     }
+}
+
+#[test]
+fn form_dates_copy_uses_arrow_and_keeps_start_only() {
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+    assert_eq!(
+        format_picker_dates(PickerDate::Range(Some(start), None)),
+        "Jul 6 → …"
+    );
+    let end = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+    let both = format_picker_dates(PickerDate::Range(Some(start), Some(end)));
+    assert_eq!(both, "Jul 6 → Jul 20");
+    assert!(
+        !both.contains(" - "),
+        "modal dates must use →, not a hyphen join, got {both}"
+    );
+}
+
+#[test]
+fn read_only_closed_date_uses_compact_text() {
+    let mut values = serde_json::Map::new();
+    values.insert(
+        "Microsoft.VSTS.Common.ClosedDate".into(),
+        serde_json::json!("2026-07-20T00:00:00Z"),
+    );
+    let value = values
+        .get("Microsoft.VSTS.Common.ClosedDate")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        date_field_text("Microsoft.VSTS.Common.ClosedDate", &value, &values),
+        "Jul 20"
+    );
 }
 
 #[test]
@@ -702,6 +736,48 @@ fn inline_dates_use_a_range_picker(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn typed_complete_range_does_not_commit_until_enter(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_dates(1, window, cx);
+            view.type_inline_dates("2026-08-01 → 2026-08-15", window, cx);
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-dates").is_some(),
+        "a complete typed range must stay in the picker until Enter"
+    );
+    view.update(cx, |view, _| {
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .expect("item 1");
+        assert_eq!(
+            node.start_date.as_deref(),
+            Some("2026-07-06T00:00:00Z"),
+            "typing a complete range must not PATCH until Enter"
+        );
+        assert_eq!(
+            node.target_date.as_deref(),
+            Some("2026-07-20T00:00:00Z"),
+            "typing a complete range must not PATCH until Enter"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn inline_assignee_opens_an_editor(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -895,10 +971,15 @@ fn lighter_toasts_and_today_label_paint(cx: &mut gpui_kit::TestAppContext) {
     let toast = cx.debug_bounds("planner-toast").expect("toast");
     let nav = cx.debug_bounds("gantt-nav").expect("toolbar");
     let toast_top = f32::from(toast.origin.y);
+    let toast_bottom = toast_top + f32::from(toast.size.height);
     let nav_bottom = f32::from(nav.origin.y) + f32::from(nav.size.height);
     assert!(
         toast_top >= nav_bottom - 2.0,
         "toasts at y={toast_top} must sit below the toolbar bottom {nav_bottom}"
+    );
+    assert!(
+        toast_bottom < 800.0 - 80.0,
+        "toasts at bottom={toast_bottom} must not cover the Gantt bars"
     );
 }
 
@@ -1794,6 +1875,54 @@ fn start_only_details_dialog_shows_the_start_date(cx: &mut gpui_kit::TestAppCont
         cx.debug_bounds("form-date-picker").is_some(),
         "start-only items must still paint a date picker, not an empty Select date control"
     );
+    assert!(
+        cx.debug_bounds("form-dates-value").is_some(),
+        "a start-only item must show its start date, not the empty YYYY-MM-DD placeholder"
+    );
+}
+
+#[gpui_kit::test]
+fn read_only_closed_date_paints_text(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert(
+        "Microsoft.VSTS.Common.ClosedDate".into(),
+        serde_json::json!("2026-07-20T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![ado_core::FormControl {
+                    id: "Microsoft.VSTS.Common.ClosedDate".into(),
+                    reference_name: "Microsoft.VSTS.Common.ClosedDate".into(),
+                    label: "Closed Date".into(),
+                    kind: ado_core::FormControlKind::DateTime,
+                    required: false,
+                    read_only: true,
+                    visible: true,
+                    options: None,
+                }],
+            }],
+        }],
+        values,
+    }));
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-dates-value").is_some(),
+        "read-only dates such as Closed Date must show compact text, not an empty widget"
+    );
 }
 
 #[gpui_kit::test]
@@ -2477,6 +2606,33 @@ fn selected_link_shows_a_visible_remove_control(cx: &mut gpui_kit::TestAppContex
     assert!(
         cx.debug_bounds("gantt-link-remove").is_some(),
         "a selected dependency must show a × to remove it"
+    );
+}
+
+#[gpui_kit::test]
+fn delete_on_a_selected_item_asks_for_confirm(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let delete = KeyDownEvent {
+        keystroke: Keystroke::parse("delete").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&delete, cx);
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-delete-confirm").is_some(),
+        "Delete on a selected work item must ask before removing it"
     );
 }
 

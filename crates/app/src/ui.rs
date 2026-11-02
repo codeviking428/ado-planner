@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ado_core::{
-    AuthMode, FLAVORS, FormControlKind, color_for_type, dates_column_text, identity_from_field,
-    is_unscheduled, iso_date_only, parse_iso_date,
+    AuthMode, FLAVORS, FormControlKind, color_for_type, compact_date, dates_column_text,
+    format_date_range, identity_from_field, is_unscheduled, iso_date_only, parse_iso_date,
 };
 use ado_session::PlannerSession;
 use chrono::Datelike;
@@ -47,7 +47,7 @@ use crate::gantt::{
 };
 use crate::paths::AppPaths;
 use crate::state::{DateSaveRole, PendingDateSave, PlannerState};
-use crate::toasts::{ToastKind, UndoAction};
+use crate::toasts::{ToastKind, UndoAction, error_text};
 
 actions!(
     ado_planner,
@@ -83,6 +83,7 @@ pub struct PlannerView {
     /// overwritten unless the user actually edited the field.
     inline_dates_typed_seed: String,
     pending_typed_preview: Option<String>,
+    pending_delete: Option<(i64, String)>,
     /// True after Enter commits an inline editor so the same key does not
     /// also open the details dialog.
     inline_enter_guard: bool,
@@ -165,7 +166,8 @@ impl PlannerView {
                 let overlay = this.state.form.is_some()
                     || this.state.gantt.context_menu.is_some()
                     || this.popup_open()
-                    || this.inline_edit.is_some();
+                    || this.inline_edit.is_some()
+                    || this.pending_delete.is_some();
                 if key == "f2"
                     && this.state.form.is_none()
                     && this.inline_edit.is_none()
@@ -208,8 +210,16 @@ impl PlannerView {
                     (mods.control || mods.platform) && (key == "y" || (key == "z" && mods.shift));
                 let delete_link = matches!(key, "delete" | "backspace")
                     && this.state.gantt.selected_link.is_some();
+                let delete_item = matches!(key, "delete" | "backspace")
+                    && this.state.gantt.selected_link.is_none()
+                    && this.state.gantt.selected_id.is_some()
+                    && this.state.form.is_none()
+                    && this.inline_edit.is_none()
+                    && !this.input_focused(window, cx);
+                let confirm_delete = this.pending_delete.is_some()
+                    && matches!(key, "enter" | "escape" | "delete" | "backspace");
                 let nav = matches!(key, "up" | "down" | "pageup" | "pagedown" | "home" | "end");
-                if undo || redo || delete_link {
+                if undo || redo || delete_link || delete_item || confirm_delete {
                     this.on_key(
                         &KeyDownEvent {
                             keystroke: event.keystroke.clone(),
@@ -253,6 +263,7 @@ impl PlannerView {
             inline_dates: None,
             inline_dates_typed_seed: String::new(),
             pending_typed_preview: None,
+            pending_delete: None,
             inline_enter_guard: false,
             dates_anchor: None,
             banner_dismissed: false,
@@ -273,7 +284,7 @@ impl PlannerView {
             _subscriptions: vec![keystrokes],
         };
         this.bind_sign_in_events(window, cx);
-        this.bind_inline_input(window, cx);
+        this.bind_inline_input(cx);
         this
     }
 
@@ -381,6 +392,14 @@ impl PlannerView {
         self.begin_inline(InlineEdit::Dates(id), String::new(), window, cx);
     }
 
+    /// Tests type a complete range into the inline dates field.
+    pub fn type_inline_dates(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.inline_input.update(cx, |input, cx| {
+            input.replace_all(text, window, cx);
+        });
+        cx.notify();
+    }
+
     pub fn form_input_value(&self, field: &str, cx: &App) -> Option<String> {
         self.form_inputs
             .get(field)
@@ -463,7 +482,7 @@ impl PlannerView {
         self._subscriptions.push(scope);
     }
 
-    fn bind_inline_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn bind_inline_input(&mut self, cx: &mut Context<Self>) {
         let enter = cx.subscribe(&self.inline_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) && this.inline_edit.is_some() {
                 this.inline_enter_guard = true;
@@ -471,37 +490,6 @@ impl PlannerView {
             }
         });
         self._subscriptions.push(enter);
-        let typed = cx.subscribe_in(
-            &self.inline_input,
-            window,
-            |this, input, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                if !matches!(this.inline_edit, Some(InlineEdit::Dates(_))) {
-                    return;
-                }
-                let Some((start, target)) = parse_typed_dates(&input.read(cx).value()) else {
-                    return;
-                };
-                let (Some(start), Some(target)) = (
-                    start.and_then(jiff_to_naive),
-                    target.and_then(jiff_to_naive),
-                ) else {
-                    return;
-                };
-                let Some(picker) = this.inline_dates.clone() else {
-                    return;
-                };
-                let next = PickerDate::Range(Some(start), Some(target));
-                picker.update(cx, |state, cx| {
-                    if state.date() != next {
-                        state.set_date(next, window, cx);
-                    }
-                });
-            },
-        );
-        self._subscriptions.push(typed);
     }
 
     fn spawn_state<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
@@ -716,6 +704,7 @@ impl PlannerView {
         self.inline_dates = None;
         self.inline_dates_typed_seed.clear();
         self.dates_anchor = None;
+        self.pending_delete = None;
         self.state.gantt.context_menu = None;
     }
 
@@ -825,7 +814,7 @@ impl PlannerView {
                         }
                         return;
                     }
-                    this.commit_picker_dates(item_id, date, true, cx);
+                    this.commit_picker_dates(item_id, date, true, true, cx);
                 }));
             self.inline_dates = Some(picker);
         } else {
@@ -852,9 +841,16 @@ impl PlannerView {
         id: i64,
         date: PickerDate,
         close: bool,
+        from_calendar: bool,
         cx: &mut Context<Self>,
     ) {
-        let typed = self.inline_input.read(cx).value().to_string();
+        // Calendar auto-commit must ignore live typed text. Otherwise typing a
+        // complete range into an already-complete picker saves before Enter.
+        let typed = if from_calendar {
+            self.inline_dates_typed_seed.clone()
+        } else {
+            self.inline_input.read(cx).value().to_string()
+        };
         let Some((start, target)) =
             dates_from_range_picker(date, &typed, &self.inline_dates_typed_seed)
         else {
@@ -911,7 +907,7 @@ impl PlannerView {
                     .map(|picker| picker.read(cx).date());
                 self.inline_dates = None;
                 if let Some(date) = date {
-                    self.commit_picker_dates(id, date, false, cx);
+                    self.commit_picker_dates(id, date, false, false, cx);
                 } else if let Some((start, target)) = dates_from_range_picker(
                     PickerDate::Range(None, None),
                     &value,
@@ -1057,7 +1053,7 @@ impl PlannerView {
         v_flex()
             .id("toasts")
             .absolute()
-            .bottom_8()
+            .top(px(216.))
             .right_4()
             .w(px(360.))
             .gap_2()
@@ -1159,9 +1155,12 @@ impl PlannerView {
                             .push(ToastKind::Success, this.state.undo_confirmation(&action));
                     }
                     Ok((working, Err(err))) => {
-                        if let Some(msg) = working.toasts.last_error_message() {
-                            this.state.toasts.push(ToastKind::Error, msg.to_string());
-                        }
+                        let message = working
+                            .toasts
+                            .last_error_message()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| error_text(&err, "Could not undo"));
+                        this.state.toasts.push(ToastKind::Error, message);
                         tracing::warn!("toast undo failed: {err}");
                     }
                     Err(_) => tracing::warn!("toast undo cancelled"),
@@ -3251,10 +3250,7 @@ impl PlannerView {
                         .when(hovered && !dragging, |el| el.opacity(0.92))
                 })
                 .when(unscheduled && !summary, |el| {
-                    el.bg(cx.theme().muted)
-                        .opacity(0.95)
-                        .border_2()
-                        .border_color(cx.theme().primary)
+                    el.bg(cx.theme().muted).opacity(0.7)
                 })
                 .text_color(if summary { muted_fg } else { bar_label_fg })
                 .when(!milestone && !unscheduled, |el| {
@@ -3584,8 +3580,14 @@ impl PlannerView {
             )))
             .debug_selector(|| "gantt-link-remove".into())
             .absolute()
-            .left(px((arrow.x1 + arrow.x2) * 0.5 - min_x - 10.0))
-            .top(px(arrow.lane_y - min_y - 12.0))
+            .left(px({
+                let (x, _) = arrow.midpoint();
+                x - min_x - 10.0
+            }))
+            .top(px({
+                let (_, y) = arrow.midpoint();
+                y - min_y - 12.0
+            }))
             .occlude()
             .child(
                 Button::new(SharedString::from(format!("link-remove-{from_id}-{to_id}")))
@@ -3603,9 +3605,101 @@ impl PlannerView {
             .into_any_element()
     }
 
+    fn request_delete(&mut self, id: i64, cx: &mut Context<Self>) {
+        let title = self
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.title.clone())
+            .unwrap_or_default();
+        self.state.gantt.context_menu = None;
+        self.pending_delete = Some((id, title));
+        cx.notify();
+    }
+
+    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some((id, _)) = self.pending_delete.take() else {
+            return;
+        };
+        self.spawn_state(cx, move |mut state| async move {
+            let result = state.delete_item(id).await;
+            (state, result)
+        });
+        cx.notify();
+    }
+
+    fn render_delete_confirm(&self, cx: &Context<Self>) -> impl IntoElement {
+        let Some((id, title)) = self.pending_delete.as_ref() else {
+            return div().into_any_element();
+        };
+        let id = *id;
+        let title = title.clone();
+        v_flex()
+            .id("gantt-delete-confirm")
+            .debug_selector(|| "gantt-delete-confirm".into())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(cx.theme().overlay)
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.pending_delete = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                v_flex()
+                    .id("gantt-delete-dialog")
+                    .w(px(420.))
+                    .gap_3()
+                    .p_4()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Label::new(format!("Delete #{id} {title}?"))
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        Label::new("This removes the work item from Azure DevOps.")
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("cancel-delete").label("Cancel").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_delete = None;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                Button::new("confirm-delete")
+                                    .primary()
+                                    .label("Delete")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_delete(cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn remove_link(&mut self, from_id: i64, to_id: i64, cx: &mut Context<Self>) {
         self.state.gantt.context_menu = None;
         self.state.gantt.selected_link = None;
+        self.state.gantt.selected_id = None;
         self.state.gantt.clear_hover();
         self.state.gantt.hover_locked = true;
         self.spawn_state(cx, move |mut state| async move {
@@ -3794,6 +3888,9 @@ impl PlannerView {
                 }))
             })
             .child(self.menu_item("Open", cx, move |this, cx| this.open_form(id, cx)))
+            .child(self.menu_item("Delete", cx, move |this, cx| {
+                this.request_delete(id, cx);
+            }))
             .child(
                 self.menu_item("Open in Azure DevOps", cx, move |this, _cx| {
                     this.state.open_in_ado(id);
@@ -4177,21 +4274,83 @@ impl PlannerView {
                     if id == ado_core::START_DATE_FIELD && has_target_picker && !has_start_picker {
                         return div().into_any_element();
                     }
-                    let picker = self
-                        .form_dates
-                        .get(&id)
-                        .cloned()
-                        .or_else(|| self.form_dates.get(ado_core::START_DATE_FIELD).cloned())
-                        .or_else(|| self.form_dates.get(ado_core::TARGET_DATE_FIELD).cloned());
+                    let range_field =
+                        id == ado_core::START_DATE_FIELD || id == ado_core::TARGET_DATE_FIELD;
+                    let picker = self.form_dates.get(&id).cloned().or_else(|| {
+                        if range_field {
+                            self.form_dates
+                                .get(ado_core::START_DATE_FIELD)
+                                .cloned()
+                                .or_else(|| {
+                                    self.form_dates.get(ado_core::TARGET_DATE_FIELD).cloned()
+                                })
+                        } else {
+                            None
+                        }
+                    });
+                    let has_picker = picker.is_some();
+                    let fallback = date_field_text(&id, &value, &form.values);
                     v_flex()
                         .id(SharedString::from(format!("form-date-{id}")))
                         .debug_selector(|| "form-date-picker".into())
                         .w_full()
                         .when_some(picker, |el, state| {
+                            let date = state.read(cx).date();
+                            let display = format_picker_dates(date);
+                            let empty = display.is_empty();
                             el.child(
-                                DatePicker::new(&state)
+                                div()
+                                    .relative()
                                     .w_full()
-                                    .placeholder("YYYY-MM-DD → YYYY-MM-DD"),
+                                    .min_h(px(36.))
+                                    .child(
+                                        h_flex()
+                                            .id("form-dates-value")
+                                            .debug_selector(|| "form-dates-value".into())
+                                            .absolute()
+                                            .inset_0()
+                                            .px_3()
+                                            .items_center()
+                                            .border_1()
+                                            .border_color(cx.theme().input)
+                                            .rounded(cx.theme().radius)
+                                            .bg(cx.theme().background)
+                                            .text_sm()
+                                            .when(empty, |row| {
+                                                row.text_color(cx.theme().muted_foreground)
+                                            })
+                                            .child(if empty {
+                                                "YYYY-MM-DD → YYYY-MM-DD".to_string()
+                                            } else {
+                                                display
+                                            }),
+                                    )
+                                    .child(
+                                        DatePicker::new(&state)
+                                            .w_full()
+                                            .appearance(false)
+                                            .text_color(gpui_kit::hsla(0., 0., 0., 0.))
+                                            .placeholder(""),
+                                    ),
+                            )
+                        })
+                        .when(!has_picker, |el| {
+                            let empty = fallback.is_empty();
+                            el.child(
+                                h_flex()
+                                    .id("form-dates-value")
+                                    .debug_selector(|| "form-dates-value".into())
+                                    .w_full()
+                                    .min_h(px(36.))
+                                    .px_3()
+                                    .items_center()
+                                    .border_1()
+                                    .border_color(cx.theme().input)
+                                    .rounded(cx.theme().radius)
+                                    .bg(cx.theme().background)
+                                    .text_sm()
+                                    .when(empty, |row| row.text_color(cx.theme().muted_foreground))
+                                    .child(if empty { "—".to_string() } else { fallback }),
                             )
                         })
                         .into_any_element()
@@ -4703,12 +4862,20 @@ impl PlannerView {
             return;
         }
         if key == "escape" {
+            if self.pending_delete.take().is_some() {
+                cx.notify();
+                return;
+            }
             if self.inline_edit.take().is_some() {
                 cx.notify();
                 return;
             }
             self.dismiss_all_overlays();
             cx.notify();
+            return;
+        }
+        if self.pending_delete.is_some() && matches!(key, "enter" | "delete" | "backspace") {
+            self.confirm_delete(cx);
             return;
         }
         if key == "enter" && self.inline_edit.is_some() {
@@ -4740,6 +4907,13 @@ impl PlannerView {
             && let Some((from_id, to_id)) = self.state.gantt.selected_link
         {
             self.remove_link(from_id, to_id, cx);
+            return;
+        }
+        if matches!(key, "delete" | "backspace")
+            && self.state.form.is_none()
+            && let Some(id) = self.state.gantt.selected_id
+        {
+            self.request_delete(id, cx);
             return;
         }
         if self.state.form.is_some() || self.popup_open() {
@@ -5011,6 +5185,44 @@ fn month_name(month: u8) -> &'static str {
 /// scheduled item is not ignored. An incomplete typed value (the start-only
 /// `…` preview after the first calendar click) must not override a complete
 /// calendar range.
+pub fn format_picker_dates(date: PickerDate) -> String {
+    match date {
+        PickerDate::Range(start, end) => {
+            format_date_range(start.and_then(naive_to_jiff), end.and_then(naive_to_jiff))
+        }
+        PickerDate::Single(day) => format_date_range(day.and_then(naive_to_jiff), None),
+    }
+}
+
+/// Visible copy for a form DateTime when no picker exists (read-only fields).
+pub fn date_field_text(
+    id: &str,
+    value: &serde_json::Value,
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    if id == ado_core::START_DATE_FIELD || id == ado_core::TARGET_DATE_FIELD {
+        let start = values
+            .get(ado_core::START_DATE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| parse_iso_date(Some(text)));
+        let target = values
+            .get(ado_core::TARGET_DATE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| parse_iso_date(Some(text)));
+        if id == ado_core::START_DATE_FIELD {
+            return format_date_range(start, target);
+        }
+        if id == ado_core::TARGET_DATE_FIELD && start.is_none() {
+            return format_date_range(None, target);
+        }
+    }
+    value
+        .as_str()
+        .and_then(|text| parse_iso_date(Some(text)))
+        .map(compact_date)
+        .unwrap_or_default()
+}
+
 pub fn dates_from_range_picker(
     date: PickerDate,
     typed: &str,
@@ -5265,6 +5477,7 @@ impl Render for PlannerView {
                             .child(self.render_context_menu(cx))
                             .child(self.render_dates_popover(cx))
                             .child(self.render_form(cx))
+                            .child(self.render_delete_confirm(cx))
                             .child(self.render_toasts(cx)),
                     )
                 },

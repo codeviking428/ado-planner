@@ -1851,12 +1851,8 @@ impl PlannerState {
             .gantt
             .selected_id
             .and_then(|id| self.nodes.iter().find(|node| node.id == id));
-        let work_item_type = ["User Story", "Task", "Bug", "Feature", "Epic"]
-            .into_iter()
-            .find(|ty| types.iter().any(|item| item == ty))
-            .map(ToString::to_string)
-            .or_else(|| types.first().cloned())
-            .unwrap_or_else(|| "User Story".into());
+        let work_item_type =
+            child_work_item_type(parent.map(|node| node.work_item_type.as_str()), &types);
         let area = parent
             .map(|node| node.area_path.clone())
             .or_else(|| self.nodes.first().map(|node| node.area_path.clone()))
@@ -1909,6 +1905,10 @@ impl PlannerState {
                 self.nodes.push(node);
                 self.gantt.selected_id = Some(id);
                 self.persist_hierarchy_cache();
+                self.record(HistoryEntry::Created {
+                    id,
+                    title: title.clone(),
+                });
                 self.toasts.push_undo(
                     format!("Created #{id} {title}"),
                     UndoAction::DeleteCreated { id, title },
@@ -2173,7 +2173,9 @@ impl PlannerState {
         self.history_recording = true;
         if result.is_ok() {
             self.push_history_toast(&entry, true);
-            self.history.redo.push(entry);
+            if !matches!(entry, HistoryEntry::Created { .. }) {
+                self.history.redo.push(entry);
+            }
             self.toasts.items.retain(|toast| toast.undo.is_none());
         } else {
             self.history.undo.push(entry);
@@ -2234,6 +2236,13 @@ impl PlannerState {
                     self.remove_dependency(*successor_id, *predecessor_id).await
                 }
             }
+            HistoryEntry::Created { id, .. } => {
+                if is_undo {
+                    self.delete_item(*id).await
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -2261,7 +2270,7 @@ impl PlannerState {
                 successor_id,
                 predecessor_id,
             } => self.add_dependency(*successor_id, *predecessor_id).await,
-            UndoAction::DeleteCreated { id, .. } => self.delete_created_item(*id).await,
+            UndoAction::DeleteCreated { id, .. } => self.delete_item(*id).await,
         };
         self.history_recording = true;
         if result.is_ok() {
@@ -2390,20 +2399,50 @@ impl PlannerState {
                     self.history.undo.remove(index);
                 }
             }
-            UndoAction::DeleteCreated { .. } => {}
+            UndoAction::DeleteCreated { id, .. } => {
+                self.drop_history_for_item(*id);
+            }
         }
     }
 
-    async fn delete_created_item(&mut self, id: i64) -> Result<(), AppError> {
+    fn drop_history_for_item(&mut self, id: i64) {
+        let keep = |entry: &HistoryEntry| match entry {
+            HistoryEntry::Created { id: entry_id, .. }
+            | HistoryEntry::Dates { id: entry_id, .. } => *entry_id != id,
+            HistoryEntry::Link {
+                successor_id,
+                predecessor_id,
+                ..
+            } => *successor_id != id && *predecessor_id != id,
+        };
+        self.history.undo.retain(keep);
+        self.history.redo.retain(keep);
+    }
+
+    pub async fn delete_item(&mut self, id: i64) -> Result<(), AppError> {
         let Some(scope) = self.scope() else {
             return Err(AppError::message("Choose a Team first"));
         };
-        self.client
+        let title = self.item_title(id);
+        if let Err(err) = self
+            .client
             .delete_work_item(&scope.org, &scope.project, id)
-            .await?;
+            .await
+        {
+            self.toasts.push(
+                ToastKind::Error,
+                error_text(&err, "Could not delete work item"),
+            );
+            return Err(err.into());
+        }
         self.nodes.retain(|node| node.id != id);
         if self.gantt.selected_id == Some(id) {
             self.gantt.selected_id = None;
+        }
+        self.drop_history_for_item(id);
+        if self.history_recording {
+            self.toasts
+                .push(ToastKind::Success, format!("Deleted #{id} {title}"));
         }
         self.persist_hierarchy_cache();
         Ok(())
@@ -2553,6 +2592,9 @@ impl PlannerState {
             HistoryEntry::Link { successor_id, .. } => {
                 format!("{verb}: {} dependency", self.item_title(*successor_id))
             }
+            HistoryEntry::Created { title, .. } => {
+                format!("{verb}: created {title}")
+            }
         };
         self.toasts.push(ToastKind::Success, message);
     }
@@ -2565,7 +2607,7 @@ pub(crate) fn dates_moved_message(
 ) -> String {
     match (start, target) {
         (Some(start), Some(target)) => format!(
-            "Moved {title} to {} – {}",
+            "Moved {title} to {} → {}",
             short_month_day(start),
             short_month_day(target)
         ),
@@ -2604,6 +2646,22 @@ pub(crate) fn field_toast_name(reference: &str, label: Option<&str>) -> String {
             out
         }
     }
+}
+
+pub(crate) fn child_work_item_type(parent_type: Option<&str>, types: &[String]) -> String {
+    let preferred: &[&str] = match parent_type {
+        Some("Epic") => &["Feature", "User Story", "Task"],
+        Some("Feature") => &["User Story", "Task", "Bug"],
+        Some("User Story") => &["Task", "Bug"],
+        Some("Task") | Some("Bug") => &["Task", "Bug"],
+        _ => &["User Story", "Task", "Bug", "Feature", "Epic"],
+    };
+    preferred
+        .iter()
+        .find(|ty| types.iter().any(|item| item == **ty))
+        .map(|ty| (*ty).to_string())
+        .or_else(|| types.first().cloned())
+        .unwrap_or_else(|| "User Story".into())
 }
 
 fn toggle_hidden(list: &mut Vec<String>, value: &str) {

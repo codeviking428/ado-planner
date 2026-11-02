@@ -50,6 +50,10 @@ pub enum HistoryEntry {
         predecessor_id: i64,
         linked: bool,
     },
+    Created {
+        id: i64,
+        title: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]

@@ -2,6 +2,7 @@ use ado_core::{START_DATE_FIELD, TARGET_DATE_FIELD, parse_iso_date};
 use ado_planner::gantt::{GanttScale, GanttView, GestureKind, NudgeAxis};
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{DateSaveRole, PlannerState, fake_hierarchy};
+use ado_planner::toasts::{HistoryEntry, UndoAction};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use jiff::ToSpan;
 use jiff::civil::Date;
@@ -1068,6 +1069,104 @@ async fn undo_created_item_deletes_it() {
     assert!(
         state.nodes.iter().all(|node| node.id != created.id),
         "Undo on Created must delete the new work item"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_z_undoes_create_from_the_history_stack() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.add_item().await.expect("create");
+    let created = state.nodes.last().cloned().expect("created");
+    assert!(
+        matches!(
+            state.history.undo.last(),
+            Some(HistoryEntry::Created { id, .. }) if *id == created.id
+        ),
+        "create must land on the Ctrl+Z stack, not only the toast"
+    );
+    state.undo().await.expect("undo create");
+    assert!(
+        state.nodes.iter().all(|node| node.id != created.id),
+        "Ctrl+Z must delete the created work item after the toast expires"
+    );
+}
+
+#[tokio::test]
+async fn failed_delete_surfaces_an_error_toast() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let id = state.nodes[0].id;
+    mock.fail_next(&format!("/workitems/{id}"), 503, "delete failed");
+    let err = state.delete_item(id).await;
+    assert!(err.is_err(), "DELETE 503 must fail the action");
+    assert!(
+        state.nodes.iter().any(|node| node.id == id),
+        "a failed delete must leave the work item in the list"
+    );
+    assert!(
+        state
+            .toasts
+            .last_error_message()
+            .is_some_and(|message| !message.is_empty()),
+        "a failed delete must toast an error instead of failing silently"
+    );
+}
+
+#[tokio::test]
+async fn undo_create_drops_date_history_for_that_item() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.add_item().await.expect("create");
+    let created = state.nodes.last().cloned().expect("created");
+    state.history.undo.push(HistoryEntry::Dates {
+        id: created.id,
+        before_start: None,
+        before_target: None,
+        after_start: Some("2026-07-06".into()),
+        after_target: Some("2026-07-20".into()),
+    });
+    state.history.redo.push(HistoryEntry::Dates {
+        id: created.id,
+        before_start: None,
+        before_target: None,
+        after_start: Some("2026-07-06".into()),
+        after_target: Some("2026-07-20".into()),
+    });
+    let undo = UndoAction::DeleteCreated {
+        id: created.id,
+        title: created.title.clone(),
+    };
+    state.apply_undo(undo).await.expect("delete created");
+    let leftover = |entry: &HistoryEntry| match entry {
+        HistoryEntry::Created { id, .. } | HistoryEntry::Dates { id, .. } => *id == created.id,
+        HistoryEntry::Link {
+            successor_id,
+            predecessor_id,
+            ..
+        } => *successor_id == created.id || *predecessor_id == created.id,
+    };
+    assert!(
+        state.history.undo.iter().all(|entry| !leftover(entry)),
+        "undoing a create must drop date/link history for that id"
+    );
+    assert!(
+        state.history.redo.iter().all(|entry| !leftover(entry)),
+        "undoing a create must drop redo history for that id"
+    );
+}
+
+#[tokio::test]
+async fn add_item_under_a_user_story_creates_a_task() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.gantt.selected_id = Some(1003);
+    state.add_item().await.expect("create");
+    let created = state.nodes.last().expect("created");
+    assert_eq!(
+        created.parent_id,
+        Some(1003),
+        "new items nest under the selected User Story"
+    );
+    assert_eq!(
+        created.work_item_type, "Task",
+        "a child of a User Story must be a Task, not another User Story"
     );
 }
 
