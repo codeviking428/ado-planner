@@ -18,7 +18,10 @@ use serde_json::{Value, json};
 use crate::cache::{CacheFreshness, QueryCache};
 use crate::error::AppError;
 use crate::form::FormDraft;
-use crate::gantt::{GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView, VisibleRow};
+use crate::gantt::{
+    GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView, VisibleRow,
+    insert_index_for_child,
+};
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
 use crate::toasts::{EditHistory, HistoryEntry, ToastKind, Toasts, UndoAction, error_text};
@@ -1058,7 +1061,7 @@ impl PlannerState {
                         .unwrap_or((None, None));
                     dates_moved_message(&title, start, target)
                 } else {
-                    format!("Saved {}", names.join(", "))
+                    format!("Saved {} on {}", names.join(", "), self.item_title(id))
                 };
                 if only_dates {
                     if let Some(before) = before.as_ref() {
@@ -1929,10 +1932,7 @@ impl PlannerState {
                 }
                 let id = node.id;
                 let title = node.title.clone();
-                let insert_at = parent_id
-                    .and_then(|pid| self.nodes.iter().position(|item| item.id == pid))
-                    .map(|index| index + 1)
-                    .unwrap_or(0);
+                let insert_at = insert_index_for_child(&self.nodes, parent_id);
                 self.nodes.insert(insert_at, node);
                 self.gantt.selected_id = Some(id);
                 self.persist_hierarchy_cache();
@@ -2033,7 +2033,11 @@ impl PlannerState {
                         changes: vec![(reference.to_string(), before_value.clone(), value.clone())],
                     });
                     self.toasts.push_undo(
-                        format!("Saved {}", field_toast_name(reference, None)),
+                        format!(
+                            "Saved {} on {}",
+                            field_toast_name(reference, None),
+                            self.item_title(id)
+                        ),
                         UndoAction::RestoreFields {
                             id,
                             fields: vec![(reference.to_string(), before_value)],
@@ -2696,7 +2700,7 @@ impl PlannerState {
     pub(crate) fn undo_confirmation(&self, action: &UndoAction) -> String {
         match action {
             UndoAction::RestoreDates { id, .. } => {
-                format!("Undid dates of {}", self.item_title(*id))
+                format!("Undid dates on {}", self.item_title(*id))
             }
             UndoAction::RestoreFields { id, fields } => {
                 let title = self.item_title(*id);
@@ -2708,16 +2712,16 @@ impl PlannerState {
                     _ => format!("Undid field changes on {title}"),
                 }
             }
-            UndoAction::DeleteCreated { id, title } => {
+            UndoAction::DeleteCreated { title, .. } => {
                 if title.is_empty() {
-                    format!("Removed #{id}")
+                    "Undid create on item".into()
                 } else {
-                    format!("Removed #{id} {title}")
+                    format!("Undid create on {title}")
                 }
             }
             UndoAction::RemoveLink { successor_id, .. }
             | UndoAction::RestoreLink { successor_id, .. } => {
-                format!("Undid {} dependency", self.item_title(*successor_id))
+                format!("Undid dependency on {}", self.item_title(*successor_id))
             }
         }
     }
@@ -2726,13 +2730,13 @@ impl PlannerState {
         let verb = if is_undo { "Undid" } else { "Redid" };
         let message = match entry {
             HistoryEntry::Dates { id, .. } => {
-                format!("{verb}: {} dates", self.item_title(*id))
+                format!("{verb} dates on {}", self.item_title(*id))
             }
             HistoryEntry::Link { successor_id, .. } => {
-                format!("{verb}: {} dependency", self.item_title(*successor_id))
+                format!("{verb} dependency on {}", self.item_title(*successor_id))
             }
             HistoryEntry::Created { title, .. } => {
-                format!("{verb}: created {title}")
+                format!("{verb} create on {title}")
             }
             HistoryEntry::Fields { id, changes } => {
                 let title = self.item_title(*id);
@@ -2762,12 +2766,12 @@ pub(crate) fn dates_moved_message(
 ) -> String {
     match (start, target) {
         (Some(start), Some(target)) => format!(
-            "Moved dates of {title} to {} → {}",
+            "Moved dates on {title} to {} → {}",
             toast_date(start),
             toast_date(target)
         ),
-        (Some(start), None) => format!("Moved start of {title} to {}", toast_date(start)),
-        (None, Some(target)) => format!("Moved dates of {title} to {}", toast_date(target)),
+        (Some(start), None) => format!("Moved start on {title} to {}", toast_date(start)),
+        (None, Some(target)) => format!("Moved dates on {title} to {}", toast_date(target)),
         (None, None) => format!("Saved {title} dates"),
     }
 }
@@ -3112,8 +3116,8 @@ mod toast_copy_tests {
         let target = Date::new(2026, 8, 18).unwrap();
         let message = dates_moved_message("Cart", Some(start), Some(target));
         assert!(
-            message.starts_with("Moved dates of Cart"),
-            "move toasts must say 'dates of', got {message}"
+            message.starts_with("Moved dates on Cart"),
+            "move toasts must say 'dates on', got {message}"
         );
         assert!(
             message.contains('\u{00a0}'),

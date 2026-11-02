@@ -54,8 +54,8 @@ actions!(
     [Quit, NudgeLeft, NudgeRight, EscapeCancel, OpenSelected]
 );
 
-const DATES_RANGE_HINT: &str = "Jul 6 → Jul 20";
-const DATE_HINT: &str = "Jul 6";
+const DATES_RANGE_HINT: &str = "Start → Target";
+const DATE_HINT: &str = "Date";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InlineEdit {
@@ -75,6 +75,7 @@ pub struct PlannerView {
     inline_input: Entity<InputState>,
     form_inputs: HashMap<String, Entity<InputState>>,
     form_dates: HashMap<String, Entity<CalendarState>>,
+    form_dates_preview: Option<String>,
     form_inputs_for: Option<i64>,
     form_title_focused_for: Option<i64>,
     form_focus: FocusHandle,
@@ -268,6 +269,7 @@ impl PlannerView {
             inline_input,
             form_inputs: HashMap::new(),
             form_dates: HashMap::new(),
+            form_dates_preview: None,
             form_inputs_for: None,
             form_title_focused_for: None,
             form_focus: cx.focus_handle(),
@@ -411,6 +413,45 @@ impl PlannerView {
             .map(|node| node.title.clone())
             .unwrap_or_default();
         self.begin_inline(InlineEdit::Title(id), title, window, cx);
+    }
+
+    /// Title click: single-click selects, double-click starts inline rename.
+    pub fn activate_title(
+        &mut self,
+        id: i64,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.gantt.selected_id = Some(id);
+        if click_count >= 2 {
+            self.open_inline_title(id, window, cx);
+            return;
+        }
+        if self.inline_edit.is_none() {
+            window.focus(&self.form_focus, cx);
+        }
+    }
+
+    pub fn inline_picker_date(&self, cx: &App) -> Option<PickerDate> {
+        self.inline_dates
+            .as_ref()
+            .map(|picker| picker.read(cx).date())
+    }
+
+    pub fn inline_input_value(&self, cx: &App) -> String {
+        self.inline_input.read(cx).value().to_string()
+    }
+
+    pub fn form_picker_date(&self, cx: &App) -> Option<PickerDate> {
+        self.form_dates
+            .get(ado_core::START_DATE_FIELD)
+            .or_else(|| self.form_dates.get(ado_core::TARGET_DATE_FIELD))
+            .map(|picker| picker.read(cx).date())
+    }
+
+    pub fn details_icon_hint() -> &'static str {
+        "Open details (Enter)"
     }
 
     pub fn open_inline_assignee(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
@@ -739,6 +780,7 @@ impl PlannerView {
         self.inline_edit = None;
         self.inline_dates = None;
         self.inline_dates_typed_seed.clear();
+        self.pending_typed_preview = None;
         self.dates_anchor = None;
         self.pending_delete = None;
         self.state.gantt.context_menu = None;
@@ -815,6 +857,7 @@ impl PlannerView {
                 start.and_then(naive_to_jiff),
                 target.and_then(naive_to_jiff),
             );
+            self.pending_typed_preview = None;
             self.inline_dates_typed_seed = typed.clone();
             let picker = cx.new(|cx| {
                 let mut state = CalendarState::new(window, cx);
@@ -1202,7 +1245,7 @@ impl PlannerView {
                 self.enqueue_date_save(cx, pending);
                 self.state
                     .toasts
-                    .push(ToastKind::Success, format!("Undid dates of {title}"));
+                    .push(ToastKind::Success, format!("Undid dates on {title}"));
             }
             cx.notify();
             return;
@@ -1826,32 +1869,29 @@ impl PlannerView {
 
     fn render_flavor(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        v_flex()
+        h_flex()
+            .id("flavor")
             .gap_1()
+            .items_center()
             .child(
                 div()
                     .id("header-theme-label")
                     .debug_selector(|| "header-theme-label".into())
                     .child(Label::new("Theme").text_xs().text_color(muted)),
             )
-            .child(
-                h_flex()
-                    .id("flavor")
-                    .gap_1()
-                    .children(FLAVORS.iter().map(|flavor| {
-                        let selected = self.state.flavor() == *flavor;
-                        let flavor = *flavor;
-                        Button::new(flavor.as_str())
-                            .label(flavor.label())
-                            .selected(selected)
-                            .when(selected, |btn| btn.primary())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.set_flavor(flavor);
-                                apply_flavor(cx, flavor);
-                                cx.notify();
-                            }))
-                    })),
-            )
+            .children(FLAVORS.iter().map(|flavor| {
+                let selected = self.state.flavor() == *flavor;
+                let flavor = *flavor;
+                Button::new(flavor.as_str())
+                    .label(flavor.label())
+                    .selected(selected)
+                    .when(selected, |btn| btn.primary())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.state.set_flavor(flavor);
+                        apply_flavor(cx, flavor);
+                        cx.notify();
+                    }))
+            }))
     }
 
     fn render_gantt(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2553,8 +2593,10 @@ impl PlannerView {
                     .compact()
                     .with_size(Size::Small)
                     .label("ⓘ")
-                    .tooltip("Open details (Enter or double-click)")
-                    .tooltip_placement(Placement::Bottom)
+                    .when(self.state.form.is_none(), |btn| {
+                        btn.tooltip(Self::details_icon_hint())
+                            .tooltip_placement(Placement::Bottom)
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.open_form(id, cx);
@@ -2612,7 +2654,8 @@ impl PlannerView {
                 .into_any_element();
         }
         let title_owned = title.to_string();
-        let tip = format!("{title_owned} · Enter opens details");
+        let tip = format!("{title_owned} · Double-click or F2 to rename");
+        let form_open = self.state.form.is_some();
         div()
             .id(("title", id as u64))
             .debug_selector(move || format!("gantt-title-{id}"))
@@ -2620,30 +2663,20 @@ impl PlannerView {
             .min_w(px(120.))
             .truncate()
             .child(title_owned)
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .when(!form_open, |el| {
+                el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.state.gantt.selected_id = Some(id);
-                    if this.inline_edit.is_none() {
-                        window.focus(&this.form_focus, cx);
-                    }
                     cx.stop_propagation();
-                    if event.click_count >= 2 {
-                        this.open_form(id, cx);
-                    }
+                    this.activate_title(id, event.click_count, window, cx);
                 }),
             )
             .on_click(
                 cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
-                    this.state.gantt.selected_id = Some(id);
-                    if this.inline_edit.is_none() {
-                        window.focus(&this.form_focus, cx);
-                    }
-                    if event.click_count() >= 2 {
-                        this.open_form(id, cx);
-                    }
                     cx.stop_propagation();
+                    this.activate_title(id, event.click_count(), window, cx);
                 }),
             )
             .into_any_element()
@@ -3054,7 +3087,7 @@ impl PlannerView {
                                     .bg(weekend)
                             }),
                     )
-                    .children(ticks.iter().filter(|tick| tick.x > 0.5).map(|tick| {
+                    .children(ticks.iter().filter(|tick| tick.x >= 0.0).map(|tick| {
                         div()
                             .absolute()
                             .left(px(tick.x))
@@ -3063,6 +3096,12 @@ impl PlannerView {
                             .w(px(1.))
                             .bg(grid)
                     }))
+                    .children({
+                        let arrows = self.state.gantt.layout_dependency_arrows(bars);
+                        arrows
+                            .into_iter()
+                            .map(|arrow| self.render_dependency_arrow(&arrow, cx))
+                    })
                     .child(
                         v_flex()
                             .mt(px(-self.state.gantt.row_scroll_remainder()))
@@ -3204,12 +3243,6 @@ impl PlannerView {
                             .w(px(3.))
                             .bg(today_color),
                     )
-                    .children({
-                        let arrows = self.state.gantt.layout_dependency_arrows(bars);
-                        arrows
-                            .into_iter()
-                            .map(|arrow| self.render_dependency_arrow(&arrow, cx))
-                    })
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
                             if gesture.kind != GestureKind::Link {
@@ -3706,9 +3739,7 @@ impl PlannerView {
         };
         let stroke = if selected || hovered { 3.0 } else { 2.0 };
         let min_x = arrow.x1.min(arrow.x2).min(arrow.x_head) - 16.0;
-        let max_x = arrow.x1.max(arrow.x2).max(arrow.x_head) + 28.0;
         let min_y = arrow.y1.min(arrow.y2).min(arrow.lane_y) - 18.0;
-        let max_y = arrow.y1.max(arrow.y2).max(arrow.lane_y) + 18.0;
         let from_id = arrow.from_id;
         let to_id = arrow.to_id;
         let v1 = (arrow.lane_y - arrow.y1).abs().max(2.0);
@@ -3716,12 +3747,11 @@ impl PlannerView {
         let v2 = (arrow.y2 - arrow.lane_y).abs().max(2.0);
         let stub_h = (arrow.x_head - arrow.x2).abs().max(2.0);
         div()
-            .id(SharedString::from(format!("gantt-dep-{from_id}-{to_id}")))
             .absolute()
             .left(px(min_x))
             .top(px(min_y))
-            .w(px((max_x - min_x).max(20.0)))
-            .h(px((max_y - min_y).max(20.0)))
+            .w(px(0.))
+            .h(px(0.))
             .child(self.arrow_segment(
                 arrow.x1 - min_x,
                 arrow.y1.min(arrow.lane_y) - min_y,
@@ -3970,8 +4000,10 @@ impl PlannerView {
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .tooltip(move |window, cx| {
-                Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
+            .when(self.state.form.is_none(), |el| {
+                el.tooltip(move |window, cx| {
+                    Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
+                })
             })
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.state.gantt.hovered_link = if *hovered {
@@ -4041,12 +4073,13 @@ impl PlannerView {
             .w(px(18.))
             .h(px(20.))
             .cursor_pointer()
-            .occlude()
             .text_xl()
             .line_height(gpui_kit::relative(1.))
             .text_color(color)
-            .tooltip(move |window, cx| {
-                Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
+            .when(self.state.form.is_none(), |el| {
+                el.tooltip(move |window, cx| {
+                    Tooltip::new("Click to select · × or Delete to remove").build(window, cx)
+                })
             })
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.state.gantt.hovered_link = if *hovered {
@@ -4525,7 +4558,12 @@ impl PlannerView {
                         .gap_2()
                         .when_some(picker, |el, state| {
                             let date = state.read(cx).date();
-                            let display = format_picker_dates(date);
+                            let from_picker = format_picker_dates(date);
+                            let display = if !from_picker.is_empty() {
+                                from_picker
+                            } else {
+                                self.form_dates_preview.clone().unwrap_or_default()
+                            };
                             let empty = display.is_empty();
                             el.child(
                                 h_flex()
@@ -4703,6 +4741,8 @@ impl PlannerView {
     fn open_form(&mut self, id: i64, cx: &mut Context<Self>) {
         self.dismiss_overlays();
         self.form_inputs.clear();
+        self.form_dates.clear();
+        self.form_dates_preview = None;
         self.form_inputs_for = None;
         self.spawn_state(cx, move |mut state| async move {
             let result = state.open_form(id).await;
@@ -4928,14 +4968,27 @@ impl PlannerView {
         let Some(form) = self.state.form.as_ref() else {
             self.form_inputs.clear();
             self.form_dates.clear();
+            self.form_dates_preview = None;
             self.form_inputs_for = None;
             return;
         };
         if self.form_inputs_for != Some(form.model.id) {
             self.form_inputs.clear();
             self.form_dates.clear();
+            self.form_dates_preview = None;
             self.form_inputs_for = Some(form.model.id);
         }
+        let node_dates = self
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == form.model.id)
+            .map(|node| {
+                (
+                    parse_iso_date(node.start_date.as_deref()).and_then(jiff_to_naive),
+                    parse_iso_date(node.target_date.as_deref()).and_then(jiff_to_naive),
+                )
+            });
         for control in crate::form::all_controls(&form.model) {
             if control.read_only
                 || matches!(
@@ -4955,18 +5008,20 @@ impl PlannerView {
                 let has_target = controls
                     .iter()
                     .any(|item| item.reference_name == ado_core::TARGET_DATE_FIELD);
-                let start = form
-                    .values
-                    .get(ado_core::START_DATE_FIELD)
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|text| parse_iso_date(Some(text)))
-                    .and_then(jiff_to_naive);
-                let target = form
-                    .values
-                    .get(ado_core::TARGET_DATE_FIELD)
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|text| parse_iso_date(Some(text)))
-                    .and_then(jiff_to_naive);
+                let (start, target) = node_dates.unwrap_or_else(|| {
+                    (
+                        form.values
+                            .get(ado_core::START_DATE_FIELD)
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|text| parse_iso_date(Some(text)))
+                            .and_then(jiff_to_naive),
+                        form.values
+                            .get(ado_core::TARGET_DATE_FIELD)
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|text| parse_iso_date(Some(text)))
+                            .and_then(jiff_to_naive),
+                    )
+                });
                 let target_only = has_start && has_target && start.is_none() && target.is_some();
                 if control.reference_name == ado_core::TARGET_DATE_FIELD
                     && has_start
@@ -5052,9 +5107,19 @@ impl PlannerView {
                                 form.values.insert(field.clone(), serde_json::Value::Null);
                             }
                         }
+                        this.form_dates_preview = pending_range_typed(*date);
                         cx.notify();
                     },
                 ));
+                self._subscriptions
+                    .push(cx.observe(&picker, move |this, picker, cx| {
+                        if this.state.form.is_none() {
+                            return;
+                        }
+                        let date = picker.read(cx).date();
+                        this.form_dates_preview = pending_range_typed(date);
+                        cx.notify();
+                    }));
                 self.form_dates.insert(store_key, picker);
                 continue;
             }
@@ -5108,6 +5173,20 @@ impl PlannerView {
 
     pub fn click_inline_calendar_day(&mut self, day: chrono::NaiveDate, cx: &mut Context<Self>) {
         if let Some(picker) = self.inline_dates.clone() {
+            picker.update(cx, |state, cx| {
+                state.activate_date(day, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn click_form_calendar_day(&mut self, day: chrono::NaiveDate, cx: &mut Context<Self>) {
+        if let Some(picker) = self
+            .form_dates
+            .get(ado_core::START_DATE_FIELD)
+            .cloned()
+            .or_else(|| self.form_dates.get(ado_core::TARGET_DATE_FIELD).cloned())
+        {
             picker.update(cx, |state, cx| {
                 state.activate_date(day, cx);
             });

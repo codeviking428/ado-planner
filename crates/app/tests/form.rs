@@ -35,7 +35,7 @@ async fn open_and_save_work_item_form() {
             .toasts
             .last_message()
             .unwrap_or_default()
-            .contains("Saved title")
+            .contains("Saved title on")
     );
     assert!(
         state

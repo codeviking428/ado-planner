@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ado_core::{
-    GanttBarKind, IterationHint, IterationNode, WorkItemNode, compact_date, dates_column_text,
-    gantt_bar_display, iteration_hint_for_path, parse_iso_date,
+    DEFAULT_BAR_DAYS, GanttBarKind, IterationHint, IterationNode, WorkItemNode, compact_date,
+    dates_column_text, gantt_bar_display, iteration_hint_for_path, parse_iso_date,
 };
 use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
@@ -474,21 +474,17 @@ impl GanttView {
         self.zoom_at(factor, 0.0, 0.0);
     }
 
-    /// Nice +/− stops so 100% → 125% → 150% instead of 100 → 74 → …
-    pub const ZOOM_STEPS: [f32; 9] = [0.4, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+    /// Toolbar +/− multiplies zoom by this ratio so 60% → 75% → 94% instead of
+    /// jumping 60 → 75 → 100.
+    pub const ZOOM_RATIO: f32 = 1.25;
 
     pub fn next_zoom(zoom: f32, direction: i32) -> f32 {
-        if direction >= 0 {
-            Self::ZOOM_STEPS
-                .into_iter()
-                .find(|&step| step > zoom + 0.001)
-                .unwrap_or(4.0)
+        let raw = if direction >= 0 {
+            zoom * Self::ZOOM_RATIO
         } else {
-            Self::ZOOM_STEPS
-                .into_iter()
-                .rfind(|&step| step < zoom - 0.001)
-                .unwrap_or(0.4)
-        }
+            zoom / Self::ZOOM_RATIO
+        };
+        ((raw * 10_000.0).round() / 10_000.0).clamp(0.4, 4.0)
     }
 
     pub fn zoom_step_at_center(&mut self, direction: i32) {
@@ -807,11 +803,13 @@ impl GanttView {
                     .filter(|gesture| gesture.id == node.id && gesture.kind != GestureKind::Link);
                 let (start, target) = if let Some(gesture) = live {
                     (gesture.live_start, gesture.live_target)
-                } else {
-                    let (Some(start), Some(target)) = (display.start, display.end) else {
-                        return None;
-                    };
+                } else if let (Some(start), Some(target)) = (display.start, display.end) {
                     (start, target)
+                } else if display.kind == GanttBarKind::Unscheduled {
+                    let today = jiff::Zoned::now().date();
+                    (today, today.saturating_add((DEFAULT_BAR_DAYS - 1).days()))
+                } else {
+                    return None;
                 };
                 let mut x = self.x_for_date(start);
                 let end = ado_core::to_gantt_inclusive_target(target);
@@ -1061,24 +1059,24 @@ impl GanttView {
     }
 
     /// Skip a major label that would sit on the Today flag (Day zoom).
-    /// Pin that month to x = 0 instead of dropping it, so "Nov 2026" stays
-    /// visible when Today is the 2nd.
+    /// Pin the in-view leftover month to x = 0; keep the next month on its
+    /// own segment instead of sliding "Nov 2026" over October days.
     pub fn header_major_labels_except(
         &self,
         width: f32,
         hide_x: Option<f32>,
     ) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 80.0;
+        const TODAY_SHIFT: f32 = 16.0;
         let ticks: Vec<(f32, String)> = self
             .timeline_ticks(width)
             .into_iter()
             .filter(|tick| tick.major)
             .map(|tick| {
-                let x = if hide_x.is_some_and(|today| (tick.x - today).abs() < HIDE_PAD) {
-                    0.0
-                } else {
-                    tick.x
-                };
+                let mut x = tick.x.max(0.0);
+                if hide_x.is_some_and(|today| (x - today).abs() < HIDE_PAD && x > 1.0) {
+                    x += TODAY_SHIFT;
+                }
                 (x, tick.major_label)
             })
             .collect();
@@ -1130,10 +1128,12 @@ impl GanttView {
             return out;
         }
         if let Some(label) = sticky {
-            let overlaps = out.first().is_some_and(|(x, _)| *x < STICKY_MIN);
-            if !overlaps {
-                out.insert(0, (0.0, label));
+            if let Some((x, _)) = out.first_mut()
+                && *x < STICKY_MIN
+            {
+                *x = STICKY_MIN;
             }
+            out.insert(0, (0.0, label));
         }
         out
     }
@@ -1391,6 +1391,25 @@ pub fn flatten_visible(nodes: &[WorkItemNode], collapsed: &HashSet<i64>) -> Vec<
         walk(id, 0, &children, collapsed, &mut out);
     }
     out
+}
+
+/// Index at which a newly created child should land so flatten order appends
+/// it after the parent's existing descendants (last among siblings).
+pub fn insert_index_for_child(nodes: &[WorkItemNode], parent_id: Option<i64>) -> usize {
+    let Some(pid) = parent_id else {
+        return 0;
+    };
+    let Some(parent_index) = nodes.iter().position(|node| node.id == pid) else {
+        return 0;
+    };
+    match descendants(nodes, pid).last() {
+        Some(last_id) => nodes
+            .iter()
+            .position(|node| node.id == *last_id)
+            .map(|index| index + 1)
+            .unwrap_or(parent_index + 1),
+        None => parent_index + 1,
+    }
 }
 
 pub fn descendants(nodes: &[WorkItemNode], id: i64) -> Vec<i64> {
@@ -1942,6 +1961,27 @@ mod tests {
         let bars = gantt.layout_bars(&[item], &rows, &iterations, 720.0);
         assert_eq!(bars.len(), 1);
         assert!(!bars[0].summary);
+        assert_eq!(bars[0].kind, GanttBarKind::Unscheduled);
+        assert!(bars[0].width >= PLACEHOLDER_MIN_WIDTH);
+    }
+
+    #[test]
+    fn unscheduled_without_iteration_still_gets_a_placeholder_bar() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        item.iteration_path.clear();
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&[item.clone()]);
+        let bars = gantt.layout_bars(&[item], &rows, &[], 720.0);
+        assert_eq!(
+            bars.len(),
+            1,
+            "a new unscheduled row must still paint a bar"
+        );
         assert_eq!(bars[0].kind, GanttBarKind::Unscheduled);
         assert!(bars[0].width >= PLACEHOLDER_MIN_WIDTH);
     }
@@ -2691,18 +2731,61 @@ mod tests {
             majors
                 .iter()
                 .filter(|(_, label)| label.contains("Nov"))
-                .all(|(x, _)| (x - today_x).abs() >= 80.0 || *x <= 1.0),
+                .all(|(x, _)| (x - today_x).abs() >= 14.0 || *x <= 1.0),
             "month label must not sit on the Today flag: {majors:?} today_x={today_x}"
         );
         assert_eq!(gantt.scale.tick_label(today), "2");
     }
 
     #[test]
-    fn zoom_steps_land_on_nice_percentages() {
-        assert_eq!(GanttView::next_zoom(1.0, 1), 1.25);
-        assert_eq!(GanttView::next_zoom(1.25, 1), 1.5);
-        assert_eq!(GanttView::next_zoom(1.0, -1), 0.75);
-        assert_eq!(GanttView::next_zoom(0.74, 1), 0.75);
+    fn day_header_keeps_each_month_on_its_own_segment() {
+        let origin = Date::new(2026, 10, 24).unwrap();
+        let today = Date::new(2026, 11, 2).unwrap();
+        let gantt = GanttView {
+            origin,
+            scale: GanttScale::Day,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let today_x = gantt.today_x(today);
+        let majors = gantt.header_major_labels_except(800.0, Some(today_x));
+        let oct = majors.iter().find(|(_, label)| label.contains("Oct"));
+        let nov = majors.iter().find(|(_, label)| label.contains("Nov"));
+        assert!(
+            oct.is_some_and(|(x, _)| *x <= 1.0),
+            "October days on the left need an Oct label at x=0, got {majors:?}"
+        );
+        let nov_x = gantt.x_for_date(Date::new(2026, 11, 1).unwrap());
+        assert!(
+            nov.is_some_and(|(x, _)| (*x - nov_x).abs() < 40.0 && *x > 8.0),
+            "Nov 2026 must stay on the November segment, not cover October, got {majors:?}"
+        );
+    }
+
+    #[test]
+    fn zoom_steps_use_a_fixed_ratio() {
+        assert!((GanttView::next_zoom(1.0, 1) - 1.25).abs() < 0.0001);
+        assert!((GanttView::next_zoom(1.25, 1) - 1.5625).abs() < 0.0001);
+        assert!((GanttView::next_zoom(1.0, -1) - 0.8).abs() < 0.0001);
+        assert!((GanttView::next_zoom(0.6, 1) - 0.75).abs() < 0.0001);
+        assert!((GanttView::next_zoom(0.75, 1) - 0.9375).abs() < 0.0001);
+        assert_eq!(GanttView::next_zoom(0.4, -1), 0.4);
+        assert_eq!(GanttView::next_zoom(4.0, 1), 4.0);
+    }
+
+    #[test]
+    fn new_child_appends_after_existing_siblings() {
+        let nodes = vec![
+            node(1, None),
+            node(2, Some(1)),
+            node(3, Some(2)),
+            node(4, Some(1)),
+        ];
+        assert_eq!(insert_index_for_child(&nodes, Some(1)), 4);
+        assert_eq!(insert_index_for_child(&nodes, Some(2)), 3);
+        assert_eq!(insert_index_for_child(&nodes, None), 0);
+        assert_eq!(insert_index_for_child(&nodes, Some(4)), 4);
     }
 
     #[test]

@@ -568,7 +568,7 @@ fn down_arrow_moves_the_selection_by_one_row(cx: &mut gpui_kit::TestAppContext) 
 }
 
 #[gpui_kit::test]
-fn unscheduled_only_grid_shows_a_drop_hint(cx: &mut gpui_kit::TestAppContext) {
+fn unscheduled_only_grid_paints_placeholder_bars(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
@@ -580,8 +580,12 @@ fn unscheduled_only_grid_shows_a_drop_hint(cx: &mut gpui_kit::TestAppContext) {
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
     assert!(
-        cx.debug_bounds("unscheduled-empty-hint").is_some(),
-        "unscheduled-only teams should get a timeline drop hint"
+        cx.debug_bounds("gantt-bar-1").is_some(),
+        "unscheduled rows must still paint a placeholder bar so a new row is not blank"
+    );
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "placeholder bars replace the empty-timeline drop hint"
     );
 }
 
@@ -3083,8 +3087,13 @@ fn inline_placeholder_resets_when_switching_edit_kind(cx: &mut gpui_kit::TestApp
             view.open_inline_dates(1, window, cx);
             assert_eq!(
                 view.inline_placeholder(cx),
+                "Start → Target",
+                "empty date edits must hint at a range, not a sample like Jul 6 → Jul 20"
+            );
+            assert_eq!(
+                view.inline_input_value(cx),
                 "Jul 6 → Jul 20",
-                "date edits must hint at a compact range"
+                "a scheduled item still shows its compact range"
             );
             view.open_inline_title(1, window, cx);
             assert_eq!(
@@ -3283,6 +3292,236 @@ fn delete_confirm_warns_about_children(cx: &mut gpui_kit::TestAppContext) {
         assert!(
             warning.contains("child"),
             "deleting a parent must mention children, got {warning}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn double_click_title_starts_inline_rename(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.activate_title(1, 2, window, cx);
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_some(),
+        "double-click on a title must start inline rename, matching the tooltip"
+    );
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.form.is_none(),
+            "double-click on a title must not open details"
+        );
+        assert_eq!(view.state.gantt.selected_id, Some(1));
+    });
+}
+
+#[gpui_kit::test]
+fn unscheduled_picker_does_not_keep_the_previous_range(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = None;
+        node.target_date = None;
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_dates(1, window, cx);
+        });
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.inline_picker_date(cx),
+            Some(PickerDate::Range(
+                Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 6).unwrap()),
+                Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap()),
+            )),
+            "scheduled item 1 starts as Jul 6 → Jul 20"
+        );
+        view.click_inline_calendar_day(chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(), cx);
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_dates(2, window, cx);
+        });
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.inline_picker_date(cx),
+            Some(PickerDate::Range(None, None)),
+            "an Unscheduled item must open an empty range, not keep Jul 6 → Jul 20"
+        );
+        let typed = view.inline_input_value(cx);
+        assert!(
+            typed.is_empty() || typed == "Start → Target",
+            "unscheduled typed field must be empty, got {typed:?}"
+        );
+        assert_eq!(view.inline_placeholder(cx), "Start → Target");
+        assert!(
+            !typed.contains("Jul 6"),
+            "stale scheduled range must not prefill the unscheduled picker, got {typed:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn details_picker_is_empty_for_unscheduled_item(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = None;
+        node.target_date = None;
+        node.title = "Unscheduled feature".into();
+    }
+    let mut values = serde_json::Map::new();
+    values.insert(
+        "System.Title".into(),
+        serde_json::json!("Unscheduled feature"),
+    );
+    values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-07-06T00:00:00Z"),
+    );
+    values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-07-20T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 2,
+        rev: 1,
+        work_item_type: "Feature".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![
+                    ado_core::FormControl {
+                        id: ado_core::START_DATE_FIELD.into(),
+                        reference_name: ado_core::START_DATE_FIELD.into(),
+                        label: "Start Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                    ado_core::FormControl {
+                        id: ado_core::TARGET_DATE_FIELD.into(),
+                        reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                        label: "Target Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                ],
+            }],
+        }],
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.form_picker_date(cx),
+            Some(PickerDate::Range(None, None)),
+            "details must seed from the node's empty dates, not leftover form values"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn details_picker_previews_the_start_before_the_end(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = None;
+        node.target_date = None;
+    }
+    let mut values = serde_json::Map::new();
+    values.insert(
+        "System.Title".into(),
+        serde_json::json!("Unscheduled feature"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 2,
+        rev: 1,
+        work_item_type: "Feature".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![
+                    ado_core::FormControl {
+                        id: ado_core::START_DATE_FIELD.into(),
+                        reference_name: ado_core::START_DATE_FIELD.into(),
+                        label: "Start Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                    ado_core::FormControl {
+                        id: ado_core::TARGET_DATE_FIELD.into(),
+                        reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                        label: "Target Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                ],
+            }],
+        }],
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.click_form_calendar_day(chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(), cx);
+        });
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.form_picker_date(cx),
+            Some(PickerDate::Range(
+                Some(chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap()),
+                None,
+            )),
+            "the first click of a details range must keep the start visible"
         );
     });
 }

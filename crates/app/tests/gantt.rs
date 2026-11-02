@@ -764,13 +764,13 @@ async fn undo_dates_pushes_a_named_toast() {
     let _ = state.undo_dates_now().expect("undo");
     assert_eq!(
         state.toasts.last_message(),
-        Some("Undid: Cart UI dates"),
+        Some("Undid dates on Cart UI"),
         "undo must toast the work item title"
     );
     let _ = state.redo_dates_now().expect("redo");
     assert_eq!(
         state.toasts.last_message(),
-        Some("Redid: Cart UI dates"),
+        Some("Redid dates on Cart UI"),
         "redo must toast the work item title"
     );
 }
@@ -1252,6 +1252,63 @@ async fn add_item_under_a_user_story_creates_a_task() {
         created.work_item_type, "Task",
         "a child of a User Story must be a Task, not another User Story"
     );
+}
+
+#[tokio::test]
+async fn add_item_under_an_epic_appends_after_existing_children() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.gantt.selected_id = Some(1001);
+    let before: Vec<i64> = state
+        .gantt
+        .flatten(&state.nodes)
+        .into_iter()
+        .filter(|row| {
+            state
+                .nodes
+                .iter()
+                .any(|node| node.id == row.id && node.parent_id == Some(1001))
+        })
+        .map(|row| row.id)
+        .collect();
+    assert!(
+        !before.is_empty(),
+        "Epic 1001 should already have child Features"
+    );
+    state.add_item().await.expect("create");
+    let created = created_item(&state);
+    assert_eq!(created.parent_id, Some(1001));
+    assert_eq!(created.work_item_type, "Feature");
+    let siblings: Vec<i64> = state
+        .gantt
+        .flatten(&state.nodes)
+        .into_iter()
+        .filter(|row| {
+            state
+                .nodes
+                .iter()
+                .any(|node| node.id == row.id && node.parent_id == Some(1001))
+        })
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(
+        siblings.last().copied(),
+        Some(created.id),
+        "a new Feature must append after existing children, got {siblings:?}"
+    );
+    let created_at = siblings
+        .iter()
+        .position(|sibling| *sibling == created.id)
+        .expect("created sibling");
+    for id in &before {
+        let existing_at = siblings
+            .iter()
+            .position(|sibling| sibling == id)
+            .expect("existing sibling");
+        assert!(
+            existing_at < created_at,
+            "existing child {id} must stay above the new item, got {siblings:?}"
+        );
+    }
 }
 
 #[tokio::test]
