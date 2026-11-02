@@ -978,6 +978,47 @@ async fn undo_and_redo_restore_dates_and_links() {
 }
 
 #[tokio::test]
+async fn toast_restore_link_action_puts_the_predecessor_back() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state
+        .add_dependency(1005, 1003)
+        .await
+        .expect("link 1003 → 1005");
+    state
+        .remove_dependency(1005, 1003)
+        .await
+        .expect("remove link");
+    let action = state
+        .toasts
+        .items
+        .iter()
+        .rev()
+        .find_map(|toast| toast.undo.clone())
+        .expect("Removed link toast must offer Undo");
+    assert!(
+        matches!(
+            action,
+            UndoAction::RestoreLink {
+                successor_id: 1005,
+                predecessor_id: 1003
+            }
+        ),
+        "toast Undo must restore the dropped link, got {action:?}"
+    );
+    state.apply_undo(action).await.expect("toast undo");
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1005)
+            .unwrap()
+            .predecessors
+            .contains(&1003),
+        "toast Undo must put predecessor #1003 back on #1005"
+    );
+}
+
+#[tokio::test]
 async fn resize_end_toasts_only_target_date() {
     let (_mock, mut state, _dir) = signed_in().await;
     let node = state
@@ -1233,6 +1274,11 @@ async fn save_title_patches_system_title() {
         "Saved title must offer Undo"
     );
     state.undo().await.expect("undo title");
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.to_lowercase().contains("title change"),
+        "field undo toast must name the field, got {message}"
+    );
     let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();
     assert_ne!(
         node.title, "Inline title",

@@ -125,6 +125,7 @@ pub fn theme_color(flavor: Flavor) -> ThemeColor {
     colors.list = bg;
     colors.list_hover = primary.opacity(0.14);
     colors.list_active = primary.opacity(0.32);
+    colors.overlay = bg.opacity(0.78);
     colors.tab = bg;
     colors.tab_active = muted;
     colors.tab_foreground = fg;

@@ -2693,8 +2693,17 @@ impl PlannerState {
             HistoryEntry::Created { title, .. } => {
                 format!("{verb}: created {title}")
             }
-            HistoryEntry::Fields { id, .. } => {
-                format!("{verb}: {} fields", self.item_title(*id))
+            HistoryEntry::Fields { id, changes } => {
+                let title = self.item_title(*id);
+                match changes.as_slice() {
+                    [(reference, _, _)] => {
+                        format!(
+                            "{verb} {} change on {title}",
+                            field_toast_name(reference, None)
+                        )
+                    }
+                    _ => format!("{verb} field changes on {title}"),
+                }
             }
         };
         self.toasts.push(ToastKind::Success, message);

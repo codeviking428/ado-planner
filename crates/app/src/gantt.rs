@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ado_core::{
-    GanttBarKind, IterationHint, IterationNode, WorkItemNode, dates_column_text, gantt_bar_display,
-    iteration_hint_for_path, parse_iso_date,
+    GanttBarKind, IterationHint, IterationNode, WorkItemNode, compact_date, dates_column_text,
+    gantt_bar_display, iteration_hint_for_path, parse_iso_date,
 };
 use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
@@ -32,7 +32,7 @@ pub const SUMMARY_BAR_H: f32 = 14.0;
 pub const PLACEHOLDER_BAR_H: f32 = 24.0;
 pub const LEAF_BAR_H: f32 = 28.0;
 pub const DATES_COL_WIDTH: f32 = 140.0;
-pub const DETAILS_PILL_WIDTH: f32 = 80.0;
+pub const DETAILS_PILL_WIDTH: f32 = 36.0;
 pub const ID_COL_WIDTH: f32 = 64.0;
 pub const TYPE_COL_WIDTH: f32 = 88.0;
 pub const ASSIGNEE_COL_WIDTH: f32 = 88.0;
@@ -101,12 +101,7 @@ impl GanttScale {
 
     pub fn range_title(self, origin: Date) -> String {
         match self {
-            Self::Day => format!(
-                "{} {}, {}",
-                month_abbrev(origin),
-                origin.day(),
-                origin.year()
-            ),
+            Self::Day => compact_date(origin),
             Self::Week => format!("Week of {} {}", month_abbrev(origin), origin.day()),
             Self::Month => format!("{} {}", month_abbrev(origin), origin.year()),
             Self::Quarter => {
@@ -963,9 +958,13 @@ impl GanttView {
             };
         }
         if gesture.live_start == gesture.live_target {
-            gesture.live_start.to_string()
+            compact_date(gesture.live_start)
         } else {
-            format!("{} → {}", gesture.live_start, gesture.live_target)
+            format!(
+                "{} → {}",
+                compact_date(gesture.live_start),
+                compact_date(gesture.live_target)
+            )
         }
     }
 
@@ -1026,13 +1025,32 @@ impl GanttView {
     /// Two-level header majors, with at most one sticky label at x = 0 so
     /// scrolled-past months/years do not stack on top of each other.
     pub fn header_major_labels(&self, width: f32) -> Vec<(f32, String)> {
-        Self::sticky_header_labels(
-            self.timeline_ticks(width)
-                .into_iter()
-                .filter(|tick| tick.major)
-                .map(|tick| (tick.x, tick.major_label)),
-            false,
-        )
+        self.header_major_labels_except(width, None)
+    }
+
+    /// Skip a major label that would sit on the Today flag (Day zoom).
+    pub fn header_major_labels_except(
+        &self,
+        width: f32,
+        hide_x: Option<f32>,
+    ) -> Vec<(f32, String)> {
+        const HIDE_PAD: f32 = 80.0;
+        let mut skip_sticky = false;
+        let ticks: Vec<(f32, String)> = self
+            .timeline_ticks(width)
+            .into_iter()
+            .filter(|tick| tick.major)
+            .filter_map(|tick| {
+                if hide_x.is_some_and(|x| (tick.x - x).abs() < HIDE_PAD) {
+                    if tick.x <= HIDE_PAD {
+                        skip_sticky = true;
+                    }
+                    return None;
+                }
+                Some((tick.x, tick.major_label))
+            })
+            .collect();
+        Self::sticky_header_labels(ticks, skip_sticky)
     }
 
     /// Month (or day/week) tick labels, with the in-view period stuck at x = 0
@@ -1130,14 +1148,14 @@ impl GanttView {
             .max(7) as f32
             + 4.0;
         let target_ppd = ((width * 0.78) / days).clamp(0.4, 96.0);
-        let base = match self.scale {
-            GanttScale::Day => 48.0,
-            GanttScale::Week => 24.0,
-            GanttScale::Month => 12.0,
-            GanttScale::Quarter => 4.0,
-            GanttScale::Year => 1.5,
-        };
-        self.zoom = (target_ppd / base).clamp(0.4, 4.0);
+        // Pick the finest scale whose 40% zoom floor can still show the span.
+        // Staying on Day at 40% leaves a Jul–Nov cluster hanging off the right.
+        let chosen = GanttScale::ALL
+            .into_iter()
+            .find(|scale| days * scale.base_pixels_per_day() * 0.4 <= width)
+            .unwrap_or(GanttScale::Year);
+        self.scale = chosen;
+        self.zoom = (target_ppd / chosen.base_pixels_per_day()).clamp(0.4, 4.0);
     }
 
     pub fn apply_nudge(
@@ -1778,6 +1796,40 @@ mod tests {
             bars[0].width
         );
         assert!(!bars[0].title.is_empty());
+    }
+
+    #[test]
+    fn auto_fit_switches_scale_when_day_cannot_fit() {
+        let mut item = node(1, None);
+        item.start_date = Some("2026-07-06T00:00:00Z".into());
+        item.target_date = Some("2026-11-20T00:00:00Z".into());
+        let nodes = vec![item];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 11, 1).unwrap(),
+            scale: GanttScale::Day,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.auto_fit(&nodes, &[], 800.0);
+        assert_ne!(
+            gantt.scale,
+            GanttScale::Day,
+            "a Jul–Nov span must leave Day so 40% zoom is not the only lever, got {:?} @ {:.2}",
+            gantt.scale,
+            gantt.zoom
+        );
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert!(!bars.is_empty());
+        assert!(
+            bars[0].x + bars[0].width <= 800.0 + 1.0,
+            "fitted bar must stay on screen, x={} width={} scale={:?} zoom={}",
+            bars[0].x,
+            bars[0].width,
+            gantt.scale,
+            gantt.zoom
+        );
     }
 
     #[test]
@@ -2453,7 +2505,11 @@ mod tests {
         );
         assert_eq!(
             GanttView::drag_preview_text(&gesture),
-            format!("{} → {}", gesture.live_start, gesture.live_target)
+            format!(
+                "{} → {}",
+                compact_date(gesture.live_start),
+                compact_date(gesture.live_target)
+            )
         );
     }
 
@@ -2545,9 +2601,11 @@ mod tests {
         let before = gantt.viewport_center_date();
         gantt.set_scale(GanttScale::Day);
         assert_eq!(gantt.viewport_center_date(), before);
+        let title = gantt.scale.range_title(before);
+        assert_eq!(title, compact_date(before));
         assert!(
-            gantt.scale.range_title(before).contains("2026"),
-            "Day header must include the year"
+            !title.contains(',') && !title.contains("2026"),
+            "Day header must use compact month-day, got {title}"
         );
     }
 
@@ -2565,6 +2623,11 @@ mod tests {
         assert!(
             labels.iter().all(|(x, _)| (x - today_x).abs() >= 22.0),
             "today's day number must not sit under the Today line: {labels:?} today_x={today_x}"
+        );
+        let majors = gantt.header_major_labels_except(800.0, Some(today_x));
+        assert!(
+            majors.iter().all(|(x, _)| (x - today_x).abs() >= 80.0),
+            "month label must not overlap the Today flag: {majors:?} today_x={today_x}"
         );
         assert_eq!(gantt.scale.tick_label(today), "2");
     }

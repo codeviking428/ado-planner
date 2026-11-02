@@ -38,6 +38,40 @@ pub fn parse_iso_date(value: Option<&str>) -> Option<Date> {
     ymd.parse().ok()
 }
 
+const MONTH_ABBREVS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Parse a typed date. Display copy is compact (`Jul 6`); ISO `YYYY-MM-DD` is
+/// still accepted as input, with an optional year on compact forms.
+pub fn parse_user_date(value: Option<&str>) -> Option<Date> {
+    let value = value?.trim();
+    if value.is_empty() || value == "…" {
+        return None;
+    }
+    if let Some(date) = parse_iso_date(Some(value)) {
+        return Some(date);
+    }
+    parse_compact_date(value)
+}
+
+fn parse_compact_date(value: &str) -> Option<Date> {
+    let mut parts = value.split_whitespace();
+    let month_token = parts.next()?;
+    let day_token = parts.next()?;
+    let year_token = parts.next();
+    let month = MONTH_ABBREVS
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(month_token))? as i8
+        + 1;
+    let day: i8 = day_token.trim_end_matches(',').parse().ok()?;
+    let year: i16 = match year_token {
+        Some(year) => year.trim_end_matches(',').parse().ok()?,
+        None => jiff::Zoned::now().date().year(),
+    };
+    Date::new(year, month, day).ok()
+}
+
 pub fn client_rollup(nodes: &[WorkItemNode], parent_id: i64) -> Option<(Date, Date)> {
     let mut dates: Vec<(Date, Date)> = Vec::new();
     let mut children: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
@@ -321,10 +355,7 @@ pub fn type_has_start_and_target(field_reference_names: &[impl AsRef<str>]) -> b
 
 /// Short month-and-day copy for tree cells and form fields (`Jul 6`).
 pub fn compact_date(date: Date) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let month = MONTHS[(date.month() as u8).saturating_sub(1).min(11) as usize];
+    let month = MONTH_ABBREVS[(date.month() as u8).saturating_sub(1).min(11) as usize];
     format!("{month} {}", date.day())
 }
 
@@ -413,6 +444,20 @@ mod tests {
             predecessors: Vec::new(),
             fields: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn parse_user_date_accepts_iso_and_compact() {
+        let july_6 = Date::new(2026, 7, 6).unwrap();
+        assert_eq!(parse_user_date(Some("2026-07-06")), Some(july_6));
+        assert_eq!(parse_user_date(Some("2026-07-06T00:00:00Z")), Some(july_6));
+        assert_eq!(parse_user_date(Some("Jul 6, 2026")), Some(july_6));
+        let year = jiff::Zoned::now().date().year();
+        assert_eq!(
+            parse_user_date(Some("Jul 6")),
+            Some(Date::new(year, 7, 6).unwrap())
+        );
+        assert_eq!(parse_user_date(Some("…")), None);
     }
 
     #[test]

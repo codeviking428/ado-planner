@@ -283,7 +283,7 @@ fn calendar_end_click_wins_over_pending_typed_start() {
     let end = chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
     let calendar = PickerDate::Range(Some(start), Some(end));
     let pending_arrow = pending_range_typed(PickerDate::Range(Some(start), None)).unwrap();
-    assert_eq!(pending_arrow, "2026-07-10 → …");
+    assert_eq!(pending_arrow, "Jul 10 → …");
     for pending in [pending_arrow.as_str(), "2026-07-10 / …"] {
         let picked = dates_from_range_picker(calendar, pending, seed).unwrap();
         assert_eq!(
@@ -337,8 +337,24 @@ fn pending_start_shows_ellipsis_in_the_typed_field() {
     let start = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
     assert_eq!(
         pending_range_typed(PickerDate::Range(Some(start), None)).as_deref(),
-        Some("2026-11-10 → …")
+        Some("Nov 10 → …")
     );
+}
+
+#[test]
+fn typed_compact_range_does_not_split_on_comma() {
+    let (start, target) = dates_from_range_picker(
+        PickerDate::Range(None, None),
+        "Jul 6, 2026 → Jul 20, 2026",
+        "",
+    )
+    .unwrap();
+    assert_eq!(start, Some(Date::new(2026, 7, 6).unwrap()));
+    assert_eq!(target, Some(Date::new(2026, 7, 20).unwrap()));
+    let iso = dates_from_range_picker(PickerDate::Range(None, None), "2026-08-04 → 2026-08-21", "")
+        .unwrap();
+    assert_eq!(iso.0, Some(Date::new(2026, 8, 4).unwrap()));
+    assert_eq!(iso.1, Some(Date::new(2026, 8, 21).unwrap()));
 }
 
 #[gpui_kit::test]
@@ -1074,8 +1090,16 @@ fn day_zoom_shows_today_label_and_year_in_the_header(cx: &mut gpui_kit::TestAppC
     view.update(cx, |view, _| {
         let title = view.state.gantt.viewport_range_title();
         assert!(
-            title.contains("2026"),
-            "Day header must include the year, got {title:?}"
+            !title.contains(',') && title.chars().any(|ch| ch.is_ascii_digit()),
+            "Day header must use compact month-day, got {title:?}"
+        );
+        let majors = view
+            .state
+            .gantt
+            .header_major_labels(view.state.gantt.timeline_width.max(400.0));
+        assert!(
+            majors.iter().any(|(_, label)| label.contains("2026")),
+            "the year belongs on the month banner, not the Day range title: {majors:?}"
         );
         let today = jiff::Zoned::now().date();
         let today_x = view.state.gantt.today_x(today);
@@ -2512,8 +2536,12 @@ fn dates_picker_has_month_arrows_and_typed_input(cx: &mut gpui_kit::TestAppConte
         "range picker must allow typed dates"
     );
     assert!(
+        cx.debug_bounds("gantt-dates-range-start").is_some(),
+        "a complete range must highlight the start day"
+    );
+    assert!(
         cx.debug_bounds("gantt-dates-range-end").is_some(),
-        "a complete range must highlight the start and end days"
+        "a complete range must highlight the end day"
     );
     assert!(
         cx.debug_bounds("gantt-dates-in-range").is_some(),
@@ -2776,6 +2804,61 @@ fn f2_opens_inline_title_on_the_selected_row(cx: &mut gpui_kit::TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn click_on_selected_title_selects_without_renaming(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let title = cx
+        .debug_bounds("gantt-title-1")
+        .expect("selected row title");
+    cx.simulate_click(title.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_none(),
+        "a single click on a selected title must not start rename"
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.selected_id, Some(1));
+    });
+    let delete = KeyDownEvent {
+        keystroke: Keystroke::parse("delete").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&delete, cx);
+        assert_eq!(
+            view.pending_delete_id(),
+            Some(1),
+            "Delete after a title click must open confirm, not type into a rename field"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn team_search_shows_a_placeholder(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.scope_placeholder(cx),
+            "Search",
+            "Org/Project/Team search must show a Search placeholder"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn parent_summary_bar_shows_link_handles_without_resize(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -2955,8 +3038,8 @@ fn inline_placeholder_resets_when_switching_edit_kind(cx: &mut gpui_kit::TestApp
             view.open_inline_dates(1, window, cx);
             assert_eq!(
                 view.inline_placeholder(cx),
-                "YYYY-MM-DD → YYYY-MM-DD",
-                "date edits must hint at a range"
+                "Jul 6 → Jul 20",
+                "date edits must hint at a compact range"
             );
             view.open_inline_title(1, window, cx);
             assert_eq!(

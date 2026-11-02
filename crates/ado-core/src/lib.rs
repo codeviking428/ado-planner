@@ -19,7 +19,7 @@ pub use dates::{
     build_replace_dates_patch, build_start_target_patch, client_rollup, compact_date,
     dates_column_text, format_date_range, from_gantt_exclusive_end, gantt_bar_display,
     is_unscheduled, iso_date_only, iteration_hint_for_path, parent_relation_op, parse_iso_date,
-    schedule_from_iteration, to_gantt_inclusive_target, type_has_start_and_target,
+    parse_user_date, schedule_from_iteration, to_gantt_inclusive_target, type_has_start_and_target,
 };
 pub use error::Error;
 pub use flavor::{

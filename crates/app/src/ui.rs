@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use ado_core::{
     AuthMode, FLAVORS, FormControlKind, color_for_type, compact_date, dates_column_text,
     format_date_range, identity_from_field, is_unscheduled, iso_date_only, parse_iso_date,
+    parse_user_date,
 };
 use ado_session::PlannerSession;
 use chrono::Datelike;
@@ -47,12 +48,15 @@ use crate::gantt::{
 };
 use crate::paths::AppPaths;
 use crate::state::{DateSaveRole, PendingDateSave, PlannerState};
-use crate::toasts::{ToastKind, UndoAction, error_text};
+use crate::toasts::{ToastKind, UndoAction};
 
 actions!(
     ado_planner,
     [Quit, NudgeLeft, NudgeRight, EscapeCancel, OpenSelected]
 );
+
+const DATES_RANGE_HINT: &str = "Jul 6 → Jul 20";
+const DATE_HINT: &str = "Jul 6";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InlineEdit {
@@ -294,6 +298,12 @@ impl PlannerView {
             skip_camera_anim: false,
             _subscriptions: vec![keystrokes],
         };
+        this.scope_query.update(cx, |input, cx| {
+            input.set_placeholder("Search", window, cx);
+        });
+        this.filter_query.update(cx, |input, cx| {
+            input.set_placeholder("Search", window, cx);
+        });
         this.bind_sign_in_events(window, cx);
         this.bind_inline_input(cx);
         this
@@ -363,6 +373,14 @@ impl PlannerView {
 
     pub fn inline_placeholder(&self, cx: &App) -> String {
         self.inline_input
+            .read(cx)
+            .presentation()
+            .placeholder()
+            .to_string()
+    }
+
+    pub fn scope_placeholder(&self, cx: &App) -> String {
+        self.scope_query
             .read(cx)
             .presentation()
             .placeholder()
@@ -796,12 +814,10 @@ impl PlannerView {
             let target = node.and_then(|node| {
                 parse_iso_date(node.target_date.as_deref()).and_then(jiff_to_naive)
             });
-            typed = match (start, target) {
-                (Some(start), Some(target)) => format!("{start} → {target}"),
-                (Some(start), None) => start.to_string(),
-                (None, Some(target)) => target.to_string(),
-                (None, None) => String::new(),
-            };
+            typed = format_date_range(
+                start.and_then(naive_to_jiff),
+                target.and_then(naive_to_jiff),
+            );
             self.inline_dates_typed_seed = typed.clone();
             let picker = cx.new(|cx| {
                 let mut state = CalendarState::new(window, cx);
@@ -830,7 +846,7 @@ impl PlannerView {
                     }
                     let CalendarEvent::Selected(date) = event;
                     if range_picker_is_complete(*date) {
-                        this.commit_picker_dates(item_id, *date, true, true, cx);
+                        this.commit_picker_dates(item_id, *date, false, true, cx);
                     }
                 },
             ));
@@ -855,8 +871,8 @@ impl PlannerView {
         }
         self.inline_edit = Some(edit);
         let placeholder = match edit {
-            InlineEdit::Dates(_) => "YYYY-MM-DD → YYYY-MM-DD",
-            InlineEdit::Start(_) | InlineEdit::Target(_) => "YYYY-MM-DD",
+            InlineEdit::Dates(_) => DATES_RANGE_HINT,
+            InlineEdit::Start(_) | InlineEdit::Target(_) => DATE_HINT,
             InlineEdit::Title(_) | InlineEdit::Assignee(_) => "",
         };
         self.inline_input.update(cx, |input, cx| {
@@ -1171,40 +1187,20 @@ impl PlannerView {
             cx.notify();
             return;
         }
+        // Same path as Ctrl+Z: spawn_state adopts the full working tree so a
+        // RestoreLink toast actually puts the predecessor back on the node.
+        if !self.spawn_state(cx, move |mut state| async move {
+            let result = state.apply_undo(action.clone()).await;
+            if result.is_ok() {
+                let message = state.undo_confirmation(&action);
+                state.toasts.push(ToastKind::Success, message);
+            }
+            (state, result)
+        }) {
+            return;
+        }
         self.state.toasts.dismiss_undo();
         self.state.toasts.dismiss(toast_id);
-        let runtime = self.state.runtime.clone();
-        let mut working = self.state.clone();
-        let action_clone = action.clone();
-        let rx = runtime.spawn_result(async move {
-            let result = working.apply_undo(action_clone).await;
-            (working, result)
-        });
-        cx.spawn(async move |this, cx| {
-            let outcome = rx.await;
-            let _ = this.update(cx, |this, cx| {
-                match outcome {
-                    Ok((working, Ok(()))) => {
-                        this.state.merge_undo_action(&working, &action);
-                        this.state
-                            .toasts
-                            .push(ToastKind::Success, this.state.undo_confirmation(&action));
-                    }
-                    Ok((working, Err(err))) => {
-                        let message = working
-                            .toasts
-                            .last_error_message()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_else(|| error_text(&err, "Could not undo"));
-                        this.state.toasts.push(ToastKind::Error, message);
-                        tracing::warn!("toast undo failed: {err}");
-                    }
-                    Err(_) => tracing::warn!("toast undo cancelled"),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
         cx.notify();
     }
 
@@ -1684,17 +1680,13 @@ impl PlannerView {
             "root-filter" | "type-filter" => self.state.types(),
             _ => self.state.states(),
         };
-        let caption = if id == "root-filter" {
+        let caption = if hidden == 0 {
+            format!("{label}: All")
+        } else if id == "root-filter" {
             let selected = items.len().saturating_sub(hidden);
-            if hidden > 0 {
-                format!("{label} ({selected})")
-            } else {
-                label.to_string()
-            }
-        } else if hidden > 0 {
-            format!("{label} ({hidden})")
+            format!("{label}: {selected}")
         } else {
-            label.to_string()
+            format!("{label}: {hidden} hidden")
         };
         let hidden_set = match id {
             "type-filter" => self.state.prefs.planner.hidden_types.clone(),
@@ -2333,6 +2325,8 @@ impl PlannerView {
                                     .unwrap_or_else(|| "Unassigned".into());
                                 let editing_title = self.inline_edit == Some(InlineEdit::Title(id));
                                 let hovered = hovered_id == Some(id);
+                                let dim_selection = self.state.form.is_some()
+                                    || self.pending_delete.is_some();
                                 let row_selector = format!("gantt-tree-row-{id}");
                                 div()
                                     .id(("work-item", id as u64))
@@ -2346,7 +2340,7 @@ impl PlannerView {
                                     .flex_basis(px(ROW_HEIGHT))
                                     .flex_shrink_0()
                                     .overflow_hidden()
-                                    .bg(if selected {
+                                    .bg(if selected && !dim_selection {
                                         selected_bg
                                     } else if hovered {
                                         hover_bg
@@ -2532,7 +2526,7 @@ impl PlannerView {
                     .ghost()
                     .compact()
                     .with_size(Size::Small)
-                    .label("ⓘ Details")
+                    .label("ⓘ")
                     .tooltip("Open details (Enter or double-click)")
                     .tooltip_placement(Placement::Bottom)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2573,7 +2567,7 @@ impl PlannerView {
         &self,
         id: i64,
         title: &str,
-        selected: bool,
+        _selected: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         if self.inline_edit == Some(InlineEdit::Title(id)) {
@@ -2595,10 +2589,11 @@ impl PlannerView {
         let tip = format!("{title_owned} · Enter opens details");
         div()
             .id(("title", id as u64))
+            .debug_selector(move || format!("gantt-title-{id}"))
             .flex_1()
             .min_w(px(120.))
             .truncate()
-            .child(title_owned.clone())
+            .child(title_owned)
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_mouse_down(
                 MouseButton::Left,
@@ -2610,12 +2605,10 @@ impl PlannerView {
                 }),
             )
             .on_click(
-                cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                cx.listener(move |this, event: &gpui_kit::ClickEvent, _, cx| {
                     this.state.gantt.selected_id = Some(id);
                     if event.click_count() >= 2 {
                         this.open_form(id, cx);
-                    } else if selected {
-                        this.begin_inline(InlineEdit::Title(id), title_owned.clone(), window, cx);
                     }
                     cx.stop_propagation();
                 }),
@@ -2893,11 +2886,12 @@ impl PlannerView {
                     .w_full()
                     .flex_shrink_0()
                     .children(week.into_iter().map(move |day| {
-                        let active = selected.is_active(&day);
-                        let in_range = selected.is_in_range(&day);
+                        let (is_start, is_end, in_range) = range_day_flags(selected, day);
                         let other_month = day.month() != current_month;
                         let day_key = day.to_string();
-                        let selector = if active {
+                        let selector = if is_start {
+                            "gantt-dates-range-start".to_string()
+                        } else if is_end {
                             "gantt-dates-range-end".to_string()
                         } else if in_range {
                             "gantt-dates-in-range".to_string()
@@ -2917,11 +2911,11 @@ impl PlannerView {
                             .rounded_md()
                             .text_xs()
                             .when(other_month, |el| el.text_color(muted))
-                            .when(in_range && !active, |el| {
-                                el.bg(cx.theme().accent)
-                                    .text_color(cx.theme().accent_foreground)
+                            .when(in_range, |el| {
+                                el.bg(cx.theme().primary.opacity(0.28))
+                                    .text_color(cx.theme().foreground)
                             })
-                            .when(active, |el| {
+                            .when(is_start || is_end, |el| {
                                 el.bg(cx.theme().primary)
                                     .text_color(cx.theme().primary_foreground)
                             })
@@ -2964,8 +2958,11 @@ impl PlannerView {
         let dragging = self.state.gantt.gesture.is_some();
         let show_weekends = self.state.gantt.scale.shows_weekend_bands();
         let weekend_w = self.state.gantt.scale.pixels_per_day(self.state.gantt.zoom);
-        let major_labels = self.state.gantt.header_major_labels(width);
         let hide_today = (self.state.gantt.scale == GanttScale::Day).then_some(today_x);
+        let major_labels = self
+            .state
+            .gantt
+            .header_major_labels_except(width, hide_today);
         let tick_labels = self
             .state
             .gantt
@@ -3033,6 +3030,8 @@ impl PlannerView {
                                 let id = row.id;
                                 let selected = selected_id == Some(id);
                                 let hovered = hovered_id == Some(id);
+                                let dim_selection = self.state.form.is_some()
+                                    || self.pending_delete.is_some();
                                 let striped = (first_row + offset) % 2 == 1;
                                 let bar = bars.iter().find(|bar| bar.id == id).cloned();
                                 let hit_bar = bar.clone();
@@ -3047,7 +3046,7 @@ impl PlannerView {
                                     .max_h(px(ROW_HEIGHT))
                                     .flex_basis(px(ROW_HEIGHT))
                                     .flex_shrink_0()
-                                    .bg(if selected {
+                                    .bg(if selected && !dim_selection {
                                         selected_bg
                                     } else if hovered {
                                         hover_bg
@@ -3409,7 +3408,7 @@ impl PlannerView {
                         )
                 })
                 .when(summary && !milestone, |el| {
-                    el.bg(cx.theme().muted).rounded_sm()
+                    el.bg(rgb(bar.color).opacity(0.55)).rounded_sm()
                 })
                 .when(!summary && !milestone, |el| {
                     el.bg(rgb(bar.color))
@@ -3438,11 +3437,8 @@ impl PlannerView {
                             .top_0()
                             .bottom_0()
                             .w(px(progress_w))
-                            .bg(if summary {
-                                gpui_kit::hsla(0., 0., 1., 0.45)
-                            } else {
-                                gpui_kit::hsla(0., 0., 1., 0.28)
-                            }),
+                            .when(summary, |el| el.bg(rgb(bar.color)))
+                            .when(!summary, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.22))),
                     )
                 })
                 .when(!milestone, |el| {
@@ -4489,7 +4485,7 @@ impl PlannerView {
                                                 row.text_color(cx.theme().muted_foreground)
                                             })
                                             .child(if empty {
-                                                "YYYY-MM-DD → YYYY-MM-DD".to_string()
+                                                DATES_RANGE_HINT.to_string()
                                             } else {
                                                 display
                                             }),
@@ -5445,12 +5441,33 @@ pub fn range_picker_is_complete(date: PickerDate) -> bool {
 /// Typed-field preview while the user is still picking the other end.
 pub fn pending_range_typed(date: PickerDate) -> Option<String> {
     match date {
-        PickerDate::Range(Some(start), None) => Some(format!("{start} → …")),
-        PickerDate::Range(None, Some(end)) => Some(format!("… → {end}")),
-        PickerDate::Range(Some(start), Some(end)) => Some(format!("{start} → {end}")),
-        PickerDate::Single(Some(day)) => Some(day.to_string()),
+        PickerDate::Range(start, end) if start.is_some() || end.is_some() => Some(
+            format_date_range(start.and_then(naive_to_jiff), end.and_then(naive_to_jiff)),
+        ),
+        PickerDate::Single(Some(day)) => Some(format_date_range(naive_to_jiff(day), None)),
         _ => None,
     }
+}
+
+fn range_day_flags(selected: PickerDate, day: chrono::NaiveDate) -> (bool, bool, bool) {
+    let start = match selected {
+        PickerDate::Single(Some(value)) | PickerDate::Range(Some(value), _) => Some(value),
+        _ => None,
+    };
+    let end = match selected {
+        PickerDate::Range(_, Some(value)) => Some(value),
+        _ => None,
+    };
+    let is_start = start == Some(day);
+    let is_end = end == Some(day) && start != Some(day);
+    let in_range = match (start, end) {
+        (Some(a), Some(b)) => {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            day > lo && day < hi
+        }
+        _ => false,
+    };
+    (is_start, is_end, in_range)
 }
 
 fn typed_dates_changed(typed: &str, seed: &str) -> bool {
@@ -5463,7 +5480,7 @@ fn normalize_typed_dates(typed: &str) -> String {
         .replace('→', "/")
         .replace(" to ", "/")
         .replace(" - ", "/")
-        .split(['/', ','])
+        .split('/')
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
@@ -5482,13 +5499,13 @@ fn parse_typed_dates(
         .replace(" to ", "/")
         .replace(" - ", "/");
     let parts: Vec<&str> = normalized
-        .split(['/', ','])
+        .split('/')
         .map(str::trim)
-        .filter(|part| !part.is_empty())
+        .filter(|part| !part.is_empty() && *part != "…")
         .collect();
     match parts.as_slice() {
-        [start] => Some((parse_iso_date(Some(start)), None)),
-        [start, target] => Some((parse_iso_date(Some(start)), parse_iso_date(Some(target)))),
+        [start] => Some((parse_user_date(Some(start)), None)),
+        [start, target] => Some((parse_user_date(Some(start)), parse_user_date(Some(target)))),
         _ => None,
     }
 }
