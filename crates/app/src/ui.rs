@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -45,7 +45,7 @@ use crate::gantt::{
     SUMMARY_BAR_H, TIMELINE_HEADER_H, TYPE_COL_WIDTH,
 };
 use crate::paths::AppPaths;
-use crate::state::{PendingDateSave, PlannerState};
+use crate::state::{DateSaveRole, PendingDateSave, PlannerState};
 use crate::toasts::ToastKind;
 
 actions!(
@@ -81,6 +81,8 @@ pub struct PlannerView {
     dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
     io_busy: bool,
+    date_save_busy: bool,
+    date_save_queue: VecDeque<PendingDateSave>,
     update_checked: bool,
     toast_expiry_armed: bool,
     loading_shown_at: Option<std::time::Instant>,
@@ -206,6 +208,8 @@ impl PlannerView {
             dates_anchor: None,
             banner_dismissed: false,
             io_busy: false,
+            date_save_busy: false,
+            date_save_queue: VecDeque::new(),
             update_checked: false,
             toast_expiry_armed: false,
             loading_shown_at: None,
@@ -711,7 +715,7 @@ impl PlannerView {
         v_flex()
             .id("toasts")
             .absolute()
-            .top(px(72.))
+            .bottom_8()
             .right_4()
             .w(px(360.))
             .gap_2()
@@ -785,6 +789,11 @@ impl PlannerView {
         if self.state.history.undo.is_empty() {
             return;
         }
+        if let Some(pending) = self.state.undo_dates_now() {
+            self.enqueue_date_save(cx, pending);
+            cx.notify();
+            return;
+        }
         self.spawn_state(cx, |mut state| async move {
             let result = state.undo().await;
             (state, result)
@@ -793,6 +802,11 @@ impl PlannerView {
 
     fn redo_last(&mut self, cx: &mut Context<Self>) {
         if self.state.history.redo.is_empty() {
+            return;
+        }
+        if let Some(pending) = self.state.redo_dates_now() {
+            self.enqueue_date_save(cx, pending);
+            cx.notify();
             return;
         }
         self.spawn_state(cx, |mut state| async move {
@@ -1459,12 +1473,18 @@ impl PlannerView {
                                 .flex()
                                 .items_center()
                                 .justify_center()
+                                .occlude()
                                 .child(
                                     v_flex()
-                                        .bg(cx.theme().popover)
+                                        .id("empty-gantt-card")
+                                        .debug_selector(|| "empty-gantt-card".into())
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(cx.theme().border)
                                         .rounded_md()
                                         .p_4()
                                         .shadow_md()
+                                        .occlude()
                                         .child(self.render_empty_gantt(cx)),
                                 ),
                         )
@@ -1640,7 +1660,7 @@ impl PlannerView {
                 div()
                     .id("gantt-range-title")
                     .debug_selector(|| "gantt-range-title".into())
-                    .w(px(168.))
+                    .w(px(196.))
                     .flex_shrink_0()
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child(self.state.gantt.viewport_range_title()),
@@ -1742,6 +1762,10 @@ impl PlannerView {
             nodes.iter().map(|n| (n.id, n.clone())).collect();
         let header_fg = cx.theme().muted_foreground;
         let hover_bg = cx.theme().list_hover;
+        let selected_bg = cx.theme().list_active;
+        let stripe = cx.theme().muted;
+        let row_bg = cx.theme().background;
+        let first_row = self.state.gantt.first_visible_row_index();
         let remainder = self.state.gantt.row_scroll_remainder();
         let show_type = self.state.gantt.show_type_column();
         let show_assignee = self.state.gantt.show_assignee_column();
@@ -1800,13 +1824,14 @@ impl PlannerView {
                     .child(
                         v_flex()
                             .mt(px(-remainder))
-                            .children(window.iter().map(|row| {
+                            .children(window.iter().enumerate().map(|(offset, row)| {
                                 let node = by_id.get(&row.id).cloned();
                                 let Some(node) = node else {
                                     return div().into_any_element();
                                 };
                                 let id = node.id;
                                 let selected = self.state.gantt.selected_id == Some(id);
+                                let striped = (first_row + offset) % 2 == 1;
                                 let hint =
                                     crate::gantt::iteration_for(&node, &self.state.iterations);
                                 let dates = dates_column_text(&node, nodes, hint.as_ref());
@@ -1839,9 +1864,11 @@ impl PlannerView {
                                     .flex_shrink_0()
                                     .overflow_hidden()
                                     .bg(if selected {
-                                        cx.theme().list_active
+                                        selected_bg
+                                    } else if striped {
+                                        stripe
                                     } else {
-                                        cx.theme().background
+                                        row_bg
                                     })
                                     .when(!selected, |el| el.hover(|el| el.bg(hover_bg)))
                                     .on_click(cx.listener(
@@ -1967,13 +1994,11 @@ impl PlannerView {
                                     .into_any_element()
                             }))
                             .children({
-                                let start = window.len();
+                                let start = first_row + window.len();
                                 let fill = crate::gantt::GanttView::filler_row_count(
                                     window.len(),
                                     content_h,
                                 );
-                                let bg = cx.theme().background;
-                                let stripe = cx.theme().muted;
                                 (0..fill).map(move |index| {
                                     div()
                                         .id(("gantt-tree-fill", index as u64))
@@ -1985,7 +2010,7 @@ impl PlannerView {
                                         .bg(if (start + index) % 2 == 1 {
                                             stripe
                                         } else {
-                                            bg
+                                            row_bg
                                         })
                                 })
                             }),
@@ -2213,9 +2238,11 @@ impl PlannerView {
         let muted_fg = cx.theme().foreground;
         let bar_label_fg = gpui_kit::hsla(240. / 360., 0.21, 0.12, 1.);
         let grid = cx.theme().border;
-        let weekend = cx.theme().muted;
+        let weekend = cx.theme().muted.opacity(0.35);
         let hover_bg = cx.theme().list_hover;
         let selected_bg = cx.theme().list_active;
+        let stripe = cx.theme().muted;
+        let first_row = self.state.gantt.first_visible_row_index();
         let today_color = cx.theme().primary;
         let selected_id = self.state.gantt.selected_id;
         let hovered_id = self.state.gantt.hovered_id;
@@ -2287,10 +2314,11 @@ impl PlannerView {
                     .child(
                         v_flex()
                             .mt(px(-self.state.gantt.row_scroll_remainder()))
-                            .children(window.iter().map(|row| {
+                            .children(window.iter().enumerate().map(|(offset, row)| {
                                 let id = row.id;
                                 let selected = selected_id == Some(id);
                                 let hovered = hovered_id == Some(id);
+                                let striped = (first_row + offset) % 2 == 1;
                                 let bar = bars.iter().find(|bar| bar.id == id).cloned();
                                 let band_selector = format!("gantt-row-band-{id}");
                                 div()
@@ -2307,6 +2335,8 @@ impl PlannerView {
                                         selected_bg
                                     } else if hovered {
                                         hover_bg
+                                    } else if striped {
+                                        stripe
                                     } else {
                                         gpui_kit::hsla(0., 0., 0., 0.)
                                     })
@@ -2367,12 +2397,11 @@ impl PlannerView {
                                     }))
                             }))
                             .children({
-                                let start = window.len();
+                                let start = first_row + window.len();
                                 let fill = crate::gantt::GanttView::filler_row_count(
                                     window.len(),
                                     content_h,
                                 );
-                                let stripe = cx.theme().muted;
                                 (0..fill).map(move |index| {
                                     div()
                                         .id(("gantt-row-fill", index as u64))
@@ -2474,6 +2503,11 @@ impl PlannerView {
                                         .id("unscheduled-empty-hint")
                                         .debug_selector(|| "unscheduled-empty-hint".into())
                                         .max_w(px(280.))
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(cx.theme().background)
+                                        .occlude()
                                         .text_sm()
                                         .text_color(header_fg)
                                         .child(
@@ -2483,20 +2517,6 @@ impl PlannerView {
                         )
                     }),
             )
-            .when(today_x >= 0.0 && today_x <= width, |el| {
-                el.child(
-                    div()
-                        .id("gantt-today-label")
-                        .debug_selector(|| "gantt-today-label".into())
-                        .absolute()
-                        .left(px((today_x + 6.0).max(4.0)))
-                        .top(px(2.))
-                        .text_xs()
-                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .text_color(today_color)
-                        .child("Today"),
-                )
-            })
             .child(
                 div()
                     .id("gantt-scale-header")
@@ -2510,11 +2530,14 @@ impl PlannerView {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
-                    .children(major_labels.into_iter().filter(|(x, _)| *x < width - 8.0).map(|(x, label)| {
+                    .children(major_labels.into_iter().filter(|(x, _)| *x < width).map(|(x, label)| {
                         div()
                             .absolute()
                             .left(px(x))
                             .top(px(2.))
+                            .w(px((width - x).max(24.0)))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
                             .text_xs()
                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                             .text_color(muted_fg)
@@ -2528,11 +2551,28 @@ impl PlannerView {
                             .absolute()
                             .left(px(x))
                             .top(px(22.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
                             .text_xs()
                             .text_color(header_fg)
                             .child(label)
                     })),
             )
+            .when(today_x >= 0.0 && today_x <= width, |el| {
+                el.child(
+                    div()
+                        .id("gantt-today-label")
+                        .debug_selector(|| "gantt-today-label".into())
+                        .absolute()
+                        .left(px((today_x + 6.0).max(4.0)))
+                        .top(px(2.))
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(today_color)
+                        .child("Today"),
+                )
+            })
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.state.gantt.gesture.is_some() {
                     let x: f32 = event.position.x.into();
@@ -3650,18 +3690,31 @@ impl PlannerView {
         self.state.gantt.clear_hover();
         self.state.gantt.hover_locked = true;
         if let Some(pending) = self.state.commit_date_gesture_now() {
-            self.spawn_persist_dates(cx, pending);
+            self.enqueue_date_save(cx, pending);
         }
         cx.notify();
     }
 
-    fn spawn_persist_dates(&mut self, cx: &mut Context<Self>, pending: PendingDateSave) {
+    fn enqueue_date_save(&mut self, cx: &mut Context<Self>, pending: PendingDateSave) {
+        self.date_save_queue.push_back(pending);
+        self.drain_date_saves(cx);
+    }
+
+    fn drain_date_saves(&mut self, cx: &mut Context<Self>) {
+        if self.date_save_busy {
+            return;
+        }
+        let Some(pending) = self.date_save_queue.pop_front() else {
+            return;
+        };
+        self.date_save_busy = true;
         let runtime = self.state.runtime.clone();
         let mut working = self.state.clone();
         let id = pending.id;
         let after_start = pending.after_start.clone();
         let after_target = pending.after_target.clone();
         let previous = pending.previous.clone();
+        let role = pending.role;
         let rx = runtime.spawn_result(async move {
             let result = working.persist_pending_dates(pending).await;
             (working, result)
@@ -3669,6 +3722,7 @@ impl PlannerView {
         cx.spawn(async move |this, cx| {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
+                this.date_save_busy = false;
                 if let Ok((working, result)) = outcome {
                     let still_after = this.state.nodes.iter().any(|node| {
                         node.id == id
@@ -3677,30 +3731,50 @@ impl PlannerView {
                     });
                     match result {
                         Ok(()) => {
-                            if still_after
-                                && let Some(rev) = working
-                                    .nodes
-                                    .iter()
-                                    .find(|node| node.id == id)
-                                    .map(|n| n.rev)
+                            if let Some(rev) = working
+                                .nodes
+                                .iter()
+                                .find(|node| node.id == id)
+                                .map(|n| n.rev)
                                 && let Some(live) =
                                     this.state.nodes.iter_mut().find(|node| node.id == id)
                             {
                                 live.rev = rev;
                             }
-                            if still_after && let Some(msg) = working.toasts.last_message() {
+                            if still_after
+                                && role == DateSaveRole::Commit
+                                && let Some(msg) = working.toasts.last_message()
+                            {
                                 this.state.toasts.push(ToastKind::Success, msg.to_string());
                             }
                         }
                         Err(err) => {
                             if still_after {
                                 this.state.restore_node(previous);
-                                this.state.discard_last_dates(id);
+                                this.state
+                                    .discard_dates_after(id, &after_start, &after_target);
+                                match role {
+                                    DateSaveRole::Undo => {
+                                        if let Some(entry) = this.state.history.redo.pop() {
+                                            this.state.history.undo.push(entry);
+                                        }
+                                    }
+                                    DateSaveRole::Redo => {
+                                        if let Some(entry) = this.state.history.undo.pop() {
+                                            this.state.history.redo.push(entry);
+                                        }
+                                    }
+                                    DateSaveRole::Commit => {}
+                                }
+                            }
+                            if let Some(msg) = working.toasts.last_error_message() {
+                                this.state.toasts.push(ToastKind::Error, msg.to_string());
                             }
                             tracing::warn!("planner action failed: {err}");
                         }
                     }
                 }
+                this.drain_date_saves(cx);
                 cx.notify();
             });
         })

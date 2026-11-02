@@ -2,7 +2,9 @@
 
 use ado_core::SessionInfo;
 use ado_planner::form::FormDraft;
-use ado_planner::gantt::{ContextTarget, GanttView, GestureKind, MIN_TIMELINE_WIDTH, ROW_HEIGHT};
+use ado_planner::gantt::{
+    ContextTarget, GanttScale, GanttView, GestureKind, MIN_TIMELINE_WIDTH, ROW_HEIGHT,
+};
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::ui::PlannerView;
@@ -793,6 +795,10 @@ fn lighter_toasts_and_today_label_paint(cx: &mut gpui_kit::TestAppContext) {
         "Copied work item ID",
     );
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
     draw(cx);
     assert!(
         cx.debug_bounds("planner-toast").is_some(),
@@ -801,6 +807,14 @@ fn lighter_toasts_and_today_label_paint(cx: &mut gpui_kit::TestAppContext) {
     assert!(
         cx.debug_bounds("gantt-today").is_some(),
         "today marker should paint"
+    );
+    let toast = cx.debug_bounds("planner-toast").expect("toast");
+    let nav = cx.debug_bounds("gantt-nav").expect("toolbar");
+    let toast_top = f32::from(toast.origin.y);
+    let nav_bottom = f32::from(nav.origin.y) + f32::from(nav.size.height);
+    assert!(
+        toast_top >= nav_bottom - 2.0,
+        "toasts at y={toast_top} must sit below the toolbar bottom {nav_bottom}"
     );
 }
 
@@ -833,10 +847,52 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
             );
         }
         let title = view.state.gantt.viewport_range_title();
-        let first = labels.first().expect("axis must have a first tick");
+        let centre = view.state.gantt.viewport_center_date();
+        assert_eq!(
+            title,
+            view.state.gantt.scale.range_title(centre),
+            "range title must follow the viewport centre ({centre}), not the first tick ({labels:?})"
+        );
+        let today_x = view.state.gantt.today_x(jiff::Zoned::now().date());
+        let expected = view.state.gantt.timeline_width.max(1.0) / 3.0;
         assert!(
-            title.starts_with(first),
-            "range title {title:?} must match the first axis tick {first:?} ({labels:?})"
+            (today_x - expected).abs() < 8.0,
+            "Today line at {today_x} should sit about a third in, expected {expected}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn day_zoom_shows_today_label_and_year_in_the_header(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.set_scale(GanttScale::Day);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today_btn = cx.debug_bounds("gantt-today-btn").expect("Today button");
+    cx.simulate_click(today_btn.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-today-label").is_some(),
+        "Day zoom must paint the Today label instead of clipping it at the left edge"
+    );
+    view.update(cx, |view, _| {
+        let title = view.state.gantt.viewport_range_title();
+        assert!(
+            title.contains("2026"),
+            "Day header must include the year, got {title:?}"
+        );
+        let today = jiff::Zoned::now().date();
+        let today_x = view.state.gantt.today_x(today);
+        let expected = view.state.gantt.timeline_width.max(1.0) / 3.0;
+        assert!(
+            (today_x - expected).abs() < 8.0,
+            "Day zoom Today line at {today_x} should sit about a third in, expected {expected}"
         );
     });
 }
@@ -1544,6 +1600,10 @@ fn filtered_empty_keeps_the_timeline_header_and_grid(cx: &mut gpui_kit::TestAppC
         cx.debug_bounds("empty-show-all").is_some(),
         "filtered empty overlay should still offer Show all"
     );
+    assert!(
+        cx.debug_bounds("empty-gantt-card").is_some(),
+        "filter-hidden notice must paint a solid card above the Today line"
+    );
 }
 
 #[gpui_kit::test]
@@ -1591,8 +1651,11 @@ fn zoom_buttons_and_ctrl_scroll_update_the_range_title(cx: &mut gpui_kit::TestAp
         let title_after = view.state.gantt.viewport_range_title();
         assert_eq!(
             title_after,
-            view.state.gantt.viewport_range_title(),
-            "range title is derived from the viewport left date"
+            view.state
+                .gantt
+                .scale
+                .range_title(view.state.gantt.viewport_center_date()),
+            "range title is derived from the viewport centre"
         );
         let _ = title_before;
     });

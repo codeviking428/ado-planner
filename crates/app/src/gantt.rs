@@ -21,6 +21,8 @@ pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
 pub const TODAY_MARGIN_PX: f32 = 80.0;
+/// Place the Today line about a third of the way across the timeline.
+pub const TODAY_ALIGN: f32 = 1.0 / 3.0;
 pub const SCALE_BUTTON_WIDTH: f32 = 132.0;
 pub const PLACEHOLDER_MIN_WIDTH: f32 = 48.0;
 pub const MILESTONE_SIZE: f32 = 16.0;
@@ -92,7 +94,12 @@ impl GanttScale {
 
     pub fn range_title(self, origin: Date) -> String {
         match self {
-            Self::Day => format!("{} {}", month_abbrev(origin), origin.day()),
+            Self::Day => format!(
+                "{} {}, {}",
+                month_abbrev(origin),
+                origin.day(),
+                origin.year()
+            ),
             Self::Week => format!("Week of {} {}", month_abbrev(origin), origin.day()),
             Self::Month => format!("{} {}", month_abbrev(origin), origin.year()),
             Self::Quarter => {
@@ -175,6 +182,15 @@ fn is_weekend(date: Date) -> bool {
         date.weekday(),
         jiff::civil::Weekday::Saturday | jiff::civil::Weekday::Sunday
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SavedGanttView {
+    pub origin: Date,
+    pub scroll_x: f32,
+    pub scroll_y: f32,
+    pub scale: GanttScale,
+    pub zoom: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +358,10 @@ impl GanttView {
         self.scroll_y.rem_euclid(ROW_HEIGHT)
     }
 
+    pub fn first_visible_row_index(&self) -> usize {
+        (self.scroll_y / ROW_HEIGHT).floor() as usize
+    }
+
     pub fn row_y(&self, window_offset: usize) -> f32 {
         window_offset as f32 * ROW_HEIGHT - self.row_scroll_remainder()
     }
@@ -389,21 +409,11 @@ impl GanttView {
     }
 
     pub fn viewport_range_title(&self) -> String {
-        self.scale.range_title(self.first_visible_period_date())
+        self.scale.range_title(self.viewport_center_date())
     }
 
-    /// Month/week/day of the first on-screen tick, not the (possibly
-    /// off-screen) period that contains the left pixel. After Today in early
-    /// November the left edge can still sit in October while the axis starts
-    /// at Nov 1 — the title must match the axis.
-    pub fn first_visible_period_date(&self) -> Date {
-        let left = self.date_for_x(0.0);
-        let start = self.scale.floor_date(left);
-        if self.x_for_date(start) < -0.5 {
-            self.scale.next_date(start)
-        } else {
-            start
-        }
+    pub fn viewport_center_date(&self) -> Date {
+        self.date_for_x(self.timeline_width.max(1.0) * 0.5)
     }
 
     pub fn clear_hover(&mut self) {
@@ -433,15 +443,18 @@ impl GanttView {
         self.origin = self.origin.saturating_add(span);
     }
 
-    /// Snap the left edge to this scale's period so Year columns stay equal width.
+    /// Keep the date under the viewport centre still when switching Day/Week/Month/…
     pub fn set_scale(&mut self, scale: GanttScale) {
         if self.scale == scale {
             return;
         }
-        let left = self.date_for_x(0.0);
+        let width = self.timeline_width.max(1.0);
+        let center = self.date_for_x(width * 0.5);
         self.scale = scale;
-        self.origin = scale.floor_date(left);
+        self.origin = center;
         self.scroll_x = 0.0;
+        let x = self.x_for_date(center);
+        self.scroll_x = x - width * 0.5;
     }
 
     pub fn filler_row_count(window_len: usize, content_h: f32) -> usize {
@@ -460,8 +473,29 @@ impl GanttView {
     }
 
     pub fn go_today(&mut self, today: Date) {
-        self.origin = self.scale.floor_date(today);
+        self.origin = today;
         self.scroll_x = 0.0;
+        let x = self.x_for_date(today);
+        let target = self.timeline_width.max(1.0) * TODAY_ALIGN;
+        self.scroll_x = x - target;
+    }
+
+    pub fn snapshot(&self) -> SavedGanttView {
+        SavedGanttView {
+            origin: self.origin,
+            scroll_x: self.scroll_x,
+            scroll_y: self.scroll_y,
+            scale: self.scale,
+            zoom: self.zoom,
+        }
+    }
+
+    pub fn restore(&mut self, saved: SavedGanttView) {
+        self.origin = saved.origin;
+        self.scroll_x = saved.scroll_x;
+        self.scroll_y = saved.scroll_y;
+        self.scale = saved.scale;
+        self.zoom = saved.zoom;
     }
 
     pub fn scroll_rows(&mut self, rows: i32, viewport_h: f32, row_count: usize) {
@@ -494,6 +528,7 @@ impl GanttView {
             self.origin = start;
             self.scroll_x = 0.0;
         }
+        self.scroll_y = 0.0;
     }
 
     pub fn max_tree_width(&self) -> f32 {
@@ -1596,7 +1631,13 @@ mod tests {
         };
         gantt.auto_fit(&[item], &[], 800.0);
         let today = jiff::Zoned::now().date();
-        assert_eq!(gantt.origin, gantt.scale.floor_date(today));
+        assert_eq!(gantt.origin, today);
+        let today_x = gantt.today_x(today);
+        let expected = gantt.timeline_width.max(1.0) * TODAY_ALIGN;
+        assert!(
+            (today_x - expected).abs() < 1.5,
+            "Today line at {today_x} should sit near {expected}"
+        );
         assert!((gantt.zoom - 1.0).abs() < f32::EPSILON);
     }
 
@@ -1719,27 +1760,20 @@ mod tests {
         let mut gantt = GanttView::default();
         let today = Date::new(2026, 10, 30).unwrap();
         gantt.go_today(today);
-        let start = gantt.scale.floor_date(today);
-        let start_x = gantt.x_for_date(start);
-        assert!(
-            start_x.abs() < 0.5,
-            "Today must put the current month at the axis start, got {start_x}"
-        );
         let today_x = gantt.today_x(today);
+        let expected = gantt.timeline_width.max(1.0) * TODAY_ALIGN;
         assert!(
-            today_x > 20.0,
-            "Today marker at {today_x} must sit after the month gridline"
+            (today_x - expected).abs() < 1.5,
+            "Today line at {today_x} should sit about a third in, expected {expected}"
         );
-        assert_eq!(gantt.viewport_range_title(), "Oct 2026");
-        let labels: Vec<_> = gantt
-            .header_tick_labels(800.0)
-            .into_iter()
-            .map(|(_, label)| label)
-            .collect();
+        let oct1 = Date::new(2026, 10, 1).unwrap();
+        assert!(
+            (today_x - gantt.x_for_date(oct1)).abs() > 20.0,
+            "Today must not sit on the month gridline"
+        );
         assert_eq!(
-            labels.first().map(String::as_str),
-            Some("Oct"),
-            "axis must start with October after Today, got {labels:?}"
+            gantt.viewport_range_title(),
+            gantt.scale.range_title(gantt.viewport_center_date()),
         );
     }
 
@@ -1749,30 +1783,22 @@ mod tests {
         let today = Date::new(2026, 11, 2).unwrap();
         gantt.go_today(today);
         assert_eq!(gantt.viewport_range_title(), "Nov 2026");
-        let labels: Vec<_> = gantt
-            .header_tick_labels(800.0)
-            .into_iter()
-            .map(|(_, label)| label)
-            .collect();
-        assert_eq!(
-            labels.first().map(String::as_str),
-            Some("Nov"),
-            "axis must start with November after Today, got {labels:?}"
-        );
     }
 
     #[test]
-    fn range_title_follows_the_first_visible_tick() {
+    fn range_title_follows_the_viewport_centre() {
         let gantt = GanttView {
-            origin: Date::new(2026, 11, 2).unwrap(),
-            scroll_x: -TODAY_MARGIN_PX,
+            origin: Date::new(2026, 10, 1).unwrap(),
+            timeline_width: 800.0,
             ..Default::default()
         };
+        let centre = gantt.viewport_center_date();
         assert_eq!(
             gantt.viewport_range_title(),
-            "Nov 2026",
-            "left edge can sit in late October while the first tick is Nov 1"
+            gantt.scale.range_title(centre),
+            "header month must follow the viewport centre ({centre})"
         );
+        assert_eq!(gantt.viewport_range_title(), "Nov 2026");
     }
 
     #[test]
@@ -2082,15 +2108,22 @@ mod tests {
     }
 
     #[test]
-    fn year_scale_snaps_origin_and_does_not_repeat_year_labels() {
+    fn year_scale_keeps_the_centre_date_and_does_not_repeat_year_labels() {
         let mut gantt = GanttView {
-            origin: Date::new(2026, 11, 2).unwrap(),
+            origin: Date::new(2026, 7, 1).unwrap(),
             scale: GanttScale::Month,
             zoom: 1.0,
+            timeline_width: 800.0,
             ..Default::default()
         };
+        let before = gantt.viewport_center_date();
         gantt.set_scale(GanttScale::Year);
-        assert_eq!(gantt.origin, Date::new(2026, 1, 1).unwrap());
+        assert_eq!(
+            gantt.viewport_center_date(),
+            before,
+            "Month → Year must keep the centred date, not jump to Jan 1"
+        );
+        assert_ne!(gantt.origin, Date::new(2026, 1, 1).unwrap());
         let majors: Vec<_> = gantt
             .header_major_labels(800.0)
             .into_iter()
@@ -2125,6 +2158,24 @@ mod tests {
     }
 
     #[test]
+    fn day_scale_keeps_the_july_centre() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let before = gantt.viewport_center_date();
+        gantt.set_scale(GanttScale::Day);
+        assert_eq!(gantt.viewport_center_date(), before);
+        assert!(
+            gantt.scale.range_title(before).contains("2026"),
+            "Day header must include the year"
+        );
+    }
+
+    #[test]
     fn day_header_hides_the_tick_under_today() {
         let today = Date::new(2026, 11, 2).unwrap();
         let gantt = GanttView {
@@ -2146,5 +2197,36 @@ mod tests {
     fn filler_rows_cover_the_unused_viewport() {
         assert_eq!(GanttView::filler_row_count(2, 400.0), 8);
         assert_eq!(GanttView::filler_row_count(20, 400.0), 0);
+    }
+
+    #[test]
+    fn first_visible_row_follows_scroll_y() {
+        let gantt = GanttView {
+            scroll_y: 50.0,
+            ..Default::default()
+        };
+        assert_eq!(gantt.first_visible_row_index(), 1);
+    }
+
+    #[test]
+    fn snapshot_restore_keeps_scroll_and_scale() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 15).unwrap(),
+            scroll_x: 120.0,
+            scroll_y: 80.0,
+            scale: GanttScale::Week,
+            zoom: 1.5,
+            ..Default::default()
+        };
+        let saved = gantt.snapshot();
+        gantt.scroll_x = 0.0;
+        gantt.scroll_y = 0.0;
+        gantt.scale = GanttScale::Month;
+        gantt.restore(saved);
+        assert_eq!(gantt.scroll_x, 120.0);
+        assert_eq!(gantt.scroll_y, 80.0);
+        assert_eq!(gantt.scale, GanttScale::Week);
+        assert!((gantt.zoom - 1.5).abs() < f32::EPSILON);
+        assert_eq!(gantt.origin, Date::new(2026, 7, 15).unwrap());
     }
 }

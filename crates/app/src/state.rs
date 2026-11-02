@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::cache::{CacheFreshness, QueryCache};
 use crate::error::AppError;
 use crate::form::FormDraft;
-use crate::gantt::{GanttView, GestureKind, NudgeAxis, PendingNudge, VisibleRow};
+use crate::gantt::{GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView, VisibleRow};
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
 use crate::toasts::{EditHistory, HistoryEntry, ToastKind, Toasts, UndoAction, error_text};
@@ -59,6 +59,15 @@ pub struct PlannerState {
     pub copied: Option<String>,
     last_nudge_at: Option<Instant>,
     history_recording: bool,
+    team_views: HashMap<String, SavedGanttView>,
+}
+
+/// Why this date PATCH was queued — so a failed persist can put history back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateSaveRole {
+    Commit,
+    Undo,
+    Redo,
 }
 
 /// Date change already applied and recorded locally; persist over HTTP next.
@@ -70,6 +79,7 @@ pub struct PendingDateSave {
     pub after_start: Option<String>,
     pub after_target: Option<String>,
     pub previous: WorkItemNode,
+    pub role: DateSaveRole,
 }
 
 impl PlannerState {
@@ -126,6 +136,7 @@ impl PlannerState {
             copied: None,
             last_nudge_at: None,
             history_recording: true,
+            team_views: HashMap::new(),
             prefs,
         }
     }
@@ -636,6 +647,9 @@ impl PlannerState {
     }
 
     pub async fn set_team(&mut self, team: String) -> Result<(), AppError> {
+        if team != self.prefs.planner.team {
+            self.save_gantt_view();
+        }
         self.prefs.planner.team = team;
         self.prefs.planner.iteration_path.clear();
         self.prefs.planner.root_types = Some(None);
@@ -646,8 +660,25 @@ impl PlannerState {
         self.load_hierarchy().await
     }
 
+    fn save_gantt_view(&mut self) {
+        let team = self.prefs.planner.team.clone();
+        if team.is_empty() || self.nodes.is_empty() {
+            return;
+        }
+        self.team_views.insert(team, self.gantt.snapshot());
+    }
+
+    fn restore_gantt_view(&mut self) -> bool {
+        let Some(saved) = self.team_views.get(&self.prefs.planner.team).copied() else {
+            return false;
+        };
+        self.gantt.restore(saved);
+        true
+    }
+
     /// Drop stale rows and show the new team name before the hierarchy fetch returns.
     pub fn begin_team_switch(&mut self, team: String) {
+        self.save_gantt_view();
         self.prefs.planner.team = team;
         self.prefs.planner.iteration_path.clear();
         self.prefs.planner.root_types = Some(None);
@@ -842,7 +873,9 @@ impl PlannerState {
         self.team_settings_error = result.warning.clone();
         self.nodes = result.nodes.clone();
         self.hierarchy = Some(result);
-        self.gantt.reveal_content(&self.nodes, &self.iterations);
+        if !self.restore_gantt_view() {
+            self.gantt.reveal_content(&self.nodes, &self.iterations);
+        }
     }
 
     fn cache_identity(&self) -> String {
@@ -1097,6 +1130,47 @@ impl PlannerState {
         }
     }
 
+    /// Drop the matching Dates undo entry, not merely the last one for `id`.
+    /// A failed second persist must not swallow the first drag.
+    pub fn discard_dates_after(
+        &mut self,
+        id: i64,
+        after_start: &Option<String>,
+        after_target: &Option<String>,
+    ) {
+        if let Some(index) = self.history.undo.iter().rposition(|entry| {
+            matches!(
+                entry,
+                HistoryEntry::Dates {
+                    id: entry_id,
+                    after_start: start,
+                    after_target: target,
+                    ..
+                } if *entry_id == id && start == after_start && target == after_target
+            )
+        }) {
+            self.history.undo.remove(index);
+        }
+    }
+
+    fn revert_date_save_history(&mut self, pending: &PendingDateSave) {
+        match pending.role {
+            DateSaveRole::Commit => {
+                self.discard_dates_after(pending.id, &pending.after_start, &pending.after_target);
+            }
+            DateSaveRole::Undo => {
+                if let Some(entry) = self.history.redo.pop() {
+                    self.history.undo.push(entry);
+                }
+            }
+            DateSaveRole::Redo => {
+                if let Some(entry) = self.history.undo.pop() {
+                    self.history.redo.push(entry);
+                }
+            }
+        }
+    }
+
     /// Apply the live gesture dates and push undo immediately, before PATCH.
     pub fn commit_date_gesture_now(&mut self) -> Option<PendingDateSave> {
         let gesture = self.gantt.gesture.take()?;
@@ -1136,6 +1210,80 @@ impl PlannerState {
             after_start,
             after_target,
             previous,
+            role: DateSaveRole::Commit,
+        })
+    }
+
+    /// Apply the last Dates undo locally so a second Ctrl+Z is not dropped
+    /// while the first PATCH is in flight. Returns the persist to queue.
+    pub fn undo_dates_now(&mut self) -> Option<PendingDateSave> {
+        let HistoryEntry::Dates {
+            id,
+            before_start,
+            before_target,
+            after_start,
+            after_target,
+        } = self.history.undo.last().cloned()?
+        else {
+            return None;
+        };
+        let previous = self.nodes.iter().find(|node| node.id == id).cloned()?;
+        let _ = self.history.pop_undo();
+        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
+            node.start_date = before_start.clone();
+            node.target_date = before_target.clone();
+        }
+        self.history.redo.push(HistoryEntry::Dates {
+            id,
+            before_start: before_start.clone(),
+            before_target: before_target.clone(),
+            after_start,
+            after_target,
+        });
+        Some(PendingDateSave {
+            id,
+            start: parse_iso_date(before_start.as_deref()),
+            target: parse_iso_date(before_target.as_deref()),
+            after_start: before_start,
+            after_target: before_target,
+            previous,
+            role: DateSaveRole::Undo,
+        })
+    }
+
+    /// Apply the last Dates redo locally so a second Ctrl+Shift+Z is not dropped.
+    pub fn redo_dates_now(&mut self) -> Option<PendingDateSave> {
+        let HistoryEntry::Dates {
+            id,
+            before_start,
+            before_target,
+            after_start,
+            after_target,
+        } = self.history.redo.last().cloned()?
+        else {
+            return None;
+        };
+        let previous = self.nodes.iter().find(|node| node.id == id).cloned()?;
+        let _ = self.history.pop_redo();
+        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
+            node.start_date = after_start.clone();
+            node.target_date = after_target.clone();
+        }
+        self.history.undo.push(HistoryEntry::Dates {
+            id,
+            before_start,
+            before_target,
+            after_start: after_start.clone(),
+            after_target: after_target.clone(),
+        });
+        Some(PendingDateSave {
+            id,
+            start: parse_iso_date(after_start.as_deref()),
+            target: parse_iso_date(after_target.as_deref()),
+            after_start,
+            after_target,
+            previous,
+            role: DateSaveRole::Redo,
         })
     }
 
@@ -1160,26 +1308,29 @@ impl PlannerState {
         if !node.has_date_fields {
             return Err(AppError::message("no date fields"));
         }
-        let ops = build_dates_patch(node.rev, pending.start, pending.target);
+        let ops = if pending.start.is_none() && pending.target.is_none() {
+            build_clear_dates_patch(node.rev)
+        } else {
+            build_dates_patch(node.rev, pending.start, pending.target)
+        };
         match self
             .client
             .patch_work_item(&scope.org, &scope.project, pending.id, &ops)
             .await
         {
             Ok(rev) => {
-                if let Some(live) = self.nodes.iter_mut().find(|node| node.id == pending.id)
-                    && live.start_date == pending.after_start
-                    && live.target_date == pending.after_target
-                {
+                if let Some(live) = self.nodes.iter_mut().find(|node| node.id == pending.id) {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                let message = match (pending.start, pending.target) {
-                    (Some(_), None) => "Saved Start Date",
-                    (None, Some(_)) => "Saved Target Date",
-                    _ => "Saved Start Date and Target Date",
-                };
-                self.toasts.push(ToastKind::Success, message);
+                if pending.role == DateSaveRole::Commit {
+                    let message = match (pending.start, pending.target) {
+                        (Some(_), None) => "Saved Start Date",
+                        (None, Some(_)) => "Saved Target Date",
+                        _ => "Saved Start Date and Target Date",
+                    };
+                    self.toasts.push(ToastKind::Success, message);
+                }
                 Ok(())
             }
             Err(err) => {
@@ -1188,8 +1339,8 @@ impl PlannerState {
                         && node.start_date == pending.after_start
                         && node.target_date == pending.after_target
                 }) {
-                    self.restore_node(pending.previous);
-                    self.discard_last_dates(pending.id);
+                    self.restore_node(pending.previous.clone());
+                    self.revert_date_save_history(&pending);
                 }
                 self.toasts
                     .push(ToastKind::Error, error_text(&err, "Could not save dates"));

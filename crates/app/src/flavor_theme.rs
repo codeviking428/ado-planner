@@ -124,7 +124,7 @@ pub fn theme_color(flavor: Flavor) -> ThemeColor {
     colors.window_border = border;
     colors.list = bg;
     colors.list_hover = muted;
-    colors.list_active = pal.color(pal.secondary);
+    colors.list_active = primary.opacity(0.32);
     colors.tab = bg;
     colors.tab_active = muted;
     colors.tab_foreground = fg;
@@ -157,5 +157,13 @@ mod tests {
         let latte = theme_color(Flavor::Latte);
         assert!(mocha.background.l < latte.background.l);
         assert_ne!(mocha.popover, mocha.background);
+        assert_ne!(
+            mocha.list_active, mocha.list_hover,
+            "selection must not use the same wash as hover"
+        );
+        assert_ne!(
+            latte.list_active, latte.list_hover,
+            "selection must not use the same wash as hover"
+        );
     }
 }

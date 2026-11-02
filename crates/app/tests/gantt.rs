@@ -185,6 +185,97 @@ async fn undo_after_a_bar_drag_restores_original_dates() {
 }
 
 #[tokio::test]
+async fn two_drags_then_two_undos_revert_both() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let original_start = node.start_date.clone();
+    let original_target = node.target_date.clone();
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 2.0);
+    state.commit_gesture().await.expect("drag 1");
+    let after_first = state
+        .nodes
+        .iter()
+        .find(|n| n.id == node.id)
+        .cloned()
+        .unwrap();
+    assert_ne!(after_first.start_date, original_start);
+
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 3.0);
+    state.commit_gesture().await.expect("drag 2");
+    let after_second = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_ne!(after_second.start_date, after_first.start_date);
+    assert_eq!(
+        state.history.undo.len(),
+        2,
+        "two drags must leave two undo entries, got {}",
+        state.history.undo.len()
+    );
+
+    state.undo().await.expect("undo 2");
+    let undone_once = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(undone_once.start_date, after_first.start_date);
+    assert_eq!(undone_once.target_date, after_first.target_date);
+
+    state.undo().await.expect("undo 1");
+    let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(restored.start_date, original_start);
+    assert_eq!(restored.target_date, original_target);
+}
+
+#[tokio::test]
+async fn two_optimistic_undos_revert_both_drags() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let original_start = node.start_date.clone();
+    let original_target = node.target_date.clone();
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 2.0);
+    let pending1 = state.commit_date_gesture_now().expect("drag 1");
+    state
+        .persist_pending_dates(pending1)
+        .await
+        .expect("persist 1");
+    let after_first = state
+        .nodes
+        .iter()
+        .find(|n| n.id == node.id)
+        .cloned()
+        .unwrap();
+    let _ = state.begin_bar_gesture(node.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 3.0);
+    let pending2 = state.commit_date_gesture_now().expect("drag 2");
+    state
+        .persist_pending_dates(pending2)
+        .await
+        .expect("persist 2");
+    assert_eq!(state.history.undo.len(), 2);
+
+    let _ = state.undo_dates_now().expect("optimistic undo 2");
+    let undone_once = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(undone_once.start_date, after_first.start_date);
+    let _ = state.undo_dates_now().expect("optimistic undo 1");
+    let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(restored.start_date, original_start);
+    assert_eq!(restored.target_date, original_target);
+}
+
+#[tokio::test]
 async fn end_handle_drop_records_undo_before_the_patch_returns() {
     let (_mock, mut state, _dir) = signed_in().await;
     let node = state
@@ -291,6 +382,29 @@ async fn changing_scope_reveals_timeline_content() {
         Date::new(2025, 1, 1).unwrap(),
         "reloading a team should reveal the new work on the timeline"
     );
+}
+
+#[tokio::test]
+async fn switching_teams_restores_gantt_scroll() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let home = state.prefs.planner.team.clone();
+    state.gantt.scroll_y = 80.0;
+    state.gantt.scroll_x = 48.0;
+    let origin = state.gantt.origin;
+    state.begin_team_switch("Growth".into());
+    state
+        .set_team("Growth".into())
+        .await
+        .expect("switch to Growth");
+    assert_eq!(
+        state.gantt.scroll_y, 0.0,
+        "a team without a saved view should start at the top"
+    );
+    state.begin_team_switch(home.clone());
+    state.set_team(home).await.expect("switch home");
+    assert_eq!(state.gantt.scroll_y, 80.0);
+    assert_eq!(state.gantt.scroll_x, 48.0);
+    assert_eq!(state.gantt.origin, origin);
 }
 
 #[tokio::test]
