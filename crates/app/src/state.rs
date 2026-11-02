@@ -1929,7 +1929,11 @@ impl PlannerState {
                 }
                 let id = node.id;
                 let title = node.title.clone();
-                self.nodes.push(node);
+                let insert_at = parent_id
+                    .and_then(|pid| self.nodes.iter().position(|item| item.id == pid))
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                self.nodes.insert(insert_at, node);
                 self.gantt.selected_id = Some(id);
                 self.persist_hierarchy_cache();
                 self.record(HistoryEntry::Created {
@@ -2691,8 +2695,19 @@ impl PlannerState {
 
     pub(crate) fn undo_confirmation(&self, action: &UndoAction) -> String {
         match action {
-            UndoAction::RestoreDates { id, .. } => format!("Restored {}", self.item_title(*id)),
-            UndoAction::RestoreFields { id, .. } => format!("Restored {}", self.item_title(*id)),
+            UndoAction::RestoreDates { id, .. } => {
+                format!("Undid dates of {}", self.item_title(*id))
+            }
+            UndoAction::RestoreFields { id, fields } => {
+                let title = self.item_title(*id);
+                match fields.as_slice() {
+                    [(reference, _)] => format!(
+                        "Undid {} change on {title}",
+                        field_toast_name(reference, None)
+                    ),
+                    _ => format!("Undid field changes on {title}"),
+                }
+            }
             UndoAction::DeleteCreated { id, title } => {
                 if title.is_empty() {
                     format!("Removed #{id}")
@@ -2702,7 +2717,7 @@ impl PlannerState {
             }
             UndoAction::RemoveLink { successor_id, .. }
             | UndoAction::RestoreLink { successor_id, .. } => {
-                format!("Restored {} dependency", self.item_title(*successor_id))
+                format!("Undid {} dependency", self.item_title(*successor_id))
             }
         }
     }
@@ -2736,6 +2751,10 @@ impl PlannerState {
     }
 }
 
+fn toast_date(date: Date) -> String {
+    compact_date(date).replace(' ', "\u{00a0}")
+}
+
 pub(crate) fn dates_moved_message(
     title: &str,
     start: Option<Date>,
@@ -2743,12 +2762,12 @@ pub(crate) fn dates_moved_message(
 ) -> String {
     match (start, target) {
         (Some(start), Some(target)) => format!(
-            "Moved {title} to {} → {}",
-            compact_date(start),
-            compact_date(target)
+            "Moved dates of {title} to {} → {}",
+            toast_date(start),
+            toast_date(target)
         ),
-        (Some(start), None) => format!("Moved {title} start to {}", compact_date(start)),
-        (None, Some(target)) => format!("Moved {title} to {}", compact_date(target)),
+        (Some(start), None) => format!("Moved start of {title} to {}", toast_date(start)),
+        (None, Some(target)) => format!("Moved dates of {title} to {}", toast_date(target)),
         (None, None) => format!("Saved {title} dates"),
     }
 }
@@ -3078,6 +3097,27 @@ mod node_field_tests {
         assert_eq!(
             node_field_json(&node, "System.AreaPath"),
             json!("Shop\\Platform")
+        );
+    }
+}
+
+#[cfg(test)]
+mod toast_copy_tests {
+    use super::dates_moved_message;
+    use jiff::civil::Date;
+
+    #[test]
+    fn moved_toast_names_dates_of_the_item() {
+        let start = Date::new(2026, 7, 6).unwrap();
+        let target = Date::new(2026, 8, 18).unwrap();
+        let message = dates_moved_message("Cart", Some(start), Some(target));
+        assert!(
+            message.starts_with("Moved dates of Cart"),
+            "move toasts must say 'dates of', got {message}"
+        );
+        assert!(
+            message.contains('\u{00a0}'),
+            "the range must use a non-breaking space so '18' cannot wrap alone, got {message}"
         );
     }
 }

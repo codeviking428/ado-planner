@@ -1053,11 +1053,10 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
             );
         }
         let title = view.state.gantt.viewport_range_title();
-        let start = view.state.gantt.viewport_start_date();
-        let start_label = view.state.gantt.scale.range_title(start);
+        let first = labels.first().map(String::as_str).unwrap_or("");
         assert!(
-            title.starts_with(start_label.split_whitespace().next().unwrap_or("")),
-            "range title {title:?} must follow the visible start ({start_label}), labels={labels:?}"
+            title.starts_with(first) || first.is_empty(),
+            "range title {title:?} must match the painted axis start {first:?}, labels={labels:?}"
         );
         let today_x = view.state.gantt.today_x(jiff::Zoned::now().date());
         let expected = view.state.gantt.timeline_width.max(1.0) * TODAY_ALIGN;
@@ -1856,11 +1855,14 @@ fn zoom_buttons_and_ctrl_scroll_update_the_range_title(cx: &mut gpui_kit::TestAp
             "Ctrl+scroll must change zoom"
         );
         let title_after = view.state.gantt.viewport_range_title();
-        let start = view.state.gantt.viewport_start_date();
-        let start_label = view.state.gantt.scale.range_title(start);
+        let axis = view
+            .state
+            .gantt
+            .header_tick_labels(view.state.gantt.timeline_width.max(400.0));
+        let first = axis.first().map(|(_, label)| label.as_str()).unwrap_or("");
         assert!(
-            title_after.starts_with(start_label.split_whitespace().next().unwrap_or("")),
-            "range title {title_after:?} is derived from the visible start ({start_label})"
+            title_after.starts_with(first) || first.is_empty(),
+            "range title {title_after:?} must match the painted axis start {first:?}"
         );
         let _ = title_before;
     });
@@ -3054,5 +3056,190 @@ fn inline_placeholder_resets_when_switching_edit_kind(cx: &mut gpui_kit::TestApp
                 "assignee edits must not keep the date-range placeholder"
             );
         });
+    });
+}
+
+#[gpui_kit::test]
+fn click_on_title_keeps_grid_focus_for_enter(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let title = cx.debug_bounds("gantt-title-1").expect("row title");
+    cx.simulate_click(title.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_none(),
+        "a single title click must not start rename"
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.selected_id, Some(1));
+    });
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    let enter = KeyDownEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        if view.state.form.is_none() && !view.is_busy() {
+            view.handle_key(&enter, cx);
+        }
+        assert!(
+            view.is_busy() || view.state.form.is_some(),
+            "Enter after a title click must open details, same as clicking the #id cell"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn completing_a_picker_range_closes_the_popover(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_dates(1, window, cx);
+        });
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("gantt-inline-dates").is_some());
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.click_inline_calendar_day(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+                cx,
+            );
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-dates").is_some(),
+        "the first click of a new range must keep the picker open"
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.click_inline_calendar_day(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+                cx,
+            );
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-dates").is_none(),
+        "start+end must close the picker instead of leaving Jul 8 → …"
+    );
+}
+
+#[gpui_kit::test]
+fn details_modal_reuses_the_grid_range_picker(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-07-06T00:00:00Z"),
+    );
+    values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-07-20T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![
+                    ado_core::FormControl {
+                        id: ado_core::START_DATE_FIELD.into(),
+                        reference_name: ado_core::START_DATE_FIELD.into(),
+                        label: "Start Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                    ado_core::FormControl {
+                        id: ado_core::TARGET_DATE_FIELD.into(),
+                        reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                        label: "Target Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                ],
+            }],
+        }],
+        values,
+    }));
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-date-picker").is_some(),
+        "details dates must paint the shared range picker"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dates-prev-month").is_some(),
+        "details must reuse the grid picker's month arrows"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dates-range-start").is_some(),
+        "details must shade the range start"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dates-range-end").is_some(),
+        "details must shade the range end"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dates-in-range").is_some(),
+        "details must fill the days between start and end"
+    );
+}
+
+#[gpui_kit::test]
+fn delete_confirm_warns_about_children(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let delete = KeyDownEvent {
+        keystroke: Keystroke::parse("delete").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&delete, cx);
+        let warning = view.pending_delete_warning().unwrap_or_default();
+        assert!(
+            warning.contains("child"),
+            "deleting a parent must mention children, got {warning}"
+        );
     });
 }

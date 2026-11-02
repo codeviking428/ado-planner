@@ -1053,7 +1053,7 @@ async fn add_item_creates_a_work_item_on_the_team() {
     let before = state.nodes.len();
     state.add_item().await.expect("create");
     assert_eq!(state.nodes.len(), before + 1);
-    let created = state.nodes.last().expect("created");
+    let created = created_item(&state);
     assert_eq!(created.title, "New work item");
     assert_eq!(
         created.work_item_type, "Epic",
@@ -1061,6 +1061,12 @@ async fn add_item_creates_a_work_item_on_the_team() {
         created.work_item_type
     );
     assert_eq!(state.gantt.selected_id, Some(created.id));
+    let rows = state.gantt.flatten(&state.nodes);
+    assert_eq!(
+        rows.first().map(|row| row.id),
+        Some(created.id),
+        "a new root must appear at the top of the list, not mid-tree"
+    );
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
         message.contains(&format!("Created #{} {}", created.id, created.title)),
@@ -1081,7 +1087,7 @@ async fn add_item_keeps_the_selected_parent_after_reload() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.selected_id = Some(1005);
     state.add_item().await.expect("create");
-    let created = state.nodes.last().cloned().expect("created");
+    let created = created_item(&state);
     assert_eq!(
         created.parent_id,
         Some(1005),
@@ -1104,7 +1110,7 @@ async fn add_item_keeps_the_selected_parent_after_reload() {
 async fn undo_created_item_deletes_it() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.add_item().await.expect("create");
-    let created = state.nodes.last().cloned().expect("created");
+    let created = created_item(&state);
     let undo = state
         .toasts
         .items
@@ -1122,7 +1128,7 @@ async fn undo_created_item_deletes_it() {
 async fn ctrl_z_undoes_create_from_the_history_stack() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.add_item().await.expect("create");
-    let created = state.nodes.last().cloned().expect("created");
+    let created = created_item(&state);
     assert!(
         matches!(
             state.history.undo.last(),
@@ -1161,7 +1167,7 @@ async fn failed_delete_surfaces_an_error_toast() {
 async fn delete_item_dismisses_create_undo_toast() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.add_item().await.expect("create");
-    let created = state.nodes.last().cloned().expect("created");
+    let created = created_item(&state);
     assert!(
         state.toasts.items.iter().any(|toast| {
             matches!(
@@ -1191,7 +1197,7 @@ async fn delete_item_dismisses_create_undo_toast() {
 async fn undo_create_drops_date_history_for_that_item() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.add_item().await.expect("create");
-    let created = state.nodes.last().cloned().expect("created");
+    let created = created_item(&state);
     state.history.undo.push(HistoryEntry::Dates {
         id: created.id,
         before_start: None,
@@ -1236,7 +1242,7 @@ async fn add_item_under_a_user_story_creates_a_task() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.selected_id = Some(1003);
     state.add_item().await.expect("create");
-    let created = state.nodes.last().expect("created");
+    let created = created_item(&state);
     assert_eq!(
         created.parent_id,
         Some(1003),
@@ -1301,6 +1307,16 @@ async fn server_dates(mock: &ado_mock::AdoMock, id: i64) -> (Option<Date>, Optio
                 .and_then(|value| value.as_str()),
         ),
     )
+}
+
+fn created_item(state: &PlannerState) -> ado_core::WorkItemNode {
+    let id = state.gantt.selected_id.expect("selected created item");
+    state
+        .nodes
+        .iter()
+        .find(|node| node.id == id)
+        .cloned()
+        .expect("created")
 }
 
 fn live_dates(state: &PlannerState, id: i64) -> (Option<Date>, Option<Date>) {

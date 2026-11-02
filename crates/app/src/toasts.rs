@@ -108,7 +108,14 @@ pub struct Toasts {
 }
 
 impl Toasts {
+    fn dismiss_success(&mut self) {
+        self.items.retain(|toast| toast.kind != ToastKind::Success);
+    }
+
     pub fn push(&mut self, kind: ToastKind, message: impl Into<String>) -> u64 {
+        if kind == ToastKind::Success {
+            self.dismiss_success();
+        }
         self.next_id += 1;
         let copyable = kind == ToastKind::Error;
         self.items.push(Toast {
@@ -145,7 +152,7 @@ impl Toasts {
     }
 
     pub fn push_undo(&mut self, message: impl Into<String>, undo: UndoAction) -> u64 {
-        self.dismiss_undo();
+        self.dismiss_success();
         self.next_id += 1;
         self.items.push(Toast {
             id: self.next_id,
@@ -247,21 +254,18 @@ mod tests {
                 rev: 1,
             },
         );
-        assert_eq!(toasts.items.len(), 2);
-        assert!(
+        assert_eq!(
+            toasts.items.len(),
+            1,
+            "a new action must drop the stale Undid toast, got {:?}",
             toasts
                 .items
                 .iter()
-                .filter(|toast| toast.undo.is_some())
-                .count()
-                == 1
+                .map(|toast| toast.message.as_str())
+                .collect::<Vec<_>>()
         );
-        assert!(
-            toasts
-                .items
-                .iter()
-                .any(|toast| toast.message == "Undid: A dates")
-        );
+        assert_eq!(toasts.items[0].message, "Moved B");
+        assert!(toasts.items[0].undo.is_some());
     }
 
     #[test]

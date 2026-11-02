@@ -474,6 +474,30 @@ impl GanttView {
         self.zoom_at(factor, 0.0, 0.0);
     }
 
+    /// Nice +/− stops so 100% → 125% → 150% instead of 100 → 74 → …
+    pub const ZOOM_STEPS: [f32; 9] = [0.4, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+
+    pub fn next_zoom(zoom: f32, direction: i32) -> f32 {
+        if direction >= 0 {
+            Self::ZOOM_STEPS
+                .into_iter()
+                .find(|&step| step > zoom + 0.001)
+                .unwrap_or(4.0)
+        } else {
+            Self::ZOOM_STEPS
+                .into_iter()
+                .rfind(|&step| step < zoom - 0.001)
+                .unwrap_or(0.4)
+        }
+    }
+
+    pub fn zoom_step_at_center(&mut self, direction: i32) {
+        let next = Self::next_zoom(self.zoom, direction);
+        if self.zoom > 0.0 {
+            self.zoom_at_center(next / self.zoom);
+        }
+    }
+
     /// Pixel width of the scale period that contains `date` (a month at Month).
     pub fn period_width(&self, date: Date) -> f32 {
         let start = self.scale.floor_date(date);
@@ -492,8 +516,16 @@ impl GanttView {
     }
 
     pub fn viewport_range_title(&self) -> String {
-        let start = self.viewport_start_date();
-        let end = self.date_for_x((self.timeline_width.max(1.0) - 1.0).max(0.0));
+        let width = self.timeline_width.max(1.0);
+        // Follow the first painted axis tick so a leftover previous month that
+        // the sticky header skipped is not claimed in the toolbar.
+        let start = self
+            .header_tick_labels(width)
+            .into_iter()
+            .find(|(x, _)| *x >= 0.0)
+            .map(|(x, _)| self.date_for_x(x))
+            .unwrap_or_else(|| self.viewport_start_date());
+        let end = self.date_for_x((width - 1.0).max(0.0));
         match self.scale {
             GanttScale::Month if start.month() != end.month() || start.year() != end.year() => {
                 if start.year() == end.year() {
@@ -1029,28 +1061,28 @@ impl GanttView {
     }
 
     /// Skip a major label that would sit on the Today flag (Day zoom).
+    /// Pin that month to x = 0 instead of dropping it, so "Nov 2026" stays
+    /// visible when Today is the 2nd.
     pub fn header_major_labels_except(
         &self,
         width: f32,
         hide_x: Option<f32>,
     ) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 80.0;
-        let mut skip_sticky = false;
         let ticks: Vec<(f32, String)> = self
             .timeline_ticks(width)
             .into_iter()
             .filter(|tick| tick.major)
-            .filter_map(|tick| {
-                if hide_x.is_some_and(|x| (tick.x - x).abs() < HIDE_PAD) {
-                    if tick.x <= HIDE_PAD {
-                        skip_sticky = true;
-                    }
-                    return None;
-                }
-                Some((tick.x, tick.major_label))
+            .map(|tick| {
+                let x = if hide_x.is_some_and(|today| (tick.x - today).abs() < HIDE_PAD) {
+                    0.0
+                } else {
+                    tick.x
+                };
+                (x, tick.major_label)
             })
             .collect();
-        Self::sticky_header_labels(ticks, skip_sticky)
+        Self::sticky_header_labels(ticks, false)
     }
 
     /// Month (or day/week) tick labels, with the in-view period stuck at x = 0
@@ -1059,10 +1091,11 @@ impl GanttView {
         self.header_tick_labels_except(width, None)
     }
 
-    /// Skip empty Year ticks and the Day number sitting under the Today line.
+    /// Skip empty Year ticks. Shift the Day number off the Today line so "2"
+    /// stays readable instead of hiding it.
     pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 22.0;
-        let mut skip_sticky = false;
+        const SHIFT: f32 = 16.0;
         let ticks: Vec<(f32, String)> = self
             .timeline_ticks(width)
             .into_iter()
@@ -1070,16 +1103,13 @@ impl GanttView {
                 if tick.label.is_empty() {
                     return None;
                 }
-                if hide_x.is_some_and(|x| (tick.x - x).abs() < HIDE_PAD) {
-                    if tick.x <= HIDE_PAD {
-                        skip_sticky = true;
-                    }
-                    return None;
+                if let Some(today) = hide_x.filter(|x| (tick.x - x).abs() < HIDE_PAD) {
+                    return Some((today + SHIFT, tick.label));
                 }
                 Some((tick.x, tick.label))
             })
             .collect();
-        Self::sticky_header_labels(ticks, skip_sticky)
+        Self::sticky_header_labels(ticks, false)
     }
 
     fn sticky_header_labels(
@@ -1246,24 +1276,40 @@ impl GanttView {
                 };
                 let y1 = pred.y + ROW_HEIGHT / 2.0;
                 let y2 = bar.y + ROW_HEIGHT / 2.0;
-                let lane_y = if (pred.y - bar.y).abs() < 1.0 {
-                    y1
-                } else {
-                    pred.y.min(bar.y) + ROW_HEIGHT
-                };
-                let x1 = pred.x + pred.width + STUB;
+                let far_apart = (pred.y - bar.y).abs() > ROW_HEIGHT + 1.0;
+                let x_out = pred.x + pred.width + STUB;
                 let x_head = bar.x;
-                let x2 = bar.x - STUB;
-                out.push(DependencyArrow {
-                    from_id: *pred_id,
-                    to_id: bar.id,
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    x_head,
-                    lane_y,
-                });
+                if far_apart {
+                    // Route to the right of both bars so the long vertical does
+                    // not slice through intervening placeholder bars.
+                    let wrap_x = pred.x.max(bar.x) + pred.width.max(bar.width) + STUB;
+                    out.push(DependencyArrow {
+                        from_id: *pred_id,
+                        to_id: bar.id,
+                        x1: x_out,
+                        y1,
+                        x2: wrap_x,
+                        y2,
+                        x_head,
+                        lane_y: y1,
+                    });
+                } else {
+                    let lane_y = if (pred.y - bar.y).abs() < 1.0 {
+                        y1
+                    } else {
+                        pred.y.min(bar.y) + ROW_HEIGHT
+                    };
+                    out.push(DependencyArrow {
+                        from_id: *pred_id,
+                        to_id: bar.id,
+                        x1: x_out,
+                        y1,
+                        x2: bar.x - STUB,
+                        y2,
+                        x_head,
+                        lane_y,
+                    });
+                }
             }
         }
         out
@@ -2113,12 +2159,12 @@ mod tests {
             (today_x - gantt.x_for_date(oct1)).abs() > 20.0,
             "Today must not sit on the month gridline"
         );
-        let start = gantt.viewport_start_date();
         let title = gantt.viewport_range_title();
-        let start_label = gantt.scale.range_title(start);
+        let axis = gantt.header_tick_labels(gantt.timeline_width.max(800.0));
+        let first = axis.first().map(|(_, label)| label.as_str()).unwrap_or("");
         assert!(
-            title.starts_with(start_label.split_whitespace().next().unwrap_or("")),
-            "header {title:?} must start at the visible range ({start_label})"
+            title.starts_with(first) || first.is_empty(),
+            "header {title:?} must match the painted axis start {first:?}"
         );
     }
 
@@ -2127,12 +2173,16 @@ mod tests {
         let mut gantt = GanttView::default();
         let today = Date::new(2026, 11, 2).unwrap();
         gantt.go_today(today);
-        let start = gantt.viewport_start_date();
         let title = gantt.viewport_range_title();
-        let start_label = gantt.scale.range_title(start);
+        let axis = gantt.header_tick_labels(gantt.timeline_width.max(800.0));
+        let first = axis.first().map(|(_, label)| label.as_str()).unwrap_or("");
         assert!(
-            title.starts_with(start_label.split_whitespace().next().unwrap_or("")),
-            "header {title:?} must follow the visible start {start} ({start_label}), not the centre"
+            title.starts_with(first) || first.is_empty(),
+            "header {title:?} must match the painted axis start {first:?}, not a leftover month"
+        );
+        assert!(
+            !title.starts_with("Sep") || first.starts_with("Sep"),
+            "toolbar must not claim September when the axis starts later: {title} vs {axis:?}"
         );
     }
 
@@ -2610,26 +2660,111 @@ mod tests {
     }
 
     #[test]
-    fn day_header_hides_the_tick_under_today() {
+    fn day_header_keeps_the_month_and_shifts_today_number() {
         let today = Date::new(2026, 11, 2).unwrap();
         let gantt = GanttView {
             origin: today,
             scale: GanttScale::Day,
             zoom: 1.0,
+            timeline_width: 800.0,
             ..Default::default()
         };
         let today_x = gantt.today_x(today);
         let labels = gantt.header_tick_labels_except(800.0, Some(today_x));
         assert!(
-            labels.iter().all(|(x, _)| (x - today_x).abs() >= 22.0),
-            "today's day number must not sit under the Today line: {labels:?} today_x={today_x}"
+            labels.iter().any(|(_, label)| label == "2"),
+            "today's day number must stay visible: {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .filter(|(_, label)| label == "2")
+                .all(|(x, _)| (x - today_x).abs() >= 14.0),
+            "the 2 must sit off the Today line: {labels:?} today_x={today_x}"
         );
         let majors = gantt.header_major_labels_except(800.0, Some(today_x));
         assert!(
-            majors.iter().all(|(x, _)| (x - today_x).abs() >= 80.0),
-            "month label must not overlap the Today flag: {majors:?} today_x={today_x}"
+            majors.iter().any(|(_, label)| label.contains("Nov")),
+            "Day zoom must keep the Nov 2026 month label, got {majors:?}"
+        );
+        assert!(
+            majors
+                .iter()
+                .filter(|(_, label)| label.contains("Nov"))
+                .all(|(x, _)| (x - today_x).abs() >= 80.0 || *x <= 1.0),
+            "month label must not sit on the Today flag: {majors:?} today_x={today_x}"
         );
         assert_eq!(gantt.scale.tick_label(today), "2");
+    }
+
+    #[test]
+    fn zoom_steps_land_on_nice_percentages() {
+        assert_eq!(GanttView::next_zoom(1.0, 1), 1.25);
+        assert_eq!(GanttView::next_zoom(1.25, 1), 1.5);
+        assert_eq!(GanttView::next_zoom(1.0, -1), 0.75);
+        assert_eq!(GanttView::next_zoom(0.74, 1), 0.75);
+    }
+
+    #[test]
+    fn auto_fit_toolbar_matches_the_painted_axis() {
+        let mut item = node(1, None);
+        item.start_date = Some("2026-07-01T00:00:00Z".into());
+        item.target_date = Some("2026-10-15T00:00:00Z".into());
+        let nodes = vec![item];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 1, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.auto_fit(&nodes, &[], 800.0);
+        let title = gantt.viewport_range_title();
+        let axis = gantt.header_tick_labels(800.0);
+        let first = axis.first().map(|(_, label)| label.as_str()).unwrap_or("");
+        assert!(
+            title.starts_with(first) || first.is_empty(),
+            "toolbar {title:?} must match the first axis tick {first:?} ({axis:?})"
+        );
+        assert!(
+            !title.starts_with("Jun") || first.starts_with("Jun"),
+            "toolbar must not say June when the axis starts in July: {title} vs {axis:?}"
+        );
+    }
+
+    #[test]
+    fn far_apart_dependency_wraps_to_the_right_of_both_bars() {
+        let mut a = node(1, None);
+        let mut b = node(2, None);
+        let mut c = node(3, None);
+        a.parent_id = None;
+        b.parent_id = Some(1);
+        c.parent_id = None;
+        c.start_date = Some("2026-07-21T00:00:00Z".into());
+        c.target_date = Some("2026-08-04T00:00:00Z".into());
+        c.predecessors = vec![1];
+        let nodes = vec![a, b, c];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 1);
+        let pred = bars.iter().find(|bar| bar.id == 1).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 3).unwrap();
+        assert!(
+            (succ.y - pred.y).abs() > ROW_HEIGHT + 1.0,
+            "fixture must place the successor at least two rows below"
+        );
+        assert!(
+            arrows[0].x2 >= pred.x + pred.width && arrows[0].x2 >= succ.x + succ.width,
+            "the long vertical must sit to the right of both bars, got x2={} pred_right={} succ_right={}",
+            arrows[0].x2,
+            pred.x + pred.width,
+            succ.x + succ.width
+        );
     }
 
     #[test]
