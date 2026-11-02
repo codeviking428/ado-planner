@@ -93,6 +93,10 @@ async fn save_toast_uses_display_names_and_skips_unchanged_fields() {
         "toast should use the display name, got {message}"
     );
     assert!(
+        message.contains("\"Persist cart\"") && message.contains("\"Persist cart (named)\""),
+        "rename toasts must quote both names, got {message}"
+    );
+    assert!(
         !message.to_lowercase().contains("storypoints"),
         "unchanged fields must stay out of the toast: {message}"
     );

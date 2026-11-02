@@ -20,7 +20,7 @@ use crate::error::AppError;
 use crate::form::FormDraft;
 use crate::gantt::{
     GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView, VisibleRow,
-    insert_index_for_child,
+    insert_index_for_sibling,
 };
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
@@ -1336,9 +1336,6 @@ impl PlannerState {
             return None;
         }
         let _ = self.apply_optimistic_partial(id, start, target);
-        if let Some(date) = start.or(target) {
-            self.gantt.reveal_date(date);
-        }
         if self.history_recording {
             self.record_dates(id, &previous, after_start.clone(), after_target.clone());
         }
@@ -1888,25 +1885,27 @@ impl PlannerState {
             return Err(AppError::message("Choose a Team first"));
         };
         let types = self.types();
-        let parent = self
-            .gantt
-            .selected_id
-            .and_then(|id| self.nodes.iter().find(|node| node.id == id));
-        let work_item_type =
-            child_work_item_type(parent.map(|node| node.work_item_type.as_str()), &types);
-        let area = parent
-            .map(|node| node.area_path.clone())
-            .or_else(|| self.nodes.first().map(|node| node.area_path.clone()))
-            .unwrap_or_else(|| scope.project.clone());
-        let iteration = parent
-            .map(|node| node.iteration_path.clone())
-            .filter(|path| !path.is_empty())
-            .or_else(|| {
-                let path = self.prefs.planner.iteration_path.clone();
-                (!path.is_empty()).then_some(path)
-            })
-            .unwrap_or_default();
-        let parent_id = parent.map(|node| node.id);
+        let selected_id = self.gantt.selected_id;
+        let (parent_id, work_item_type, area, iteration) = {
+            let selected = selected_id.and_then(|id| self.nodes.iter().find(|node| node.id == id));
+            let parent_id = selected.and_then(|node| node.parent_id);
+            let parent = parent_id.and_then(|id| self.nodes.iter().find(|node| node.id == id));
+            let work_item_type =
+                child_work_item_type(parent.map(|node| node.work_item_type.as_str()), &types);
+            let area = selected
+                .map(|node| node.area_path.clone())
+                .or_else(|| self.nodes.first().map(|node| node.area_path.clone()))
+                .unwrap_or_else(|| scope.project.clone());
+            let iteration = selected
+                .map(|node| node.iteration_path.clone())
+                .filter(|path| !path.is_empty())
+                .or_else(|| {
+                    let path = self.prefs.planner.iteration_path.clone();
+                    (!path.is_empty()).then_some(path)
+                })
+                .unwrap_or_default();
+            (parent_id, work_item_type, area, iteration)
+        };
         let mut ops = vec![
             ado_core::JsonPatchOp {
                 op: ado_core::PatchOp::Add,
@@ -1943,7 +1942,7 @@ impl PlannerState {
                 }
                 let id = node.id;
                 let title = node.title.clone();
-                let insert_at = insert_index_for_child(&self.nodes, parent_id);
+                let insert_at = insert_index_for_sibling(&self.nodes, selected_id);
                 self.nodes.insert(insert_at, node);
                 self.gantt.selected_id = Some(id);
                 let rows = self.gantt.flatten(&self.nodes);
@@ -2695,7 +2694,13 @@ impl PlannerState {
         previous: &WorkItemNode,
     ) {
         self.toasts.push_undo(
-            dates_moved_message(&self.item_title(id), start, target),
+            dates_changed_message(
+                &self.item_title(id),
+                parse_iso_date(previous.start_date.as_deref()),
+                parse_iso_date(previous.target_date.as_deref()),
+                start,
+                target,
+            ),
             UndoAction::RestoreDates {
                 id,
                 start_date: previous.start_date.clone(),
@@ -2744,11 +2749,16 @@ impl PlannerState {
                 start_date,
                 target_date,
                 ..
-            } => dates_moved_message(
-                &self.item_title(*id),
-                parse_iso_date(start_date.as_deref()),
-                parse_iso_date(target_date.as_deref()),
-            ),
+            } => {
+                let live = self.nodes.iter().find(|node| node.id == *id);
+                dates_undo_message(
+                    &self.item_title(*id),
+                    parse_iso_date(start_date.as_deref()),
+                    parse_iso_date(target_date.as_deref()),
+                    live.and_then(|node| parse_iso_date(node.start_date.as_deref())),
+                    live.and_then(|node| parse_iso_date(node.target_date.as_deref())),
+                )
+            }
             UndoAction::RestoreFields { id, fields } => {
                 let title = self.item_title(*id);
                 match fields.as_slice() {
@@ -2777,11 +2787,15 @@ impl PlannerState {
         match entry {
             HistoryEntry::Dates {
                 id,
+                before_start,
+                before_target,
                 after_start,
                 after_target,
                 ..
-            } => dates_moved_message(
+            } => dates_changed_message(
                 &self.item_title(*id),
+                parse_iso_date(before_start.as_deref()),
+                parse_iso_date(before_target.as_deref()),
                 parse_iso_date(after_start.as_deref()),
                 parse_iso_date(after_target.as_deref()),
             ),
@@ -2807,7 +2821,7 @@ impl PlannerState {
             self.history_action_message(entry)
         };
         let message = if is_undo {
-            format!("Undone: {original}")
+            undone_message(&original)
         } else {
             format!("Redid: {original}")
         };
@@ -2820,14 +2834,26 @@ impl PlannerState {
                 id,
                 before_start,
                 before_target,
+                after_start,
+                after_target,
                 ..
-            } => dates_moved_message(
+            } => dates_undo_message(
                 &self.item_title(*id),
                 parse_iso_date(before_start.as_deref()),
                 parse_iso_date(before_target.as_deref()),
+                parse_iso_date(after_start.as_deref()),
+                parse_iso_date(after_target.as_deref()),
             ),
             other => self.history_action_message(other),
         }
+    }
+}
+
+pub(crate) fn undone_message(original: &str) -> String {
+    let mut chars = original.chars();
+    match chars.next() {
+        Some(first) => format!("Undone {}{}", first.to_lowercase(), chars.as_str()),
+        None => "Undone".into(),
     }
 }
 
@@ -2852,6 +2878,52 @@ pub(crate) fn dates_moved_message(
     }
 }
 
+fn dates_changed_message(
+    title: &str,
+    before_start: Option<Date>,
+    before_target: Option<Date>,
+    after_start: Option<Date>,
+    after_target: Option<Date>,
+) -> String {
+    let was_clear = before_start.is_none() && before_target.is_none();
+    let now_clear = after_start.is_none() && after_target.is_none();
+    if was_clear && !now_clear {
+        match (after_start, after_target) {
+            (Some(start), Some(target)) => format!(
+                "Scheduled {title} {} → {}",
+                toast_date(start),
+                toast_date(target)
+            ),
+            (Some(start), None) => format!("Scheduled {title} {}", toast_date(start)),
+            (None, Some(target)) => format!("Scheduled {title} {}", toast_date(target)),
+            _ => format!("Scheduled {title}"),
+        }
+    } else {
+        dates_moved_message(title, after_start, after_target)
+    }
+}
+
+fn dates_undo_message(
+    title: &str,
+    before_start: Option<Date>,
+    before_target: Option<Date>,
+    after_start: Option<Date>,
+    after_target: Option<Date>,
+) -> String {
+    let was_clear = before_start.is_none() && before_target.is_none();
+    if was_clear {
+        dates_changed_message(
+            title,
+            before_start,
+            before_target,
+            after_start,
+            after_target,
+        )
+    } else {
+        dates_moved_message(title, before_start, before_target)
+    }
+}
+
 fn created_message(title: &str) -> String {
     let title = title.trim();
     if title.is_empty() {
@@ -2862,7 +2934,7 @@ fn created_message(title: &str) -> String {
 }
 
 fn renamed_message(old: &str, new: &str) -> String {
-    format!("Renamed {old} to {new}")
+    format!("Renamed \"{old}\" to \"{new}\"")
 }
 
 fn field_changes_message(title: &str, changes: &[(String, Value, Value)]) -> String {
@@ -3286,6 +3358,18 @@ mod toast_copy_tests {
         assert!(
             message.contains('\u{00a0}'),
             "the range must use a non-breaking space so '18' cannot wrap alone, got {message}"
+        );
+    }
+
+    #[test]
+    fn undo_prefix_has_no_double_colon() {
+        use super::undone_message;
+        let message = undone_message("Added link: A → B");
+        assert_eq!(message, "Undone added link: A → B");
+        assert_eq!(message.matches(':').count(), 1);
+        assert_eq!(
+            undone_message("Renamed \"Cart\" to \"Basket\""),
+            "Undone renamed \"Cart\" to \"Basket\""
         );
     }
 }

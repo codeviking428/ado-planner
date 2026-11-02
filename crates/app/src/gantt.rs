@@ -41,6 +41,8 @@ pub const TODAY_PILL_W: f32 = 44.0;
 pub const TODAY_PILL_GAP: f32 = 6.0;
 const MAJOR_LABEL_ESTIMATE: f32 = 76.0;
 const TICK_MIN_GAP: f32 = 18.0;
+/// Keep edge tick/year labels off the clip, and gridlines off the last 1px.
+const HEADER_EDGE_PAD: f32 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GanttScale {
@@ -193,6 +195,11 @@ fn compact_date_span(start: Date, end: Date) -> String {
     }
 }
 
+fn quarter_title(date: Date) -> String {
+    let q = ((date.month() as i32 - 1) / 3) + 1;
+    format!("{} Q{q}", date.year())
+}
+
 fn month_abbrev(date: Date) -> &'static str {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -341,6 +348,12 @@ impl DependencyArrow {
         } else {
             self.x2.min(self.x_head)
         }
+    }
+
+    /// × sits on the predecessor row, not at the polyline midpoint (which
+    /// lands on other rows for wrap-around links).
+    pub fn remove_control_pos(&self) -> (f32, f32) {
+        (self.x1, self.y1)
     }
 
     pub fn gutter_y(&self) -> f32 {
@@ -567,7 +580,7 @@ impl GanttView {
     pub fn leading_period_width(&self, width: f32) -> f32 {
         self.header_tick_labels(width)
             .into_iter()
-            .find(|(x, _)| *x > 1.0)
+            .find(|(x, _)| *x > HEADER_EDGE_PAD + 1.0)
             .map(|(x, _)| x)
             .unwrap_or(0.0)
     }
@@ -577,26 +590,45 @@ impl GanttView {
         let width = self.timeline_width.max(1.0);
         let end = self.date_for_x((width - 1.0).max(0.0));
         match self.scale {
-            GanttScale::Month if start.month() != end.month() || start.year() != end.year() => {
-                if start.year() == end.year() {
-                    format!(
-                        "{} – {} {}",
-                        month_abbrev(start),
-                        month_abbrev(end),
-                        start.year()
-                    )
+            GanttScale::Month => {
+                if start.month() != end.month() || start.year() != end.year() {
+                    if start.year() == end.year() {
+                        format!(
+                            "{} – {} {}",
+                            month_abbrev(start),
+                            month_abbrev(end),
+                            start.year()
+                        )
+                    } else {
+                        format!(
+                            "{} {} – {} {}",
+                            month_abbrev(start),
+                            start.year(),
+                            month_abbrev(end),
+                            end.year()
+                        )
+                    }
                 } else {
-                    format!(
-                        "{} {} – {} {}",
-                        month_abbrev(start),
-                        start.year(),
-                        month_abbrev(end),
-                        end.year()
-                    )
+                    self.scale.range_title(start)
                 }
             }
             GanttScale::Day | GanttScale::Week => compact_date_span(start, end),
-            _ => self.scale.range_title(start),
+            GanttScale::Quarter => {
+                let left = quarter_title(start);
+                let right = quarter_title(end);
+                if left == right {
+                    left
+                } else {
+                    format!("{left} – {right}")
+                }
+            }
+            GanttScale::Year => {
+                if start.year() == end.year() {
+                    start.year().to_string()
+                } else {
+                    format!("{} – {}", start.year(), end.year())
+                }
+            }
         }
     }
 
@@ -683,7 +715,13 @@ impl GanttView {
         }
         let width = self.timeline_width.max(1.0);
         let center = self.date_for_x(width * 0.5);
+        let current_ppd = self.scale.pixels_per_day(self.zoom);
         self.scale = scale;
+        // Keep day-width when we can, but never zoom a scale so far that a
+        // single period fills the viewport (Year at 400% showed one column).
+        let period_days = scale.step_days().max(1) as f32;
+        let max_zoom = (width / (scale.base_pixels_per_day() * period_days * 1.6)).clamp(0.4, 4.0);
+        self.zoom = (current_ppd / scale.base_pixels_per_day()).clamp(0.4, max_zoom);
         self.origin = center;
         self.scroll_x = 0.0;
         let x = self.x_for_date(center);
@@ -1139,13 +1177,16 @@ impl GanttView {
             return Vec::new();
         }
         let left = self.date_for_x(-ppd);
-        let right = self.date_for_x(width + ppd);
+        let right = self.date_for_x(width + ppd.max(1.0));
         let mut date = self.scale.floor_date(left);
         let mut ticks = Vec::new();
         let mut last_major = String::new();
         let mut guard = 0;
-        while date <= right && guard < 512 {
+        while guard < 512 {
             let x = self.x_for_date(date);
+            if x > width + 1.0 && date > right {
+                break;
+            }
             let major_label = self.scale.major_label(date);
             let major = major_label != last_major;
             if major {
@@ -1203,7 +1244,8 @@ impl GanttView {
                 (x, tick.major_label)
             })
             .collect();
-        Self::sticky_header_labels(ticks, false, 72.0)
+        let labels = Self::sticky_header_labels(ticks, false, 72.0);
+        Self::fit_labels_to_width(labels, width)
     }
 
     /// Month (or day/week) tick labels, with the in-view period stuck at x = 0
@@ -1243,19 +1285,23 @@ impl GanttView {
         {
             ticks[index].0 = today + SHIFT;
         }
-        let mut labels = Self::space_header_labels(
+        let labels = Self::space_header_labels(
             Self::sticky_header_labels(ticks, false, TICK_MIN_GAP),
             TICK_MIN_GAP,
         );
+        Self::fit_labels_to_width(labels, width)
+    }
+
+    fn fit_labels_to_width(mut labels: Vec<(f32, String)>, width: f32) -> Vec<(f32, String)> {
         if let Some((x, _)) = labels.first_mut()
-            && *x < 0.0
+            && *x < HEADER_EDGE_PAD
         {
-            *x = 0.0;
+            *x = HEADER_EDGE_PAD;
         }
         if let Some((x, label)) = labels.last() {
             let w = header_label_px(label);
-            if *x + w > width {
-                let shifted = (width - w).max(0.0);
+            if *x + w > width - HEADER_EDGE_PAD {
+                let shifted = (width - HEADER_EDGE_PAD - w).max(HEADER_EDGE_PAD);
                 let collision = labels
                     .len()
                     .checked_sub(2)
@@ -1304,10 +1350,11 @@ impl GanttView {
         labels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let mut out: Vec<(f32, String)> = Vec::new();
         for (x, label) in labels {
-            if let Some((prev, _)) = out.last()
-                && (x - prev).abs() < min_gap
-            {
-                continue;
+            if let Some((prev_x, prev_label)) = out.last() {
+                let need = header_label_px(prev_label).max(min_gap);
+                if x - prev_x < need {
+                    continue;
+                }
             }
             out.push((x, label));
         }
@@ -1462,9 +1509,17 @@ impl GanttView {
                 let x_out = pred_right + STUB;
                 let x_head = bar.x;
                 if far_apart {
-                    // Route past bars and their external titles so the vertical
-                    // does not run through a floating label.
-                    let wrap_x = pred_right.max(bar_label_right(bar)) + STUB;
+                    // Route past every bar and title between the two rows so
+                    // the vertical does not run through a floating label.
+                    let y_min = pred.y.min(bar.y);
+                    let y_max = pred.y.max(bar.y);
+                    let mut wrap_x = pred_right.max(bar_label_right(bar));
+                    for other in bars {
+                        if other.y + ROW_HEIGHT >= y_min && other.y <= y_max + ROW_HEIGHT {
+                            wrap_x = wrap_x.max(bar_label_right(other));
+                        }
+                    }
+                    let wrap_x = wrap_x + STUB;
                     out.push(DependencyArrow {
                         from_id: *pred_id,
                         to_id: bar.id,
@@ -1504,6 +1559,30 @@ fn parse_type_color(hex: &str) -> u32 {
 
 fn header_label_px(label: &str) -> f32 {
     (label.chars().count() as f32 * 7.0 + 8.0).max(14.0)
+}
+
+/// Child start before the parent, or child target after the parent.
+pub fn parent_date_overflow(nodes: &[WorkItemNode], id: i64) -> bool {
+    let Some(node) = nodes.iter().find(|node| node.id == id) else {
+        return false;
+    };
+    let Some(parent_id) = node.parent_id else {
+        return false;
+    };
+    let Some(parent) = nodes.iter().find(|node| node.id == parent_id) else {
+        return false;
+    };
+    let child_start = parse_iso_date(node.start_date.as_deref());
+    let child_end = parse_iso_date(node.target_date.as_deref());
+    let parent_start = parse_iso_date(parent.start_date.as_deref());
+    let parent_end = parse_iso_date(parent.target_date.as_deref());
+    matches!(
+        (child_start, parent_start),
+        (Some(child), Some(parent)) if child < parent
+    ) || matches!(
+        (child_end, parent_end),
+        (Some(child), Some(parent)) if child > parent
+    )
 }
 
 fn bar_title_px(title: &str) -> f32 {
@@ -1601,6 +1680,15 @@ pub fn flatten_visible(nodes: &[WorkItemNode], collapsed: &HashSet<i64>) -> Vec<
         walk(id, 0, &children, collapsed, &mut out);
     }
     out
+}
+
+/// Index after `selected_id` and its descendants so a new sibling lands next
+/// to the selection instead of nesting under it.
+pub fn insert_index_for_sibling(nodes: &[WorkItemNode], selected_id: Option<i64>) -> usize {
+    let Some(id) = selected_id else {
+        return nodes.len();
+    };
+    insert_index_for_child(nodes, Some(id))
 }
 
 /// Index at which a newly created child should land so flatten order appends
@@ -2773,7 +2861,7 @@ mod tests {
     }
 
     #[test]
-    fn link_remove_sits_at_the_polyline_midpoint() {
+    fn link_remove_sits_on_the_predecessor_row() {
         let arrow = DependencyArrow {
             from_id: 1,
             to_id: 2,
@@ -2784,15 +2872,13 @@ mod tests {
             x_head: 412.0,
             lane_y: 200.0,
         };
-        let mid = arrow.midpoint();
-        let last_run = ((arrow.x1 + arrow.x2) * 0.5, arrow.lane_y);
+        let (x, y) = arrow.remove_control_pos();
+        assert_eq!(x, arrow.x1);
+        assert_eq!(y, arrow.y1);
         assert!(
-            (mid.0 - last_run.0).abs() > 40.0,
-            "× must follow path length, not the last horizontal; got {mid:?} vs {last_run:?}"
-        );
-        assert!(
-            (mid.1 - arrow.lane_y).abs() < 1.0,
-            "a long lane should own the midpoint, got {mid:?}"
+            (y - arrow.y2).abs() > ROW_HEIGHT,
+            "× must not sit on the successor row, got y={y} y2={}",
+            arrow.y2
         );
     }
 
@@ -3059,8 +3145,8 @@ mod tests {
         let oct = majors.iter().find(|(_, label)| label.contains("Oct"));
         let nov = majors.iter().find(|(_, label)| label.contains("Nov"));
         assert!(
-            oct.is_some_and(|(x, _)| *x <= 1.0),
-            "October days on the left need an Oct label at x=0, got {majors:?}"
+            oct.is_some_and(|(x, _)| *x <= HEADER_EDGE_PAD + 0.1),
+            "October days on the left need an Oct label at the left pad, got {majors:?}"
         );
         assert!(
             nov.is_some_and(|(x, _)| *x > today_x + TODAY_PILL_W && *x > 8.0),
@@ -3085,9 +3171,10 @@ mod tests {
             "Day 24 must stay on the axis, got {texts:?}"
         );
         if let Some((x, label)) = labels.last() {
+            let w = (label.chars().count() as f32 * 7.0 + 8.0).max(14.0);
             assert!(
-                *x + 18.0 <= 800.1,
-                "rightmost tick {label} at {x} must not clip past the timeline"
+                *x + w <= 800.0 - HEADER_EDGE_PAD + 0.1,
+                "rightmost tick {label} at {x} width {w} must sit inside the right pad"
             );
         }
     }
@@ -3178,12 +3265,12 @@ mod tests {
         for (x, label) in &labels {
             let w = (label.chars().count() as f32 * 7.0 + 8.0).max(14.0);
             assert!(
-                *x >= -0.1,
-                "week tick {label:?} at {x} must not clip the left edge"
+                *x >= HEADER_EDGE_PAD - 0.1,
+                "week tick {label:?} at {x} must sit inside the left pad"
             );
             assert!(
-                *x + w <= 800.1,
-                "week tick {label:?} at {x} width {w} must not clip the right edge"
+                *x + w <= 800.0 - HEADER_EDGE_PAD + 0.1,
+                "week tick {label:?} at {x} width {w} must sit inside the right pad"
             );
         }
     }
@@ -3327,6 +3414,9 @@ mod tests {
         assert_eq!(insert_index_for_child(&nodes, Some(2)), 3);
         assert_eq!(insert_index_for_child(&nodes, None), 4);
         assert_eq!(insert_index_for_child(&nodes, Some(4)), 4);
+        assert_eq!(insert_index_for_sibling(&nodes, Some(2)), 3);
+        assert_eq!(insert_index_for_sibling(&nodes, Some(1)), 4);
+        assert_eq!(insert_index_for_sibling(&nodes, None), 4);
     }
 
     #[test]
@@ -3362,8 +3452,13 @@ mod tests {
         let mut b = node(2, None);
         let mut c = node(3, None);
         a.parent_id = None;
+        a.title = "Persist cart".into();
         b.parent_id = Some(1);
+        b.title = "Go-live milestone".into();
+        b.start_date = Some("2026-08-15T00:00:00Z".into());
+        b.target_date = Some("2026-08-15T00:00:00Z".into());
         c.parent_id = None;
+        c.title = "Unparented spike".into();
         c.start_date = Some("2026-07-21T00:00:00Z".into());
         c.target_date = Some("2026-08-04T00:00:00Z".into());
         c.predecessors = vec![1];
@@ -3377,16 +3472,20 @@ mod tests {
         let arrows = gantt.layout_dependency_arrows(&bars);
         assert_eq!(arrows.len(), 1);
         let pred = bars.iter().find(|bar| bar.id == 1).unwrap();
+        let mid = bars.iter().find(|bar| bar.id == 2).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 3).unwrap();
         assert!(
             (succ.y - pred.y).abs() > ROW_HEIGHT + 1.0,
             "fixture must place the successor at least two rows below"
         );
         assert!(
-            arrows[0].x2 >= bar_label_right(pred) && arrows[0].x2 >= bar_label_right(succ),
-            "the long vertical must sit to the right of bars and their titles, got x2={} pred_label={} succ_label={}",
+            arrows[0].x2 >= bar_label_right(pred)
+                && arrows[0].x2 >= bar_label_right(succ)
+                && arrows[0].x2 >= bar_label_right(mid),
+            "the long vertical must sit to the right of in-between labels, got x2={} pred={} mid={} succ={}",
             arrows[0].x2,
             bar_label_right(pred),
+            bar_label_right(mid),
             bar_label_right(succ)
         );
         assert!(
@@ -3399,6 +3498,152 @@ mod tests {
             arrows[0].stub_start(),
             succ.x
         );
+    }
+
+    #[test]
+    fn quarter_and_year_titles_span_the_visible_range() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 10, 1).unwrap(),
+            scale: GanttScale::Quarter,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let title = gantt.viewport_range_title();
+        assert!(
+            title.contains('–'),
+            "Quarter spanning two years must not collapse to Q1, got {title:?}"
+        );
+        assert!(
+            !title.ends_with("Q1") || title.contains('–'),
+            "a 2026–2027 Quarter span must not read only '2026 Q1', got {title:?}"
+        );
+        let mut year = gantt.clone();
+        year.scale = GanttScale::Year;
+        year.zoom = 1.0;
+        year.origin = Date::new(2026, 7, 1).unwrap();
+        year.scroll_x = 0.0;
+        let year_title = year.viewport_range_title();
+        let year_start = year.viewport_axis_start_date();
+        let year_end = year.date_for_x(799.0);
+        if year_end.year() != year_start.year() {
+            assert!(
+                year_title.contains('–')
+                    && year_title.contains(&year_start.year().to_string())
+                    && year_title.contains(&year_end.year().to_string()),
+                "Year spanning {year_start}–{year_end} must name both years, got {year_title:?}"
+            );
+        } else {
+            assert_eq!(year_title, year_start.year().to_string());
+        }
+    }
+
+    #[test]
+    fn year_major_labels_stay_inside_the_timeline() {
+        let gantt = GanttView {
+            origin: Date::new(2025, 1, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let labels = gantt.header_major_labels(800.0);
+        assert!(!labels.is_empty(), "Year view must paint year majors");
+        for (x, label) in &labels {
+            let w = header_label_px(label);
+            assert!(
+                *x >= HEADER_EDGE_PAD - 0.1,
+                "year label {label:?} at {x} must sit inside the left pad"
+            );
+            assert!(
+                *x + w <= 800.0 - HEADER_EDGE_PAD + 0.1,
+                "year label {label:?} at {x} width {w} must not clip a digit off the right edge"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_scale_changes_the_toolbar_percent() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 0.6,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let month = GanttScale::Month.toolbar_label(gantt.zoom, true);
+        gantt.set_scale(GanttScale::Year);
+        let year = GanttScale::Year.toolbar_label(gantt.zoom, true);
+        gantt.set_scale(GanttScale::Day);
+        let day = GanttScale::Day.toolbar_label(gantt.zoom, true);
+        assert_ne!(
+            month, year,
+            "Year zoom % must not copy Month's 60% after a scale change"
+        );
+        assert_ne!(
+            month, day,
+            "Day zoom % must not copy Month's 60% after a scale change"
+        );
+        assert!(month.contains('%') && year.contains('%') && day.contains('%'));
+    }
+
+    #[test]
+    fn month_ticks_are_not_cramped_together() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 8, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 0.4,
+            timeline_width: 400.0,
+            ..Default::default()
+        };
+        let labels = gantt.header_tick_labels(400.0);
+        for pair in labels.windows(2) {
+            let (x0, l0) = &pair[0];
+            let (x1, l1) = &pair[1];
+            let need = (l0.chars().count() as f32 * 7.0 + 8.0).max(18.0);
+            assert!(
+                x1 - x0 >= need - 0.5,
+                "ticks {l0:?}@{x0} and {l1:?}@{x1} are cramped (need {need})"
+            );
+        }
+    }
+
+    #[test]
+    fn day_gridlines_reach_the_right_edge() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 11, 2).unwrap(),
+            scale: GanttScale::Day,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let ticks = gantt.timeline_ticks(800.0);
+        let last = ticks
+            .iter()
+            .filter(|tick| tick.x <= 800.0)
+            .map(|tick| tick.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            800.0 - last < 50.0,
+            "last Day gridline at {last} is too far from the right edge"
+        );
+        assert!(
+            ticks.iter().any(|tick| tick.x >= 800.0),
+            "ticks must extend to or past the right edge so the last column is not clipped, last in-view {last}"
+        );
+    }
+
+    #[test]
+    fn child_outside_parent_dates_is_overflow() {
+        let mut parent = node(1, None);
+        parent.start_date = Some("2026-07-01T00:00:00Z".into());
+        parent.target_date = Some("2026-07-31T00:00:00Z".into());
+        let mut child = node(2, Some(1));
+        child.start_date = Some("2026-07-20T00:00:00Z".into());
+        child.target_date = Some("2026-08-15T00:00:00Z".into());
+        assert!(parent_date_overflow(&[parent.clone(), child.clone()], 2));
+        child.target_date = Some("2026-07-25T00:00:00Z".into());
+        assert!(!parent_date_overflow(&[parent, child], 2));
     }
 
     #[test]

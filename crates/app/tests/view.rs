@@ -8,7 +8,7 @@ use ado_planner::gantt::{
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
-use ado_planner::toasts::HistoryEntry;
+use ado_planner::toasts::{HistoryEntry, UndoAction};
 use ado_planner::ui::PlannerView;
 use ado_planner::ui::{
     date_field_text, dates_from_range_picker, dates_from_range_picker_in_years,
@@ -3269,6 +3269,54 @@ fn completing_a_picker_range_closes_the_popover(cx: &mut gpui_kit::TestAppContex
 }
 
 #[gpui_kit::test]
+fn picker_error_slot_is_reserved_before_a_parse_error(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_dates(1, window, cx);
+        });
+    });
+    draw(cx);
+    let before = cx
+        .debug_bounds("gantt-dates-error")
+        .expect("error slot must exist while the picker is clean");
+    assert!(
+        f32::from(before.size.height) >= 14.0,
+        "parse-error space must be reserved so the picker does not shift, height={}",
+        f32::from(before.size.height)
+    );
+    let picker_before = cx.debug_bounds("gantt-inline-dates").expect("picker");
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_inline_dates("foo", window, cx);
+        });
+    });
+    draw(cx);
+    let after = cx.debug_bounds("gantt-dates-error").expect("error slot");
+    let picker_after = cx.debug_bounds("gantt-inline-dates").expect("picker");
+    assert!(
+        (f32::from(after.size.height) - f32::from(before.size.height)).abs() < 1.0,
+        "error slot height must stay put, before={} after={}",
+        f32::from(before.size.height),
+        f32::from(after.size.height)
+    );
+    assert!(
+        (f32::from(picker_after.size.height) - f32::from(picker_before.size.height)).abs() < 2.0,
+        "the picker must not jump when a parse error appears, before={} after={}",
+        f32::from(picker_before.size.height),
+        f32::from(picker_after.size.height)
+    );
+}
+
+#[gpui_kit::test]
 fn invalid_typed_dates_keep_the_grid_picker_open(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -3318,6 +3366,139 @@ fn invalid_typed_dates_keep_the_grid_picker_open(cx: &mut gpui_kit::TestAppConte
         cx.debug_bounds("gantt-dates-error").is_some(),
         "the grid picker must show the parse error"
     );
+}
+
+#[gpui_kit::test]
+fn toast_undo_click_restores_dates_without_a_hit_through(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let before_start = state
+        .nodes
+        .iter()
+        .find(|node| node.id == 1)
+        .and_then(|node| node.start_date.clone());
+    let before_target = state
+        .nodes
+        .iter()
+        .find(|node| node.id == 1)
+        .and_then(|node| node.target_date.clone());
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 1) {
+        node.start_date = Some("2026-08-04T00:00:00Z".into());
+        node.target_date = Some("2026-08-21T00:00:00Z".into());
+    }
+    state.history.push(HistoryEntry::Dates {
+        id: 1,
+        before_start: before_start.clone(),
+        before_target: before_target.clone(),
+        after_start: Some("2026-08-04T00:00:00Z".into()),
+        after_target: Some("2026-08-21T00:00:00Z".into()),
+    });
+    state.toasts.push_undo(
+        "Moved Persist cart to Aug 4 → Aug 21",
+        UndoAction::RestoreDates {
+            id: 1,
+            start_date: before_start.clone(),
+            target_date: before_target.clone(),
+            rev: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let toast = cx.debug_bounds("planner-toast").expect("toast");
+    let undo = cx.debug_bounds("toast-undo").expect("toast Undo");
+    assert!(
+        f32::from(undo.size.width) >= 40.0,
+        "toast Undo must stay wide enough to click, width={} bounds={undo:?} toast={toast:?}",
+        f32::from(undo.size.width)
+    );
+    cx.simulate_mouse_move(undo.center(), None, gpui_kit::Modifiers::default());
+    draw(cx);
+    cx.simulate_click(undo.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let messages: Vec<String> = view
+            .state
+            .toasts
+            .items
+            .iter()
+            .map(|toast| toast.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.to_lowercase().starts_with("undone")),
+            "clicking Undo must apply, not only dismiss, got {messages:?}"
+        );
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .all(|toast| toast.undo.is_none()),
+            "the Undo control must consume the action instead of a hit-through no-op, got {messages:?}"
+        );
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "Undo must not start a bar gesture through the toast"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn toast_undo_while_busy_is_not_dropped(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.predecessors = vec![1];
+    }
+    state.toasts.push_undo(
+        "Added link: A → B",
+        UndoAction::RemoveLink {
+            successor_id: 2,
+            predecessor_id: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| {
+        view.set_busy_for_test(true);
+        let toast_id = view
+            .state
+            .toasts
+            .items
+            .last()
+            .map(|toast| toast.id)
+            .unwrap();
+        let action = view
+            .state
+            .toasts
+            .items
+            .last()
+            .and_then(|toast| toast.undo.clone())
+            .unwrap();
+        view.apply_toast_undo(toast_id, action, cx);
+        assert!(
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.id == 2)
+                .is_some_and(|node| node.predecessors.contains(&1)),
+            "a busy Undo must queue instead of dismissing as a no-op"
+        );
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .any(|toast| toast.undo.is_some()),
+            "the Undo toast must stay until the queued action runs"
+        );
+    });
 }
 
 #[gpui_kit::test]

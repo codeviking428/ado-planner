@@ -504,12 +504,84 @@ async fn toast_undo_after_picker_dates_restores_them() {
     assert_eq!(live.target_date, before_target);
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message.starts_with("Undone: Moved"),
+        message.starts_with("Undone moved"),
         "toast undo must describe the restored dates, got {message}"
     );
     assert!(
         !message.contains("Aug\u{00a0}4") && !message.contains("Aug 4"),
         "undo toast must not keep the forward dates, got {message}"
+    );
+}
+
+#[tokio::test]
+async fn scheduling_an_unscheduled_item_says_scheduled() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_none() && n.target_date.is_none())
+        .cloned()
+        .expect("unscheduled item");
+    let start = Date::new(2026, 11, 10).unwrap();
+    let target = Date::new(2026, 11, 12).unwrap();
+    let pending = state
+        .commit_range_dates_now(node.id, Some(start), Some(target))
+        .expect("schedule");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist schedule");
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.starts_with("Scheduled ") && message.contains('→'),
+        "scheduling an unscheduled item must say Scheduled, got {message}"
+    );
+    let action = state
+        .toasts
+        .items
+        .iter()
+        .rev()
+        .find_map(|toast| toast.undo.clone())
+        .expect("schedule toast undo");
+    let _ = state
+        .toast_restore_or_undo_dates(action)
+        .expect("undo schedule");
+    let undone = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        undone.to_lowercase().starts_with("undone scheduled"),
+        "undoing a schedule must not say Cleared dates, got {undone}"
+    );
+    assert!(
+        !undone.to_lowercase().contains("cleared dates"),
+        "undoing a schedule must not say Cleared dates, got {undone}"
+    );
+}
+
+#[tokio::test]
+async fn picker_dates_do_not_jump_the_camera() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scroll_x = 120.0;
+    let origin = state.gantt.origin;
+    let scroll = state.gantt.scroll_x;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some())
+        .cloned()
+        .unwrap();
+    let _ = state.commit_range_dates_now(
+        node.id,
+        Some(Date::new(2026, 11, 10).unwrap()),
+        Some(Date::new(2026, 11, 12).unwrap()),
+    );
+    assert_eq!(
+        state.gantt.origin, origin,
+        "scheduling from the picker must not move the origin"
+    );
+    assert_eq!(
+        state.gantt.scroll_x, scroll,
+        "scheduling from the picker must not pan the camera"
     );
 }
 
@@ -803,7 +875,7 @@ async fn undo_dates_pushes_a_named_toast() {
     let _ = state.undo_dates_now().expect("undo");
     let undid = state.toasts.last_message().unwrap_or_default();
     assert!(
-        undid.starts_with("Undone: Moved Cart UI"),
+        undid.starts_with("Undone moved Cart UI"),
         "undo must name the restored dates, got {undid}"
     );
     let _ = state.redo_dates_now().expect("redo");
@@ -1222,10 +1294,14 @@ async fn add_item_keeps_the_selected_parent_after_reload() {
     state.gantt.selected_id = Some(1005);
     state.add_item().await.expect("create");
     let created = created_item(&state);
+    let selected_parent = state
+        .nodes
+        .iter()
+        .find(|node| node.id == 1005)
+        .and_then(|node| node.parent_id);
     assert_eq!(
-        created.parent_id,
-        Some(1005),
-        "new items nest under the selected work item"
+        created.parent_id, selected_parent,
+        "new items must be siblings of the selected work item, not nested under it"
     );
     state.load_hierarchy().await.expect("reload");
     let reloaded = state
@@ -1234,8 +1310,7 @@ async fn add_item_keeps_the_selected_parent_after_reload() {
         .find(|node| node.id == created.id)
         .expect("created item survives reload");
     assert_eq!(
-        reloaded.parent_id,
-        Some(1005),
+        reloaded.parent_id, selected_parent,
         "Hierarchy-Reverse must persist System.Parent after refetch"
     );
 }
@@ -1372,24 +1447,28 @@ async fn undo_create_drops_date_history_for_that_item() {
 }
 
 #[tokio::test]
-async fn add_item_under_a_user_story_creates_a_task() {
+async fn add_item_next_to_a_user_story_creates_a_user_story() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.selected_id = Some(1003);
+    let parent = state
+        .nodes
+        .iter()
+        .find(|node| node.id == 1003)
+        .and_then(|node| node.parent_id);
     state.add_item().await.expect("create");
     let created = created_item(&state);
     assert_eq!(
-        created.parent_id,
-        Some(1003),
-        "new items nest under the selected User Story"
+        created.parent_id, parent,
+        "new items must share the selected row's parent"
     );
     assert_eq!(
-        created.work_item_type, "Task",
-        "a child of a User Story must be a Task, not another User Story"
+        created.work_item_type, "User Story",
+        "a sibling of a User Story must be a User Story, not a nested Task"
     );
 }
 
 #[tokio::test]
-async fn add_item_under_an_epic_appends_after_existing_children() {
+async fn add_item_next_to_an_epic_appends_a_root_sibling() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.selected_id = Some(1001);
     let before: Vec<i64> = state
@@ -1400,49 +1479,34 @@ async fn add_item_under_an_epic_appends_after_existing_children() {
             state
                 .nodes
                 .iter()
-                .any(|node| node.id == row.id && node.parent_id == Some(1001))
+                .any(|node| node.id == row.id && node.parent_id.is_none())
         })
         .map(|row| row.id)
         .collect();
-    assert!(
-        !before.is_empty(),
-        "Epic 1001 should already have child Features"
-    );
+    assert!(before.contains(&1001), "Epic 1001 should already be a root");
     state.add_item().await.expect("create");
     let created = created_item(&state);
-    assert_eq!(created.parent_id, Some(1001));
-    assert_eq!(created.work_item_type, "Feature");
-    let siblings: Vec<i64> = state
+    assert_eq!(created.parent_id, None);
+    assert_eq!(created.work_item_type, "Epic");
+    let rows: Vec<i64> = state
         .gantt
         .flatten(&state.nodes)
         .into_iter()
-        .filter(|row| {
-            state
-                .nodes
-                .iter()
-                .any(|node| node.id == row.id && node.parent_id == Some(1001))
-        })
         .map(|row| row.id)
         .collect();
-    assert_eq!(
-        siblings.last().copied(),
-        Some(created.id),
-        "a new Feature must append after existing children, got {siblings:?}"
-    );
-    let created_at = siblings
+    let epic_at = rows.iter().position(|id| *id == 1001).expect("epic");
+    let created_at = rows
         .iter()
-        .position(|sibling| *sibling == created.id)
+        .position(|id| *id == created.id)
         .expect("created sibling");
-    for id in &before {
-        let existing_at = siblings
-            .iter()
-            .position(|sibling| sibling == id)
-            .expect("existing sibling");
-        assert!(
-            existing_at < created_at,
-            "existing child {id} must stay above the new item, got {siblings:?}"
-        );
-    }
+    assert!(
+        created_at > epic_at,
+        "a sibling of Epic 1001 must land after it, got {rows:?}"
+    );
+    assert!(
+        before.contains(&1001),
+        "the selected Epic must still be a root"
+    );
 }
 
 #[tokio::test]
@@ -1473,7 +1537,7 @@ async fn save_title_patches_system_title() {
     state.undo().await.expect("undo title");
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message.starts_with("Undone: Renamed"),
+        message.starts_with("Undone renamed"),
         "field undo toast must repeat the rename, got {message}"
     );
     let node = state.nodes.iter().find(|n| n.id == 1003).unwrap();

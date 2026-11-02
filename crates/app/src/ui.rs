@@ -45,9 +45,12 @@ use crate::gantt::{
     LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis,
     PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SPLITTER_WIDTH, SUMMARY_BAR_H,
     SavedGanttView, TIMELINE_HEADER_H, TODAY_PILL_GAP, TODAY_PILL_W, TYPE_COL_WIDTH,
+    parent_date_overflow,
 };
 use crate::paths::AppPaths;
-use crate::state::{DateSaveRole, PendingDateSave, PlannerState};
+use crate::state::{
+    DateSaveRole, PendingDateSave, PlannerState, undone_message as undone_toast_message,
+};
 use crate::toasts::{ToastKind, UndoAction};
 
 actions!(
@@ -119,6 +122,10 @@ pub struct PlannerView {
     /// True after a drag move with the left button down. A later move with
     /// the button up then commits, covering mouse-up outside the window.
     saw_pressed_drag: bool,
+    /// Pointer is down on a toast; skip Gantt mouse-up commit for this click.
+    toast_pointer: bool,
+    /// Toast Undo clicked while spawn_state is busy; replay when I/O frees.
+    pending_toast_undo: Option<(u64, UndoAction)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -323,6 +330,8 @@ impl PlannerView {
             pending_camera_from: None,
             skip_camera_anim: false,
             saw_pressed_drag: false,
+            toast_pointer: false,
+            pending_toast_undo: None,
             _subscriptions: vec![keystrokes],
         };
         this.scope_query.update(cx, |input, cx| {
@@ -730,6 +739,9 @@ impl PlannerView {
                     Err(_) => tracing::warn!("planner action cancelled"),
                 }
                 this.form_loading = None;
+                if let Some((toast_id, action)) = this.pending_toast_undo.take() {
+                    this.apply_toast_undo(toast_id, action, cx);
+                }
                 if let Some(team) = this.pending_team.take() {
                     this.start_team_switch(team, cx);
                 }
@@ -1293,6 +1305,15 @@ impl PlannerView {
             .right_0()
             .items_center()
             .gap_2()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.arm_toast_pointer();
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .children(self.state.toasts.items.iter().map(|toast| {
                 let id = toast.id;
                 let copyable = toast.copyable;
@@ -1302,6 +1323,15 @@ impl PlannerView {
                 h_flex()
                     .id(("toast", id))
                     .debug_selector(|| "planner-toast".into())
+                    .occlude()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.arm_toast_pointer();
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .w(px(520.))
                     .gap_2()
                     .px_3()
@@ -1344,15 +1374,34 @@ impl PlannerView {
                         ))
                     })
                     .when_some(undo.clone(), |el, action| {
-                        el.child(Button::new(("undo-toast", id)).label("Undo").on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.apply_toast_undo(id, action.clone(), cx);
-                            }),
-                        ))
+                        let action_down = action.clone();
+                        el.child(
+                            div()
+                                .id(("toast-undo-wrap", id))
+                                .debug_selector(|| "toast-undo".into())
+                                .occlude()
+                                .flex_shrink_0()
+                                .min_w(px(52.))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.arm_toast_pointer();
+                                        cx.stop_propagation();
+                                        this.apply_toast_undo(id, action_down.clone(), cx);
+                                    }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.apply_toast_undo(id, action.clone(), cx);
+                                }))
+                                .child(Button::new(("undo-toast", id)).label("Undo")),
+                        )
                     })
                     .child(
                         Button::new(("dismiss-toast", id))
                             .label("×")
+                            .flex_shrink_0()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.state.toasts.dismiss(id);
                                 cx.notify();
@@ -1361,9 +1410,25 @@ impl PlannerView {
             }))
     }
 
-    fn apply_toast_undo(&mut self, toast_id: u64, action: UndoAction, cx: &mut Context<Self>) {
+    fn arm_toast_pointer(&mut self) {
+        self.toast_pointer = true;
+        self.state.cancel_gesture();
+        self.state.gantt.schedule_drag = None;
+        self.saw_pressed_drag = false;
+    }
+
+    pub fn apply_toast_undo(&mut self, toast_id: u64, action: UndoAction, cx: &mut Context<Self>) {
+        if !self
+            .state
+            .toasts
+            .items
+            .iter()
+            .any(|toast| toast.id == toast_id)
+        {
+            return;
+        }
         let original = self.state.history_action_message_for_undo(&action);
-        let undid = format!("Undone: {original}");
+        let undid = undone_toast_message(&original);
         if matches!(action, UndoAction::RestoreDates { .. }) {
             if let Some(pending) = self.state.toast_restore_or_undo_dates(action) {
                 self.state.toasts.dismiss_undo();
@@ -1378,17 +1443,20 @@ impl PlannerView {
             cx.notify();
             return;
         }
-        // Same path as Ctrl+Z: spawn_state adopts the full working tree so a
-        // RestoreLink toast actually puts the predecessor back on the node.
-        if !self.spawn_state(cx, move |mut state| async move {
+        // spawn_unbounded so a date persist (which does not take io_busy) or a
+        // still-in-flight link save cannot turn Undo into a silent dismiss.
+        if self.io_busy {
+            self.pending_toast_undo = Some((toast_id, action));
+            cx.notify();
+            return;
+        }
+        self.spawn_unbounded(cx, move |mut state| async move {
             let result = state.apply_undo(action.clone()).await;
             if result.is_ok() {
                 state.toasts.push(ToastKind::Success, undid.clone());
             }
             (state, result)
-        }) {
-            return;
-        }
+        });
         self.state.toasts.dismiss_undo();
         self.state.toasts.dismiss(toast_id);
         cx.notify();
@@ -2333,7 +2401,7 @@ impl PlannerView {
                         Button::new("add-item")
                             .primary()
                             .label("+ Add item")
-                            .tooltip("Create a work item on this team.")
+                            .tooltip("Add a work item at the same level as the selected row.")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.spawn_state(cx, |mut state| async move {
                                     let result = state.add_item().await;
@@ -2951,7 +3019,12 @@ impl PlannerView {
         } else {
             full.clone()
         };
-        let tip = full;
+        let tip = if parent_date_overflow(&self.state.nodes, id) {
+            format!("{full} · outside parent dates")
+        } else {
+            full
+        };
+        let overflow = parent_date_overflow(&self.state.nodes, id);
         div()
             .id(("dates", id as u64))
             .debug_selector(move || {
@@ -2966,8 +3039,17 @@ impl PlannerView {
             .truncate()
             .text_xs()
             .when(unscheduled, |el| el.text_color(muted))
+            .when(overflow, |el| el.text_color(cx.theme().warning))
             .when(editing, |el| el.bg(cx.theme().accent.opacity(0.35)))
             .child(display.clone())
+            .when(overflow, |el| {
+                el.child(
+                    div()
+                        .id(("dates-overflow", id as u64))
+                        .debug_selector(|| "gantt-parent-overflow".into())
+                        .child(" !"),
+                )
+            })
             .when(!editing, |el| {
                 el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             })
@@ -3028,16 +3110,15 @@ impl PlannerView {
                                 .w_full()
                                 .child(Input::new(&self.inline_input).id("inline-date").w_full()),
                         )
-                        .when_some(self.inline_dates_error.clone(), |el, message| {
-                            el.child(
-                                div()
-                                    .id("gantt-dates-error")
-                                    .debug_selector(|| "gantt-dates-error".into())
-                                    .text_xs()
-                                    .text_color(cx.theme().danger)
-                                    .child(message),
-                            )
-                        })
+                        .child(
+                            div()
+                                .id("gantt-dates-error")
+                                .debug_selector(|| "gantt-dates-error".into())
+                                .h(px(16.))
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(self.inline_dates_error.clone().unwrap_or_default()),
+                        )
                         .child(self.render_calendar_chrome(&state, cx)),
                 )
             })
@@ -3340,15 +3421,25 @@ impl PlannerView {
                                     .bg(weekend)
                             }),
                     )
-                    .children(ticks.iter().filter(|tick| tick.x >= 0.0).map(|tick| {
-                        div()
-                            .absolute()
-                            .left(px(tick.x))
-                            .top_0()
-                            .bottom_0()
-                            .w(px(1.))
-                            .bg(grid)
-                    }))
+                    .children({
+                        let mut xs: Vec<f32> = ticks
+                            .iter()
+                            .filter(|tick| tick.x >= 0.0 && tick.x < width)
+                            .map(|tick| tick.x)
+                            .collect();
+                        if xs.last().is_none_or(|x| width - x > 2.0) {
+                            xs.push((width - 1.0).max(0.0));
+                        }
+                        xs.into_iter().map(move |x| {
+                            div()
+                                .absolute()
+                                .left(px(x))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(1.))
+                                .bg(grid)
+                        })
+                    })
                     .child(
                         v_flex()
                             .mt(px(-self.state.gantt.row_scroll_remainder()))
@@ -3968,6 +4059,22 @@ impl PlannerView {
                 );
             }
         }
+        if parent_date_overflow(&self.state.nodes, id) {
+            let warn = cx.theme().warning;
+            items.push(
+                div()
+                    .id(("gantt-overflow", id as u64))
+                    .debug_selector(|| "gantt-parent-overflow".into())
+                    .absolute()
+                    .left(px(bar.x + bar.width.max(8.0) - 2.0))
+                    .top(px(bar_top - 2.0))
+                    .w(px(8.))
+                    .h(px(bar_h + 4.0))
+                    .rounded_sm()
+                    .bg(warn.opacity(0.85))
+                    .into_any_element(),
+            );
+        }
         div()
             .relative()
             .size_full()
@@ -4195,11 +4302,11 @@ impl PlannerView {
             .debug_selector(|| "gantt-link-remove".into())
             .absolute()
             .left(px({
-                let (x, _) = arrow.midpoint();
+                let (x, _) = arrow.remove_control_pos();
                 x - min_x - 10.0
             }))
             .top(px({
-                let (_, y) = arrow.midpoint();
+                let (_, y) = arrow.remove_control_pos();
                 y - min_y - 12.0
             }))
             .occlude()
@@ -4323,7 +4430,6 @@ impl PlannerView {
     fn remove_link(&mut self, from_id: i64, to_id: i64, cx: &mut Context<Self>) {
         self.state.gantt.context_menu = None;
         self.state.gantt.selected_link = None;
-        self.state.gantt.selected_id = None;
         self.state.gantt.clear_hover();
         self.state.gantt.hover_locked = true;
         self.spawn_state(cx, move |mut state| async move {
@@ -4390,14 +4496,12 @@ impl PlannerView {
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.state.gantt.selected_link = Some((from_id, to_id));
-                    this.state.gantt.selected_id = Some(to_id);
                     cx.notify();
                 }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.state.gantt.selected_link = Some((from_id, to_id));
-                this.state.gantt.selected_id = Some(to_id);
                 cx.notify();
             }))
             .on_mouse_down(
@@ -4462,7 +4566,6 @@ impl PlannerView {
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.state.gantt.selected_link = Some((from_id, to_id));
-                    this.state.gantt.selected_id = Some(to_id);
                     cx.notify();
                 }),
             )
@@ -6493,6 +6596,13 @@ impl Render for PlannerView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                if this.toast_pointer {
+                    this.toast_pointer = false;
+                    this.state.cancel_gesture();
+                    this.state.gantt.schedule_drag = None;
+                    this.saw_pressed_drag = false;
+                    return;
+                }
                 this.state.gantt.clear_hover();
                 this.state.gantt.hover_locked = true;
                 if this.state.gantt.gesture.is_some() {
