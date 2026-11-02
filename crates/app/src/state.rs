@@ -860,15 +860,9 @@ impl PlannerState {
         self.hierarchy_loading = true;
         self.team_settings_error = None;
         let key = self.hierarchy_cache_key(&scope);
-        if let Some(hit) = self.cache.get(&key)
-            && let Ok(result) = serde_json::from_value::<HierarchyResult>(hit.value.clone())
-        {
-            self.apply_hierarchy(result.clone());
-            if hit.freshness == CacheFreshness::Fresh && !result.top_backlog_types.is_empty() {
-                self.hierarchy_loading = false;
-                return Ok(());
-            }
-        }
+        // Always refetch rows. A Fresh cache hit is a per-team snapshot of
+        // nodes and can overwrite a date persist that only updated a worker
+        // clone's cache. Camera restore stays in apply_hierarchy.
         match self.client.load_hierarchy(&scope).await {
             Ok(result) => {
                 if let Ok(value) = serde_json::to_value(&result) {

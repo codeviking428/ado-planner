@@ -1082,7 +1082,7 @@ impl GanttView {
                     && x <= bar.x + bar.width + HANDLE_WIDTH
             })?
             .clone();
-        let kind = if bar.milestone {
+        let kind = if bar.milestone || bar.summary {
             GestureKind::Move
         } else if x <= bar.x + HANDLE_WIDTH {
             GestureKind::ResizeStart
@@ -1388,7 +1388,7 @@ mod tests {
         let milestone = BarLayout {
             milestone: true,
             width: MILESTONE_SIZE,
-            ..bar
+            ..bar.clone()
         };
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&milestone), 102.0, 4.0)
@@ -1399,6 +1399,15 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(&[milestone], 114.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::Move)
+        );
+        let summary = BarLayout {
+            summary: true,
+            ..bar
+        };
+        assert_eq!(
+            GanttView::hit_test_bar(&[summary], 176.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::Move),
+            "a parent summary bar has no resize handles"
         );
     }
 

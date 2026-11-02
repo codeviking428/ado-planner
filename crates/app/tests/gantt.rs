@@ -1,4 +1,4 @@
-use ado_core::parse_iso_date;
+use ado_core::{START_DATE_FIELD, TARGET_DATE_FIELD, parse_iso_date};
 use ado_planner::gantt::{GanttScale, GanttView, GestureKind, NudgeAxis};
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{DateSaveRole, PlannerState, fake_hierarchy};
@@ -575,6 +575,90 @@ async fn switching_teams_through_a_spawn_clone_restores_scroll() {
     assert_eq!(state.gantt.scroll_y, 80.0);
     assert_eq!(state.gantt.scroll_x, 48.0);
     assert_eq!(state.gantt.origin, origin);
+}
+
+#[tokio::test]
+async fn drag_save_then_team_switch_refetches_grid_dates() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let id = 1012;
+    let original = state
+        .nodes
+        .iter()
+        .find(|node| node.id == id)
+        .cloned()
+        .expect("1012");
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+    let _ = state.begin_bar_gesture(id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 8.0);
+    let pending = state.commit_date_gesture_now().expect("drag");
+    let mut working = state.clone();
+    working
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist drag");
+    if let Some(rev) = working
+        .nodes
+        .iter()
+        .find(|node| node.id == id)
+        .map(|node| node.rev)
+        && let Some(live) = state.nodes.iter_mut().find(|node| node.id == id)
+    {
+        live.rev = rev;
+    }
+    let saved = state
+        .nodes
+        .iter()
+        .find(|node| node.id == id)
+        .cloned()
+        .expect("saved 1012");
+    assert_ne!(
+        saved.target_date, original.target_date,
+        "drag must move Target Date off the fixture 08-04"
+    );
+
+    state.begin_team_switch("Empty".into());
+    let mut working = state.clone();
+    working.set_team("Empty".into()).await.expect("Empty");
+    state.adopt_spawned(working);
+    state.begin_team_switch("Platform".into());
+    let mut working = state.clone();
+    working.set_team("Platform".into()).await.expect("Platform");
+    state.adopt_spawned(working);
+
+    let grid = state
+        .nodes
+        .iter()
+        .find(|node| node.id == id)
+        .cloned()
+        .expect("1012 after switch");
+    assert_eq!(
+        grid.start_date, saved.start_date,
+        "grid Start Date must match the saved server dates after Platform→Empty→Platform"
+    );
+    assert_eq!(
+        grid.target_date, saved.target_date,
+        "grid Target Date must not snap back to the cached 08-04"
+    );
+    let grid_start = grid.start_date.as_deref().and_then(|value| value.get(..10));
+    let grid_target = grid
+        .target_date
+        .as_deref()
+        .and_then(|value| value.get(..10));
+
+    state.open_form(id).await.expect("details");
+    let form = state.form.as_ref().expect("form");
+    let form_start = form
+        .values
+        .get(START_DATE_FIELD)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.get(..10));
+    let form_target = form
+        .values
+        .get(TARGET_DATE_FIELD)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.get(..10));
+    assert_eq!(form_start, grid_start);
+    assert_eq!(form_target, grid_target);
 }
 
 #[tokio::test]

@@ -9,8 +9,9 @@ use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::toasts::HistoryEntry;
 use ado_planner::ui::PlannerView;
-use ado_planner::ui::looks_like_pat;
+use ado_planner::ui::{dates_from_range_picker, looks_like_pat};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
+use gpui_kit::component::calendar::Date as PickerDate;
 use gpui_kit::{
     KeyDownEvent, Keystroke, Modifiers, MouseButton, ScrollDelta, ScrollEvent, VisualTestContext,
     point, px,
@@ -215,6 +216,28 @@ fn looks_like_a_pat_masks_long_tokens() {
     assert!(looks_like_pat("abcdefghijklmnopqrstuv123"));
     assert!(!looks_like_pat("contoso"));
     assert!(!looks_like_pat("https://dev.azure.com/contoso"));
+}
+
+#[test]
+fn range_picker_start_only_keeps_target_none() {
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap();
+    let picked = dates_from_range_picker(PickerDate::Range(Some(start), None), "").unwrap();
+    assert_eq!(
+        picked.0,
+        Some(Date::new(2026, 8, 4).unwrap()),
+        "a start-only pick must produce a Start Date"
+    );
+    assert!(
+        picked.1.is_none(),
+        "a start-only pick must leave Target Date unset so save keeps it"
+    );
+    let typed = dates_from_range_picker(PickerDate::Range(None, None), "2026-08-12").unwrap();
+    assert_eq!(typed.0, Some(Date::new(2026, 8, 12).unwrap()));
+    assert!(typed.1.is_none());
+    let both =
+        dates_from_range_picker(PickerDate::Range(None, None), "2026-08-04 → 2026-08-21").unwrap();
+    assert_eq!(both.0, Some(Date::new(2026, 8, 4).unwrap()));
+    assert_eq!(both.1, Some(Date::new(2026, 8, 21).unwrap()));
 }
 
 #[gpui_kit::test]
@@ -2243,5 +2266,108 @@ fn team_switch_loading_does_not_reset_the_timeline(cx: &mut gpui_kit::TestAppCon
             "an in-flight team switch must not recentre the timeline"
         );
         assert_eq!(view.state.gantt.scroll_x, 96.0);
+    });
+}
+
+#[gpui_kit::test]
+fn dates_picker_has_month_arrows_and_typed_input(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let cell = cx
+        .debug_bounds("gantt-dates-cell")
+        .expect("dates cell should paint");
+    cx.simulate_click(cell.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-dates-prev-month").is_some(),
+        "range picker must show a previous-month arrow"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dates-next-month").is_some(),
+        "range picker must show a next-month arrow"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dates-typed").is_some(),
+        "range picker must allow typed dates"
+    );
+    let before = view.update(cx, |view, cx| view.inline_calendar_month(cx));
+    let prev = cx
+        .debug_bounds("gantt-dates-prev-month")
+        .expect("prev month");
+    cx.simulate_click(prev.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    let after = view.update(cx, |view, cx| view.inline_calendar_month(cx));
+    assert_ne!(
+        before, after,
+        "clicking ‹ must change the visible month, {before:?} -> {after:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn parent_summary_bar_shows_link_handles_without_resize(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    state.gantt.hovered_id = Some(1);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-handle-1-link-end").is_some(),
+        "a hovered parent summary bar must show a link handle"
+    );
+    assert!(
+        cx.debug_bounds("gantt-resize-handle-1-end").is_none(),
+        "a parent summary bar must not grow resize handles"
+    );
+}
+
+#[gpui_kit::test]
+fn resize_starts_on_mouse_down_without_hover(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-resize-handle-2-end").is_none(),
+        "resize grips stay hidden until hover"
+    );
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let grip = point(
+        bar.origin.x + bar.size.width + px(4.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("mouse-down on the end grip must start a resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "hit-testing on mouse-down must pick the end handle without a prior hover, got {:?}",
+            gesture.kind
+        );
+        assert_eq!(gesture.id, 2);
     });
 }

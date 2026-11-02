@@ -16,7 +16,7 @@ use gpui_kit::component::Sizable;
 use gpui_kit::component::Size;
 use gpui_kit::component::avatar::Avatar;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::calendar::{Calendar, CalendarEvent, CalendarState, Date as PickerDate};
+use gpui_kit::component::calendar::{Calendar, CalendarState, Date as PickerDate};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::date_picker::{DatePicker, DatePickerState};
 use gpui_kit::component::h_flex;
@@ -39,10 +39,10 @@ use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
-    ASSIGNEE_COL_WIDTH, DATES_COL_WIDTH, DependencyArrow, GanttScale, GestureKind, HANDLE_WIDTH,
-    ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH,
-    NUDGE_IDLE_MS, NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SPLITTER_WIDTH,
-    SUMMARY_BAR_H, TIMELINE_HEADER_H, TYPE_COL_WIDTH,
+    ASSIGNEE_COL_WIDTH, DATES_COL_WIDTH, DependencyArrow, GanttScale, GanttView, GestureKind,
+    HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE,
+    MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT,
+    SCALE_BUTTON_WIDTH, SPLITTER_WIDTH, SUMMARY_BAR_H, TIMELINE_HEADER_H, TYPE_COL_WIDTH,
 };
 use crate::paths::AppPaths;
 use crate::state::{DateSaveRole, PendingDateSave, PlannerState};
@@ -160,6 +160,18 @@ impl PlannerView {
                     cx.stop_propagation();
                     return;
                 }
+                if key == "enter" && this.inline_edit.is_some() {
+                    this.on_key(
+                        &KeyDownEvent {
+                            keystroke: event.keystroke.clone(),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        cx,
+                    );
+                    cx.stop_propagation();
+                    return;
+                }
                 let mods = event.keystroke.modifiers;
                 let undo = (mods.control || mods.platform) && key == "z";
                 let redo =
@@ -224,6 +236,7 @@ impl PlannerView {
             _subscriptions: vec![keystrokes],
         };
         this.bind_sign_in_events(window, cx);
+        this.bind_inline_input(cx);
         this
     }
 
@@ -364,6 +377,15 @@ impl PlannerView {
         });
         self._subscriptions.push(filter);
         self._subscriptions.push(scope);
+    }
+
+    fn bind_inline_input(&mut self, cx: &mut Context<Self>) {
+        let enter = cx.subscribe(&self.inline_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) && this.inline_edit.is_some() {
+                this.commit_inline(cx);
+            }
+        });
+        self._subscriptions.push(enter);
     }
 
     fn spawn_state<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
@@ -584,22 +606,18 @@ impl PlannerView {
                 state
             });
             let item_id = id;
-            cx.subscribe(&picker, move |this, picker, event: &CalendarEvent, cx| {
-                if let CalendarEvent::Selected(value) = event
-                    && let (Some(start), Some(end)) = (value.start(), value.end())
-                    && let (Some(start), Some(target)) = (naive_to_jiff(start), naive_to_jiff(end))
-                {
-                    this.inline_edit = None;
-                    this.inline_dates = None;
-                    this.spawn_state(cx, move |mut state| async move {
-                        let result = state.save_dates(item_id, start, target).await;
-                        (state, result)
-                    });
-                }
-                let _ = picker;
-                cx.notify();
-            })
-            .detach();
+            self._subscriptions
+                .push(cx.observe(&picker, move |this, picker, cx| {
+                    if this.inline_edit != Some(InlineEdit::Dates(item_id)) {
+                        return;
+                    }
+                    let date = picker.read(cx).date();
+                    let close = matches!(
+                        date,
+                        PickerDate::Range(Some(_), Some(_)) | PickerDate::Single(Some(_))
+                    );
+                    this.commit_picker_dates(item_id, date, close, cx);
+                }));
             self.inline_dates = Some(picker);
         } else {
             self.inline_dates = None;
@@ -609,10 +627,53 @@ impl PlannerView {
             input.set_value(&initial, window, cx);
             input.select_all(window, cx);
         });
-        if !matches!(edit, InlineEdit::Dates(_)) {
-            Self::focus_input(&self.inline_input, window, cx);
-        }
+        Self::focus_input(&self.inline_input, window, cx);
         cx.notify();
+    }
+
+    fn commit_picker_dates(
+        &mut self,
+        id: i64,
+        date: PickerDate,
+        close: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let typed = self.inline_input.read(cx).value().to_string();
+        let Some((start, target)) = dates_from_range_picker(date, &typed) else {
+            return;
+        };
+        let Some(node) = self.state.nodes.iter().find(|node| node.id == id) else {
+            return;
+        };
+        let next_start = start.map(iso_date_only).or_else(|| node.start_date.clone());
+        let next_target = target
+            .map(iso_date_only)
+            .or_else(|| node.target_date.clone());
+        if next_start == node.start_date && next_target == node.target_date {
+            return;
+        }
+        if close {
+            self.inline_edit = None;
+            self.inline_dates = None;
+        }
+        self.spawn_range_dates(id, start, target, cx);
+        cx.notify();
+    }
+
+    fn spawn_range_dates(
+        &mut self,
+        id: i64,
+        start: Option<jiff::civil::Date>,
+        target: Option<jiff::civil::Date>,
+        cx: &mut Context<Self>,
+    ) {
+        self.spawn_state(cx, move |mut state| async move {
+            let result = match (start, target) {
+                (Some(start), Some(target)) => state.save_dates(id, start, target).await,
+                (start, target) => state.save_partial_dates(id, start, target).await,
+            };
+            (state, result)
+        });
     }
 
     fn commit_inline(&mut self, cx: &mut Context<Self>) {
@@ -628,17 +689,18 @@ impl PlannerView {
                 });
             }
             InlineEdit::Dates(id) => {
-                if let Some(picker) = self.inline_dates.take() {
-                    let date = picker.read(cx).date();
-                    if let PickerDate::Range(Some(start), Some(end)) = date
-                        && let (Some(start), Some(target)) =
-                            (naive_to_jiff(start), naive_to_jiff(end))
-                    {
-                        self.spawn_state(cx, move |mut state| async move {
-                            let result = state.save_dates(id, start, target).await;
-                            (state, result)
-                        });
-                    }
+                let typed = value.clone();
+                let date = self
+                    .inline_dates
+                    .as_ref()
+                    .map(|picker| picker.read(cx).date());
+                self.inline_dates = None;
+                if let Some(date) = date {
+                    self.commit_picker_dates(id, date, false, cx);
+                } else if let Some((start, target)) =
+                    dates_from_range_picker(PickerDate::Range(None, None), &typed)
+                {
+                    self.spawn_range_dates(id, start, target, cx);
                 }
             }
             InlineEdit::Start(id) | InlineEdit::Target(id) => {
@@ -2313,13 +2375,65 @@ impl PlannerView {
                         .debug_selector(|| "gantt-inline-dates".into())
                         .min_w(px(280.))
                         .p_2()
+                        .gap_2()
                         .rounded_md()
                         .border_1()
                         .border_color(cx.theme().border)
                         .bg(cx.theme().popover)
                         .shadow_md()
                         .occlude()
-                        .child(Calendar::new(&state).number_of_months(1)),
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .id("gantt-dates-prev-month")
+                                        .debug_selector(|| "gantt-dates-prev-month".into())
+                                        .child(
+                                            Button::new("dates-prev-month").label("‹").on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    if let Some(picker) = this.inline_dates.clone()
+                                                    {
+                                                        picker.update(cx, |state, cx| {
+                                                            state.prev_month();
+                                                            cx.notify();
+                                                        });
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("gantt-dates-next-month")
+                                        .debug_selector(|| "gantt-dates-next-month".into())
+                                        .child(
+                                            Button::new("dates-next-month").label("›").on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    if let Some(picker) = this.inline_dates.clone()
+                                                    {
+                                                        picker.update(cx, |state, cx| {
+                                                            state.next_month();
+                                                            cx.notify();
+                                                        });
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        ),
+                                ),
+                        )
+                        .child(Calendar::new(&state).number_of_months(1))
+                        .child(
+                            div()
+                                .id("gantt-dates-typed")
+                                .debug_selector(|| "gantt-dates-typed".into())
+                                .w_full()
+                                .child(Input::new(&self.inline_input).id("inline-date").w_full()),
+                        ),
                 )
             })
             .when(self.inline_dates.is_none(), |el| {
@@ -2431,6 +2545,7 @@ impl PlannerView {
                                 let hovered = hovered_id == Some(id);
                                 let striped = (first_row + offset) % 2 == 1;
                                 let bar = bars.iter().find(|bar| bar.id == id).cloned();
+                                let hit_bar = bar.clone();
                                 let band_selector = format!("gantt-row-band-{id}");
                                 div()
                                     .id(("gantt-row-band", id as u64))
@@ -2472,7 +2587,7 @@ impl PlannerView {
                                     }))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                             if this.state.gantt.gesture.is_some()
                                                 || this.state.gantt.context_menu.is_some()
                                             {
@@ -2495,7 +2610,26 @@ impl PlannerView {
                                                 this.state.gantt.selected_id = Some(id);
                                                 this.state.gantt.hovered_id = Some(id);
                                                 cx.notify();
+                                                return;
                                             }
+                                            let Some(bar) = hit_bar.as_ref() else {
+                                                return;
+                                            };
+                                            let x: f32 = event.position.x.into();
+                                            let local_x = x - this.state.gantt.timeline_origin_x;
+                                            let Some((_, kind)) = GanttView::hit_test_bar(
+                                                std::slice::from_ref(bar),
+                                                local_x,
+                                                bar.y + 1.0,
+                                            ) else {
+                                                return;
+                                            };
+                                            this.state.gantt.selected_id = Some(id);
+                                            this.dismiss_overlays();
+                                            let _ = this
+                                                .state
+                                                .begin_bar_gesture(id, kind, local_x);
+                                            cx.notify();
                                         }),
                                     )
                                     .children(bar.map(|bar| {
@@ -2720,9 +2854,8 @@ impl PlannerView {
         muted_fg: gpui_kit::Hsla,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let layout = bar.clone();
         let id = bar.id;
-        let bar_x = bar.x;
-        let bar_width = bar.width;
         let summary = bar.summary;
         let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
         let milestone = bar.milestone;
@@ -2733,7 +2866,7 @@ impl PlannerView {
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
         let show_handles = !summary && !unscheduled && !milestone && hovered && !dragging;
-        let show_link_handles = !unscheduled && hovered && !dragging;
+        let show_link_handles = !unscheduled && !dragging && (hovered || (summary && selected));
         let bar_h = if milestone {
             MILESTONE_SIZE
         } else if summary {
@@ -2864,15 +2997,13 @@ impl PlannerView {
                         }
                         let x: f32 = event.position.x.into();
                         let local_x = x - this.state.gantt.timeline_origin_x;
-                        let kind = if milestone {
-                            GestureKind::Move
-                        } else if local_x <= bar_x + HANDLE_WIDTH {
-                            GestureKind::ResizeStart
-                        } else if local_x >= bar_x + bar_width - HANDLE_WIDTH {
-                            GestureKind::ResizeEnd
-                        } else {
-                            GestureKind::Move
-                        };
+                        let kind = GanttView::hit_test_bar(
+                            std::slice::from_ref(&layout),
+                            local_x,
+                            layout.y + 1.0,
+                        )
+                        .map(|(_, kind)| kind)
+                        .unwrap_or(GestureKind::Move);
                         this.dismiss_overlays();
                         let _ = this.state.begin_bar_gesture(id, kind, local_x);
                         cx.notify();
@@ -4157,6 +4288,12 @@ impl PlannerView {
         self.on_key(event, cx);
     }
 
+    pub fn inline_calendar_month(&self, cx: &gpui_kit::App) -> Option<u8> {
+        self.inline_dates
+            .as_ref()
+            .map(|picker| picker.read(cx).current_month())
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if event.is_held
@@ -4445,6 +4582,43 @@ fn jiff_to_naive(date: jiff::civil::Date) -> Option<chrono::NaiveDate> {
 
 fn naive_to_jiff(date: chrono::NaiveDate) -> Option<jiff::civil::Date> {
     jiff::civil::Date::new(date.year() as i16, date.month() as i8, date.day() as i8).ok()
+}
+
+/// Map a range picker value (and optional typed ISO text) to Start/Target.
+/// A missing side is `None` so the other date can stay as-is.
+pub fn dates_from_range_picker(
+    date: PickerDate,
+    typed: &str,
+) -> Option<(Option<jiff::civil::Date>, Option<jiff::civil::Date>)> {
+    match date {
+        PickerDate::Range(Some(start), Some(end)) => {
+            Some((naive_to_jiff(start), naive_to_jiff(end)))
+        }
+        PickerDate::Range(Some(start), None) => Some((naive_to_jiff(start), None)),
+        PickerDate::Range(None, Some(end)) => Some((None, naive_to_jiff(end))),
+        PickerDate::Single(Some(day)) => Some((naive_to_jiff(day), None)),
+        PickerDate::Single(None) | PickerDate::Range(None, None) => parse_typed_dates(typed),
+    }
+}
+
+fn parse_typed_dates(
+    typed: &str,
+) -> Option<(Option<jiff::civil::Date>, Option<jiff::civil::Date>)> {
+    let text = typed.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let normalized = text.replace('→', "/").replace(" to ", "/");
+    let parts: Vec<&str> = normalized
+        .split(['/', ','])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    match parts.as_slice() {
+        [start] => Some((parse_iso_date(Some(start)), None)),
+        [start, target] => Some((parse_iso_date(Some(start)), parse_iso_date(Some(target)))),
+        _ => None,
+    }
 }
 
 pub fn looks_like_pat(value: &str) -> bool {
