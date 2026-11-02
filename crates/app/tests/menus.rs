@@ -128,8 +128,17 @@ async fn toast_undo_keeps_a_later_dates_history_entry() {
     assert_eq!(restored.target_date, original_target);
     assert_eq!(
         state.history.undo.len(),
+        later_len,
+        "toast undo must keep history until the restore persist succeeds"
+    );
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist restore");
+    assert_eq!(
+        state.history.undo.len(),
         later_len - 1,
-        "toast undo must drop the matching clear, not the later dates edit"
+        "a successful restore persist must drop the matching clear, not the later dates edit"
     );
     assert!(
         matches!(
@@ -140,6 +149,51 @@ async fn toast_undo_keeps_a_later_dates_history_entry() {
             }) if start == "2026-09-01T00:00:00Z"
         ),
         "the later dates entry must remain on the Ctrl+Z stack"
+    );
+}
+
+#[tokio::test]
+async fn merge_undo_action_keeps_live_dates() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let successor_id = 1005;
+    let predecessor_id = 1003;
+    let mut working = state.clone();
+    if let Some(node) = working.nodes.iter_mut().find(|n| n.id == successor_id) {
+        node.predecessors.retain(|id| *id != predecessor_id);
+        node.start_date = Some("2026-01-01T00:00:00Z".into());
+        node.target_date = Some("2026-01-10T00:00:00Z".into());
+        node.rev = 99;
+    }
+    if let Some(node) = state.nodes.iter_mut().find(|n| n.id == successor_id) {
+        node.start_date = Some("2026-09-01T00:00:00Z".into());
+        node.target_date = Some("2026-09-10T00:00:00Z".into());
+        node.rev = 12;
+        if !node.predecessors.contains(&predecessor_id) {
+            node.predecessors.push(predecessor_id);
+        }
+    }
+    let live_start = state
+        .nodes
+        .iter()
+        .find(|n| n.id == successor_id)
+        .unwrap()
+        .start_date
+        .clone();
+    state.merge_undo_action(
+        &working,
+        &UndoAction::RemoveLink {
+            successor_id,
+            predecessor_id,
+        },
+    );
+    let live = state.nodes.iter().find(|n| n.id == successor_id).unwrap();
+    assert_eq!(
+        live.start_date, live_start,
+        "live date edits must survive a link toast merge"
+    );
+    assert!(
+        !live.predecessors.contains(&predecessor_id),
+        "the link undo must still copy predecessors from the spawned clone"
     );
 }
 

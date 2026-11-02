@@ -418,6 +418,88 @@ async fn failed_persist_pending_dates_pushes_an_error_toast() {
     );
 }
 
+#[test]
+fn follow_up_date_save_rolls_back_to_the_persisted_node() {
+    let persisted = fake_hierarchy(1).remove(0);
+    let mut live = persisted.clone();
+    live.start_date = Some("2026-09-01T00:00:00Z".into());
+    live.target_date = Some("2026-09-10T00:00:00Z".into());
+    live.rev = persisted.rev + 3;
+    let pending = PlannerState::follow_up_date_save(&live, &persisted);
+    assert_eq!(
+        pending.previous.start_date, persisted.start_date,
+        "a follow-up persist must roll back to the just-saved server dates, not the newer live node"
+    );
+    assert_eq!(pending.previous.rev, persisted.rev);
+    assert_eq!(pending.after_start, live.start_date);
+    assert_eq!(pending.rev, persisted.rev);
+}
+
+#[tokio::test]
+async fn picker_range_save_records_undo_before_persist() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let start = Date::new(2026, 8, 4).unwrap();
+    let target = Date::new(2026, 8, 21).unwrap();
+    let pending = state
+        .commit_range_dates_now(node.id, Some(start), Some(target))
+        .expect("picker save");
+    assert!(
+        !state.history.undo.is_empty(),
+        "Ctrl+Z must see the picker save before PATCH returns"
+    );
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(parse_iso_date(live.start_date.as_deref()), Some(start));
+    assert_eq!(parse_iso_date(live.target_date.as_deref()), Some(target));
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist picker dates");
+}
+
+#[tokio::test]
+async fn failed_toast_restore_keeps_undo_history() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    state.clear_dates(node.id).await.expect("clear");
+    let undo = state
+        .toasts
+        .items
+        .iter()
+        .rev()
+        .find_map(|t| t.undo.clone())
+        .expect("toast undo");
+    let history_len = state.history.undo.len();
+    mock.fail_next(&format!("/workitems/{}", node.id), 503, "save failed");
+    let pending = state.apply_toast_restore_dates(undo).expect("restore");
+    assert_eq!(state.history.undo.len(), history_len);
+    let _ = state.persist_pending_dates(pending).await;
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert!(
+        live.start_date.is_none() && live.target_date.is_none(),
+        "a failed restore persist must roll dates back to the cleared node"
+    );
+    assert_eq!(
+        state.history.undo.len(),
+        history_len,
+        "a failed restore persist must keep the Dates undo entry"
+    );
+    assert!(
+        state.toasts.items.iter().any(|toast| toast.undo.is_some()),
+        "a failed restore must re-offer toast Undo"
+    );
+}
+
 #[tokio::test]
 async fn persist_pending_dates_retries_a_stale_rev() {
     let (mock, mut state, _dir) = signed_in().await;

@@ -1205,6 +1205,85 @@ impl PlannerState {
         }
     }
 
+    /// Drop the matching Dates undo entry after a toast Restore persist succeeds.
+    pub fn complete_restore_date_save(&mut self, pending: &PendingDateSave) {
+        if pending.role != DateSaveRole::Restore {
+            return;
+        }
+        self.discard_history_for_undo(&UndoAction::RestoreDates {
+            id: pending.id,
+            start_date: pending.after_start.clone(),
+            target_date: pending.after_target.clone(),
+            rev: pending.rev,
+        });
+    }
+
+    /// Re-offer toast Undo when a Restore persist fails. History was left in
+    /// place so Ctrl+Z still sees the original Dates entry.
+    pub fn restore_date_save_failed(&mut self, pending: &PendingDateSave) {
+        if pending.role != DateSaveRole::Restore {
+            return;
+        }
+        self.toasts.push_undo(
+            "Cleared dates",
+            UndoAction::RestoreDates {
+                id: pending.id,
+                start_date: pending.after_start.clone(),
+                target_date: pending.after_target.clone(),
+                rev: pending.previous.rev,
+            },
+        );
+    }
+
+    /// A later local edit landed while this persist was in flight. Queue the
+    /// live dates, rolling back to the just-persisted node if that PATCH fails.
+    pub fn follow_up_date_save(live: &WorkItemNode, persisted: &WorkItemNode) -> PendingDateSave {
+        PendingDateSave {
+            id: live.id,
+            start: parse_iso_date(live.start_date.as_deref()),
+            target: parse_iso_date(live.target_date.as_deref()),
+            after_start: live.start_date.clone(),
+            after_target: live.target_date.clone(),
+            rev: persisted.rev,
+            previous: persisted.clone(),
+            role: DateSaveRole::Commit,
+        }
+    }
+
+    /// Apply picker dates locally and queue a persist. Start-only is allowed
+    /// on explicit commit; the view decides when to call this.
+    pub fn commit_range_dates_now(
+        &mut self,
+        id: i64,
+        start: Option<Date>,
+        target: Option<Date>,
+    ) -> Option<PendingDateSave> {
+        let previous = self.nodes.iter().find(|node| node.id == id).cloned()?;
+        let after_start = start
+            .map(iso_date_only)
+            .or_else(|| previous.start_date.clone());
+        let after_target = target
+            .map(iso_date_only)
+            .or_else(|| previous.target_date.clone());
+        if after_start == previous.start_date && after_target == previous.target_date {
+            return None;
+        }
+        let _ = self.apply_optimistic_partial(id, start, target);
+        if self.history_recording {
+            self.record_dates(id, &previous, after_start.clone(), after_target.clone());
+        }
+        Some(PendingDateSave {
+            id,
+            start,
+            target,
+            after_start,
+            after_target,
+            rev: previous.rev,
+            previous,
+            role: DateSaveRole::Commit,
+        })
+    }
+
     /// Apply the live gesture dates and push undo immediately, before PATCH.
     pub fn commit_date_gesture_now(&mut self) -> Option<PendingDateSave> {
         let gesture = self.gantt.gesture.take()?;
@@ -1373,6 +1452,7 @@ impl PlannerState {
                         dates_saved_message(pending.start.is_some(), pending.target.is_some()),
                     );
                 }
+                self.complete_restore_date_save(&pending);
                 Ok(())
             }
             Err(err) => {
@@ -1383,6 +1463,7 @@ impl PlannerState {
                 }) {
                     self.restore_node(pending.previous.clone());
                     self.revert_date_save_history(&pending);
+                    self.restore_date_save_failed(&pending);
                 }
                 self.toasts
                     .push(ToastKind::Error, error_text(&err, "Could not save dates"));
@@ -2142,8 +2223,8 @@ impl PlannerState {
         result
     }
 
-    /// Apply a toast RestoreDates locally and queue a persist. Does not replace
-    /// the whole planner state, so a later drag on another item is kept.
+    /// Apply a toast RestoreDates locally and queue a persist. History stays
+    /// until the persist succeeds so a failed PATCH can still be undone.
     pub fn apply_toast_restore_dates(&mut self, action: UndoAction) -> Option<PendingDateSave> {
         let UndoAction::RestoreDates {
             id,
@@ -2162,10 +2243,6 @@ impl PlannerState {
             node.start_date = start_date.clone();
             node.target_date = target_date.clone();
         }
-        self.discard_history_for_undo(&action);
-        self.toasts
-            .items
-            .retain(|toast| toast.undo.as_ref() != Some(&action));
         Some(PendingDateSave {
             id,
             start: parse_iso_date(start_date.as_deref()),
@@ -2178,8 +2255,8 @@ impl PlannerState {
         })
     }
 
-    /// Copy only the work items touched by a toast Undo so live camera/date
-    /// edits on other rows survive the HTTP round-trip.
+    /// Copy predecessors (and rev when dates were not edited) for a toast
+    /// link Undo so live date edits on those rows survive the HTTP round-trip.
     pub fn merge_undo_action(&mut self, working: &PlannerState, action: &UndoAction) {
         let ids: Vec<i64> = match action {
             UndoAction::RestoreDates { id, .. } => vec![*id],
@@ -2198,9 +2275,9 @@ impl PlannerState {
             };
             if let Some(dst) = self.nodes.iter_mut().find(|node| node.id == id) {
                 dst.predecessors = src.predecessors.clone();
-                dst.start_date = src.start_date.clone();
-                dst.target_date = src.target_date.clone();
-                dst.rev = src.rev;
+                if dst.start_date == src.start_date && dst.target_date == src.target_date {
+                    dst.rev = src.rev;
+                }
             }
         }
         self.discard_history_for_undo(action);

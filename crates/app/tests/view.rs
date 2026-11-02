@@ -9,7 +9,7 @@ use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_hierarchy};
 use ado_planner::toasts::HistoryEntry;
 use ado_planner::ui::PlannerView;
-use ado_planner::ui::{dates_from_range_picker, looks_like_pat};
+use ado_planner::ui::{dates_from_range_picker, looks_like_pat, range_picker_is_complete};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use gpui_kit::component::calendar::Date as PickerDate;
 use gpui_kit::{
@@ -221,7 +221,7 @@ fn looks_like_a_pat_masks_long_tokens() {
 #[test]
 fn range_picker_start_only_keeps_target_none() {
     let start = chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap();
-    let picked = dates_from_range_picker(PickerDate::Range(Some(start), None), "").unwrap();
+    let picked = dates_from_range_picker(PickerDate::Range(Some(start), None), "", "").unwrap();
     assert_eq!(
         picked.0,
         Some(Date::new(2026, 8, 4).unwrap()),
@@ -231,13 +231,37 @@ fn range_picker_start_only_keeps_target_none() {
         picked.1.is_none(),
         "a start-only pick must leave Target Date unset so save keeps it"
     );
-    let typed = dates_from_range_picker(PickerDate::Range(None, None), "2026-08-12").unwrap();
+    let typed = dates_from_range_picker(PickerDate::Range(None, None), "2026-08-12", "").unwrap();
     assert_eq!(typed.0, Some(Date::new(2026, 8, 12).unwrap()));
     assert!(typed.1.is_none());
     let both =
-        dates_from_range_picker(PickerDate::Range(None, None), "2026-08-04 → 2026-08-21").unwrap();
+        dates_from_range_picker(PickerDate::Range(None, None), "2026-08-04 → 2026-08-21", "")
+            .unwrap();
     assert_eq!(both.0, Some(Date::new(2026, 8, 4).unwrap()));
     assert_eq!(both.1, Some(Date::new(2026, 8, 21).unwrap()));
+}
+
+#[test]
+fn range_picker_prefers_typed_when_it_changed() {
+    let cal_start = chrono::NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+    let cal_end = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+    let calendar = PickerDate::Range(Some(cal_start), Some(cal_end));
+    let seed = "2026-07-06 / 2026-07-20";
+    let from_calendar = dates_from_range_picker(calendar, seed, seed).unwrap();
+    assert_eq!(from_calendar.0, Some(Date::new(2026, 7, 6).unwrap()));
+    assert_eq!(from_calendar.1, Some(Date::new(2026, 7, 20).unwrap()));
+    let from_typed = dates_from_range_picker(calendar, "2026-08-01 / 2026-08-15", seed).unwrap();
+    assert_eq!(
+        from_typed.0,
+        Some(Date::new(2026, 8, 1).unwrap()),
+        "a typed edit on a scheduled item must win over the seeded calendar"
+    );
+    assert_eq!(from_typed.1, Some(Date::new(2026, 8, 15).unwrap()));
+    assert!(
+        !range_picker_is_complete(PickerDate::Range(Some(cal_start), None)),
+        "a start-only first click must not auto-save"
+    );
+    assert!(range_picker_is_complete(calendar));
 }
 
 #[gpui_kit::test]

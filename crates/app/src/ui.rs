@@ -79,6 +79,9 @@ pub struct PlannerView {
     open_scope: Option<&'static str>,
     inline_edit: Option<InlineEdit>,
     inline_dates: Option<Entity<CalendarState>>,
+    /// Typed ISO text at picker open; used so a later calendar pick is not
+    /// overwritten unless the user actually edited the field.
+    inline_dates_typed_seed: String,
     dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
     io_busy: bool,
@@ -232,6 +235,7 @@ impl PlannerView {
             open_scope: None,
             inline_edit: None,
             inline_dates: None,
+            inline_dates_typed_seed: String::new(),
             dates_anchor: None,
             banner_dismissed: false,
             io_busy: false,
@@ -593,6 +597,7 @@ impl PlannerView {
         self.open_scope = None;
         self.inline_edit = None;
         self.inline_dates = None;
+        self.inline_dates_typed_seed.clear();
         self.dates_anchor = None;
         self.state.gantt.context_menu = None;
     }
@@ -670,6 +675,7 @@ impl PlannerView {
                 (None, Some(target)) => target.to_string(),
                 (None, None) => String::new(),
             };
+            self.inline_dates_typed_seed = typed.clone();
             let picker = cx.new(|cx| {
                 let mut state = CalendarState::new(window, cx);
                 match (start, target) {
@@ -695,15 +701,15 @@ impl PlannerView {
                         return;
                     }
                     let date = picker.read(cx).date();
-                    let close = matches!(
-                        date,
-                        PickerDate::Range(Some(_), Some(_)) | PickerDate::Single(Some(_))
-                    );
-                    this.commit_picker_dates(item_id, date, close, cx);
+                    if !range_picker_is_complete(date) {
+                        return;
+                    }
+                    this.commit_picker_dates(item_id, date, true, cx);
                 }));
             self.inline_dates = Some(picker);
         } else {
             self.inline_dates = None;
+            self.inline_dates_typed_seed.clear();
         }
         self.inline_edit = Some(edit);
         self.inline_input.update(cx, |input, cx| {
@@ -725,7 +731,9 @@ impl PlannerView {
         cx: &mut Context<Self>,
     ) {
         let typed = self.inline_input.read(cx).value().to_string();
-        let Some((start, target)) = dates_from_range_picker(date, &typed) else {
+        let Some((start, target)) =
+            dates_from_range_picker(date, &typed, &self.inline_dates_typed_seed)
+        else {
             return;
         };
         let Some(node) = self.state.nodes.iter().find(|node| node.id == id) else {
@@ -741,6 +749,7 @@ impl PlannerView {
         if close {
             self.inline_edit = None;
             self.inline_dates = None;
+            self.inline_dates_typed_seed.clear();
         }
         self.spawn_range_dates(id, start, target, cx);
         cx.notify();
@@ -753,13 +762,9 @@ impl PlannerView {
         target: Option<jiff::civil::Date>,
         cx: &mut Context<Self>,
     ) {
-        self.spawn_state(cx, move |mut state| async move {
-            let result = match (start, target) {
-                (Some(start), Some(target)) => state.save_dates(id, start, target).await,
-                (start, target) => state.save_partial_dates(id, start, target).await,
-            };
-            (state, result)
-        });
+        if let Some(pending) = self.state.commit_range_dates_now(id, start, target) {
+            self.enqueue_date_save(cx, pending);
+        }
     }
 
     fn commit_inline(&mut self, cx: &mut Context<Self>) {
@@ -775,7 +780,6 @@ impl PlannerView {
                 });
             }
             InlineEdit::Dates(id) => {
-                let typed = value.clone();
                 let date = self
                     .inline_dates
                     .as_ref()
@@ -783,11 +787,14 @@ impl PlannerView {
                 self.inline_dates = None;
                 if let Some(date) = date {
                     self.commit_picker_dates(id, date, false, cx);
-                } else if let Some((start, target)) =
-                    dates_from_range_picker(PickerDate::Range(None, None), &typed)
-                {
+                } else if let Some((start, target)) = dates_from_range_picker(
+                    PickerDate::Range(None, None),
+                    &value,
+                    &self.inline_dates_typed_seed,
+                ) {
                     self.spawn_range_dates(id, start, target, cx);
                 }
+                self.inline_dates_typed_seed.clear();
             }
             InlineEdit::Start(id) | InlineEdit::Target(id) => {
                 let parsed = ado_core::parse_iso_date(Some(value.trim()));
@@ -4314,21 +4321,17 @@ impl PlannerView {
                                 {
                                     this.state.toasts.push(ToastKind::Success, msg.to_string());
                                 }
+                                if role == DateSaveRole::Restore {
+                                    this.state.complete_restore_date_save(&revert);
+                                }
                             } else if let Some(live) =
                                 this.state.nodes.iter().find(|node| node.id == id).cloned()
+                                && let Some(persisted) =
+                                    working.nodes.iter().find(|node| node.id == id).cloned()
                             {
                                 this.enqueue_date_save(
                                     cx,
-                                    PendingDateSave {
-                                        id,
-                                        start: parse_iso_date(live.start_date.as_deref()),
-                                        target: parse_iso_date(live.target_date.as_deref()),
-                                        after_start: live.start_date.clone(),
-                                        after_target: live.target_date.clone(),
-                                        rev: live.rev,
-                                        previous: live,
-                                        role: DateSaveRole::Commit,
-                                    },
+                                    PlannerState::follow_up_date_save(&live, &persisted),
                                 );
                             }
                         }
@@ -4336,6 +4339,7 @@ impl PlannerView {
                             if still_after {
                                 this.state.restore_node(previous);
                                 this.state.revert_date_save_history(&revert);
+                                this.state.restore_date_save_failed(&revert);
                             }
                             if let Some(msg) = working.toasts.last_error_message() {
                                 this.state.toasts.push(ToastKind::Error, msg.to_string());
@@ -4791,10 +4795,18 @@ fn month_name(month: u8) -> &'static str {
 
 /// Map a range picker value (and optional typed ISO text) to Start/Target.
 /// A missing side is `None` so the other date can stay as-is.
+/// When `typed` differs from `typed_seed` (the value at picker open), prefer
+/// the typed dates so an edit on a scheduled item is not ignored.
 pub fn dates_from_range_picker(
     date: PickerDate,
     typed: &str,
+    typed_seed: &str,
 ) -> Option<(Option<jiff::civil::Date>, Option<jiff::civil::Date>)> {
+    if typed_dates_changed(typed, typed_seed)
+        && let Some(parsed) = parse_typed_dates(typed)
+    {
+        return Some(parsed);
+    }
     match date {
         PickerDate::Range(Some(start), Some(end)) => {
             Some((naive_to_jiff(start), naive_to_jiff(end)))
@@ -4804,6 +4816,31 @@ pub fn dates_from_range_picker(
         PickerDate::Single(Some(day)) => Some((naive_to_jiff(day), None)),
         PickerDate::Single(None) | PickerDate::Range(None, None) => parse_typed_dates(typed),
     }
+}
+
+/// Auto-save from the calendar observer only once both ends of a range (or a
+/// single day) are chosen. Start-only first clicks wait for an explicit commit.
+pub fn range_picker_is_complete(date: PickerDate) -> bool {
+    matches!(
+        date,
+        PickerDate::Range(Some(_), Some(_)) | PickerDate::Single(Some(_))
+    )
+}
+
+fn typed_dates_changed(typed: &str, seed: &str) -> bool {
+    normalize_typed_dates(typed) != normalize_typed_dates(seed)
+}
+
+fn normalize_typed_dates(typed: &str) -> String {
+    typed
+        .trim()
+        .replace('→', "/")
+        .replace(" to ", "/")
+        .split(['/', ','])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 fn parse_typed_dates(
