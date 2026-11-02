@@ -1,7 +1,7 @@
 use ado_core::{
     FormControl, FormControlKind, IdentityValue, WorkItemFormModel, WorkItemNode,
-    all_editable_controls, build_form_patch, html_to_markdown, is_plain_html_field,
-    markdown_to_html, missing_required_fields,
+    all_editable_controls, build_form_patch, html_to_markdown, identity_from_field,
+    is_plain_html_field, markdown_to_html, missing_required_fields,
 };
 use serde_json::{Value, json};
 
@@ -114,7 +114,7 @@ impl FormDraft {
                 node.state = state.clone();
             }
             if let Some(assigned) = self.values.get("System.AssignedTo") {
-                node.assigned_to = identity_from_value(assigned);
+                node.assigned_to = identity_from_field(assigned);
             }
             if let Some(Value::String(iteration)) = self.values.get("System.IterationPath") {
                 node.iteration_path = iteration.clone();
@@ -133,6 +133,25 @@ impl FormDraft {
             }
         }
     }
+
+    /// Fill Assigned To from the Gantt row when the form payload has no usable identity.
+    pub fn hydrate_assigned_to(&mut self, node: &WorkItemNode) {
+        if self
+            .values
+            .get("System.AssignedTo")
+            .and_then(identity_from_field)
+            .is_some()
+        {
+            return;
+        }
+        let Some(assigned) = node.assigned_to.as_ref() else {
+            return;
+        };
+        let value = identity_json(assigned);
+        self.values
+            .insert("System.AssignedTo".into(), value.clone());
+        self.model.values.insert("System.AssignedTo".into(), value);
+    }
 }
 
 fn gantt_date_from_draft(value: &Value) -> Option<String> {
@@ -141,39 +160,6 @@ fn gantt_date_from_draft(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
-}
-
-fn identity_from_value(value: &Value) -> Option<IdentityValue> {
-    match value {
-        Value::Null => None,
-        Value::String(text) if text.is_empty() => None,
-        Value::String(text) => Some(IdentityValue {
-            display_name: text.clone(),
-            unique_name: text.clone(),
-            id: None,
-        }),
-        Value::Object(map) => {
-            let display = map.get("displayName").and_then(Value::as_str).unwrap_or("");
-            let unique = map
-                .get("uniqueName")
-                .and_then(Value::as_str)
-                .unwrap_or(display);
-            if display.is_empty() && unique.is_empty() {
-                None
-            } else {
-                Some(IdentityValue {
-                    display_name: if display.is_empty() {
-                        unique.to_string()
-                    } else {
-                        display.to_string()
-                    },
-                    unique_name: unique.to_string(),
-                    id: map.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
-                })
-            }
-        }
-        _ => None,
-    }
 }
 
 pub fn all_controls(model: &WorkItemFormModel) -> Vec<FormControl> {
@@ -249,6 +235,106 @@ pub fn format_form_value(kind: FormControlKind, value: &Value) -> String {
 mod tests {
     use super::*;
     use ado_core::FormControlKind;
+
+    fn assigned_control() -> FormControl {
+        FormControl {
+            id: "System.AssignedTo".into(),
+            reference_name: "System.AssignedTo".into(),
+            label: "Assigned To".into(),
+            kind: FormControlKind::Identity,
+            required: false,
+            read_only: false,
+            visible: true,
+            options: None,
+        }
+    }
+
+    #[test]
+    fn unchanged_dialog_does_not_patch_assigned_to() {
+        let mut values = serde_json::Map::new();
+        values.insert("System.Title".into(), json!("Persist cart"));
+        values.insert(
+            "System.AssignedTo".into(),
+            json!({
+                "displayName": "Ada Lovelace",
+                "uniqueName": "ada@contoso.com",
+                "_links": { "avatar": { "href": "https://dev.azure.com/avatar" } }
+            }),
+        );
+        let draft = FormDraft::from_model(WorkItemFormModel {
+            id: 52917,
+            rev: 4,
+            work_item_type: "User Story".into(),
+            system_controls: vec![
+                FormControl {
+                    id: "System.Title".into(),
+                    reference_name: "System.Title".into(),
+                    label: "Title".into(),
+                    kind: FormControlKind::String,
+                    required: true,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                },
+                assigned_control(),
+            ],
+            pages: Vec::new(),
+            values,
+        });
+        let ops = draft.patch_ops();
+        assert!(
+            ops.iter().all(|op| op.path != "/fields/System.AssignedTo"),
+            "saving an unchanged dialog must not send System.AssignedTo: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn hydrate_assigned_to_fills_empty_form_from_the_gantt_row() {
+        let draft_model = WorkItemFormModel {
+            id: 52917,
+            rev: 4,
+            work_item_type: "User Story".into(),
+            system_controls: vec![assigned_control()],
+            pages: Vec::new(),
+            values: serde_json::Map::from_iter([(
+                "System.AssignedTo".into(),
+                json!({ "id": "guid-only", "descriptor": "aad.1" }),
+            )]),
+        };
+        let mut draft = FormDraft::from_model(draft_model);
+        let node = WorkItemNode {
+            id: 52917,
+            rev: 4,
+            title: "Cart".into(),
+            work_item_type: "User Story".into(),
+            state: "Active".into(),
+            assigned_to: Some(IdentityValue {
+                display_name: "Ada Lovelace".into(),
+                unique_name: "ada@contoso.com".into(),
+                id: Some("guid-ada".into()),
+            }),
+            parent_id: None,
+            area_path: "Shop".into(),
+            iteration_path: "Shop".into(),
+            start_date: None,
+            target_date: None,
+            has_date_fields: true,
+            predecessors: Vec::new(),
+            fields: serde_json::Map::new(),
+        };
+        draft.hydrate_assigned_to(&node);
+        assert_eq!(
+            identity_from_field(draft.values.get("System.AssignedTo").expect("value"))
+                .expect("identity")
+                .display_name,
+            "Ada Lovelace"
+        );
+        let ops = draft.patch_ops();
+        assert!(
+            ops.iter().all(|op| op.path != "/fields/System.AssignedTo"),
+            "hydrating from the row must not count as an Assigned To edit: {ops:?}"
+        );
+    }
 
     #[test]
     fn format_form_value_drops_integer_fraction_and_iso_time() {

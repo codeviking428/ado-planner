@@ -1774,3 +1774,151 @@ fn mouse_up_clears_hover_even_when_the_pointer_stays_on_the_bar(cx: &mut gpui_ki
         "paint-level: handles must not remain after mouse-up on the same bar"
     );
 }
+
+#[gpui_kit::test]
+fn empty_platform_team_shows_an_empty_state(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes.clear();
+    state.prefs.planner.team = "Platform".into();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("empty-gantt").is_some(),
+        "an empty Platform team must show an empty state, not a blank pane"
+    );
+}
+
+#[gpui_kit::test]
+fn loading_hides_the_empty_state(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes.clear();
+    state.hierarchy_loading = true;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-loading-skeleton").is_some(),
+        "loading should show the skeleton"
+    );
+    assert!(
+        cx.debug_bounds("empty-gantt").is_none(),
+        "empty text must not overlap the loading skeleton"
+    );
+}
+
+#[gpui_kit::test]
+fn switching_team_clears_rows_and_updates_the_label(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(!view.state.nodes.is_empty());
+        view.state.begin_team_switch("Shop".into());
+        assert_eq!(view.state.prefs.planner.team, "Shop");
+        assert!(view.state.nodes.is_empty());
+        assert!(view.state.hierarchy_loading);
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("team-trigger").is_some(),
+        "team picker should still paint after the switch"
+    );
+}
+
+#[gpui_kit::test]
+fn form_hides_the_team_settings_banner(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.team_settings_error = Some("Team \"Platform\" has invalid backlog settings.".into());
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: Vec::new(),
+        pages: Vec::new(),
+        values,
+    }));
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("work-item-form").is_some(),
+        "details dialog should paint"
+    );
+    assert!(
+        cx.debug_bounds("team-settings-error").is_none(),
+        "the banner must not show through the modal"
+    );
+}
+
+#[gpui_kit::test]
+fn few_rows_fill_the_timeline_with_grid_shading(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes.truncate(2);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-grid-fill").is_some(),
+        "few rows must fill the rest of the pane with shaded grid rows"
+    );
+    let body = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    assert!(
+        f32::from(body.size.height) > 200.0,
+        "timeline body should fill the pane, got {}",
+        f32::from(body.size.height)
+    );
+}
+
+#[gpui_kit::test]
+fn splitter_shows_a_resize_grip(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-splitter-grip").is_some(),
+        "the tree splitter must show a visible resize grip"
+    );
+}
+
+#[gpui_kit::test]
+fn current_team_shows_a_checkmark_in_the_picker(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.teams = vec![
+        ado_core::Team {
+            id: "1".into(),
+            name: "Platform".into(),
+        },
+        ado_core::Team {
+            id: "2".into(),
+            name: "Shop".into(),
+        },
+    ];
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let trigger = cx.debug_bounds("team-trigger").expect("team trigger");
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("scope-current").is_some(),
+        "the current team must show a checkmark in the picker"
+    );
+}

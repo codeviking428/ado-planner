@@ -8,10 +8,11 @@ use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
 
 pub const ROW_HEIGHT: f32 = 40.0;
-pub const DEFAULT_TREE_WIDTH: f32 = 480.0;
+pub const DEFAULT_TREE_WIDTH: f32 = 640.0;
 pub const MIN_TREE_WIDTH: f32 = 240.0;
 pub const MIN_TIMELINE_WIDTH: f32 = 240.0;
 pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
+pub const SPLITTER_WIDTH: f32 = 8.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
 pub const LINK_HANDLE: f32 = 14.0;
@@ -111,7 +112,7 @@ impl GanttScale {
                 let q = ((date.month() as i32 - 1) / 3) + 1;
                 format!("Q{q}")
             }
-            Self::Year => date.year().to_string(),
+            Self::Year => String::new(),
         }
     }
 
@@ -432,6 +433,21 @@ impl GanttView {
         self.origin = self.origin.saturating_add(span);
     }
 
+    /// Snap the left edge to this scale's period so Year columns stay equal width.
+    pub fn set_scale(&mut self, scale: GanttScale) {
+        if self.scale == scale {
+            return;
+        }
+        let left = self.date_for_x(0.0);
+        self.scale = scale;
+        self.origin = scale.floor_date(left);
+        self.scroll_x = 0.0;
+    }
+
+    pub fn filler_row_count(window_len: usize, content_h: f32) -> usize {
+        ((content_h / ROW_HEIGHT).ceil() as usize).saturating_sub(window_len)
+    }
+
     /// Apply a wheel/trackpad delta whose signs already match content direction
     /// (positive X reveals later dates, positive Y reveals later rows).
     pub fn apply_wheel(&mut self, dx: f32, dy: f32, shift: bool) {
@@ -481,14 +497,14 @@ impl GanttView {
     }
 
     pub fn max_tree_width(&self) -> f32 {
-        (self.viewport_w - 6.0 - MIN_TIMELINE_WIDTH).max(HARD_MIN_TREE_WIDTH)
+        (self.viewport_w - SPLITTER_WIDTH - MIN_TIMELINE_WIDTH).max(HARD_MIN_TREE_WIDTH)
     }
 
     pub fn min_tree_width(&self) -> f32 {
-        if self.viewport_w >= MIN_TREE_WIDTH + MIN_TIMELINE_WIDTH + 6.0 {
+        if self.viewport_w >= MIN_TREE_WIDTH + MIN_TIMELINE_WIDTH + SPLITTER_WIDTH {
             MIN_TREE_WIDTH
         } else {
-            (self.viewport_w - 6.0 - MIN_TIMELINE_WIDTH).max(HARD_MIN_TREE_WIDTH)
+            (self.viewport_w - SPLITTER_WIDTH - MIN_TIMELINE_WIDTH).max(HARD_MIN_TREE_WIDTH)
         }
     }
 
@@ -508,7 +524,8 @@ impl GanttView {
         let min = self.min_tree_width();
         let max = self.max_tree_width().max(min);
         self.tree_width = width.clamp(min, max);
-        self.timeline_width = (self.viewport_w - self.tree_width - 6.0).max(MIN_TIMELINE_WIDTH);
+        self.timeline_width =
+            (self.viewport_w - self.tree_width - SPLITTER_WIDTH).max(MIN_TIMELINE_WIDTH);
     }
 
     /// Clamp against the live pane width so a stale `viewport_w` cannot let the
@@ -854,11 +871,21 @@ impl GanttView {
     /// Month (or day/week) tick labels, with the in-view period stuck at x = 0
     /// when its gridline has scrolled off the left edge.
     pub fn header_tick_labels(&self, width: f32) -> Vec<(f32, String)> {
-        Self::sticky_header_labels(
-            self.timeline_ticks(width)
-                .into_iter()
-                .map(|tick| (tick.x, tick.label)),
-        )
+        self.header_tick_labels_except(width, None)
+    }
+
+    /// Skip empty Year ticks and the Day number sitting under the Today line.
+    pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
+        const HIDE_PAD: f32 = 22.0;
+        Self::sticky_header_labels(self.timeline_ticks(width).into_iter().filter_map(|tick| {
+            if tick.label.is_empty() {
+                return None;
+            }
+            if hide_x.is_some_and(|x| (tick.x - x).abs() < HIDE_PAD) {
+                return None;
+            }
+            Some((tick.x, tick.label))
+        }))
     }
 
     fn sticky_header_labels(ticks: impl IntoIterator<Item = (f32, String)>) -> Vec<(f32, String)> {
@@ -1603,7 +1630,9 @@ mod tests {
             ..Default::default()
         };
         gantt.set_tree_width(10_000.0);
-        assert!((gantt.tree_width - (800.0 - 6.0 - MIN_TIMELINE_WIDTH)).abs() < f32::EPSILON);
+        assert!(
+            (gantt.tree_width - (800.0 - SPLITTER_WIDTH - MIN_TIMELINE_WIDTH)).abs() < f32::EPSILON
+        );
         assert!(gantt.timeline_width >= MIN_TIMELINE_WIDTH);
         gantt.nudge_tree_width(500.0);
         assert!(gantt.tree_width <= gantt.max_tree_width());
@@ -1625,7 +1654,7 @@ mod tests {
             gantt.timeline_width
         );
         assert!(
-            gantt.tree_width <= 700.0 - 6.0 - MIN_TIMELINE_WIDTH + 0.5,
+            gantt.tree_width <= 700.0 - SPLITTER_WIDTH - MIN_TIMELINE_WIDTH + 0.5,
             "tree {} ate the timeline",
             gantt.tree_width
         );
@@ -1647,7 +1676,7 @@ mod tests {
         };
         gantt.set_tree_width_for_pane(10_000.0, 1024.0);
         assert!(
-            (gantt.tree_width - (1024.0 - 6.0 - MIN_TIMELINE_WIDTH)).abs() < 0.5,
+            (gantt.tree_width - (1024.0 - SPLITTER_WIDTH - MIN_TIMELINE_WIDTH)).abs() < 0.5,
             "tree_width {} should clamp against the 1024px pane, not the stale 1280",
             gantt.tree_width
         );
@@ -2050,5 +2079,72 @@ mod tests {
         gantt.select_relative(&rows, 5);
         assert_eq!(gantt.selected_id, Some(6));
         assert!(gantt.scroll_y > 0.0);
+    }
+
+    #[test]
+    fn year_scale_snaps_origin_and_does_not_repeat_year_labels() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 11, 2).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            ..Default::default()
+        };
+        gantt.set_scale(GanttScale::Year);
+        assert_eq!(gantt.origin, Date::new(2026, 1, 1).unwrap());
+        let majors: Vec<_> = gantt
+            .header_major_labels(800.0)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        let ticks: Vec<_> = gantt
+            .header_tick_labels(800.0)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert!(
+            majors.iter().any(|label| label == "2026"),
+            "year header must keep the year on the major row: {majors:?}"
+        );
+        assert!(
+            ticks.iter().all(|label| !majors.contains(label)),
+            "year ticks must not repeat the major year labels: ticks={ticks:?} majors={majors:?}"
+        );
+        let xs: Vec<f32> = gantt
+            .timeline_ticks(1200.0)
+            .into_iter()
+            .filter(|tick| tick.major)
+            .map(|tick| tick.x)
+            .collect();
+        let widths: Vec<f32> = xs.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(widths.len() >= 2, "need at least two year columns: {xs:?}");
+        let first = widths[0];
+        assert!(
+            widths.iter().all(|width| (width - first).abs() < 3.0),
+            "year columns must be equal width, got {widths:?}"
+        );
+    }
+
+    #[test]
+    fn day_header_hides_the_tick_under_today() {
+        let today = Date::new(2026, 11, 2).unwrap();
+        let gantt = GanttView {
+            origin: today,
+            scale: GanttScale::Day,
+            zoom: 1.0,
+            ..Default::default()
+        };
+        let today_x = gantt.today_x(today);
+        let labels = gantt.header_tick_labels_except(800.0, Some(today_x));
+        assert!(
+            labels.iter().all(|(x, _)| (x - today_x).abs() >= 22.0),
+            "today's day number must not sit under the Today line: {labels:?} today_x={today_x}"
+        );
+        assert_eq!(gantt.scale.tick_label(today), "2");
+    }
+
+    #[test]
+    fn filler_rows_cover_the_unused_viewport() {
+        assert_eq!(GanttView::filler_row_count(2, 400.0), 8);
+        assert_eq!(GanttView::filler_row_count(20, 400.0), 0);
     }
 }

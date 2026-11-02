@@ -646,6 +646,21 @@ impl PlannerState {
         self.load_hierarchy().await
     }
 
+    /// Drop stale rows and show the new team name before the hierarchy fetch returns.
+    pub fn begin_team_switch(&mut self, team: String) {
+        self.prefs.planner.team = team;
+        self.prefs.planner.iteration_path.clear();
+        self.prefs.planner.root_types = Some(None);
+        self.nodes.clear();
+        self.hierarchy = None;
+        self.team_settings_error = None;
+        self.hierarchy_loading = true;
+        self.gantt.clear_hover();
+        self.gantt.selected_id = None;
+        self.gantt.hovered_id = None;
+        self.gantt.selected_link = None;
+    }
+
     pub fn hidden_by_filters_count(&self) -> usize {
         let visible: HashSet<i64> = self.visible_nodes().iter().map(|node| node.id).collect();
         self.nodes
@@ -873,7 +888,11 @@ impl PlannerState {
         };
         match self.client.load_form(&scope.org, &scope.project, id).await {
             Ok(model) => {
-                self.form = Some(FormDraft::from_model(model));
+                let mut draft = FormDraft::from_model(model);
+                if let Some(node) = self.nodes.iter().find(|node| node.id == id) {
+                    draft.hydrate_assigned_to(node);
+                }
+                self.form = Some(draft);
                 Ok(())
             }
             Err(err) => {

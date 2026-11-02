@@ -41,6 +41,17 @@ async fn open_and_save_work_item_form() {
 }
 
 #[tokio::test]
+async fn saving_unchanged_dialog_does_not_patch_assigned_to() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.open_form(1003).await.expect("open");
+    let ops = state.form.as_ref().expect("form").patch_ops();
+    assert!(
+        ops.iter().all(|op| op.path != "/fields/System.AssignedTo"),
+        "saving an unchanged dialog must not send System.AssignedTo: {ops:?}"
+    );
+}
+
+#[tokio::test]
 async fn save_toast_uses_display_names_and_skips_unchanged_fields() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.open_form(1003).await.expect("open");

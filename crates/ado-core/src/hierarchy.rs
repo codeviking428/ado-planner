@@ -77,19 +77,34 @@ pub fn chunk_ids(ids: &[i64], size: usize) -> Vec<Vec<i64>> {
     ids.chunks(size).map(<[i64]>::to_vec).collect()
 }
 
+const IDENTITY_DISPLAY_KEYS: [&str; 3] = ["displayName", "providerDisplayName", "name"];
+const IDENTITY_UNIQUE_KEYS: [&str; 4] = [
+    "uniqueName",
+    "mailAddress",
+    "principalName",
+    "directoryAlias",
+];
+
 pub fn identity_from_field(value: &Value) -> Option<IdentityValue> {
     if is_js_falsy(value) {
         return None;
     }
     match value {
-        Value::String(text) => Some(IdentityValue {
-            display_name: text.clone(),
-            unique_name: text.clone(),
-            id: None,
-        }),
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(IdentityValue {
+                    display_name: text.to_string(),
+                    unique_name: text.to_string(),
+                    id: None,
+                })
+            }
+        }
         Value::Object(map) => {
-            let display_name = string_field(map, "displayName");
-            let unique_name = string_field(map, "uniqueName");
+            let display_name = first_string(map, &IDENTITY_DISPLAY_KEYS);
+            let unique_name = first_string(map, &IDENTITY_UNIQUE_KEYS);
             if display_name.is_none() && unique_name.is_none() {
                 return None;
             }
@@ -106,6 +121,12 @@ pub fn identity_from_field(value: &Value) -> Option<IdentityValue> {
         }
         _ => None,
     }
+}
+
+fn first_string(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| string_field(map, key))
+        .filter(|text| !text.is_empty())
 }
 
 pub fn parent_id_from_fields(fields: &serde_json::Map<String, Value>) -> Option<i64> {
@@ -397,6 +418,23 @@ mod tests {
                 unique_name: "ada@contoso".into(),
                 id: None,
             })
+        );
+    }
+
+    #[test]
+    fn identity_from_field_reads_name_and_mail_address() {
+        let identity = identity_from_field(&json!({
+            "name": "Ada Lovelace",
+            "mailAddress": "ada@contoso.com",
+            "id": "guid-ada"
+        }))
+        .expect("identity");
+        assert_eq!(identity.display_name, "Ada Lovelace");
+        assert_eq!(identity.unique_name, "ada@contoso.com");
+        assert_eq!(identity.id.as_deref(), Some("guid-ada"));
+        assert!(
+            identity_from_field(&json!({ "id": "guid-only", "descriptor": "aad.1" })).is_none(),
+            "an id-only identity ref is not enough to show a name"
         );
     }
 

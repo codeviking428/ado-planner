@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use crate::error::Error;
+use crate::hierarchy::identity_from_field;
 use crate::types::{
     FormControl, FormControlKind, FormGroup, FormPage, JsonPatchOp, PatchOp, WorkItemFormModel,
 };
@@ -88,7 +89,9 @@ pub fn kind_from_metadata(
     control: &LayoutControl,
     meta: Option<&FieldMetadata>,
 ) -> FormControlKind {
-    if meta.is_some_and(|m| m.is_identity == Some(true)) {
+    if meta.is_some_and(|m| m.is_identity == Some(true))
+        || control.id.as_deref() == Some("System.AssignedTo")
+    {
         return FormControlKind::Identity;
     }
     if control.control_type.as_deref() == Some("HtmlFieldControl")
@@ -335,16 +338,13 @@ fn date_prefix(value: &Value) -> Option<&str> {
 }
 
 fn identity_key(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) if !text.is_empty() => Some(text.clone()),
-        Value::Object(map) => map
-            .get("uniqueName")
-            .and_then(Value::as_str)
-            .or_else(|| map.get("displayName").and_then(Value::as_str))
-            .filter(|text| !text.is_empty())
-            .map(ToOwned::to_owned),
-        _ => None,
-    }
+    identity_from_field(value).map(|identity| {
+        if identity.unique_name.is_empty() {
+            identity.display_name
+        } else {
+            identity.unique_name
+        }
+    })
 }
 
 /// TanStack Form treated `.` as a nested path. ADO reference names stay flat.
@@ -595,6 +595,36 @@ mod tests {
             vec![FormControlKind::Picklist, FormControlKind::Identity]
         );
         assert!(!pages[0].groups[0].controls.iter().any(|c| c.id == "hidden"));
+    }
+
+    #[test]
+    fn assigned_to_is_identity_even_without_is_identity_metadata() {
+        let control = LayoutControl {
+            id: Some("System.AssignedTo".into()),
+            label: Some("Assigned To".into()),
+            visible: Some(true),
+            read_only: None,
+            control_type: Some("FieldControl".into()),
+            is_contribution: None,
+        };
+        assert_eq!(
+            kind_from_metadata(&control, None),
+            FormControlKind::Identity
+        );
+        let meta = FieldMetadata {
+            reference_name: "System.AssignedTo".into(),
+            name: Some("Assigned To".into()),
+            field_type: Some("string".into()),
+            is_identity: None,
+            is_picklist: None,
+            always_required: None,
+            read_only: None,
+            allowed_values: None,
+        };
+        assert_eq!(
+            kind_from_metadata(&control, Some(&meta)),
+            FormControlKind::Identity
+        );
     }
 
     #[test]
@@ -863,6 +893,40 @@ mod tests {
                     value: Some(json!("Persist cart (saved)")),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn unchanged_assigned_to_is_not_patched() {
+        let assigned = json!({
+            "displayName": "Ada Lovelace",
+            "uniqueName": "ada@contoso.com",
+            "_links": { "avatar": { "href": "https://dev.azure.com/avatar" } }
+        });
+        let mut original = serde_json::Map::new();
+        original.insert("System.Title".into(), json!("Cart"));
+        original.insert("System.AssignedTo".into(), assigned);
+        let mut draft = original.clone();
+        draft.insert(
+            "System.AssignedTo".into(),
+            json!({
+                "displayName": "Ada Lovelace",
+                "uniqueName": "ada@contoso.com",
+                "id": null
+            }),
+        );
+        let document =
+            build_form_patch(5, &original, &draft, &[title_control(), assigned_control()]);
+        assert!(
+            document
+                .iter()
+                .all(|op| op.path != "/fields/System.AssignedTo"),
+            "unchanged Assigned To must not be patched: {document:?}"
+        );
+        assert_eq!(
+            document.len(),
+            1,
+            "only the rev test should remain: {document:?}"
         );
     }
 

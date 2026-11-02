@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ado_core::{
-    AuthMode, FLAVORS, FormControlKind, color_for_type, dates_column_text, is_unscheduled,
-    iso_date_only, parse_iso_date,
+    AuthMode, FLAVORS, FormControlKind, color_for_type, dates_column_text, identity_from_field,
+    is_unscheduled, iso_date_only, parse_iso_date,
 };
 use ado_session::PlannerSession;
 use chrono::Datelike;
@@ -41,8 +41,8 @@ use crate::form::ado_edit_url_on;
 use crate::gantt::{
     ASSIGNEE_COL_WIDTH, DATES_COL_WIDTH, DependencyArrow, GanttScale, GestureKind, HANDLE_WIDTH,
     ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH,
-    NUDGE_IDLE_MS, NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SUMMARY_BAR_H,
-    TIMELINE_HEADER_H, TYPE_COL_WIDTH,
+    NUDGE_IDLE_MS, NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SPLITTER_WIDTH,
+    SUMMARY_BAR_H, TIMELINE_HEADER_H, TYPE_COL_WIDTH,
 };
 use crate::paths::AppPaths;
 use crate::state::{PendingDateSave, PlannerState};
@@ -666,7 +666,7 @@ impl PlannerView {
     }
 
     fn render_error_banner(&self, cx: &Context<Self>) -> impl IntoElement {
-        if self.banner_dismissed {
+        if self.banner_dismissed || self.state.form.is_some() {
             return div().into_any_element();
         }
         let Some(message) = self.state.team_settings_error.as_ref() else {
@@ -1024,31 +1024,37 @@ impl PlannerView {
         let options = self.scope_options(id);
         let search = self.scope_query.read(cx).value().to_string();
         let muted = cx.theme().muted_foreground;
-        let trigger = Button::new(id)
-            .label(if value.is_empty() {
-                format!("Select {label}")
-            } else {
-                value
-            })
-            .disabled(disabled)
-            .on_click(cx.listener(move |this, event, window, cx| {
-                this.open_filter = None;
-                this.state.gantt.context_menu = None;
-                this.open_scope = if this.open_scope == Some(id) {
-                    None
-                } else {
-                    Some(id)
-                };
-                this.scope_query.update(cx, |input, cx| {
-                    input.set_value("", window, cx);
-                });
-                if this.open_scope == Some(id) {
-                    Self::focus_input(&this.scope_query, window, cx);
-                }
-                let _ = event;
-                cx.notify();
-            }));
-        let option_buttons: Vec<_> = if open {
+        let current = value.clone();
+        let trigger = div()
+            .id(SharedString::from(format!("{id}-trigger")))
+            .debug_selector(move || format!("{id}-trigger"))
+            .child(
+                Button::new(id)
+                    .label(if current.is_empty() {
+                        format!("Select {label}")
+                    } else {
+                        current.clone()
+                    })
+                    .disabled(disabled)
+                    .on_click(cx.listener(move |this, event, window, cx| {
+                        this.open_filter = None;
+                        this.state.gantt.context_menu = None;
+                        this.open_scope = if this.open_scope == Some(id) {
+                            None
+                        } else {
+                            Some(id)
+                        };
+                        this.scope_query.update(cx, |input, cx| {
+                            input.set_value("", window, cx);
+                        });
+                        if this.open_scope == Some(id) {
+                            Self::focus_input(&this.scope_query, window, cx);
+                        }
+                        let _ = event;
+                        cx.notify();
+                    })),
+            );
+        let option_buttons: Vec<AnyElement> = if open {
             options
                 .iter()
                 .filter(|(val, lab)| {
@@ -1058,11 +1064,25 @@ impl PlannerView {
                 })
                 .map(|(val, lab)| {
                     let val_click = val.clone();
-                    Button::new(SharedString::from(format!("{id}-{val}")))
-                        .label(lab.clone())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.choose_scope(id, val_click.clone(), cx);
-                        }))
+                    let selected = val == &current;
+                    let caption = if selected {
+                        format!("✓ {lab}")
+                    } else {
+                        lab.clone()
+                    };
+                    div()
+                        .id(SharedString::from(format!("{id}-option-{val}")))
+                        .when(selected, |el| el.debug_selector(|| "scope-current".into()))
+                        .child(
+                            Button::new(SharedString::from(format!("{id}-{val}")))
+                                .label(caption)
+                                .selected(selected)
+                                .when(selected, |btn| btn.primary())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.choose_scope(id, val_click.clone(), cx);
+                                })),
+                        )
+                        .into_any_element()
                 })
                 .collect()
         } else {
@@ -1141,13 +1161,15 @@ impl PlannerView {
                 });
             }
             "team" => {
-                self.state.hierarchy_loading = true;
-                self.loading_shown_at = Some(std::time::Instant::now());
-                self.banner_dismissed = false;
-                self.spawn_state(cx, move |mut state| async move {
-                    let result = state.set_team(value).await;
-                    (state, result)
-                });
+                if !self.io_busy {
+                    self.state.begin_team_switch(value.clone());
+                    self.loading_shown_at = Some(std::time::Instant::now());
+                    self.banner_dismissed = false;
+                    self.spawn_state(cx, move |mut state| async move {
+                        let result = state.set_team(value).await;
+                        (state, result)
+                    });
+                }
             }
             "iteration" => self.state.set_iteration(value),
             "assignee" => self.state.set_assignee(value),
@@ -1389,16 +1411,28 @@ impl PlannerView {
                             this.clear_canvas_hover(cx);
                         }
                     }))
-                    .child(self.render_tree(&visible, &window, cx))
+                    .child(self.render_tree(&visible, &window, content_h, cx))
                     .child(
-                        div()
+                        h_flex()
                             .id("gantt-splitter")
-                            .w(px(6.))
+                            .debug_selector(|| "gantt-splitter".into())
+                            .w(px(SPLITTER_WIDTH))
                             .flex_shrink_0()
                             .h_full()
-                            .bg(cx.theme().border)
+                            .bg(cx.theme().muted)
                             .cursor_col_resize()
                             .hover(|el| el.bg(cx.theme().primary))
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .id("gantt-splitter-grip")
+                                    .debug_selector(|| "gantt-splitter-grip".into())
+                                    .w(px(2.))
+                                    .h(px(28.))
+                                    .rounded_full()
+                                    .bg(cx.theme().muted_foreground),
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -1416,7 +1450,25 @@ impl PlannerView {
                                 }),
                             ),
                     )
-                    .child(self.render_timeline(&window, &bars, cx)),
+                    .child(self.render_timeline(&window, &bars, content_h, cx))
+                    .when(empty_canvas && !self.state.hierarchy_loading, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    v_flex()
+                                        .bg(cx.theme().popover)
+                                        .rounded_md()
+                                        .p_4()
+                                        .shadow_md()
+                                        .child(self.render_empty_gantt(cx)),
+                                ),
+                        )
+                    }),
             )
             .when(self.state.hierarchy_loading, |el| {
                 el.child(self.render_gantt_loading(cx))
@@ -1617,7 +1669,7 @@ impl PlannerView {
                                 .when(!selected, |btn| btn.ghost())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.dismiss_overlays();
-                                    this.state.gantt.scale = scale;
+                                    this.state.gantt.set_scale(scale);
                                     cx.notify();
                                 })),
                         )
@@ -1683,6 +1735,7 @@ impl PlannerView {
         &mut self,
         nodes: &[ado_core::WorkItemNode],
         window: &[crate::gantt::VisibleRow],
+        content_h: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let by_id: std::collections::HashMap<_, _> =
@@ -1912,7 +1965,30 @@ impl PlannerView {
                                             }),
                                     )
                                     .into_any_element()
-                            })),
+                            }))
+                            .children({
+                                let start = window.len();
+                                let fill = crate::gantt::GanttView::filler_row_count(
+                                    window.len(),
+                                    content_h,
+                                );
+                                let bg = cx.theme().background;
+                                let stripe = cx.theme().muted;
+                                (0..fill).map(move |index| {
+                                    div()
+                                        .id(("gantt-tree-fill", index as u64))
+                                        .debug_selector(|| "gantt-grid-fill".into())
+                                        .w_full()
+                                        .h(px(ROW_HEIGHT))
+                                        .min_h(px(ROW_HEIGHT))
+                                        .flex_shrink_0()
+                                        .bg(if (start + index) % 2 == 1 {
+                                            stripe
+                                        } else {
+                                            bg
+                                        })
+                                })
+                            }),
                     ),
             )
     }
@@ -2126,11 +2202,13 @@ impl PlannerView {
         &mut self,
         window: &[crate::gantt::VisibleRow],
         bars: &[crate::gantt::BarLayout],
+        content_h: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let width = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
         let ticks = self.state.gantt.timeline_ticks(width);
-        let today_x = self.state.gantt.today_x(jiff::Zoned::now().date());
+        let today = jiff::Zoned::now().date();
+        let today_x = self.state.gantt.today_x(today);
         let header_fg = cx.theme().muted_foreground;
         let muted_fg = cx.theme().foreground;
         let bar_label_fg = gpui_kit::hsla(240. / 360., 0.21, 0.12, 1.);
@@ -2145,7 +2223,11 @@ impl PlannerView {
         let show_weekends = self.state.gantt.scale.shows_weekend_bands();
         let weekend_w = self.state.gantt.scale.pixels_per_day(self.state.gantt.zoom);
         let major_labels = self.state.gantt.header_major_labels(width);
-        let tick_labels = self.state.gantt.header_tick_labels(width);
+        let hide_today = (self.state.gantt.scale == GanttScale::Day).then_some(today_x);
+        let tick_labels = self
+            .state
+            .gantt
+            .header_tick_labels_except(width, hide_today);
         div()
             .id("gantt-timeline")
             .debug_selector(|| "gantt-timeline".into())
@@ -2177,8 +2259,7 @@ impl PlannerView {
                     .top(px(TIMELINE_HEADER_H))
                     .left_0()
                     .right_0()
-                    .bottom_0()
-                    .relative()
+                    .h(px(content_h))
                     .overflow_hidden()
                     .children(
                         ticks
@@ -2284,7 +2365,29 @@ impl PlannerView {
                                             cx,
                                         )
                                     }))
-                            })),
+                            }))
+                            .children({
+                                let start = window.len();
+                                let fill = crate::gantt::GanttView::filler_row_count(
+                                    window.len(),
+                                    content_h,
+                                );
+                                let stripe = cx.theme().muted;
+                                (0..fill).map(move |index| {
+                                    div()
+                                        .id(("gantt-row-fill", index as u64))
+                                        .debug_selector(|| "gantt-grid-fill".into())
+                                        .w_full()
+                                        .h(px(ROW_HEIGHT))
+                                        .min_h(px(ROW_HEIGHT))
+                                        .flex_shrink_0()
+                                        .bg(if (start + index) % 2 == 1 {
+                                            stripe
+                                        } else {
+                                            gpui_kit::hsla(0., 0., 0., 0.)
+                                        })
+                                })
+                            }),
                     )
                     .child(
                         div()
@@ -2430,25 +2533,6 @@ impl PlannerView {
                             .child(label)
                     })),
             )
-            .when(window.is_empty(), |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .mt(px(TIMELINE_HEADER_H))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            v_flex()
-                                .bg(cx.theme().popover)
-                                .rounded_md()
-                                .p_4()
-                                .shadow_md()
-                                .child(self.render_empty_gantt(cx)),
-                        ),
-                )
-            })
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.state.gantt.gesture.is_some() {
                     let x: f32 = event.position.x.into();
@@ -3329,12 +3413,9 @@ impl PlannerView {
                         .into_any_element()
                 }
                 FormControlKind::Identity => {
-                    let display = value
-                        .get("displayName")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| value.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let display = identity_from_field(&value)
+                        .map(|identity| identity.display_name)
+                        .unwrap_or_default();
                     let results = form.identity_results.clone();
                     let editor = self.form_inputs.get(&id).cloned();
                     let field = id.clone();
@@ -4050,17 +4131,13 @@ impl Render for PlannerView {
         self.state.gantt.viewport_h = (viewport_h - 140.0).max(120.0);
         self.state.gantt.viewport_w = viewport_w;
         self.state.gantt.clamp_tree_width();
-        self.state.gantt.timeline_origin_x = self.state.gantt.tree_width + 6.0;
+        self.state.gantt.timeline_origin_x = self.state.gantt.tree_width + SPLITTER_WIDTH;
         self.state.gantt.timeline_origin_y = (viewport_h - self.state.gantt.viewport_h).max(0.0);
         self.state.toasts.expire();
         self.ensure_form_inputs(window, cx);
         if let Some(form_id) = self.state.form.as_ref().map(|form| form.model.id) {
             if self.form_title_focused_for != Some(form_id) {
-                if let Some(input) = self.form_inputs.get("System.Title").cloned() {
-                    Self::focus_input(&input, window, cx);
-                } else {
-                    window.focus(&self.form_focus, cx);
-                }
+                window.focus(&self.form_focus, cx);
                 self.form_title_focused_for = Some(form_id);
             }
         } else {
