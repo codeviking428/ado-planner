@@ -24,6 +24,8 @@ pub const TODAY_MARGIN_PX: f32 = 80.0;
 /// Place the Today line about a third of the way across the timeline.
 pub const TODAY_ALIGN: f32 = 1.0 / 3.0;
 pub const SCALE_BUTTON_WIDTH: f32 = 132.0;
+/// Toolbar zoom, Today, and team-switch camera easing.
+pub const CAMERA_EASE_MS: u64 = 150;
 pub const PLACEHOLDER_MIN_WIDTH: f32 = 48.0;
 pub const MILESTONE_SIZE: f32 = 16.0;
 pub const SUMMARY_BAR_H: f32 = 14.0;
@@ -64,22 +66,26 @@ impl GanttScale {
     }
 
     pub fn button_label(self, zoom: f32) -> String {
-        if (zoom - 1.0).abs() < 0.005 {
+        let pct = (self.pixels_per_day(zoom) / self.base_pixels_per_day()) * 100.0;
+        if (pct - 100.0).abs() < 0.5 {
             self.label().to_string()
         } else {
-            format!("{} ({:.0}%)", self.label(), zoom * 100.0)
+            format!("{} ({:.0}%)", self.label(), pct)
         }
     }
 
-    pub fn pixels_per_day(self, zoom: f32) -> f32 {
-        let base = match self {
+    pub fn base_pixels_per_day(self) -> f32 {
+        match self {
             Self::Day => 48.0,
             Self::Week => 24.0,
             Self::Month => 12.0,
             Self::Quarter => 4.0,
             Self::Year => 1.5,
-        };
-        (base * zoom).clamp(0.4, 96.0)
+        }
+    }
+
+    pub fn pixels_per_day(self, zoom: f32) -> f32 {
+        (self.base_pixels_per_day() * zoom).clamp(0.4, 96.0)
     }
 
     pub fn step_days(self) -> i32 {
@@ -191,6 +197,31 @@ pub struct SavedGanttView {
     pub scroll_y: f32,
     pub scale: GanttScale,
     pub zoom: f32,
+}
+
+impl SavedGanttView {
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = ease_out_quad(t.clamp(0.0, 1.0));
+        Self {
+            origin: lerp_date(self.origin, other.origin, t),
+            scroll_x: self.scroll_x + (other.scroll_x - self.scroll_x) * t,
+            scroll_y: self.scroll_y + (other.scroll_y - self.scroll_y) * t,
+            scale: other.scale,
+            zoom: self.zoom + (other.zoom - self.zoom) * t,
+        }
+    }
+}
+
+fn ease_out_quad(t: f32) -> f32 {
+    1.0 - (1.0 - t) * (1.0 - t)
+}
+
+fn lerp_date(from: Date, to: Date, t: f32) -> Date {
+    let days = to
+        .since((Unit::Day, from))
+        .map(|span| span.get_days())
+        .unwrap_or(0) as f32;
+    from.saturating_add(((days * t).round() as i32).days())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,6 +437,29 @@ impl GanttView {
     pub fn zoom_at_center(&mut self, factor: f32) {
         let pointer = self.timeline_width.max(1.0) * 0.5;
         self.zoom_at(factor, pointer, 0.0);
+    }
+
+    /// Toolbar +/−: keep the left-edge date still so month columns grow/shrink
+    /// in place instead of the leftover fragment at x=0 collapsing.
+    pub fn zoom_at_left(&mut self, factor: f32) {
+        self.zoom_at(factor, 0.0, 0.0);
+    }
+
+    /// Pixel width of the scale period that contains `date` (a month at Month).
+    pub fn period_width(&self, date: Date) -> f32 {
+        let start = self.scale.floor_date(date);
+        let end = self.scale.next_date(start);
+        (self.x_for_date(end) - self.x_for_date(start)).abs()
+    }
+
+    /// Distance from the sticky left header to the next tick (the leftover
+    /// column a screenshot measures).
+    pub fn leading_period_width(&self, width: f32) -> f32 {
+        self.header_tick_labels(width)
+            .into_iter()
+            .find(|(x, _)| *x > 1.0)
+            .map(|(x, _)| x)
+            .unwrap_or(0.0)
     }
 
     pub fn viewport_range_title(&self) -> String {
@@ -1338,7 +1392,58 @@ mod tests {
         assert_eq!(
             gantt.date_for_x(400.0),
             before,
-            "the +/− buttons must zoom around the viewport centre"
+            "wheel zoom off the timeline must keep the viewport centre"
+        );
+    }
+
+    #[test]
+    fn zoom_in_widens_month_columns_and_zoom_out_goes_below_100() {
+        let oct1 = Date::new(2026, 10, 1).unwrap();
+        let mut gantt = GanttView {
+            origin: oct1,
+            scroll_x: 0.0,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let before = gantt.period_width(oct1);
+        let leading_before = gantt.leading_period_width(800.0);
+        assert!(
+            (before - 31.0 * 12.0).abs() < 0.5,
+            "October at 100% is 31×12px, got {before}"
+        );
+        gantt.zoom_at_left(1.25);
+        let after = gantt.period_width(oct1);
+        let leading_after = gantt.leading_period_width(800.0);
+        assert!(
+            after > before,
+            "+ must widen the month column: {before} -> {after}"
+        );
+        assert!(
+            leading_after > leading_before,
+            "+ must widen the leftover month at the left edge: {leading_before} -> {leading_after}"
+        );
+        assert!(
+            gantt.scale.button_label(gantt.zoom).contains("125%"),
+            "percentage must track column width, got {}",
+            gantt.scale.button_label(gantt.zoom)
+        );
+        gantt.zoom_at_left(0.8);
+        assert!(
+            (gantt.zoom - 1.0).abs() < 0.01,
+            "− from 125% returns to 100%, got {}",
+            gantt.zoom
+        );
+        gantt.zoom_at_left(0.8);
+        assert!(gantt.zoom < 1.0, "− must go below 100%, got {}", gantt.zoom);
+        assert!(
+            gantt.scale.button_label(gantt.zoom).contains("80%"),
+            "− below 100% must show the column percentage, got {}",
+            gantt.scale.button_label(gantt.zoom)
+        );
+        assert!(
+            gantt.period_width(oct1) < before,
+            "− below 100% must shrink month columns"
         );
     }
 

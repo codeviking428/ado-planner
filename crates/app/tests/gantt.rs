@@ -79,7 +79,7 @@ async fn drag_patches_start_and_target() {
             .toasts
             .last_message()
             .unwrap_or_default()
-            .contains("Saved Start Date and Target Date")
+            .contains("Saved dates: Start, Target")
     );
 }
 
@@ -905,7 +905,7 @@ async fn resize_end_toasts_only_target_date() {
         .expect("save target");
     let message = state.toasts.last_message().unwrap_or_default();
     assert_eq!(
-        message, "Saved Target Date",
+        message, "Saved dates: Target",
         "end-only save must toast Target Date, got {message}"
     );
     assert!(

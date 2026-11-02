@@ -1021,8 +1021,16 @@ impl PlannerState {
                         })
                     })
                     .collect();
+                let start_saved = names.iter().any(|name| name == "start date");
+                let target_saved = names.iter().any(|name| name == "target date");
+                let only_dates = !names.is_empty()
+                    && names
+                        .iter()
+                        .all(|name| name == "start date" || name == "target date");
                 let message = if names.is_empty() {
                     format!("Saved Work Item #{id}")
+                } else if only_dates {
+                    dates_saved_message(start_saved, target_saved).to_string()
                 } else {
                     format!("Saved {}", names.join(", "))
                 };
@@ -1360,12 +1368,10 @@ impl PlannerState {
                 }
                 self.persist_hierarchy_cache();
                 if pending.role == DateSaveRole::Commit {
-                    let message = match (pending.start, pending.target) {
-                        (Some(_), None) => "Saved Start Date",
-                        (None, Some(_)) => "Saved Target Date",
-                        _ => "Saved Start Date and Target Date",
-                    };
-                    self.toasts.push(ToastKind::Success, message);
+                    self.toasts.push(
+                        ToastKind::Success,
+                        dates_saved_message(pending.start.is_some(), pending.target.is_some()),
+                    );
                 }
                 Ok(())
             }
@@ -1424,7 +1430,7 @@ impl PlannerState {
                 self.persist_hierarchy_cache();
                 if self.history_recording {
                     self.toasts
-                        .push(ToastKind::Success, "Saved Start Date and Target Date");
+                        .push(ToastKind::Success, dates_saved_message(true, true));
                 }
                 Ok(())
             }
@@ -1496,13 +1502,11 @@ impl PlannerState {
                             node.rev = rev;
                         }
                         self.persist_hierarchy_cache();
-                        let message = match (start, target) {
-                            (Some(_), None) => "Saved Start Date",
-                            (None, Some(_)) => "Saved Target Date",
-                            _ => "Saved Start Date and Target Date",
-                        };
                         if self.history_recording {
-                            self.toasts.push(ToastKind::Success, message);
+                            self.toasts.push(
+                                ToastKind::Success,
+                                dates_saved_message(start.is_some(), target.is_some()),
+                            );
                         }
                         Ok(())
                     }
@@ -1566,12 +1570,10 @@ impl PlannerState {
                 }
                 self.persist_hierarchy_cache();
                 if self.history_recording {
-                    let message = match (start, target) {
-                        (Some(_), None) => "Saved Start Date",
-                        (None, Some(_)) => "Saved Target Date",
-                        _ => "Saved Start Date and Target Date",
-                    };
-                    self.toasts.push(ToastKind::Success, message);
+                    self.toasts.push(
+                        ToastKind::Success,
+                        dates_saved_message(start.is_some(), target.is_some()),
+                    );
                 }
                 Ok(())
             }
@@ -1860,10 +1862,14 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                self.toasts.push(
-                    ToastKind::Success,
-                    format!("Saved {}", field_toast_name(reference, None)),
-                );
+                let message = if reference == ado_core::START_DATE_FIELD {
+                    dates_saved_message(true, false).to_string()
+                } else if reference == ado_core::TARGET_DATE_FIELD {
+                    dates_saved_message(false, true).to_string()
+                } else {
+                    format!("Saved {}", field_toast_name(reference, None))
+                };
+                self.toasts.push(ToastKind::Success, message);
                 Ok(())
             }
             Err(err) => {
@@ -2363,6 +2369,14 @@ impl PlannerState {
             }
         };
         self.toasts.push(ToastKind::Success, message);
+    }
+}
+
+pub(crate) fn dates_saved_message(start: bool, target: bool) -> &'static str {
+    match (start, target) {
+        (true, false) => "Saved dates: Start",
+        (false, true) => "Saved dates: Target",
+        _ => "Saved dates: Start, Target",
     }
 }
 

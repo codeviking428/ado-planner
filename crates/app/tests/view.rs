@@ -2308,6 +2308,99 @@ fn dates_picker_has_month_arrows_and_typed_input(cx: &mut gpui_kit::TestAppConte
         before, after,
         "clicking ‹ must change the visible month, {before:?} -> {after:?}"
     );
+    assert!(
+        cx.debug_bounds("gantt-dates-month-label").is_some(),
+        "range picker must show the current month between the arrows"
+    );
+}
+
+#[gpui_kit::test]
+fn zoom_plus_widens_month_columns_and_minus_goes_below_100(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let oct1 = Date::new(2026, 10, 1).unwrap();
+    let before = view.update(cx, |view, _| view.state.gantt.period_width(oct1));
+    let zoom_in = cx.debug_bounds("gantt-zoom-in").expect("zoom in");
+    cx.simulate_click(zoom_in.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let after = view.state.gantt.period_width(oct1);
+        assert!(
+            after > before,
+            "+ must widen month columns: {before} -> {after}"
+        );
+        assert!(
+            view.state.gantt.zoom > 1.0,
+            "+ must raise zoom above 100%, got {}",
+            view.state.gantt.zoom
+        );
+    });
+    view.update(cx, |view, _| {
+        view.state.gantt.zoom = 1.0;
+        view.state.gantt.scroll_x = 0.0;
+    });
+    let zoom_out = cx.debug_bounds("gantt-zoom-out").expect("zoom out");
+    cx.simulate_click(zoom_out.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.zoom < 1.0,
+            "− must go below 100%, got {}",
+            view.state.gantt.zoom
+        );
+        assert!(
+            view.state.gantt.period_width(oct1) < before,
+            "− below 100% must shrink month columns"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn hovered_row_shows_open_details_icon(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(1);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-open-details").is_some(),
+        "hovered rows must show an ⓘ to open details"
+    );
+}
+
+#[gpui_kit::test]
+fn selected_link_shows_a_visible_remove_control(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.predecessors = vec![1];
+        node.start_date = Some("2026-07-21T00:00:00Z".into());
+        node.target_date = Some("2026-08-04T00:00:00Z".into());
+    }
+    state.gantt.selected_link = Some((1, 2));
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-remove").is_some(),
+        "a selected dependency must show a × to remove it"
+    );
 }
 
 #[gpui_kit::test]

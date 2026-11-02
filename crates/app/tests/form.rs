@@ -138,15 +138,12 @@ async fn save_toast_does_not_report_needs_review_when_only_dates_changed() {
         serde_json::json!("2026-08-21T00:00:00Z"),
     );
     state.save_form().await.expect("save");
-    let message = state
-        .toasts
-        .last_message()
-        .unwrap_or_default()
-        .to_lowercase();
-    assert!(
-        message.contains("start date") && message.contains("target date"),
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert_eq!(
+        message, "Saved dates: Start, Target",
         "toast should mention the dates that changed, got {message}"
     );
+    let message = message.to_lowercase();
     assert!(
         !message.contains("needs review"),
         "null vs false must not count as a Needs Review change: {message}"
