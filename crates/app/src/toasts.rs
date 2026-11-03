@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const TOAST_CAP: usize = 2;
-const SUCCESS_TTL: Duration = Duration::from_secs(5);
+const SUCCESS_TTL: Duration = Duration::from_secs(7);
 const UNDO_TTL: Duration = Duration::from_secs(8);
 const WARNING_TTL: Duration = Duration::from_secs(8);
 
@@ -33,6 +33,8 @@ pub enum UndoAction {
     DeleteCreated {
         id: i64,
         title: String,
+        work_item_type: String,
+        placement: String,
     },
     RestoreFields {
         id: i64,
@@ -57,6 +59,8 @@ pub enum HistoryEntry {
     Created {
         id: i64,
         title: String,
+        work_item_type: String,
+        placement: String,
     },
     Fields {
         id: i64,
@@ -105,6 +109,8 @@ pub struct Toast {
 pub struct Toasts {
     next_id: u64,
     pub items: Vec<Toast>,
+    /// Hovered toasts do not expire until the pointer leaves.
+    pub paused: bool,
 }
 
 impl Toasts {
@@ -176,6 +182,9 @@ impl Toasts {
     }
 
     pub fn expire(&mut self) {
+        if self.paused {
+            return;
+        }
         let now = Instant::now();
         self.items.retain(|toast| match toast.kind {
             ToastKind::Error => true,
@@ -293,6 +302,8 @@ mod tests {
             UndoAction::DeleteCreated {
                 id: 7,
                 title: "Cart".into(),
+                work_item_type: "Feature".into(),
+                placement: "at the root".into(),
             },
         );
         toasts.push(ToastKind::Success, "Saved");
@@ -308,5 +319,18 @@ mod tests {
             toasts.items.iter().any(|toast| toast.message == "Saved"),
             "unrelated toasts must stay"
         );
+    }
+
+    #[test]
+    fn hover_pauses_expiry() {
+        let mut toasts = Toasts::default();
+        toasts.push(ToastKind::Success, "Saved");
+        toasts.items[0].created_at = Instant::now() - Duration::from_secs(20);
+        toasts.paused = true;
+        toasts.expire();
+        assert_eq!(toasts.items.len(), 1, "hovered toasts must not expire");
+        toasts.paused = false;
+        toasts.expire();
+        assert!(toasts.items.is_empty());
     }
 }

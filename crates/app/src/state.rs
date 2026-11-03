@@ -1072,7 +1072,11 @@ impl PlannerState {
                         .unwrap_or_else(|| format!("#{id}"));
                     renamed_message(&old, &self.item_title(id))
                 } else {
-                    format!("Saved {} on {}", names.join(", "), self.item_title(id))
+                    format!(
+                        "Saved {} on {}",
+                        names.join(", "),
+                        quote_name(&self.item_title(id))
+                    )
                 };
                 if only_dates {
                     if let Some(before) = before.as_ref() {
@@ -1317,8 +1321,8 @@ impl PlannerState {
         }
     }
 
-    /// Apply picker dates locally and queue a persist. Start-only is allowed
-    /// on explicit commit; the view decides when to call this.
+    /// Apply picker dates locally and queue a persist. `None` clears that
+    /// side, so start-only and an empty Enter (clear both) are exact writes.
     pub fn commit_range_dates_now(
         &mut self,
         id: i64,
@@ -1326,16 +1330,12 @@ impl PlannerState {
         target: Option<Date>,
     ) -> Option<PendingDateSave> {
         let previous = self.nodes.iter().find(|node| node.id == id).cloned()?;
-        let after_start = start
-            .map(iso_date_only)
-            .or_else(|| previous.start_date.clone());
-        let after_target = target
-            .map(iso_date_only)
-            .or_else(|| previous.target_date.clone());
+        let after_start = start.map(iso_date_only);
+        let after_target = target.map(iso_date_only);
         if after_start == previous.start_date && after_target == previous.target_date {
             return None;
         }
-        let _ = self.apply_optimistic_partial(id, start, target);
+        self.restore_partial_dates(id, start, target);
         if self.history_recording {
             self.record_dates(id, &previous, after_start.clone(), after_target.clone());
         }
@@ -1948,13 +1948,38 @@ impl PlannerState {
                 let rows = self.gantt.flatten(&self.nodes);
                 self.gantt.select_relative(&rows, 0);
                 self.persist_hierarchy_cache();
+                let work_item_type = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .map(|node| node.work_item_type.clone())
+                    .unwrap_or_else(|| "work item".into());
+                let placement = match parent_id.and_then(|pid| {
+                    self.nodes.iter().find(|node| node.id == pid).map(|parent| {
+                        format!(
+                            "under {} {}",
+                            parent.work_item_type,
+                            quote_name(&parent.title)
+                        )
+                    })
+                }) {
+                    Some(under) => under,
+                    None => "at the root".into(),
+                };
                 self.record(HistoryEntry::Created {
                     id,
                     title: title.clone(),
+                    work_item_type: work_item_type.clone(),
+                    placement: placement.clone(),
                 });
                 self.toasts.push_undo(
-                    created_message(&title),
-                    UndoAction::DeleteCreated { id, title },
+                    created_message(&work_item_type, &title, &placement),
+                    UndoAction::DeleteCreated {
+                        id,
+                        title,
+                        work_item_type,
+                        placement,
+                    },
                 );
                 Ok(())
             }
@@ -2050,7 +2075,7 @@ impl PlannerState {
                         format!(
                             "Saved {} on {}",
                             field_toast_name(reference, None),
-                            self.item_title(id)
+                            quote_name(&self.item_title(id))
                         )
                     };
                     self.toasts.push_undo(
@@ -2101,7 +2126,9 @@ impl PlannerState {
     }
 
     pub fn cancel_gesture(&mut self) {
-        if let Some(gesture) = self.gantt.gesture.clone() {
+        if let Some(gesture) = self.gantt.gesture.clone()
+            && gesture.kind != crate::gantt::GestureKind::Link
+        {
             self.restore_partial_dates(
                 gesture.id,
                 gesture.had_start.then_some(gesture.start),
@@ -2205,7 +2232,7 @@ impl PlannerState {
                 if self.history_recording {
                     self.record_dates(id, &previous, None, None);
                     self.toasts.push_undo(
-                        format!("Cleared dates on {}", self.item_title(id)),
+                        format!("Cleared dates on {}", quote_name(&self.item_title(id))),
                         UndoAction::RestoreDates {
                             id,
                             start_date: previous.start_date,
@@ -2723,8 +2750,8 @@ impl PlannerState {
     fn link_changed_message(&self, verb: &str, predecessor_id: i64, successor_id: i64) -> String {
         format!(
             "{verb} link: {} → {}",
-            self.item_title(predecessor_id),
-            self.item_title(successor_id)
+            quote_name(&self.item_title(predecessor_id)),
+            quote_name(&self.item_title(successor_id))
         )
     }
 
@@ -2766,12 +2793,21 @@ impl PlannerState {
                         renamed_message(&json_plain(before), &title)
                     }
                     [(reference, _)] => {
-                        format!("Saved {} on {title}", field_toast_name(reference, None))
+                        format!(
+                            "Saved {} on {}",
+                            field_toast_name(reference, None),
+                            quote_name(&title)
+                        )
                     }
-                    _ => format!("Saved fields on {title}"),
+                    _ => format!("Saved fields on {}", quote_name(&title)),
                 }
             }
-            UndoAction::DeleteCreated { title, .. } => created_message(title),
+            UndoAction::DeleteCreated {
+                title,
+                work_item_type,
+                placement,
+                ..
+            } => created_message(work_item_type, title, placement),
             UndoAction::RemoveLink {
                 successor_id,
                 predecessor_id,
@@ -2807,7 +2843,12 @@ impl PlannerState {
                 let verb = if *linked { "Added" } else { "Removed" };
                 self.link_changed_message(verb, *predecessor_id, *successor_id)
             }
-            HistoryEntry::Created { title, .. } => created_message(title),
+            HistoryEntry::Created {
+                title,
+                work_item_type,
+                placement,
+                ..
+            } => created_message(work_item_type, title, placement),
             HistoryEntry::Fields { id, changes } => {
                 field_changes_message(&self.item_title(*id), changes)
             }
@@ -2861,11 +2902,21 @@ fn toast_date(date: Date) -> String {
     compact_date(date).replace(' ', "\u{00a0}")
 }
 
+pub(crate) fn quote_name(title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        "\"item\"".into()
+    } else {
+        format!("\"{title}\"")
+    }
+}
+
 pub(crate) fn dates_moved_message(
     title: &str,
     start: Option<Date>,
     target: Option<Date>,
 ) -> String {
+    let title = quote_name(title);
     match (start, target) {
         (Some(start), Some(target)) => format!(
             "Moved {title} to {} → {}",
@@ -2888,6 +2939,7 @@ fn dates_changed_message(
     let was_clear = before_start.is_none() && before_target.is_none();
     let now_clear = after_start.is_none() && after_target.is_none();
     if was_clear && !now_clear {
+        let title = quote_name(title);
         match (after_start, after_target) {
             (Some(start), Some(target)) => format!(
                 "Scheduled {title} {} → {}",
@@ -2924,13 +2976,10 @@ fn dates_undo_message(
     }
 }
 
-fn created_message(title: &str) -> String {
-    let title = title.trim();
-    if title.is_empty() {
-        "Created item".into()
-    } else {
-        format!("Created {title}")
-    }
+fn created_message(work_item_type: &str, title: &str, placement: &str) -> String {
+    let ty = work_item_type.trim();
+    let ty = if ty.is_empty() { "work item" } else { ty };
+    format!("Created {ty} {} {placement}", quote_name(title))
 }
 
 fn renamed_message(old: &str, new: &str) -> String {
@@ -2942,8 +2991,12 @@ fn field_changes_message(title: &str, changes: &[(String, Value, Value)]) -> Str
         [(reference, before, after)] if reference == "System.Title" => {
             renamed_message(&json_plain(before), &json_plain(after))
         }
-        [(reference, _, _)] => format!("Saved {} on {title}", field_toast_name(reference, None)),
-        _ => format!("Saved fields on {title}"),
+        [(reference, _, _)] => format!(
+            "Saved {} on {}",
+            field_toast_name(reference, None),
+            quote_name(title)
+        ),
+        _ => format!("Saved fields on {}", quote_name(title)),
     }
 }
 
@@ -3352,8 +3405,8 @@ mod toast_copy_tests {
         let target = Date::new(2026, 8, 18).unwrap();
         let message = dates_moved_message("Cart", Some(start), Some(target));
         assert!(
-            message.starts_with("Moved Cart to"),
-            "move toasts must name the item then the range, got {message}"
+            message.starts_with("Moved \"Cart\" to"),
+            "move toasts must quote the item then the range, got {message}"
         );
         assert!(
             message.contains('\u{00a0}'),
@@ -3364,8 +3417,8 @@ mod toast_copy_tests {
     #[test]
     fn undo_prefix_has_no_double_colon() {
         use super::undone_message;
-        let message = undone_message("Added link: A → B");
-        assert_eq!(message, "Undone added link: A → B");
+        let message = undone_message("Added link: \"A\" → \"B\"");
+        assert_eq!(message, "Undone added link: \"A\" → \"B\"");
         assert_eq!(message.matches(':').count(), 1);
         assert_eq!(
             undone_message("Renamed \"Cart\" to \"Basket\""),

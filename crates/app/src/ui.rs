@@ -122,6 +122,9 @@ pub struct PlannerView {
     /// True after a drag move with the left button down. A later move with
     /// the button up then commits, covering mouse-up outside the window.
     saw_pressed_drag: bool,
+    /// Window-x where an unscheduled row press began; a click without travel
+    /// must not auto-schedule.
+    schedule_origin_x: Option<f32>,
     /// Pointer is down on a toast; skip Gantt mouse-up commit for this click.
     toast_pointer: bool,
     /// Toast Undo clicked while spawn_state is busy; replay when I/O frees.
@@ -274,6 +277,12 @@ impl PlannerView {
                 if !nav || overlay || this.input_focused(window, cx) {
                     return;
                 }
+                if this.form_focus.is_focused(window) {
+                    // capture_key_down on the focused planner already handles
+                    // Down/Up. Handling it here too skipped a row after a bar
+                    // click focused the planner.
+                    return;
+                }
                 this.on_key(
                     &KeyDownEvent {
                         keystroke: event.keystroke.clone(),
@@ -330,6 +339,7 @@ impl PlannerView {
             pending_camera_from: None,
             skip_camera_anim: false,
             saw_pressed_drag: false,
+            schedule_origin_x: None,
             toast_pointer: false,
             pending_toast_undo: None,
             _subscriptions: vec![keystrokes],
@@ -919,6 +929,7 @@ impl PlannerView {
         self.state.close_form();
         self.state.cancel_gesture();
         self.state.gantt.schedule_drag = None;
+        self.schedule_origin_x = None;
         self.state.gantt.clear_hover();
         self.dates_anchor = None;
     }
@@ -1086,10 +1097,8 @@ impl PlannerView {
         ) else {
             return;
         };
-        let next_start = start.map(iso_date_only).or_else(|| node.start_date.clone());
-        let next_target = target
-            .map(iso_date_only)
-            .or_else(|| node.target_date.clone());
+        let next_start = start.map(iso_date_only);
+        let next_target = target.map(iso_date_only);
         let unchanged = next_start == node.start_date && next_target == node.target_date;
         if close {
             self.inline_edit = None;
@@ -1316,6 +1325,10 @@ impl PlannerView {
             .items_center()
             .gap_2()
             .occlude()
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.state.toasts.paused = *hovered;
+                cx.notify();
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -1425,6 +1438,7 @@ impl PlannerView {
         self.state.cancel_gesture();
         self.state.gantt.schedule_drag = None;
         self.saw_pressed_drag = false;
+        self.schedule_origin_x = None;
     }
 
     pub fn apply_toast_undo(&mut self, toast_id: u64, action: UndoAction, cx: &mut Context<Self>) {
@@ -2524,6 +2538,16 @@ impl PlannerView {
             )
             .child(
                 div()
+                    .id("gantt-zoom-pct")
+                    .debug_selector(|| "gantt-zoom-pct".into())
+                    .w(px(48.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_center()
+                    .child(self.state.gantt.zoom_percent_label()),
+            )
+            .child(
+                div()
                     .id("gantt-zoom-in")
                     .debug_selector(|| "gantt-zoom-in".into())
                     .flex_shrink_0()
@@ -2736,6 +2760,8 @@ impl PlannerView {
                                             if can_schedule {
                                                 this.state.gantt.schedule_drag = Some(id);
                                                 this.state.gantt.selected_id = Some(id);
+                                                this.saw_pressed_drag = false;
+                                                this.schedule_origin_x = None;
                                                 cx.notify();
                                             }
                                         }),
@@ -3104,7 +3130,8 @@ impl PlannerView {
                     v_flex()
                         .id("gantt-inline-dates")
                         .debug_selector(|| "gantt-inline-dates".into())
-                        .min_w(px(280.))
+                        .w(px(280.))
+                        .max_w(px(280.))
                         .p_2()
                         .gap_2()
                         .rounded_md()
@@ -3124,9 +3151,11 @@ impl PlannerView {
                             div()
                                 .id("gantt-dates-error")
                                 .debug_selector(|| "gantt-dates-error".into())
+                                .w_full()
                                 .h(px(16.))
                                 .text_xs()
                                 .text_color(cx.theme().danger)
+                                .whitespace_normal()
                                 .child(self.inline_dates_error.clone().unwrap_or_default()),
                         )
                         .child(self.render_calendar_chrome(&state, cx)),
@@ -3437,6 +3466,9 @@ impl PlannerView {
                             .filter(|tick| tick.x >= 0.0 && tick.x < width)
                             .map(|tick| tick.x)
                             .collect();
+                        if xs.first().is_none_or(|x| *x > 0.5) {
+                            xs.insert(0, 0.0);
+                        }
                         if xs.last().is_none_or(|x| width - x > 2.0) {
                             xs.push((width - 1.0).max(0.0));
                         }
@@ -3522,9 +3554,12 @@ impl PlannerView {
                                                     )
                                             });
                                             if can_schedule {
+                                                let x: f32 = event.position.x.into();
                                                 this.state.gantt.schedule_drag = Some(id);
                                                 this.state.gantt.selected_id = Some(id);
                                                 this.state.gantt.hovered_id = Some(id);
+                                                this.saw_pressed_drag = false;
+                                                this.schedule_origin_x = Some(x);
                                                 this.focus_planner(window, cx);
                                                 cx.notify();
                                                 return;
@@ -5147,10 +5182,12 @@ impl PlannerView {
                         .or_else(|| self.form_inputs.get(ado_core::TARGET_DATE_FIELD).cloned());
                     let calendar_open = self.form_calendar_open;
                     let dates_error = self.form_dates_error(cx);
+                    let form_id = form.model.id;
                     v_flex()
                         .id(SharedString::from(format!("form-date-{id}")))
                         .debug_selector(|| "form-date-picker".into())
                         .w_full()
+                        .max_w_full()
                         .gap_2()
                         .when_some(picker, |el, state| {
                             el.child(
@@ -5166,6 +5203,7 @@ impl PlannerView {
                                                 .id("form-dates-typed")
                                                 .debug_selector(|| "form-dates-typed".into())
                                                 .flex_1()
+                                                .min_w(px(0.))
                                                 .child(
                                                     Input::new(&input)
                                                         .id("form-dates-input")
@@ -5173,6 +5211,22 @@ impl PlannerView {
                                                 ),
                                         )
                                     })
+                                    .child(
+                                        Button::new("form-dates-clear")
+                                            .ghost()
+                                            .compact()
+                                            .label("Clear dates")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.spawn_state(cx, move |mut state| async move {
+                                                    let result = state.clear_dates(form_id).await;
+                                                    (state, result)
+                                                });
+                                                if let Some(form) = this.state.form.as_mut() {
+                                                    form.set_exact_range_dates(None, None);
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
                                     .child(
                                         Button::new("form-dates-calendar-toggle")
                                             .ghost()
@@ -5191,18 +5245,15 @@ impl PlannerView {
                             .when(calendar_open, |el| {
                                 el.child(self.render_calendar_chrome(&state, cx))
                             })
-                            .when_some(
-                                dates_error.clone(),
-                                |el, message| {
-                                    el.child(
-                                        div()
-                                            .id("form-dates-error")
-                                            .debug_selector(|| "form-dates-error".into())
-                                            .text_xs()
-                                            .text_color(cx.theme().danger)
-                                            .child(message),
-                                    )
-                                },
+                            .child(
+                                div()
+                                    .id("form-dates-error")
+                                    .debug_selector(|| "form-dates-error".into())
+                                    .w_full()
+                                    .h(px(16.))
+                                    .text_xs()
+                                    .text_color(cx.theme().danger)
+                                    .child(dates_error.clone().unwrap_or_default()),
                             )
                         })
                         .when(!has_picker, |el| {
@@ -5374,6 +5425,7 @@ impl PlannerView {
             return;
         }
         self.dismiss_overlays();
+        self.state.close_form();
         self.form_inputs.clear();
         self.form_dates.clear();
         self.form_dates_preview = None;
@@ -5406,6 +5458,10 @@ impl PlannerView {
     }
 
     fn form_dates_error(&self, cx: &App) -> Option<String> {
+        let form_id = self.state.form.as_ref().map(|form| form.model.id)?;
+        if self.form_inputs_for != Some(form_id) {
+            return None;
+        }
         let typed = self
             .form_inputs
             .get(ado_core::START_DATE_FIELD)
@@ -5515,7 +5571,7 @@ impl PlannerView {
                 || reference == ado_core::START_DATE_FIELD
                 || reference == ado_core::TARGET_DATE_FIELD
             {
-                form.set_range_dates(start.map(iso_date_only), target.map(iso_date_only));
+                form.set_exact_range_dates(start.map(iso_date_only), target.map(iso_date_only));
             } else if let Some(day) = start.or(target) {
                 form.values
                     .insert(reference.clone(), serde_json::json!(iso_date_only(day)));
@@ -5548,7 +5604,7 @@ impl PlannerView {
         let x: f32 = event.position.x.into();
         self.state
             .update_bar_gesture(x - self.state.gantt.timeline_origin_x);
-        if event.dragging() {
+        if event.dragging() || event.pressed_button.is_some() {
             self.saw_pressed_drag = true;
             cx.notify();
             return;
@@ -5888,6 +5944,10 @@ impl PlannerView {
                     self._subscriptions.push(cx.subscribe(
                         &input,
                         |this, _, event: &InputEvent, cx| {
+                            let form_id = this.state.form.as_ref().map(|form| form.model.id);
+                            if this.form_inputs_for != form_id {
+                                return;
+                            }
                             if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
                                 this.sync_form_inputs(cx);
                                 cx.notify();
@@ -6400,6 +6460,9 @@ pub fn dates_from_range_picker_in_years(
     if typed_changed && matches!(parsed, TypedDateRange::Invalid) {
         return None;
     }
+    if typed_changed && matches!(parsed, TypedDateRange::Empty) {
+        return Some((None, None));
+    }
     let typed_edit = match parsed {
         TypedDateRange::Parsed(start, target) if typed_changed => Some((start, target)),
         _ => None,
@@ -6622,18 +6685,27 @@ impl Render for PlannerView {
                 this.state.gantt.clear_hover();
                 this.state.gantt.hover_locked = true;
                 if this.state.gantt.gesture.is_some() {
+                    let x: f32 = event.position.x.into();
+                    this.state
+                        .update_bar_gesture(x - this.state.gantt.timeline_origin_x);
+                    this.saw_pressed_drag = true;
                     this.commit_gesture(cx);
                 }
                 if this.state.gantt.splitter_drag.take().is_some() {
                     cx.notify();
                 }
                 if let Some(id) = this.state.gantt.schedule_drag.take() {
+                    let origin = this.schedule_origin_x.take();
                     if this.state.gantt.context_menu.is_some() {
+                        this.saw_pressed_drag = false;
                         cx.notify();
                         return;
                     }
                     let x: f32 = event.position.x.into();
-                    if x > this.state.gantt.timeline_origin_x {
+                    let dragged = this.saw_pressed_drag
+                        || origin.is_some_and(|origin| (x - origin).abs() >= 6.0);
+                    this.saw_pressed_drag = false;
+                    if dragged && x > this.state.gantt.timeline_origin_x {
                         let date = this.state.gantt.drop_date(x);
                         this.spawn_state(cx, move |mut state| async move {
                             let result = state.schedule_at(id, date).await;
@@ -6660,6 +6732,9 @@ impl Render for PlannerView {
                 if this.state.gantt.gesture.is_some() {
                     this.on_bar_drag_move(event, cx);
                     return;
+                }
+                if this.state.gantt.schedule_drag.is_some() && event.dragging() {
+                    this.saw_pressed_drag = true;
                 }
                 if !this.state.gantt.pointer_in_rows(x, y) {
                     this.clear_canvas_hover(cx);

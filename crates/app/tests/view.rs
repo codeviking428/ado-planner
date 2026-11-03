@@ -457,6 +457,19 @@ fn typed_unparseable_dates_do_not_clear_the_range() {
     );
     assert!(typed_dates_error("Jul 22 -> zz").is_some());
     assert!(typed_dates_error("").is_none());
+    let cleared = dates_from_range_picker(calendar, "", seed).expect("empty typed is a clear");
+    assert_eq!(
+        cleared,
+        (None, None),
+        "empty picker + Enter must clear both dates instead of no-op"
+    );
+    let start_only = dates_from_range_picker(PickerDate::Range(None, None), "Jul 6", "")
+        .expect("start-only typed");
+    assert_eq!(start_only.0, Some(Date::new(2026, 7, 6).unwrap()));
+    assert!(
+        start_only.1.is_none(),
+        "typed start-only must not invent a target"
+    );
 }
 
 #[gpui_kit::test]
@@ -2228,6 +2241,165 @@ fn clicking_a_bar_focuses_planner_keys_for_nudge(cx: &mut gpui_kit::TestAppConte
                 "clicking a bar must focus planner keys so ←/→ can nudge"
             );
         });
+    });
+}
+
+#[gpui_kit::test]
+fn down_after_clicking_a_bar_moves_one_row(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1").expect("bar");
+    cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let down = KeyDownEvent {
+        keystroke: Keystroke::parse("down").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        let before = view.state.gantt.selected_id;
+        let rows = view.state.visible_rows();
+        let before_idx = rows
+            .iter()
+            .position(|row| Some(row.id) == before)
+            .unwrap_or(0);
+        view.handle_key(&down, cx);
+        let after = view.state.gantt.selected_id;
+        let after_idx = rows
+            .iter()
+            .position(|row| Some(row.id) == after)
+            .unwrap_or(0);
+        assert_eq!(
+            after_idx,
+            before_idx + 1,
+            "Down after a bar click must move one row, {before:?} -> {after:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn right_link_handle_drag_does_not_unschedule_start_only(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.target_date = None;
+        node.title = "Start only".into();
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.selected_id = Some(2);
+    state.gantt.hovered_id = Some(2);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-2-link-end")
+        .expect("start-only bar must show a right link handle");
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let start = handle.center();
+    cx.simulate_mouse_move(
+        point(start.x + px(40.), start.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link)
+        );
+        view.handle_key(
+            &KeyDownEvent {
+                keystroke: Keystroke::parse("escape").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            },
+            cx,
+        );
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .expect("node");
+        assert_eq!(
+            node.start_date.as_deref(),
+            Some("2026-07-06T00:00:00Z"),
+            "cancelling a right-handle link must keep the start date"
+        );
+        assert!(
+            node.target_date.is_none(),
+            "start-only must stay start-only, got {:?}",
+            node.target_date
+        );
+        assert!(
+            view.state.toasts.items.iter().all(|toast| toast.kind
+                != ado_planner::toasts::ToastKind::Success
+                || !toast.message.contains("Cleared")),
+            "unschedule must not happen silently"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn clicking_an_empty_unscheduled_row_does_not_schedule(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 3) {
+        node.start_date = None;
+        node.target_date = None;
+        node.has_date_fields = true;
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let band = cx
+        .debug_bounds("gantt-row-band-3")
+        .expect("unscheduled gantt row");
+    let click = point(
+        gpui_kit::px(f32::from(band.origin.x) + f32::from(band.size.width) * 0.8),
+        band.center().y,
+    );
+    cx.simulate_mouse_down(click, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(click, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 3)
+            .expect("node");
+        assert!(
+            node.start_date.is_none() && node.target_date.is_none(),
+            "a click on an empty unscheduled row must not auto-schedule, got {:?} {:?}",
+            node.start_date,
+            node.target_date
+        );
+        assert_eq!(view.state.gantt.selected_id, Some(3));
+        assert!(view.state.gantt.schedule_drag.is_none());
     });
 }
 
@@ -4125,6 +4297,100 @@ fn ascii_arrow_dates_save_and_garbage_blocks_save(cx: &mut gpui_kit::TestAppCont
         cx.debug_bounds("form-dates-error").is_some(),
         "the Dates field must show the parse error"
     );
+    let picker_with_error = cx.debug_bounds("form-date-picker").expect("picker");
+    let error_w = f32::from(
+        cx.debug_bounds("form-dates-error")
+            .expect("error slot")
+            .size
+            .width,
+    );
+    assert!(
+        error_w <= f32::from(picker_with_error.size.width) + 1.0,
+        "the error must wrap inside the picker instead of widening it, error={error_w} picker={}",
+        f32::from(picker_with_error.size.width)
+    );
+}
+
+#[gpui_kit::test]
+fn form_parse_error_resets_when_opening_another_item(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert(
+        ado_core::START_DATE_FIELD.into(),
+        serde_json::json!("2026-07-06T00:00:00Z"),
+    );
+    values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-07-20T00:00:00Z"),
+    );
+    let controls = vec![
+        ado_core::FormControl {
+            id: ado_core::START_DATE_FIELD.into(),
+            reference_name: ado_core::START_DATE_FIELD.into(),
+            label: "Start Date".into(),
+            kind: ado_core::FormControlKind::DateTime,
+            required: false,
+            read_only: false,
+            visible: true,
+            options: None,
+        },
+        ado_core::FormControl {
+            id: ado_core::TARGET_DATE_FIELD.into(),
+            reference_name: ado_core::TARGET_DATE_FIELD.into(),
+            label: "Target Date".into(),
+            kind: ado_core::FormControlKind::DateTime,
+            required: false,
+            read_only: false,
+            visible: true,
+            options: None,
+        },
+    ];
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1,
+        rev: 1,
+        work_item_type: "Feature".into(),
+        system_controls: controls.clone(),
+        pages: Vec::new(),
+        values: values.clone(),
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_form_dates("Jul 22 -> zz", window, cx);
+        });
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert!(
+            view.form_dates_error_text(cx).is_some(),
+            "garbage dates must show a validation error"
+        );
+        assert!(!view.form_save_is_enabled(cx));
+        view.state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+            id: 2,
+            rev: 1,
+            work_item_type: "Feature".into(),
+            system_controls: controls,
+            pages: Vec::new(),
+            values,
+        }));
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert!(
+            view.form_dates_error_text(cx).is_none(),
+            "a stale parse error must not leak into the next item, got {:?}",
+            view.form_dates_error_text(cx)
+        );
+        assert!(
+            !view.form_save_is_enabled(cx),
+            "a clean item must not keep Save disabled from the previous parse error unless it is dirty"
+        );
+    });
 }
 
 #[gpui_kit::test]

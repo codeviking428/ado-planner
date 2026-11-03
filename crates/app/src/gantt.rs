@@ -43,6 +43,8 @@ const MAJOR_LABEL_ESTIMATE: f32 = 76.0;
 const TICK_MIN_GAP: f32 = 18.0;
 /// Keep edge tick/year labels off the clip, and gridlines off the last 1px.
 const HEADER_EDGE_PAD: f32 = 6.0;
+/// Extra inset so the first day/month number is not flush against the splitter.
+const HEADER_LEFT_PAD: f32 = 10.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GanttScale {
@@ -73,19 +75,14 @@ impl GanttScale {
         }
     }
 
-    pub fn button_label(self, zoom: f32) -> String {
-        let pct = (self.pixels_per_day(zoom) / self.base_pixels_per_day()) * 100.0;
-        format!("{} ({:.0}%)", self.label(), pct)
+    pub fn button_label(self, _zoom: f32) -> String {
+        self.label().to_string()
     }
 
-    /// Inactive scales stay unnamed-percent so the toolbar does not repeat the
-    /// same "(60%)" on every level; the selected scale tracks real zoom.
-    pub fn toolbar_label(self, zoom: f32, selected: bool) -> String {
-        if selected {
-            self.button_label(zoom)
-        } else {
-            self.label().to_string()
-        }
+    /// Scale names stay bare; zoom % lives on one shared control so Day/Week/…
+    /// do not each invent a different percent.
+    pub fn toolbar_label(self, zoom: f32, _selected: bool) -> String {
+        self.button_label(zoom)
     }
 
     pub fn base_pixels_per_day(self) -> f32 {
@@ -580,7 +577,7 @@ impl GanttView {
     pub fn leading_period_width(&self, width: f32) -> f32 {
         self.header_tick_labels(width)
             .into_iter()
-            .find(|(x, _)| *x > HEADER_EDGE_PAD + 1.0)
+            .find(|(x, _)| *x > HEADER_LEFT_PAD + 1.0)
             .map(|(x, _)| x)
             .unwrap_or(0.0)
     }
@@ -709,23 +706,28 @@ impl GanttView {
     }
 
     /// Keep the date under the viewport centre still when switching Day/Week/Month/…
+    /// Zoom is one multiplier across scales so the toolbar percent stays monotonic.
     pub fn set_scale(&mut self, scale: GanttScale) {
         if self.scale == scale {
             return;
         }
         let width = self.timeline_width.max(1.0);
         let center = self.date_for_x(width * 0.5);
-        let current_ppd = self.scale.pixels_per_day(self.zoom);
         self.scale = scale;
-        // Keep day-width when we can, but never zoom a scale so far that a
-        // single period fills the viewport (Year at 400% showed one column).
+        // Never zoom a scale so far that a single period fills the viewport
+        // (Year at 400% showed one column). Do not remap zoom to another
+        // scale's pixels-per-day — that made Day 40% / Week 80% / Month 60%.
         let period_days = scale.step_days().max(1) as f32;
         let max_zoom = (width / (scale.base_pixels_per_day() * period_days * 1.6)).clamp(0.4, 4.0);
-        self.zoom = (current_ppd / scale.base_pixels_per_day()).clamp(0.4, max_zoom);
+        self.zoom = self.zoom.clamp(0.4, max_zoom);
         self.origin = center;
         self.scroll_x = 0.0;
         let x = self.x_for_date(center);
         self.scroll_x = x - width * 0.5;
+    }
+
+    pub fn zoom_percent_label(&self) -> String {
+        format!("{:.0}%", self.zoom * 100.0)
     }
 
     pub fn filler_row_count(window_len: usize, content_h: f32) -> usize {
@@ -998,19 +1000,31 @@ impl GanttView {
     ) -> Result<(), &'static str> {
         if kind == GestureKind::Link {
             self.selected_id = Some(bar.id);
-            let today = jiff::Zoned::now().date();
+            let node = nodes.iter().find(|node| node.id == bar.id);
+            let had_start = node
+                .and_then(|node| parse_iso_date(node.start_date.as_deref()))
+                .is_some();
+            let had_target = node
+                .and_then(|node| parse_iso_date(node.target_date.as_deref()))
+                .is_some();
+            let (start, target) = node
+                .map(|node| self.dates_from_painted_bar(bar, node, nodes, iterations))
+                .unwrap_or_else(|| {
+                    let today = jiff::Zoned::now().date();
+                    (today, today)
+                });
             self.gesture = Some(Gesture {
                 kind,
                 id: bar.id,
                 origin_x,
-                start: today,
-                target: today,
-                live_start: today,
-                live_target: today,
+                start,
+                target,
+                live_start: start,
+                live_target: target,
                 live_x: origin_x,
                 link_to: None,
-                had_start: false,
-                had_target: false,
+                had_start,
+                had_target,
             });
             return Ok(());
         }
@@ -1294,9 +1308,9 @@ impl GanttView {
 
     fn fit_labels_to_width(mut labels: Vec<(f32, String)>, width: f32) -> Vec<(f32, String)> {
         if let Some((x, _)) = labels.first_mut()
-            && *x < HEADER_EDGE_PAD
+            && *x < HEADER_LEFT_PAD
         {
-            *x = HEADER_EDGE_PAD;
+            *x = HEADER_LEFT_PAD;
         }
         if let Some((x, label)) = labels.last() {
             let w = header_label_px(label);
@@ -1506,11 +1520,11 @@ impl GanttView {
                 let y2 = bar.y + ROW_HEIGHT / 2.0;
                 let far_apart = (pred.y - bar.y).abs() > ROW_HEIGHT + 1.0;
                 let pred_right = bar_label_right(pred);
-                let x_out = pred_right + STUB;
                 let x_head = bar.x;
                 if far_apart {
                     // Route past every bar and title between the two rows so
                     // the vertical does not run through a floating label.
+                    let x_out = pred_right + STUB;
                     let y_min = pred.y.min(bar.y);
                     let y_max = pred.y.max(bar.y);
                     let mut wrap_x = pred_right.max(bar_label_right(bar));
@@ -1531,6 +1545,9 @@ impl GanttView {
                         lane_y: y1,
                     });
                 } else {
+                    // Neighbours: stub off the painted bar, not out past a
+                    // long title to the far right edge of the timeline.
+                    let x_out = pred.x + pred.width + STUB;
                     let lane_y = if (pred.y - bar.y).abs() < 1.0 {
                         y1
                     } else {
@@ -1873,10 +1890,11 @@ mod tests {
             leading_after > leading_before,
             "+ must widen the leftover month at the left edge: {leading_before} -> {leading_after}"
         );
-        assert!(
-            gantt.scale.button_label(gantt.zoom).contains("125%"),
+        assert_eq!(
+            gantt.zoom_percent_label(),
+            "125%",
             "percentage must track column width, got {}",
-            gantt.scale.button_label(gantt.zoom)
+            gantt.zoom_percent_label()
         );
         gantt.zoom_at_left(0.8);
         assert!(
@@ -1886,10 +1904,11 @@ mod tests {
         );
         gantt.zoom_at_left(0.8);
         assert!(gantt.zoom < 1.0, "− must go below 100%, got {}", gantt.zoom);
-        assert!(
-            gantt.scale.button_label(gantt.zoom).contains("80%"),
+        assert_eq!(
+            gantt.zoom_percent_label(),
+            "80%",
             "− below 100% must show the column percentage, got {}",
-            gantt.scale.button_label(gantt.zoom)
+            gantt.zoom_percent_label()
         );
         assert!(
             gantt.period_width(oct1) < before,
@@ -2715,6 +2734,32 @@ mod tests {
     }
 
     #[test]
+    fn link_gesture_on_a_start_only_bar_keeps_its_dates() {
+        let mut start_only = node(1, None);
+        start_only.target_date = None;
+        start_only.start_date = Some("2026-07-06T00:00:00Z".into());
+        let nodes = vec![start_only];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 1).expect("start-only bar");
+        gantt
+            .begin_gesture(bar, GestureKind::Link, bar.x + bar.width + 6.0, &nodes, &[])
+            .expect("link");
+        let gesture = gantt.gesture.as_ref().expect("link gesture");
+        assert!(
+            gesture.had_start && !gesture.had_target,
+            "a start-only link must remember the live start, not pretend both sides were empty"
+        );
+        assert_eq!(GanttView::gesture_patch_dates(gesture), (None, None));
+        gantt.cancel_gesture();
+        assert!(gantt.gesture.is_none());
+    }
+
+    #[test]
     fn placeholder_drop_uses_painted_dates_not_today_origin() {
         let mut item = node(1, None);
         item.start_date = None;
@@ -2848,10 +2893,16 @@ mod tests {
             succ.x
         );
         assert!(
-            arrows[0].x1 > arrows[0].x2,
-            "adjacent bars must detour: outgoing stub {} should be to the right of incoming {}",
+            arrows[0].x1 <= pred.x + pred.width + 13.0,
+            "adjacent links must leave the predecessor bar, not its far-right title, got x1={} bar_right={}",
             arrows[0].x1,
-            arrows[0].x2
+            pred.x + pred.width
+        );
+        assert!(
+            arrows[0].x1 < bar_label_right(pred)
+                || bar_label_right(pred) <= pred.x + pred.width + 1.0,
+            "adjacent routing must stay local instead of wrapping to the label edge {}",
+            bar_label_right(pred)
         );
         assert!(
             arrows[0].lane_y >= pred.y.min(succ.y) + ROW_HEIGHT - 1.0,
@@ -3145,7 +3196,7 @@ mod tests {
         let oct = majors.iter().find(|(_, label)| label.contains("Oct"));
         let nov = majors.iter().find(|(_, label)| label.contains("Nov"));
         assert!(
-            oct.is_some_and(|(x, _)| *x <= HEADER_EDGE_PAD + 0.1),
+            oct.is_some_and(|(x, _)| *x <= HEADER_LEFT_PAD + 0.1),
             "October days on the left need an Oct label at the left pad, got {majors:?}"
         );
         assert!(
@@ -3180,21 +3231,18 @@ mod tests {
     }
 
     #[test]
-    fn every_scale_button_label_includes_percent() {
+    fn scale_buttons_are_names_and_zoom_percent_is_shared() {
         for scale in GanttScale::ALL {
-            let label = scale.button_label(0.5);
-            assert!(
-                label.contains('%'),
-                "scale buttons must keep a percent after Auto Fit, got {label}"
+            assert_eq!(
+                scale.button_label(0.5),
+                scale.label(),
+                "scale buttons must not each invent a percent, got {}",
+                scale.button_label(0.5)
             );
             assert_eq!(
-                scale.toolbar_label(0.5, false),
+                scale.toolbar_label(0.5, true),
                 scale.label(),
-                "inactive scales must not repeat the selected zoom percent"
-            );
-            assert!(
-                scale.toolbar_label(0.5, true).contains('%'),
-                "the selected scale must show the real zoom"
+                "selected scales share the standalone zoom control"
             );
         }
     }
@@ -3563,7 +3611,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_scale_changes_the_toolbar_percent() {
+    fn switching_scale_keeps_the_zoom_percent_monotonic() {
         let mut gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
             scale: GanttScale::Month,
@@ -3571,20 +3619,27 @@ mod tests {
             timeline_width: 800.0,
             ..Default::default()
         };
-        let month = GanttScale::Month.toolbar_label(gantt.zoom, true);
-        gantt.set_scale(GanttScale::Year);
-        let year = GanttScale::Year.toolbar_label(gantt.zoom, true);
+        let month = gantt.zoom_percent_label();
+        gantt.set_scale(GanttScale::Week);
+        let week = gantt.zoom_percent_label();
         gantt.set_scale(GanttScale::Day);
-        let day = GanttScale::Day.toolbar_label(gantt.zoom, true);
-        assert_ne!(
-            month, year,
-            "Year zoom % must not copy Month's 60% after a scale change"
+        let day = gantt.zoom_percent_label();
+        gantt.set_scale(GanttScale::Quarter);
+        let quarter = gantt.zoom_percent_label();
+        gantt.set_scale(GanttScale::Year);
+        let year = gantt.zoom_percent_label();
+        assert_eq!(month, "60%");
+        assert_eq!(
+            [
+                month.as_str(),
+                week.as_str(),
+                day.as_str(),
+                quarter.as_str(),
+                year.as_str()
+            ],
+            ["60%", "60%", "60%", "60%", "60%"],
+            "one zoom scale must stay monotonic across Day/Week/Month/Quarter/Year"
         );
-        assert_ne!(
-            month, day,
-            "Day zoom % must not copy Month's 60% after a scale change"
-        );
-        assert!(month.contains('%') && year.contains('%') && day.contains('%'));
     }
 
     #[test]
@@ -3631,6 +3686,13 @@ mod tests {
             ticks.iter().any(|tick| tick.x >= 800.0),
             "ticks must extend to or past the right edge so the last column is not clipped, last in-view {last}"
         );
+        let labels = gantt.header_tick_labels(800.0);
+        if let Some((x, label)) = labels.first() {
+            assert!(
+                *x >= HEADER_LEFT_PAD - 0.1,
+                "left-most Day tick {label:?} at {x} must sit inside the left pad"
+            );
+        }
     }
 
     #[test]

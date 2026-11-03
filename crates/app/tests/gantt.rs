@@ -38,13 +38,14 @@ fn expand_collapse_and_scale_change() {
     assert_eq!(gantt.flatten(&nodes).len(), rows.len());
     gantt.scale = GanttScale::Week;
     assert_eq!(gantt.scale.label(), "Week");
-    assert_eq!(gantt.scale.button_label(1.0), "Week (100%)");
+    assert_eq!(gantt.scale.button_label(1.0), "Week");
     gantt.zoom_at(1.5, 40.0, 0.0);
     assert!(gantt.zoom > 1.0);
     assert_eq!(
-        gantt.scale.button_label(gantt.zoom),
-        format!("Week ({:.0}%)", gantt.zoom * 100.0)
+        gantt.zoom_percent_label(),
+        format!("{:.0}%", gantt.zoom * 100.0)
     );
+    assert_eq!(gantt.scale.button_label(gantt.zoom), "Week");
 }
 
 #[test]
@@ -120,6 +121,98 @@ async fn escape_cancels_a_gesture() {
     state.cancel_gesture();
     let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
     assert_eq!(restored.start_date, original);
+}
+
+#[tokio::test]
+async fn cancelling_a_link_drag_does_not_unschedule_a_start_only_item() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let id = 1005;
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == id) {
+        node.start_date = Some("2026-07-06T00:00:00Z".into());
+        node.target_date = None;
+        node.has_date_fields = true;
+    }
+    let original = state
+        .nodes
+        .iter()
+        .find(|node| node.id == id)
+        .and_then(|node| node.start_date.clone());
+    state
+        .begin_bar_gesture(id, GestureKind::Link, 400.0)
+        .expect("right-handle link");
+    assert!(
+        state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link && gesture.had_start),
+        "link drag must remember the start-only side"
+    );
+    state.cancel_gesture();
+    let live = state.nodes.iter().find(|node| node.id == id).unwrap();
+    assert_eq!(
+        live.start_date, original,
+        "cancelling a right-handle link must not silently unschedule a start-only bar"
+    );
+    assert!(live.target_date.is_none());
+    assert!(
+        state.toasts.items.is_empty(),
+        "silent unschedule had no toast; the dates must stay put instead, got {:?}",
+        state
+            .toasts
+            .items
+            .iter()
+            .map(|toast| toast.message.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn empty_picker_enter_clears_dates_and_start_only_is_exact() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let start = Date::new(2026, 8, 4).unwrap();
+    let pending = state
+        .commit_range_dates_now(node.id, Some(start), None)
+        .expect("start-only");
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(parse_iso_date(live.start_date.as_deref()), Some(start));
+    assert!(
+        live.target_date.is_none(),
+        "start-only commit must clear Target Date, got {:?}",
+        live.target_date
+    );
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist start-only");
+    let pending = state
+        .commit_range_dates_now(node.id, None, None)
+        .expect("clear");
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert!(live.start_date.is_none() && live.target_date.is_none());
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist clear");
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.contains("Cleared dates") && message.contains('"'),
+        "clear must be undoable and quote the name, got {message}"
+    );
+    assert!(
+        state
+            .toasts
+            .items
+            .last()
+            .is_some_and(|toast| toast.undo.is_some()),
+        "Clear dates must offer Undo"
+    );
 }
 
 #[tokio::test]
@@ -875,13 +968,13 @@ async fn undo_dates_pushes_a_named_toast() {
     let _ = state.undo_dates_now().expect("undo");
     let undid = state.toasts.last_message().unwrap_or_default();
     assert!(
-        undid.starts_with("Undone moved Cart UI"),
+        undid.starts_with("Undone moved \"Cart UI\""),
         "undo must name the restored dates, got {undid}"
     );
     let _ = state.redo_dates_now().expect("redo");
     let redid = state.toasts.last_message().unwrap_or_default();
     assert!(
-        redid.starts_with("Redid: Moved Cart UI"),
+        redid.starts_with("Redid: Moved \"Cart UI\""),
         "redo must repeat the original action, got {redid}"
     );
 }
@@ -1182,8 +1275,11 @@ async fn toast_restore_link_action_puts_the_predecessor_back() {
         .expect("link 1003 → 1005");
     let added = state.toasts.last_message().unwrap_or_default();
     assert!(
-        added.starts_with("Added link:") && added.contains('→') && !added.contains('#'),
-        "link toasts must use 'Added link: A → B', got {added}"
+        added.starts_with("Added link:")
+            && added.contains('→')
+            && added.contains('"')
+            && !added.contains('#'),
+        "link toasts must use 'Added link: \"A\" → \"B\"', got {added}"
     );
     state
         .remove_dependency(1005, 1003)
@@ -1191,8 +1287,11 @@ async fn toast_restore_link_action_puts_the_predecessor_back() {
         .expect("remove link");
     let removed = state.toasts.last_message().unwrap_or_default();
     assert!(
-        removed.starts_with("Removed link:") && removed.contains('→') && !removed.contains('#'),
-        "link toasts must use item titles and →, got {removed}"
+        removed.starts_with("Removed link:")
+            && removed.contains('→')
+            && removed.contains('"')
+            && !removed.contains('#'),
+        "link toasts must quote item titles and use →, got {removed}"
     );
     let action = state
         .toasts
@@ -1275,8 +1374,10 @@ async fn add_item_creates_a_work_item_on_the_team() {
     );
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message == format!("Created {}", created.title),
-        "create toast must name the item, got {message}"
+        message.contains("Created Epic")
+            && message.contains(&format!("\"{}\"", created.title))
+            && message.contains("at the root"),
+        "create toast must name the type, quoted title, and placement, got {message}"
     );
     assert!(
         state
@@ -1424,6 +1525,8 @@ async fn undo_create_drops_date_history_for_that_item() {
     let undo = UndoAction::DeleteCreated {
         id: created.id,
         title: created.title.clone(),
+        work_item_type: created.work_item_type.clone(),
+        placement: "at the root".into(),
     };
     state.apply_undo(undo).await.expect("delete created");
     let leftover = |entry: &HistoryEntry| match entry {
@@ -1464,6 +1567,13 @@ async fn add_item_next_to_a_user_story_creates_a_user_story() {
     assert_eq!(
         created.work_item_type, "User Story",
         "a sibling of a User Story must be a User Story, not a nested Task"
+    );
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.contains("Created User Story")
+            && message.contains(&format!("\"{}\"", created.title))
+            && message.contains("under"),
+        "create toast must state type and placement, got {message}"
     );
 }
 

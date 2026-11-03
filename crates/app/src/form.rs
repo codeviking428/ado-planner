@@ -104,6 +104,18 @@ impl FormDraft {
         Ok(())
     }
 
+    /// Write both date fields exactly, including JSON null to clear a side.
+    pub fn set_exact_range_dates(&mut self, start: Option<String>, end: Option<String>) {
+        self.values.insert(
+            ado_core::START_DATE_FIELD.into(),
+            start.map(|value| json!(value)).unwrap_or(Value::Null),
+        );
+        self.values.insert(
+            ado_core::TARGET_DATE_FIELD.into(),
+            end.map(|value| json!(value)).unwrap_or(Value::Null),
+        );
+    }
+
     /// Write Start/Target from a range picker. A missing side is left as-is
     /// unless both sides are empty (the user cleared the range).
     pub fn set_range_dates(&mut self, start: Option<String>, end: Option<String>) {
@@ -580,6 +592,16 @@ mod tests {
         assert_eq!(
             draft.values.get(ado_core::TARGET_DATE_FIELD),
             Some(&Value::Null)
+        );
+        draft.set_exact_range_dates(Some("2026-08-10T00:00:00Z".into()), None);
+        assert_eq!(
+            draft.values.get(ado_core::START_DATE_FIELD),
+            Some(&json!("2026-08-10T00:00:00Z"))
+        );
+        assert_eq!(
+            draft.values.get(ado_core::TARGET_DATE_FIELD),
+            Some(&Value::Null),
+            "an explicit start-only commit must clear Target Date"
         );
     }
 
