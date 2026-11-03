@@ -176,6 +176,9 @@ struct PaintedBar {
     left: f32,
     right: f32,
     layout_x: f32,
+    /// Prepaint content origin. Independent of the 1px/2px selection border
+    /// so selecting a bar does not shift the live gesture mapping.
+    content_left: f32,
 }
 
 /// Window-space hit recorded on every bar mouse-down for tests and DEBUG_HIT.
@@ -4362,15 +4365,16 @@ impl PlannerView {
                 .aria_label(format!("Gantt bar #{id} {}", bar.title))
                 .absolute()
                 .on_prepaint(move |bounds, _, _| {
-                    let left = f32::from(bounds.origin.x) - paint_border;
-                    let right =
-                        f32::from(bounds.origin.x) + f32::from(bounds.size.width) + paint_border;
+                    let content_left = f32::from(bounds.origin.x);
+                    let left = content_left - paint_border;
+                    let right = content_left + f32::from(bounds.size.width) + paint_border;
                     painted_bars.borrow_mut().insert(
                         id,
                         PaintedBar {
                             left,
                             right,
                             layout_x,
+                            content_left,
                         },
                     );
                 })
@@ -4703,7 +4707,14 @@ impl PlannerView {
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         let x: f32 = event.position.x.into();
-                        this.begin_classified_bar_gesture(id, &layout, x, window, cx);
+                        let _ = this.classify_bar_hit(id, &layout, x);
+                        let kind = if at_start {
+                            GestureKind::ResizeStart
+                        } else {
+                            GestureKind::ResizeEnd
+                        };
+                        let origin = this.pointer_layout_x(x, Some(id));
+                        this.continue_or_begin_bar_gesture(id, kind, origin, window, cx);
                     }),
                 )
                 .into_any_element()
@@ -6507,6 +6518,7 @@ impl PlannerView {
             left: origin + layout.x,
             right: origin + layout.x + width,
             layout_x: layout.x,
+            content_left: origin + layout.x,
         }
     }
 
@@ -6523,7 +6535,7 @@ impl PlannerView {
         if let Some(id) = id
             && let Some(painted) = self.painted_bar_bounds.borrow().get(&id).copied()
         {
-            return painted.layout_x + (window_x - painted.left);
+            return painted.layout_x + (window_x - painted.content_left);
         }
         self.timeline_local_x(window_x)
     }

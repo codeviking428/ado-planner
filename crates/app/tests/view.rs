@@ -4199,6 +4199,94 @@ fn resize_starts_on_mouse_down_without_hover(cx: &mut gpui_kit::TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn inner_pixel_of_a_selected_end_grip_still_resizes(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(2);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-resize-handle-2-end")
+        .expect("end grip");
+    let inner = point(
+        handle.origin.x + px(1.),
+        handle.origin.y + handle.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(inner, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("the inner pixel of the end grip must still start a resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "grip mouse-down must force ResizeEnd even when the painted border box would classify Move, got {:?}",
+            gesture.kind
+        );
+        assert_eq!(gesture.id, 2);
+    });
+}
+
+#[gpui_kit::test]
+fn click_to_select_at_year_scale_does_not_shift_dates(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.selected_id = None;
+    let before = state
+        .nodes
+        .iter()
+        .find(|node| node.id == 2)
+        .map(|node| (node.start_date.clone(), node.target_date.clone()))
+        .expect("leaf");
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.selected_id, Some(2));
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .expect("leaf");
+        assert_eq!(
+            (node.start_date.clone(), node.target_date.clone()),
+            before,
+            "selecting a bar must not PATCH dates when the pointer did not move"
+        );
+        assert!(
+            view.state.gantt.gesture.is_none()
+                || view
+                    .state
+                    .gantt
+                    .gesture
+                    .as_ref()
+                    .is_some_and(|g| { g.live_start == g.start && g.live_target == g.target }),
+            "a click without a drag must not change live dates"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn hovered_end_grip_wins_hit_test_over_move(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
