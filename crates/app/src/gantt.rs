@@ -260,6 +260,9 @@ pub struct SavedGanttView {
     /// Park baked into `scroll_x`. Restored with the pose so a mid-ease
     /// unsnap subtracts this delta, not the destination's.
     pub year_gutter_snap: f32,
+    /// After Today. Restored with the pose so a team switch or persist
+    /// round-trip does not leave the previous camera's Today-follow on.
+    pub keep_today: bool,
 }
 
 impl SavedGanttView {
@@ -273,6 +276,7 @@ impl SavedGanttView {
             zoom: self.zoom + (other.zoom - self.zoom) * t,
             year_gutter_snap: self.year_gutter_snap
                 + (other.year_gutter_snap - self.year_gutter_snap) * t,
+            keep_today: other.keep_today,
         }
     }
 }
@@ -722,7 +726,10 @@ impl GanttView {
         }
     }
 
+    /// Pointer-anchored zoom. Drops Today-follow so a later toolbar scale
+    /// does not jump back to Today (toolbar +/− uses [`Self::zoom_step_keeping`]).
     pub fn zoom_at(&mut self, factor: f32, pointer_x: f32, timeline_origin_x: f32) {
+        self.keep_today = false;
         let old = self.scale.pixels_per_day(self.zoom);
         self.zoom = (self.zoom * factor).clamp(0.4, 4.0);
         let new = self.scale.pixels_per_day(self.zoom);
@@ -1102,6 +1109,7 @@ impl GanttView {
             scale: self.scale,
             zoom: self.zoom,
             year_gutter_snap: self.year_gutter_snap,
+            keep_today: self.keep_today,
         }
     }
 
@@ -1112,6 +1120,7 @@ impl GanttView {
         self.scale = saved.scale;
         self.zoom = saved.zoom;
         self.year_gutter_snap = saved.year_gutter_snap;
+        self.keep_today = saved.keep_today;
     }
 
     pub fn scroll_rows(&mut self, rows: i32, viewport_h: f32, row_count: usize) {
@@ -6567,18 +6576,32 @@ mod tests {
             scroll_y: 80.0,
             scale: GanttScale::Week,
             zoom: 1.5,
+            keep_today: true,
             ..Default::default()
         };
         let saved = gantt.snapshot();
         gantt.scroll_x = 0.0;
         gantt.scroll_y = 0.0;
         gantt.scale = GanttScale::Month;
+        gantt.keep_today = false;
         gantt.restore(saved);
         assert_eq!(gantt.scroll_x, 120.0);
         assert_eq!(gantt.scroll_y, 80.0);
         assert_eq!(gantt.scale, GanttScale::Week);
         assert!((gantt.zoom - 1.5).abs() < f32::EPSILON);
         assert_eq!(gantt.origin, Date::new(2026, 7, 15).unwrap());
+        assert!(
+            gantt.keep_today,
+            "snapshot must carry Today-follow so a team switch cannot leave the previous flag"
+        );
+        gantt.keep_today = false;
+        let cleared = gantt.snapshot();
+        gantt.keep_today = true;
+        gantt.restore(cleared);
+        assert!(
+            !gantt.keep_today,
+            "restore must drop Today-follow when the saved pose was not following Today"
+        );
     }
 
     #[test]
@@ -6827,7 +6850,12 @@ mod tests {
             gantt.go_today(today);
         });
         let to = gantt.snapshot();
+        assert!(to.keep_today, "go_today snapshot must carry Today-follow");
         let mid = from.lerp(to, 0.5);
+        assert!(
+            mid.keep_today,
+            "lerp snaps Today-follow to the destination pose"
+        );
         gantt.restore(mid);
         assert!(
             (gantt.year_gutter_snap - mid.year_gutter_snap).abs() < 0.01,
@@ -6904,6 +6932,36 @@ mod tests {
                 bar.x
             );
         }
+    }
+
+    #[test]
+    fn pointer_zoom_after_today_clears_keep_today() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 0.4,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.go_today(today);
+        assert!(gantt.keep_today);
+        gantt.zoom_at(1.25, 400.0, 0.0);
+        assert!(
+            !gantt.keep_today,
+            "pointer zoom must drop Today-follow like pan"
+        );
+        gantt.set_scale_from_toolbar(GanttScale::Month, today);
+        assert!(
+            !gantt.keep_today,
+            "toolbar scale after pointer zoom must not re-enter Today-follow"
+        );
+        let after = gantt.x_for_date(today);
+        let aligned = gantt.timeline_width.max(1.0) * TODAY_ALIGN;
+        assert!(
+            (after - aligned).abs() > 2.0,
+            "pointer zoom then Month must not jump back to Today, after={after} aligned={aligned}"
+        );
     }
 
     #[test]
