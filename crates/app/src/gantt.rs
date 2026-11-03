@@ -1688,9 +1688,15 @@ impl GanttView {
                 if !intervening.is_empty() {
                     let inbound_left = !backward;
                     let succ_edge = if backward { succ_right } else { bar.x };
-                    let x_vert = clear_vertical_x(x_in, &intervening, succ_edge, inbound_left);
+                    let x_vert =
+                        clear_vertical_x(x_in, &intervening, succ_edge, inbound_left, x_head);
                     if (x_vert - x_in).abs() > 0.5 {
                         x_in = x_vert;
+                    }
+                    if backward {
+                        x_in = x_in.max(x_head + STUB);
+                    } else {
+                        x_in = x_in.min(x_head - STUB);
                     }
                 }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
@@ -1728,13 +1734,12 @@ impl GanttView {
             for (rank, &index) in indexes.iter().enumerate() {
                 let shift = rank as f32 * INCOMING_FAN;
                 let lane_shift = rank as f32 * LANE_SEP;
-                let inbound_left = out[index].x2 <= out[index].x_head;
-                if inbound_left {
-                    out[index].x_head -= shift;
-                    out[index].x2 -= shift;
-                } else {
+                if out[index].inbound_right {
                     out[index].x_head += shift;
                     out[index].x2 += shift;
+                } else {
+                    out[index].x_head -= shift;
+                    out[index].x2 -= shift;
                 }
                 let dir = if out[index].y2 >= out[index].y1 {
                     -1.0
@@ -1829,12 +1834,14 @@ fn x_hits_span(x: f32, left: f32, right: f32) -> bool {
     x >= left - 1.0 && x <= right + 1.0
 }
 
-/// Keep an inbound vertical in a gap that misses intervening bars and labels.
+/// Keep an inbound vertical in a gap that misses intervening bars and labels,
+/// without flipping to the other side of `x_head`.
 fn clear_vertical_x(
     pref: f32,
     intervening: &[&BarLayout],
     succ_edge: f32,
     inbound_left: bool,
+    x_head: f32,
 ) -> f32 {
     let blocked: Vec<(f32, f32)> = intervening.iter().map(|bar| bar_occupied_x(bar)).collect();
     if blocked
@@ -1843,6 +1850,13 @@ fn clear_vertical_x(
     {
         return pref;
     }
+    let on_side = |x: f32| {
+        if inbound_left {
+            x <= x_head - 4.0
+        } else {
+            x >= x_head + 4.0
+        }
+    };
     if inbound_left {
         let intervening_right = blocked
             .iter()
@@ -1851,13 +1865,20 @@ fn clear_vertical_x(
         let gap_left = intervening_right + 6.0;
         let gap_right = succ_edge - 4.0;
         if gap_right - gap_left >= 4.0 {
-            return pref.clamp(gap_left, gap_right);
+            let cand = pref.clamp(gap_left, gap_right);
+            if on_side(cand) {
+                return cand;
+            }
         }
         let intervening_left = blocked
             .iter()
             .map(|(left, _)| *left)
             .fold(f32::INFINITY, f32::min);
-        return intervening_left - 8.0;
+        let around = intervening_left - 8.0;
+        if on_side(around) {
+            return around;
+        }
+        return pref.min(x_head - 4.0);
     }
     let intervening_left = blocked
         .iter()
@@ -1866,13 +1887,20 @@ fn clear_vertical_x(
     let gap_right = intervening_left - 6.0;
     let gap_left = succ_edge + 4.0;
     if gap_right - gap_left >= 4.0 {
-        return pref.clamp(gap_left, gap_right);
+        let cand = pref.clamp(gap_left, gap_right);
+        if on_side(cand) {
+            return cand;
+        }
     }
-    blocked
+    let around = blocked
         .iter()
         .map(|(_, right)| *right)
         .fold(f32::NEG_INFINITY, f32::max)
-        + 8.0
+        + 8.0;
+    if on_side(around) {
+        return around;
+    }
+    pref.max(x_head + 4.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4123,6 +4151,50 @@ mod tests {
             "the horizontal lane must not run through the Cart UI row body, lane {} mid {}",
             arrows[0].lane_y,
             mid.y
+        );
+    }
+
+    #[test]
+    fn backward_inbound_stays_on_the_right_of_the_head() {
+        let mut pred = node(1, None);
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-08-20T00:00:00Z".into());
+        pred.target_date = Some("2026-08-25T00:00:00Z".into());
+        let mut mid = node(2, Some(1));
+        mid.title = "Go-live milestone".into();
+        mid.start_date = Some("2026-08-08T00:00:00Z".into());
+        mid.target_date = Some("2026-08-20T00:00:00Z".into());
+        let mut succ = node(3, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1];
+        let nodes = vec![pred, mid, succ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 1);
+        assert!(
+            arrows[0].inbound_right,
+            "fixture must produce a backward FS inbound"
+        );
+        assert!(
+            arrows[0].x2 >= arrows[0].x_head + 8.0,
+            "clearing an intervening bar must not flip x2 to the left of the head, x2={} x_head={}",
+            arrows[0].x2,
+            arrows[0].x_head
+        );
+        let mid = bars.iter().find(|bar| bar.id == 2).unwrap();
+        let (left, right) = (mid.x - HANDLE_WIDTH, bar_label_right(mid));
+        assert!(
+            arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
+            "the inbound vertical must still skip the intervening row, x2={} mid={left}..{right}",
+            arrows[0].x2
         );
     }
 
