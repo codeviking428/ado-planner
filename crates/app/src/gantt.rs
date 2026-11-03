@@ -938,12 +938,23 @@ impl GanttView {
         self.year_gutter_snap = 0.0;
     }
 
+    /// Undo the Year/Quarter gutter park, run `f`, then park again. Keeps
+    /// `year_gutter_snap` in the current pixel space across scale/zoom/Today.
+    pub fn retarget_year_gutter(&mut self, f: impl FnOnce(&mut Self)) {
+        self.unsnap_year_gutter();
+        f(self);
+        self.snap_cramped_leading_column();
+    }
+
     /// If the leftover column at x=0 is a sliver, align the period start to
     /// the left edge so Week/Day first columns stay readable. Year/Quarter
     /// also park the first month after the unscheduled gutter so diamonds
     /// do not sit on dated bars.
     pub fn snap_cramped_leading_column(&mut self) {
         if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
+            // Undo a previous park first so a second snap (Year at zoom
+            // 0.4, month narrower than the gutter) does not walk left.
+            self.unsnap_year_gutter();
             let gutter_right = UNSCHEDULED_GUTTER_RIGHT;
             // Park the first on-screen month after the unscheduled gutter.
             // Using date_for_x(0) (then stepping forward if that month is
@@ -958,7 +969,7 @@ impl GanttView {
             if x < gutter_right {
                 let delta = x - gutter_right;
                 self.scroll_x += delta;
-                self.year_gutter_snap += delta;
+                self.year_gutter_snap = delta;
             }
             return;
         }
@@ -6286,6 +6297,60 @@ mod tests {
             (gantt.scroll_x - scroll_after).abs() < 0.5,
             "Year gutter snap must be idempotent, first={scroll_after} second={}",
             gantt.scroll_x
+        );
+    }
+
+    #[test]
+    fn year_gutter_snap_is_idempotent_when_a_month_fits_in_the_gutter() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 0.4,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.snap_cramped_leading_column();
+        let first = gantt.scroll_x;
+        gantt.snap_cramped_leading_column();
+        assert!(
+            (gantt.scroll_x - first).abs() < 0.5,
+            "Year at zoom 0.4 must not walk on a second snap, first={first} second={}",
+            gantt.scroll_x
+        );
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_at(GanttScale::Year, 0.0);
+        });
+        assert!(
+            (gantt.scroll_x - first).abs() < 0.5,
+            "clicking Year while already on Year must not walk, first={first} after={}",
+            gantt.scroll_x
+        );
+    }
+
+    #[test]
+    fn year_gutter_snap_retargets_after_zoom() {
+        let jul = Date::new(2026, 7, 1).unwrap();
+        let mut gantt = GanttView {
+            origin: jul,
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.set_scale_at(GanttScale::Year, 0.0);
+        gantt.snap_cramped_leading_column();
+        let parked_before_zoom = gantt.year_gutter_snap;
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.zoom_step_keeping(-1, 0.0);
+        });
+        let parked_after_zoom = gantt.year_gutter_snap;
+        gantt.unsnap_year_gutter();
+        let left = gantt.date_for_x(0.0);
+        gantt.set_scale_at(GanttScale::Month, 0.0);
+        assert_eq!(
+            gantt.date_for_x(0.0),
+            left,
+            "unsnap after a Year zoom must use the post-zoom park, not {parked_before_zoom} vs {parked_after_zoom}"
         );
     }
 

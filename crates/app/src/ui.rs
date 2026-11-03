@@ -501,7 +501,9 @@ impl PlannerView {
     /// letting the 150 ms ease race the click.
     pub fn zoom_at_center_animated(&mut self, factor: f32, cx: &mut Context<Self>) {
         self.animate_gantt(cx, |gantt| {
-            gantt.zoom_at_center(factor);
+            gantt.retarget_year_gutter(|gantt| {
+                gantt.zoom_at_center(factor);
+            });
         });
         cx.notify();
     }
@@ -2034,18 +2036,20 @@ impl PlannerView {
             let pointer = self.timeline_local_x(f32::from(event.position.x));
             let timeline_width = self.state.gantt.timeline_width;
             self.animate_gantt(cx, |gantt| {
-                let next = GanttView::next_zoom(gantt.zoom, direction);
-                let factor = if gantt.zoom > 0.0 {
-                    next / gantt.zoom
-                } else {
-                    1.0
-                };
-                if pointer >= 0.0 && pointer <= timeline_width {
-                    gantt.zoom_at(factor, pointer, 0.0);
-                } else {
-                    gantt.zoom_at_center(factor);
-                }
-                gantt.clamp_scroll(rows, viewport_h);
+                gantt.retarget_year_gutter(|gantt| {
+                    let next = GanttView::next_zoom(gantt.zoom, direction);
+                    let factor = if gantt.zoom > 0.0 {
+                        next / gantt.zoom
+                    } else {
+                        1.0
+                    };
+                    if pointer >= 0.0 && pointer <= timeline_width {
+                        gantt.zoom_at(factor, pointer, 0.0);
+                    } else {
+                        gantt.zoom_at_center(factor);
+                    }
+                    gantt.clamp_scroll(rows, viewport_h);
+                });
             });
         } else {
             self.cancel_camera_anim();
@@ -2926,7 +2930,9 @@ impl PlannerView {
                             .label("Today")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.animate_gantt(cx, |gantt| {
-                                    gantt.go_today(jiff::Zoned::now().date());
+                                    gantt.retarget_year_gutter(|gantt| {
+                                        gantt.go_today(jiff::Zoned::now().date());
+                                    });
                                 });
                                 cx.notify();
                             })),
@@ -2961,7 +2967,9 @@ impl PlannerView {
                         let iterations = this.state.iterations.clone();
                         let width = this.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
                         this.animate_gantt(cx, |gantt| {
-                            gantt.auto_fit(&nodes, &iterations, width);
+                            gantt.retarget_year_gutter(|gantt| {
+                                gantt.auto_fit(&nodes, &iterations, width);
+                            });
                         });
                         cx.notify();
                     })),
@@ -2973,7 +2981,9 @@ impl PlannerView {
                     .label("‹")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.animate_gantt(cx, |gantt| {
-                            gantt.step_period(-1);
+                            gantt.retarget_year_gutter(|gantt| {
+                                gantt.step_period(-1);
+                            });
                         });
                         cx.notify();
                     })),
@@ -2985,7 +2995,9 @@ impl PlannerView {
                     .label("›")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.animate_gantt(cx, |gantt| {
-                            gantt.step_period(1);
+                            gantt.retarget_year_gutter(|gantt| {
+                                gantt.step_period(1);
+                            });
                         });
                         cx.notify();
                     })),
@@ -3027,14 +3039,9 @@ impl PlannerView {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.dismiss_overlays();
                                         this.animate_gantt(cx, |gantt| {
-                                            if !matches!(
-                                                scale,
-                                                GanttScale::Year | GanttScale::Quarter
-                                            ) {
-                                                gantt.unsnap_year_gutter();
-                                            }
-                                            gantt.set_scale_at(scale, 0.0);
-                                            gantt.snap_cramped_leading_column();
+                                            gantt.retarget_year_gutter(|gantt| {
+                                                gantt.set_scale_at(scale, 0.0);
+                                            });
                                         });
                                         cx.notify();
                                     })),
@@ -3054,7 +3061,9 @@ impl PlannerView {
                             .tooltip("Zoom out")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.animate_gantt(cx, |gantt| {
-                                    gantt.zoom_step_keeping(-1, 0.0);
+                                    gantt.retarget_year_gutter(|gantt| {
+                                        gantt.zoom_step_keeping(-1, 0.0);
+                                    });
                                 });
                                 cx.notify();
                             })),
@@ -3083,7 +3092,9 @@ impl PlannerView {
                             .tooltip("Zoom in")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.animate_gantt(cx, |gantt| {
-                                    gantt.zoom_step_keeping(1, 0.0);
+                                    gantt.retarget_year_gutter(|gantt| {
+                                        gantt.zoom_step_keeping(1, 0.0);
+                                    });
                                 });
                                 cx.notify();
                             })),
@@ -6827,12 +6838,10 @@ impl PlannerView {
             cx.notify();
             return;
         }
-        // Mouse-up was missed (handle unmounted mid-drag). A flick never
-        // saw a pressed move, so apply this x; after a real drag keep the
-        // last live preview (Aug 8 must not become Sep 1).
-        self.apply_flick_release_x(x);
-        self.saw_pressed_drag = true;
-        self.commit_gesture(window, cx);
+        // Mouse-up was missed (handle unmounted mid-drag). Share the
+        // release path so a gutter micro-drag still cancels instead of
+        // PATCHing Today.
+        self.release_bar_gesture(x, y, window, cx);
     }
 
     /// Update the live gesture from the release pointer, then commit.
@@ -6896,6 +6905,9 @@ impl PlannerView {
         if !self.unmoved_date_gesture() {
             return;
         }
+        let unscheduled = self.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+            gesture.kind == GestureKind::Move && !gesture.had_start && !gesture.had_target
+        });
         let id = self.state.gantt.gesture.as_ref().map(|gesture| gesture.id);
         let origin_x = self
             .state
@@ -6904,9 +6916,15 @@ impl PlannerView {
             .as_ref()
             .map(|gesture| gesture.origin_x);
         let press_x = self.bar_press_window_x.or(self.pill_press_window_x);
-        let local_x = match (origin_x, press_x) {
-            (Some(origin_x), Some(press_x)) => origin_x + (window_x - press_x),
-            _ => self.pointer_layout_x(window_x, id),
+        // Unscheduled origin_x is Today, not the gutter press. Map the
+        // release to the date under the cursor so a flick is not Today+Δ.
+        let local_x = if unscheduled {
+            self.pointer_layout_x(window_x, id)
+        } else {
+            match (origin_x, press_x) {
+                (Some(origin_x), Some(press_x)) => origin_x + (window_x - press_x),
+                _ => self.pointer_layout_x(window_x, id),
+            }
         };
         self.state.update_bar_gesture(local_x);
     }
