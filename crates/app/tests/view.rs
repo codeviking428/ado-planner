@@ -4861,6 +4861,165 @@ fn start_handle_dot_is_part_of_the_resize_hit_zone(cx: &mut gpui_kit::TestAppCon
     });
 }
 
+#[gpui_kit::test]
+fn right_dot_resize_commits_on_mouse_up_at_release_x(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(2);
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-2-link-end")
+        .expect("end handle");
+    let timeline = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let drop = Date::new(2026, 8, 8).unwrap();
+    let later = Date::new(2026, 9, 1).unwrap();
+    let drop_window_x = view.update(cx, |view, _| {
+        f32::from(timeline.origin.x) + view.state.gantt.x_for_date(drop)
+    });
+    let later_window_x = view.update(cx, |view, _| {
+        f32::from(timeline.origin.x) + view.state.gantt.x_for_date(later)
+    });
+    let mid_y = handle.origin.y + handle.size.height / 2.0;
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let drop_at = point(px(drop_window_x), mid_y);
+    cx.simulate_mouse_move(drop_at, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    let preview = view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("right-dot drag must keep a resize");
+        assert_eq!(gesture.kind, GestureKind::ResizeEnd);
+        gesture.live_target
+    });
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_some(),
+        "a live right-dot resize must show the date preview"
+    );
+    cx.simulate_mouse_up(drop_at, MouseButton::Left, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "mouse-up must commit the {preview} resize, got {:?}",
+            view.state.gantt.gesture.as_ref().map(|g| g.kind)
+        );
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_none(),
+        "the preview chip must clear on mouse-up, without waiting for another mouse-move"
+    );
+    cx.simulate_mouse_move(point(px(later_window_x), mid_y), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "a later mouse-move must not keep a resize gesture"
+        );
+        let saved = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .and_then(|node| ado_core::parse_iso_date(node.target_date.as_deref()));
+        assert_ne!(
+            saved,
+            Some(later),
+            "a later mouse-move must not rewrite the {preview} release to {later}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn toast_undo_and_scale_switch_clear_hover_dots(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(2);
+    state.gantt.selected_id = Some(2);
+    let before_start = Some("2026-07-06T00:00:00Z".into());
+    let before_target = Some("2026-07-20T00:00:00Z".into());
+    state.toasts.push_undo(
+        "Resized \"Work Item 1\" to Jul 6 → Jul 24",
+        UndoAction::RestoreDates {
+            id: 2,
+            start_date: before_start,
+            target_date: before_target,
+            rev: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let undo = cx.debug_bounds("toast-undo").expect("Undo");
+    cx.simulate_click(undo.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_id, None,
+            "toast Undo must clear hover dots"
+        );
+        view.state.gantt.hovered_id = Some(2);
+    });
+    let year = cx.debug_bounds("gantt-scale-Year").expect("Year");
+    cx.simulate_click(year.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_id, None,
+            "switching views must clear hover dots"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn year_to_month_keeps_the_scroll_anchor(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 0.4;
+    state.gantt.selected_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let left = view.update(cx, |view, _| view.state.gantt.date_for_x(0.0));
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.scale, GanttScale::Month);
+        let after = view.state.gantt.date_for_x(0.0);
+        assert_eq!(
+            after, left,
+            "Year→Month must keep the left-edge date {left}, got {after}"
+        );
+        assert!(
+            after < Date::new(2027, 1, 1).unwrap(),
+            "must not jump to Jul 2027, got {after}"
+        );
+    });
+}
+
 fn click_painted_bar_inset(
     cx: &mut VisualTestContext,
     view: &Entity<PlannerView>,

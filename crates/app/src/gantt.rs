@@ -874,6 +874,7 @@ impl GanttView {
 
     /// Change scale while holding the date under `keep_x` still. World-x
     /// (not a rounded civil date) so Month→Year→Month is invertible.
+    /// Pass `keep_x = 0` to keep the scroll anchor (left-edge date).
     pub fn set_scale_at(&mut self, scale: GanttScale, keep_x: f32) {
         if self.scale == scale {
             return;
@@ -885,6 +886,25 @@ impl GanttView {
         if old > 0.0 {
             let world = (self.scroll_x + keep_x) / old;
             self.scroll_x = world * new - keep_x;
+        }
+    }
+
+    /// If the leftover column at x=0 is a sliver, align the period start to
+    /// the left edge so Week/Day first columns stay readable.
+    pub fn snap_cramped_leading_column(&mut self) {
+        if !matches!(self.scale, GanttScale::Week | GanttScale::Day) {
+            return;
+        }
+        let start = self.scale.floor_date(self.date_for_x(0.0));
+        let x = self.x_for_date(start);
+        if x >= -0.5 {
+            return;
+        }
+        let leftover = -x;
+        let full = self.period_width(start).max(1.0);
+        let min = (full * 0.4).max(40.0);
+        if leftover < min {
+            self.scroll_x += x;
         }
     }
 
@@ -5727,5 +5747,68 @@ mod tests {
         assert_eq!(gantt.scale, GanttScale::Week);
         assert!((gantt.zoom - 1.5).abs() < f32::EPSILON);
         assert_eq!(gantt.origin, Date::new(2026, 7, 15).unwrap());
+    }
+
+    #[test]
+    fn year_to_month_keeps_the_left_edge_date() {
+        let origin = Date::new(2026, 7, 1).unwrap();
+        let mut gantt = GanttView {
+            origin,
+            scale: GanttScale::Year,
+            zoom: 0.4,
+            timeline_width: 512.0,
+            ..Default::default()
+        };
+        let left = gantt.date_for_x(0.0);
+        gantt.set_scale_at(GanttScale::Month, 0.0);
+        assert_eq!(
+            gantt.date_for_x(0.0),
+            left,
+            "Year→Month must keep the scroll-anchor date, got {} (was {left})",
+            gantt.date_for_x(0.0)
+        );
+        assert!(
+            gantt.date_for_x(0.0) < Date::new(2027, 1, 1).unwrap(),
+            "must not jump to 2027, got {}",
+            gantt.date_for_x(0.0)
+        );
+    }
+
+    #[test]
+    fn week_snaps_a_cramped_first_column_and_keeps_1012_on_screen() {
+        let mut item = node(1012, None);
+        item.title = "Unparented spike".into();
+        item.start_date = Some("2026-07-21T00:00:00Z".into());
+        item.target_date = Some("2026-08-04T00:00:00Z".into());
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.set_scale_at(GanttScale::Week, 0.0);
+        gantt.snap_cramped_leading_column();
+        let leading = gantt.leading_period_width(800.0);
+        let week_w = gantt.period_width(gantt.date_for_x(0.0));
+        assert!(
+            leading >= week_w * 0.4 - 1.0,
+            "Week's first column must not be a sliver, leading={leading} week_w={week_w}"
+        );
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(&[item], &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 1012).expect("#1012");
+        assert!(
+            bar.x >= -0.5,
+            "#1012 must not clip at the left edge, x={} width={}",
+            bar.x,
+            bar.width
+        );
+        assert!(
+            bar.x + bar.width > 8.0,
+            "#1012 must paint inside the Week viewport, x={} width={}",
+            bar.x,
+            bar.width
+        );
     }
 }
