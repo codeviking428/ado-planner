@@ -623,6 +623,9 @@ pub struct GanttView {
     /// Year/Quarter gutter park. [`GanttView::unsnap_year_gutter`] subtracts
     /// this exact amount so Month→Year→Month does not drift.
     pub year_gutter_snap: f32,
+    /// After [`GanttView::go_today`], toolbar scale/zoom keeps Today still
+    /// instead of re-anchoring to a Year park at x=0.
+    pub keep_today: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -661,6 +664,7 @@ impl Default for GanttView {
             schedule_drag: None,
             hover_locked: false,
             year_gutter_snap: 0.0,
+            keep_today: false,
         }
     }
 }
@@ -889,6 +893,7 @@ impl GanttView {
         if direction == 0 {
             return;
         }
+        self.keep_today = false;
         let span = match self.scale {
             GanttScale::Day => direction.days(),
             GanttScale::Week => (direction * 7).days(),
@@ -936,13 +941,33 @@ impl GanttView {
     }
 
     /// Reverse [`snap_cramped_leading_column`]'s Year/Quarter gutter park so
-    /// Month→Year→Month keeps the left-edge date.
+    /// Month→Year→Month keeps the left-edge date. Always subtract, even on
+    /// Month: a leaked snap after Today would otherwise clip the first column.
     pub fn unsnap_year_gutter(&mut self) {
-        if !matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
-            return;
-        }
         self.scroll_x -= self.year_gutter_snap;
         self.year_gutter_snap = 0.0;
+    }
+
+    /// Screen x a toolbar scale/zoom click should hold. After Today, keep
+    /// Today still so Month does not re-anchor to a Year park at x=0.
+    pub fn toolbar_scale_keep_x(&self, today: Date) -> f32 {
+        if !self.keep_today {
+            return 0.0;
+        }
+        let x = self.x_for_date(today);
+        let width = self.timeline_width.max(1.0);
+        if x >= 0.0 && x <= width { x } else { 0.0 }
+    }
+
+    /// Toolbar Day/Week/Month/… click. After Today, re-align so a Year park
+    /// is not amplified into a clipped Month column.
+    pub fn set_scale_from_toolbar(&mut self, scale: GanttScale, today: Date) {
+        if self.keep_today {
+            self.set_scale_at(scale, 0.0);
+            self.go_today(today);
+            return;
+        }
+        self.set_scale_at(scale, 0.0);
     }
 
     /// Undo the Year/Quarter gutter park, run `f`, then park again. Keeps
@@ -1024,6 +1049,7 @@ impl GanttView {
     /// Apply a wheel/trackpad delta whose signs already match content direction
     /// (positive X reveals later dates, positive Y reveals later rows).
     pub fn apply_wheel(&mut self, dx: f32, dy: f32, shift: bool) {
+        self.keep_today = false;
         if shift {
             self.scroll_x += dy + dx;
         } else {
@@ -1035,6 +1061,10 @@ impl GanttView {
     pub fn go_today(&mut self, today: Date) {
         self.origin = today;
         self.scroll_x = 0.0;
+        // New scroll does not include a Year gutter park; leave a stale
+        // snap and the next unsnap shifts Today off by ~32px.
+        self.year_gutter_snap = 0.0;
+        self.keep_today = true;
         let x = self.x_for_date(today);
         let target = self.timeline_width.max(1.0) * TODAY_ALIGN;
         self.scroll_x = x - target;
@@ -1775,6 +1805,7 @@ impl GanttView {
 
     /// Fit every laid-out bar into `width` pixels, matching monday.com Auto Fit.
     pub fn auto_fit(&mut self, nodes: &[WorkItemNode], iterations: &[IterationNode], width: f32) {
+        self.keep_today = false;
         let mut earliest: Option<Date> = None;
         let mut latest: Option<Date> = None;
         for node in nodes {
@@ -6670,6 +6701,93 @@ mod tests {
         assert!(
             (gantt.scroll_x - expect).abs() < 0.5,
             "unsnap of the interpolated pose must use the interpolated park, scroll {} want {expect}",
+            gantt.scroll_x
+        );
+    }
+
+    #[test]
+    fn today_then_month_keeps_today_and_does_not_clip_the_left_edge() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 0.4,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.snap_cramped_leading_column();
+        assert!(
+            gantt.year_gutter_snap.abs() > 0.1,
+            "precondition: Year must park, snap={}",
+            gantt.year_gutter_snap
+        );
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.go_today(today);
+        });
+        assert!(
+            gantt.keep_today,
+            "go_today must mark the camera as following Today"
+        );
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar(GanttScale::Month, today);
+        });
+        assert_eq!(gantt.scale, GanttScale::Month);
+        assert!(
+            gantt.year_gutter_snap.abs() < 0.01,
+            "Month must not keep a Year park, snap={}",
+            gantt.year_gutter_snap
+        );
+        let after = gantt.x_for_date(today);
+        let aligned = gantt.timeline_width.max(1.0) * TODAY_ALIGN;
+        assert!(
+            (after - aligned).abs() < 2.0,
+            "Today then Month must re-align Today, after={after} aligned={aligned}"
+        );
+        let left = gantt.date_for_x(0.0);
+        assert!(
+            left > today.saturating_sub(120.days()),
+            "Month after Today must not re-anchor to a Year park, left={left} today={today}"
+        );
+        let nodes = vec![node(1, None)];
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        for bar in &bars {
+            if bar.kind != GanttBarKind::Scheduled {
+                continue;
+            }
+            let start = gantt.date_for_x(bar.x);
+            assert!(
+                start < left || bar.x >= -1.0,
+                "a bar that starts on/after the left-edge date must not clip, x={} left={left}",
+                bar.x
+            );
+        }
+    }
+
+    #[test]
+    fn go_today_clears_a_stale_year_park_snap() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 0.4,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.snap_cramped_leading_column();
+        let parked = gantt.year_gutter_snap;
+        assert!(parked.abs() > 0.1, "precondition: Year must park");
+        gantt.go_today(today);
+        assert!(
+            gantt.year_gutter_snap.abs() < 0.01,
+            "go_today overwrites scroll and must drop the park, snap={}",
+            gantt.year_gutter_snap
+        );
+        let before = gantt.scroll_x;
+        gantt.unsnap_year_gutter();
+        assert!(
+            (gantt.scroll_x - before).abs() < 0.01,
+            "unsnap after go_today must be a no-op, before={before} after={}",
             gantt.scroll_x
         );
     }

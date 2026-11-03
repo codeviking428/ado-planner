@@ -168,6 +168,9 @@ pub struct PlannerView {
     /// Window-x where a dated bar press began. A flick (mouse-up with no
     /// mouse-move) applies this delta so the release still commits.
     bar_press_window_x: Option<f32>,
+    /// Last window-x while the bar-drag button was down. A missed mouse-up
+    /// commits here, not at a later hover x (Jul 28 shrink).
+    bar_last_window_x: Option<f32>,
     /// Live window-x while dragging to schedule an unscheduled row.
     schedule_live_x: Option<f32>,
     /// Nested hover count so moving onto Undo does not unpause expiry.
@@ -196,6 +199,7 @@ pub struct PlannerView {
     /// Start date of the last committed date gesture. Persist without a
     /// mock may revert the node; tests still see that the flick committed.
     last_committed_start_for_test: Option<jiff::civil::Date>,
+    last_committed_target_for_test: Option<jiff::civil::Date>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -434,6 +438,7 @@ impl PlannerView {
             schedule_origin_x: None,
             pill_press_window_x: None,
             bar_press_window_x: None,
+            bar_last_window_x: None,
             schedule_live_x: None,
             toast_hover_depth: 0,
             toast_pointer: false,
@@ -446,6 +451,7 @@ impl PlannerView {
             painted_bar_bounds: Rc::new(RefCell::new(HashMap::new())),
             last_bar_hit: None,
             last_committed_start_for_test: None,
+            last_committed_target_for_test: None,
             _subscriptions: vec![keystrokes],
         };
         this.scope_query.update(cx, |input, cx| {
@@ -1200,6 +1206,7 @@ impl PlannerView {
         self.schedule_origin_x = None;
         self.pill_press_window_x = None;
         self.bar_press_window_x = None;
+        self.bar_last_window_x = None;
         self.schedule_live_x = None;
         self.state.gantt.clear_hover();
         self.dates_anchor = None;
@@ -1817,6 +1824,7 @@ impl PlannerView {
         self.schedule_origin_x = None;
         self.pill_press_window_x = None;
         self.bar_press_window_x = None;
+        self.bar_last_window_x = None;
         self.schedule_live_x = None;
     }
 
@@ -3042,7 +3050,8 @@ impl PlannerView {
                                         this.dismiss_overlays();
                                         this.animate_gantt(cx, |gantt| {
                                             gantt.retarget_year_gutter(|gantt| {
-                                                gantt.set_scale_at(scale, 0.0);
+                                                let today = jiff::Zoned::now().date();
+                                                gantt.set_scale_from_toolbar(scale, today);
                                             });
                                         });
                                         cx.notify();
@@ -3064,7 +3073,9 @@ impl PlannerView {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.animate_gantt(cx, |gantt| {
                                     gantt.retarget_year_gutter(|gantt| {
-                                        gantt.zoom_step_keeping(-1, 0.0);
+                                        let today = jiff::Zoned::now().date();
+                                        let keep_x = gantt.toolbar_scale_keep_x(today);
+                                        gantt.zoom_step_keeping(-1, keep_x);
                                     });
                                 });
                                 cx.notify();
@@ -3095,7 +3106,9 @@ impl PlannerView {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.animate_gantt(cx, |gantt| {
                                     gantt.retarget_year_gutter(|gantt| {
-                                        gantt.zoom_step_keeping(1, 0.0);
+                                        let today = jiff::Zoned::now().date();
+                                        let keep_x = gantt.toolbar_scale_keep_x(today);
+                                        gantt.zoom_step_keeping(1, keep_x);
                                     });
                                 });
                                 cx.notify();
@@ -3645,7 +3658,7 @@ impl PlannerView {
                 .into_any_element();
         }
         let title_owned = title.to_string();
-        let tip = format!("{title_owned} · Double-click to open · F2 or Rename to edit");
+        let tip = format!("{title_owned} · Double-click to open · F2 or Edit title to edit");
         let form_open = self.details_overlay();
         div()
             .id(("title", id as u64))
@@ -4854,7 +4867,7 @@ impl PlannerView {
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.set_bar_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
-                .when(!self.details_overlay(), |el| {
+                .when(!dragging && !self.details_overlay(), |el| {
                     let tip = bar_hover_tooltip(bar, &self.state.nodes);
                     el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 })
@@ -4904,6 +4917,7 @@ impl PlannerView {
                             // instead of PATCHing the gutter as a date.
                             this.pill_press_window_x = Some(x);
                             this.bar_press_window_x = Some(x);
+                            this.bar_last_window_x = Some(x);
                             let today_x = this.state.gantt.x_for_date(jiff::Zoned::now().date());
                             let _ = this.state.begin_bar_gesture(id, GestureKind::Move, today_x);
                             cx.notify();
@@ -4993,7 +5007,9 @@ impl PlannerView {
         dragging: bool,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
-        if !bar.can_resize() {
+        // Keep grips mounted during a date drag so a shrink to 16px cannot
+        // unmount the capturing handle before mouse-up.
+        if !dragging && !bar.can_resize() {
             return Vec::new();
         }
         let id = bar.id;
@@ -5834,7 +5850,7 @@ impl PlannerView {
                 }))
             })
             .child(self.menu_item("Open", cx, move |this, cx| this.open_form(id, cx)))
-            .child(self.menu_item("Rename", cx, move |this, _cx| {
+            .child(self.menu_item("Edit title", cx, move |this, _cx| {
                 this.state.gantt.select_row(id);
                 this.pending_inline_title = Some(id);
             }))
@@ -6841,6 +6857,7 @@ impl PlannerView {
         let x: f32 = event.position.x.into();
         let y: f32 = event.position.y.into();
         if event.dragging() || event.pressed_button.is_some() {
+            self.bar_last_window_x = Some(x);
             let id = self.state.gantt.gesture.as_ref().map(|gesture| gesture.id);
             let local_x = self.pointer_layout_x(x, id);
             self.state.update_bar_gesture(local_x);
@@ -6849,9 +6866,11 @@ impl PlannerView {
             cx.notify();
             return;
         }
-        // Mouse-up was missed (handle unmounted mid-drag). Share the
-        // release path so a gutter micro-drag still cancels instead of
-        // PATCHing Today.
+        // Mouse-up was missed (handle unmounted mid-drag, or a tooltip ate
+        // the up). Commit at the last pressed x, not this later hover
+        // (Jul 28 shrink). Share the release path so a gutter micro-drag
+        // still cancels instead of PATCHing Today.
+        let x = self.bar_last_window_x.unwrap_or(x);
         self.release_bar_gesture(x, y, window, cx);
     }
 
@@ -6878,6 +6897,7 @@ impl PlannerView {
         self.pill_press_window_x = None;
         if unscheduled_no_move || still_in_gutter {
             self.bar_press_window_x = None;
+            self.bar_last_window_x = None;
             self.state.cancel_gesture();
             self.saw_pressed_drag = false;
             self.request_repaint(Some(window), cx);
@@ -6898,6 +6918,7 @@ impl PlannerView {
         // a grown bar can snap back to origin (Aug 8 must not become Sep 1).
         self.apply_flick_release_x(window_x);
         self.bar_press_window_x = None;
+        self.bar_last_window_x = None;
         self.saw_pressed_drag = true;
         self.commit_gesture(window, cx);
     }
@@ -7078,6 +7099,7 @@ impl PlannerView {
         }
         let origin = self.pointer_layout_x(window_x, Some(id));
         self.bar_press_window_x = Some(window_x);
+        self.bar_last_window_x = Some(window_x);
         let _ = self.state.begin_bar_gesture(id, kind, origin);
         cx.notify();
     }
@@ -7149,6 +7171,7 @@ impl PlannerView {
         self.dismiss_overlays();
         if kind != GestureKind::Link {
             self.bar_press_window_x = Some(window_x);
+            self.bar_last_window_x = Some(window_x);
         }
         let _ = self.state.begin_bar_gesture(id, kind, origin);
         cx.notify();
@@ -7157,6 +7180,7 @@ impl PlannerView {
     fn commit_gesture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.saw_pressed_drag = false;
         self.bar_press_window_x = None;
+        self.bar_last_window_x = None;
         if self.state.gantt.gesture.is_none() {
             return;
         }
@@ -7187,6 +7211,7 @@ impl PlannerView {
         self.state.gantt.hover_locked = true;
         if let Some(pending) = self.state.commit_date_gesture_now() {
             self.last_committed_start_for_test = pending.start;
+            self.last_committed_target_for_test = pending.target;
             self.enqueue_date_save(cx, pending);
         }
         self.request_repaint(Some(window), cx);
@@ -7645,6 +7670,10 @@ impl PlannerView {
 
     pub fn last_committed_start_for_test(&self) -> Option<jiff::civil::Date> {
         self.last_committed_start_for_test
+    }
+
+    pub fn last_committed_target_for_test(&self) -> Option<jiff::civil::Date> {
+        self.last_committed_target_for_test
     }
 
     pub fn last_bar_hit_for_test(&self) -> Option<BarHitDebug> {

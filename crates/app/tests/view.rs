@@ -901,8 +901,8 @@ fn context_menu_opens_at_the_click_not_the_window_origin(cx: &mut gpui_kit::Test
         "right-click must offer Add child"
     );
     assert!(
-        cx.debug_bounds("gantt-menu-Rename").is_some(),
-        "right-click must offer Rename so F2 is not the only edit path"
+        cx.debug_bounds("gantt-menu-Edit title").is_some(),
+        "right-click must offer Edit title so F2 is not the only edit path"
     );
 }
 
@@ -947,12 +947,14 @@ fn context_menu_rename_starts_inline_edit(cx: &mut gpui_kit::TestAppContext) {
     });
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
-    let rename = cx.debug_bounds("gantt-menu-Rename").expect("Rename");
+    let rename = cx
+        .debug_bounds("gantt-menu-Edit title")
+        .expect("Edit title");
     cx.simulate_mouse_down(rename.center(), MouseButton::Left, Modifiers::default());
     draw(cx);
     assert!(
         cx.debug_bounds("gantt-inline-title").is_some(),
-        "Rename must start an inline title edit"
+        "Edit title must start an inline title edit"
     );
 }
 
@@ -5342,6 +5344,115 @@ fn right_dot_resize_commits_on_mouse_up_at_release_x(cx: &mut gpui_kit::TestAppC
 }
 
 #[gpui_kit::test]
+fn right_dot_missed_mouseup_does_not_commit_a_later_move_x(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(2);
+    state.gantt.bar_hovered_id = Some(2);
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-2-link-end")
+        .expect("end handle");
+    let timeline = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let drop = Date::new(2026, 8, 8).unwrap();
+    let shrink = Date::new(2026, 7, 28).unwrap();
+    let origin_target = Date::new(2026, 7, 20).unwrap();
+    let drop_window_x = view.update(cx, |view, _| {
+        f32::from(timeline.origin.x) + view.state.gantt.x_for_date(drop)
+    });
+    let shrink_window_x = view.update(cx, |view, _| {
+        f32::from(timeline.origin.x) + view.state.gantt.x_for_date(shrink)
+    });
+    let mid_y = handle.origin.y + handle.size.height / 2.0;
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    // Missed mouse-up: the next move has no button. Must not treat this
+    // hover x as a release (Jul 28 shrink).
+    cx.simulate_mouse_move(
+        point(px(shrink_window_x), mid_y),
+        None,
+        Modifiers::default(),
+    );
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "a button-up move must end the right-dot resize"
+        );
+        assert_eq!(
+            view.last_committed_target_for_test(),
+            None,
+            "a missed mouse-up with no drag must not PATCH a later hover date"
+        );
+        let saved = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .and_then(|node| ado_core::parse_iso_date(node.target_date.as_deref()));
+        assert_eq!(
+            saved,
+            Some(origin_target),
+            "a later hover must not shrink the bar to {shrink}"
+        );
+    });
+
+    view.update(cx, |view, cx| {
+        view.state.gantt.hovered_id = Some(2);
+        view.state.gantt.bar_hovered_id = Some(2);
+        cx.notify();
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-2-link-end")
+        .expect("end handle after cancel");
+    let mid_y = handle.origin.y + handle.size.height / 2.0;
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let drop_at = point(px(drop_window_x), mid_y);
+    cx.simulate_mouse_move(drop_at, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    let preview = view.update(cx, |view, _| {
+        view.state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("right-dot drag must keep a resize")
+            .live_target
+    });
+    cx.simulate_mouse_move(
+        point(px(shrink_window_x), mid_y),
+        None,
+        Modifiers::default(),
+    );
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "a missed mouse-up must commit the last pressed x, not wait for another move"
+        );
+        assert_eq!(
+            view.last_committed_target_for_test(),
+            Some(preview),
+            "must commit the {preview} drag, not a later {shrink} hover"
+        );
+        assert_ne!(
+            view.last_committed_target_for_test(),
+            Some(shrink),
+            "a later mouse-move must not rewrite the release to {shrink}"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn toast_undo_and_scale_switch_clear_hover_dots(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -5503,6 +5614,67 @@ fn year_to_month_keeps_the_scroll_anchor(cx: &mut gpui_kit::TestAppContext) {
             after < Date::new(2027, 1, 1).unwrap(),
             "must not jump to Jul 2027, got {after}"
         );
+    });
+}
+
+#[gpui_kit::test]
+fn clicking_today_then_month_does_not_clip_the_left_edge(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 0.4;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today_btn = cx.debug_bounds("gantt-today-btn").expect("Today button");
+    cx.simulate_click(today_btn.center(), Modifiers::default());
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.scale, GanttScale::Month);
+        assert!(
+            view.state.gantt.year_gutter_snap.abs() < 0.5,
+            "Month after Today must not keep a Year park, snap={}",
+            view.state.gantt.year_gutter_snap
+        );
+        let today = jiff::Zoned::now().date();
+        let today_x = view.state.gantt.today_x(today);
+        let expected = view.state.gantt.timeline_width.max(1.0) * TODAY_ALIGN;
+        assert!(
+            (today_x - expected).abs() < 12.0,
+            "Today then Month must keep Today near the axis, today_x={today_x} expected={expected}"
+        );
+        let left = view.state.gantt.date_for_x(0.0);
+        assert!(
+            left > today.saturating_sub(120.days()),
+            "Month after Today must not re-anchor to a Year park, left={left} today={today}"
+        );
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view.state.gantt.layout_bars(
+            &view.state.nodes,
+            &rows,
+            &view.state.iterations,
+            720.0,
+        );
+        for bar in &bars {
+            if bar.kind != ado_core::GanttBarKind::Scheduled {
+                continue;
+            }
+            let start = view.state.gantt.date_for_x(bar.x);
+            assert!(
+                start < left || bar.x >= -1.0,
+                "a bar that starts on/after the left-edge date must not clip, id={} x={} left={left}",
+                bar.id,
+                bar.x
+            );
+        }
     });
 }
 
