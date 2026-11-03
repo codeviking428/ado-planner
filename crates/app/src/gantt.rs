@@ -257,6 +257,9 @@ pub struct SavedGanttView {
     pub scroll_y: f32,
     pub scale: GanttScale,
     pub zoom: f32,
+    /// Park baked into `scroll_x`. Restored with the pose so a mid-ease
+    /// unsnap subtracts this delta, not the destination's.
+    pub year_gutter_snap: f32,
 }
 
 impl SavedGanttView {
@@ -268,6 +271,8 @@ impl SavedGanttView {
             scroll_y: self.scroll_y + (other.scroll_y - self.scroll_y) * t,
             scale: other.scale,
             zoom: self.zoom + (other.zoom - self.zoom) * t,
+            year_gutter_snap: self.year_gutter_snap
+                + (other.year_gutter_snap - self.year_gutter_snap) * t,
         }
     }
 }
@@ -381,7 +386,9 @@ impl BarLayout {
             && !self.milestone
             && !self.marker
             && !self.open_ended
-            && self.width + 0.1 >= HANDLE_WIDTH * 2.0
+            // Strictly wider than two grips so a YEAR_MIN_BAR_WIDTH (16px)
+            // bar keeps a Move body. `>= 16` would cover the whole bar.
+            && self.width > HANDLE_WIDTH * 2.0
     }
 
     /// Inner 8px of each end, split at the midpoint on bars shorter than 16px.
@@ -1064,6 +1071,7 @@ impl GanttView {
             scroll_y: self.scroll_y,
             scale: self.scale,
             zoom: self.zoom,
+            year_gutter_snap: self.year_gutter_snap,
         }
     }
 
@@ -1073,6 +1081,7 @@ impl GanttView {
         self.scroll_y = saved.scroll_y;
         self.scale = saved.scale;
         self.zoom = saved.zoom;
+        self.year_gutter_snap = saved.year_gutter_snap;
     }
 
     pub fn scroll_rows(&mut self, rows: i32, viewport_h: f32, row_count: usize) {
@@ -3448,6 +3457,21 @@ mod tests {
             bars[0].width + 0.1 >= YEAR_MIN_BAR_WIDTH,
             "Year-view bars must keep a {YEAR_MIN_BAR_WIDTH}px body, width={}",
             bars[0].width
+        );
+        assert!(
+            !bars[0].can_resize(),
+            "a {YEAR_MIN_BAR_WIDTH}px Year bar must stay all-Move, not two grips with no body"
+        );
+        let left = bars[0].x;
+        let right = bars[0].x + bars[0].width;
+        assert_eq!(
+            bars[0].hit_zone_at_window_x(left + 1.0, left, right),
+            BarHitZone::Move,
+            "the Year min-width start edge must move Start and Target together"
+        );
+        assert_eq!(
+            bars[0].hit_zone_at_window_x((left + right) / 2.0, left, right),
+            BarHitZone::Move
         );
     }
 
@@ -6596,6 +6620,57 @@ mod tests {
             gantt.date_for_x(0.0),
             left,
             "unsnap after a Year zoom must use the post-zoom park, not {parked_before_zoom} vs {parked_after_zoom}"
+        );
+    }
+
+    #[test]
+    fn year_gutter_snap_round_trips_through_snapshot_and_mid_ease_restore() {
+        let today = Date::new(2026, 11, 2).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 0.4,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.snap_cramped_leading_column();
+        assert!(
+            gantt.year_gutter_snap.abs() > 0.1,
+            "precondition: Year must park, snap={}",
+            gantt.year_gutter_snap
+        );
+        let from = gantt.snapshot();
+        assert!(
+            (from.year_gutter_snap - gantt.year_gutter_snap).abs() < 0.01,
+            "snapshot must carry the park"
+        );
+        gantt.year_gutter_snap = 0.0;
+        gantt.restore(from);
+        assert!(
+            (gantt.year_gutter_snap - from.year_gutter_snap).abs() < 0.01,
+            "restore must put the park back"
+        );
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.go_today(today);
+        });
+        let to = gantt.snapshot();
+        let mid = from.lerp(to, 0.5);
+        gantt.restore(mid);
+        assert!(
+            (gantt.year_gutter_snap - mid.year_gutter_snap).abs() < 0.01,
+            "mid-ease restore must keep the interpolated park, got {} want {}",
+            gantt.year_gutter_snap,
+            mid.year_gutter_snap
+        );
+        gantt.unsnap_year_gutter();
+        let t = 1.0 - 0.5 * 0.5;
+        let from_unparked = from.scroll_x - from.year_gutter_snap;
+        let to_unparked = to.scroll_x - to.year_gutter_snap;
+        let expect = from_unparked + (to_unparked - from_unparked) * t;
+        assert!(
+            (gantt.scroll_x - expect).abs() < 0.5,
+            "unsnap of the interpolated pose must use the interpolated park, scroll {} want {expect}",
+            gantt.scroll_x
         );
     }
 
