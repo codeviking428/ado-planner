@@ -5802,6 +5802,20 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
         cx.debug_bounds("gantt-drag-preview").is_some(),
         "a live resize must show the date preview chip"
     );
+    let preview = cx
+        .debug_bounds("gantt-drag-preview")
+        .expect("live resize preview");
+    let bar_live = cx
+        .debug_bounds("gantt-bar-2")
+        .expect("leaf bar during resize");
+    let preview_top = f32::from(preview.origin.y);
+    let preview_bottom = preview_top + f32::from(preview.size.height);
+    let bar_top = f32::from(bar_live.origin.y);
+    let bar_bottom = bar_top + f32::from(bar_live.size.height);
+    assert!(
+        preview_top < bar_bottom + 4.0 && preview_bottom > bar_top - 4.0,
+        "live drag preview must stay in the bar's row so the last visible row is not clipped, preview={preview_top}..{preview_bottom} bar={bar_top}..{bar_bottom}"
+    );
     cx.simulate_mouse_up(grip, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
@@ -6017,6 +6031,18 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
             view.state.gantt.pin_bar_tooltip,
             Some(2),
             "an on-bar mouse-move after drop must not consume the pin, or a remount leave would hide the new dates"
+        );
+    });
+    let tip_after = cx
+        .debug_bounds("gantt-bar-tooltip")
+        .expect("pinned tooltip after on-bar move");
+    cx.simulate_mouse_move(tip_after.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip,
+            Some(2),
+            "moving onto the same-row dates chip must not unpin"
         );
     });
     cx.simulate_mouse_move(point(px(8.), px(8.)), None, Modifiers::default());

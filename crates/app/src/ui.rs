@@ -202,6 +202,8 @@ pub struct PlannerView {
     timeline_body_origin_x: Rc<Cell<Option<f32>>>,
     /// Painted bar left/right in window coordinates, filled from on_prepaint.
     painted_bar_bounds: Rc<RefCell<HashMap<i64, PaintedBar>>>,
+    /// Window box of the pinned post-drop tooltip, filled from on_prepaint.
+    pinned_tooltip_bounds: Rc<RefCell<Option<PaintedTooltip>>>,
     /// Last bar mouse-down classification (window x vs painted bounds).
     last_bar_hit: Option<BarHitDebug>,
     /// Start date of the last committed date gesture. Persist without a
@@ -221,6 +223,15 @@ struct PaintedBar {
     /// Prepaint content origin. Independent of the 1px/2px selection border
     /// so selecting a bar does not shift the live gesture mapping.
     content_left: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PaintedTooltip {
+    id: i64,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
 }
 
 /// Window-space hit recorded on every bar mouse-down for tests and DEBUG_HIT.
@@ -461,6 +472,7 @@ impl PlannerView {
             timeline_body_origin_y: Rc::new(Cell::new(0.0)),
             timeline_body_origin_x: Rc::new(Cell::new(None)),
             painted_bar_bounds: Rc::new(RefCell::new(HashMap::new())),
+            pinned_tooltip_bounds: Rc::new(RefCell::new(None)),
             last_bar_hit: None,
             last_committed_start_for_test: None,
             last_committed_target_for_test: None,
@@ -5059,11 +5071,23 @@ impl PlannerView {
             };
             let timeline_w = self.state.gantt.timeline_width.max(1.0);
             let tip_x = row_side_tooltip_left(bar.x, painted_w, extra, tip_w, timeline_w);
+            let tooltip_bounds = self.pinned_tooltip_bounds.clone();
             items.push(
                 div()
                     .id(("gantt-bar-tooltip", id as u64))
                     .debug_selector(|| "gantt-bar-tooltip".into())
                     .absolute()
+                    .on_prepaint(move |bounds, _, _| {
+                        let left = f32::from(bounds.origin.x);
+                        let top = f32::from(bounds.origin.y);
+                        *tooltip_bounds.borrow_mut() = Some(PaintedTooltip {
+                            id,
+                            left,
+                            right: left + f32::from(bounds.size.width),
+                            top,
+                            bottom: top + f32::from(bounds.size.height),
+                        });
+                    })
                     .left(px(tip_x))
                     .top(px(bar_top))
                     .px_2()
@@ -7388,12 +7412,25 @@ impl PlannerView {
     fn pointer_on_bar(&self, id: i64, window_x: f32, window_y: f32) -> Option<bool> {
         let painted = self.painted_bar_bounds.borrow().get(&id).copied()?;
         const SLOP: f32 = 8.0;
-        Some(
-            window_x >= painted.left - SLOP
-                && window_x <= painted.right + SLOP
-                && window_y >= painted.top - SLOP
-                && window_y <= painted.bottom + SLOP,
-        )
+        let on_bar = window_x >= painted.left - SLOP
+            && window_x <= painted.right + SLOP
+            && window_y >= painted.top - SLOP
+            && window_y <= painted.bottom + SLOP;
+        if on_bar {
+            return Some(true);
+        }
+        // The live dates chip sits in empty row space beside the bar. Treat
+        // a move onto it as still on the bar so the pin does not drop.
+        if let Some(tip) = *self.pinned_tooltip_bounds.borrow()
+            && tip.id == id
+            && window_x >= tip.left - SLOP
+            && window_x <= tip.right + SLOP
+            && window_y >= tip.top - SLOP
+            && window_y <= tip.bottom + SLOP
+        {
+            return Some(true);
+        }
+        Some(false)
     }
 
     fn clear_pinned_tooltip_if_pointer_left(
@@ -7410,6 +7447,7 @@ impl PlannerView {
             return;
         }
         self.state.gantt.pin_bar_tooltip = None;
+        self.pinned_tooltip_bounds.borrow_mut().take();
         cx.notify();
     }
 
