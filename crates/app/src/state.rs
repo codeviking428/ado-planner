@@ -68,7 +68,8 @@ pub struct PlannerState {
     history_recording: bool,
     team_views: HashMap<String, SavedGanttView>,
     /// Child date restores from a Shift-move, applied to the parent toast
-    /// once PATCH succeeds (the toast does not exist at commit time).
+    /// extra once PATCH succeeds. A local undo toast is already on screen
+    /// at commit; this stash only lives until the persist clone is made.
     shifted_children: HashMap<i64, Vec<PendingDateSave>>,
 }
 
@@ -1412,7 +1413,7 @@ impl PlannerState {
         if self.history_recording {
             self.record_dates(id, &previous, after_start.clone(), after_target.clone());
         }
-        Some(PendingDateSave {
+        let pending = PendingDateSave {
             id,
             start,
             target,
@@ -1421,7 +1422,9 @@ impl PlannerState {
             rev: previous.rev,
             previous,
             role: DateSaveRole::Commit,
-        })
+        };
+        self.offer_local_date_commit_toast(&pending);
+        Some(pending)
     }
 
     /// Apply the live gesture dates and push undo immediately, before PATCH.
@@ -1456,7 +1459,7 @@ impl PlannerState {
                 after_target.clone(),
             );
         }
-        Some(PendingDateSave {
+        let pending = PendingDateSave {
             id: gesture.id,
             start,
             target,
@@ -1465,7 +1468,32 @@ impl PlannerState {
             rev: previous.rev,
             previous,
             role: DateSaveRole::Commit,
-        })
+        };
+        self.offer_local_date_commit_toast(&pending);
+        Some(pending)
+    }
+
+    /// Replace any leftover Undone/Redid toast as soon as a local date edit
+    /// lands, instead of waiting for PATCH.
+    fn offer_local_date_commit_toast(&mut self, pending: &PendingDateSave) {
+        if !self.history_recording {
+            return;
+        }
+        self.toasts.push_undo(
+            dates_changed_message(
+                &self.item_title(pending.id),
+                parse_iso_date(pending.previous.start_date.as_deref()),
+                parse_iso_date(pending.previous.target_date.as_deref()),
+                parse_iso_date(pending.after_start.as_deref()),
+                parse_iso_date(pending.after_target.as_deref()),
+            ),
+            UndoAction::RestoreDates {
+                id: pending.id,
+                start_date: pending.previous.start_date.clone(),
+                target_date: pending.previous.target_date.clone(),
+                rev: pending.previous.rev,
+            },
+        );
     }
 
     /// Apply the last Dates undo locally so a second Ctrl+Z is not dropped
@@ -3128,9 +3156,10 @@ impl PlannerState {
         if self.history_recording {
             self.fold_descendant_dates(parent_id, child_changes);
         }
-        if !self.attach_children_to_move_toast(parent_id, &pending) {
-            self.shifted_children.insert(parent_id, pending.clone());
-        }
+        // Stash even when a local commit toast already accepted the children.
+        // Persist-fail restore still reads this map.
+        self.shifted_children.insert(parent_id, pending.clone());
+        let _ = self.attach_children_to_move_toast(parent_id, &pending);
         pending
     }
 
@@ -3401,13 +3430,14 @@ impl PlannerState {
         } else {
             format!("Redid: {original}")
         };
-        self.push_stack_toast(message);
+        self.push_stack_toast(message, is_undo);
     }
 
-    /// Success toast after Undo/Redo: keep Undo while the stack remains, else Redo.
-    pub fn push_stack_toast(&mut self, message: impl Into<String>) {
-        let undo = (!self.history.undo.is_empty()).then_some(UndoAction::StackUndo);
-        let redo = (!self.history.redo.is_empty()).then_some(UndoAction::StackRedo);
+    /// Success toast after Undo/Redo. One button per toast: Redo after undo,
+    /// Undo after redo. Showing both looks like leftover actions.
+    pub fn push_stack_toast(&mut self, message: impl Into<String>, after_undo: bool) {
+        let undo = (!after_undo && !self.history.undo.is_empty()).then_some(UndoAction::StackUndo);
+        let redo = (after_undo && !self.history.redo.is_empty()).then_some(UndoAction::StackRedo);
         self.toasts.push_stack(message, undo, redo);
     }
 
@@ -4165,8 +4195,8 @@ mod toast_copy_tests {
         assert!(!pending.is_empty());
         let toast = state.toasts.items.last().expect("undone toast");
         assert!(
-            matches!(toast.undo, Some(UndoAction::StackUndo)),
-            "Undo must stay while history remains, got {:?}",
+            toast.undo.is_none(),
+            "after Undo the toast must not also keep Undo, got {:?}",
             toast.undo
         );
         assert!(
@@ -4185,6 +4215,61 @@ mod toast_copy_tests {
         assert!(
             matches!(toast.redo, Some(UndoAction::StackRedo)),
             "Redo must remain after the last Undo, got {:?}",
+            toast.redo
+        );
+    }
+
+    #[test]
+    fn a_new_date_commit_replaces_the_undone_toast() {
+        use crate::gantt::GestureKind;
+        use crate::toasts::HistoryEntry;
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-replace-toast")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+        state.history.push(HistoryEntry::Dates {
+            id: 1,
+            before_start: Some("2026-07-06T00:00:00Z".into()),
+            before_target: Some("2026-07-20T00:00:00Z".into()),
+            after_start: Some("2026-08-04T00:00:00Z".into()),
+            after_target: Some("2026-08-21T00:00:00Z".into()),
+        });
+        let _ = state.undo_date_stack_now();
+        let undone = state.toasts.items.last().expect("undone toast");
+        assert!(
+            undone.message.starts_with("Undone"),
+            "precondition: undo must leave an Undone toast, got {}",
+            undone.message
+        );
+        assert!(undone.redo.is_some() && undone.undo.is_none());
+        state
+            .begin_bar_gesture(2, GestureKind::Move, 0.0)
+            .expect("move");
+        let ppd = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+        state.update_bar_gesture(ppd * 3.0);
+        let _ = state.commit_date_gesture_now().expect("commit");
+        assert_eq!(
+            state.toasts.items.len(),
+            1,
+            "the new action must replace Undone"
+        );
+        let toast = state.toasts.items.last().expect("moved toast");
+        assert!(
+            !toast.message.starts_with("Undone"),
+            "a new edit must not leave the Undone toast, got {}",
+            toast.message
+        );
+        assert!(toast.undo.is_some(), "the new action must offer Undo");
+        assert!(
+            toast.redo.is_none(),
+            "a new edit must drop Redo, got {:?}",
             toast.redo
         );
     }

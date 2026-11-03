@@ -504,8 +504,8 @@ pub struct DependencyArrow {
     pub y2: f32,
     pub x_head: f32,
     pub lane_y: f32,
-    /// Head sits on the successor's right; inbound runs left into the bar.
-    /// Backward FS links wrap to the successor's left instead (`false`).
+    /// Head sits on the successor's right (gutter pills only). Finish-to-start
+    /// links always enter the target start, so this is `false` for dated bars.
     pub inbound_right: bool,
 }
 
@@ -619,6 +619,9 @@ pub struct GanttView {
     pub bar_hovered_id: Option<i64>,
     pub selected_link: Option<(i64, i64)>,
     pub hovered_link: Option<(i64, i64)>,
+    /// After a date drop, keep that bar's tooltip mounted without waiting for
+    /// a new mouse-enter. Cleared when hover leaves the bar.
+    pub pin_bar_tooltip: Option<i64>,
     pub collapsed: HashSet<i64>,
     pub gesture: Option<Gesture>,
     pub pending_nudge: Option<PendingNudge>,
@@ -665,6 +668,7 @@ impl Default for GanttView {
             bar_hovered_id: None,
             selected_link: None,
             hovered_link: None,
+            pin_bar_tooltip: None,
             collapsed: HashSet::new(),
             gesture: None,
             pending_nudge: None,
@@ -884,6 +888,7 @@ impl GanttView {
         self.hovered_id = None;
         self.bar_hovered_id = None;
         self.hovered_link = None;
+        self.pin_bar_tooltip = None;
     }
 
     pub fn pointer_in_canvas(&self, x: f32, y: f32) -> bool {
@@ -2058,17 +2063,15 @@ impl GanttView {
                 };
                 let pred_left = pred.x;
                 let x_out = pred_end + STUB;
-                // Inbound at succ.x-12 that sits left of the source start is
-                // the long left detour (#1003→#1012 after a left-dot resize,
-                // or a new #1003→#1013). Exit right, drop, enter the target
-                // from the right instead.
-                let detour_left = !succ_gutter && bar.x - STUB < pred_left - 0.5;
-                let mut inbound_right = succ_gutter || detour_left;
-                let mut x_head = if inbound_right { succ_right } else { bar.x };
-                let wrap_around = !succ_gutter && (detour_left || pred_end > bar.x + STUB);
-                let mut x_in = if detour_left {
-                    // Drop at the source stub, then enter the target. A drop
-                    // at succ.x-12 is left of the source start.
+                // Finish-to-start always enters the successor start. Gutter
+                // pills keep inbound_right so the head is not a cramped stub
+                // on "No dates". Overlap/backward wraps at the source stub
+                // and runs back on the successor row into that start — never
+                // flip the head to the bar's right end.
+                let inbound_right = succ_gutter;
+                let x_head = if inbound_right { succ_right } else { bar.x };
+                let wrap_around = !succ_gutter && pred_end > bar.x + STUB;
+                let mut x_in = if wrap_around {
                     x_out
                 } else if inbound_right {
                     x_head + STUB
@@ -2103,10 +2106,9 @@ impl GanttView {
                     x_in = clamp_inbound_stub(x_in, x_head, true, &intervening, include_labels);
                 }
                 if !succ_gutter && x_in < pred_left {
-                    // Dodging shoved the vertical left of the source; drop
-                    // at the source stub and enter the target from the right.
-                    inbound_right = true;
-                    x_head = succ_right;
+                    // Dodging shoved the vertical left of the source. Drop at
+                    // the source stub and keep the head on the start instead
+                    // of overshooting to a right-edge inbound.
                     x_in = x_out.max(pred_left + STUB);
                 }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
@@ -2150,19 +2152,15 @@ impl GanttView {
             for (rank, &index) in indexes.iter().enumerate() {
                 let shift = rank as f32 * INCOMING_FAN;
                 let lane_shift = rank as f32 * LANE_SEP;
-                if out[index].wraps_around_successor() {
-                    // Keep the drop on the source stub; only fan the heads.
+                if !out[index].wraps_around_successor() {
                     if out[index].inbound_right {
                         out[index].x_head += shift;
+                        out[index].x2 += shift;
                     } else {
-                        out[index].x_head -= shift;
+                        // Fan the inbound stub, not the arrowhead, so FS
+                        // still terminates at the successor start.
+                        out[index].x2 -= shift;
                     }
-                } else if out[index].inbound_right {
-                    out[index].x_head += shift;
-                    out[index].x2 += shift;
-                } else {
-                    out[index].x_head -= shift;
-                    out[index].x2 -= shift;
                 }
                 let dir = if out[index].y2 >= out[index].y1 {
                     -1.0
@@ -2762,10 +2760,15 @@ mod tests {
             pred.x
         );
         assert!(
-            (arrow.x_head - succ.x).abs() < 12.0 || (arrow.x_head - succ_right).abs() < 12.0,
-            "must enter a target edge, x_head={} succ={}..{succ_right}",
+            (arrow.x_head - succ.x).abs() < 3.0,
+            "finish-to-start must enter the target start, x_head={} succ.x={} succ_right={succ_right}",
             arrow.x_head,
             succ.x
+        );
+        assert!(
+            !arrow.inbound_right,
+            "dated FS links must not enter from the right, x_head={} succ_right={succ_right}",
+            arrow.x_head
         );
     }
 
@@ -5665,6 +5668,18 @@ mod tests {
             succ.x
         );
         assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
+        assert!(
+            (arrow.x_head - succ.x).abs() < 0.5,
+            "after a left-edge resize the link must still enter the start, x_head={} succ.x={}",
+            arrow.x_head,
+            succ.x
+        );
+        assert!(
+            arrow.wraps_around_successor(),
+            "left-edge overlap must keep the short backward loop, x2={} x_head={}",
+            arrow.x2,
+            arrow.x_head
+        );
     }
 
     #[test]
@@ -5714,6 +5729,102 @@ mod tests {
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 1013).unwrap();
         assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
+        assert!(
+            (arrow.x_head - succ.x).abs() < 0.5,
+            "forward #1003→#1013 must end at the milestone start, not overshoot to the right, x_head={} succ.x={}",
+            arrow.x_head,
+            succ.x
+        );
+        assert!(
+            !arrow.inbound_right,
+            "forward milestone links must enter the start, not the right tip"
+        );
+    }
+
+    #[test]
+    fn finish_to_start_arrow_endpoint_equals_target_start_forward() {
+        let mut pred = node(1003, Some(1002));
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-07-06T00:00:00Z".into());
+        pred.target_date = Some("2026-07-20T00:00:00Z".into());
+        let mut go_live = node(1013, Some(1001));
+        go_live.title = "Go-live milestone".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        go_live.predecessors = vec![1003];
+        let nodes = vec![
+            node(1001, None),
+            node(1002, Some(1001)),
+            pred,
+            node(1005, Some(1003)),
+            go_live,
+        ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("#1003→#1013");
+        let succ = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        assert!(
+            (arrow.x_head - succ.x).abs() < 0.5,
+            "forward arrow endpoint x must equal the target start x, x_head={} succ.x={}",
+            arrow.x_head,
+            succ.x
+        );
+    }
+
+    #[test]
+    fn finish_to_start_arrow_endpoint_equals_target_start_backward() {
+        let mut pred = node(1003, Some(1002));
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-07-06T00:00:00Z".into());
+        pred.target_date = Some("2026-07-20T00:00:00Z".into());
+        let mut succ = node(1012, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-06T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1003];
+        let nodes = vec![node(1001, None), node(1002, Some(1001)), pred, succ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+            .expect("#1003→#1012");
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1012).unwrap();
+        assert!(
+            pred.x + pred.width > succ.x + 12.0,
+            "fixture must be a backward/overlap FS link, pred_end={} succ.x={}",
+            pred.x + pred.width,
+            succ.x
+        );
+        assert!(
+            (arrow.x_head - succ.x).abs() < 0.5,
+            "backward arrow endpoint x must equal the target start x, x_head={} succ.x={}",
+            arrow.x_head,
+            succ.x
+        );
+        assert!(
+            arrow.wraps_around_successor(),
+            "overlap must use the short backward loop, x1={} x2={} x_head={}",
+            arrow.x1,
+            arrow.x2,
+            arrow.x_head
+        );
     }
 
     #[test]

@@ -3731,6 +3731,64 @@ fn dates_cell_stays_one_line_with_a_conflict_marker(cx: &mut gpui_kit::TestAppCo
 }
 
 #[gpui_kit::test]
+fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    // Shrink the parent so #2 overflows without stretching its bar past the
+    // 1280px window (a Sep 1 target parks the right grip off-screen).
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 1) {
+        node.target_date = Some("2026-07-10T00:00:00Z".into());
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.state.gantt.hovered_id = Some(2);
+        view.state.gantt.bar_hovered_id = Some(2);
+        cx.notify();
+    });
+    draw(cx);
+    let badge = cx
+        .debug_bounds("gantt-parent-overflow")
+        .expect("the overflow ! must still paint on the bar");
+    let bar = cx.debug_bounds("gantt-bar-2").expect("overflow bar");
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+    let badge_right = f32::from(badge.origin.x) + f32::from(badge.size.width);
+    assert!(
+        badge_right <= bar_right - HANDLE_WIDTH + 1.0,
+        "the ! must sit left of the {HANDLE_WIDTH}px end grip, badge_right={badge_right} bar_right={bar_right}"
+    );
+    assert!(
+        bar_right < 1280.0,
+        "the right edge must stay on-screen so the grip can receive the click, bar_right={bar_right}"
+    );
+    let on_end = point(
+        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(on_end, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("the right-edge grip must win hits over the ! badge");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "clicking the right edge under the ! must resize, got {:?}",
+            gesture.kind
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn details_dialog_keeps_a_stable_height(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -5127,6 +5185,10 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
     assert!(
         cx.debug_bounds("gantt-drag-preview").is_none(),
         "the preview chip must clear when the resize ends, without waiting for another mouse-move"
+    );
+    assert!(
+        cx.debug_bounds("gantt-bar-tooltip").is_some(),
+        "the bar tooltip must appear after a drop without waiting for another mouse-move"
     );
 }
 
@@ -6612,8 +6674,8 @@ fn toast_keeps_undo_while_history_remains(cx: &mut gpui_kit::TestAppContext) {
                 .toasts
                 .items
                 .iter()
-                .any(|toast| matches!(toast.undo, Some(UndoAction::StackUndo))),
-            "Undo must stay while history remains, got {:?}",
+                .all(|toast| toast.undo.is_none()),
+            "after Undo the toast must not also keep Undo, got {:?}",
             view.state
                 .toasts
                 .items
@@ -6627,16 +6689,16 @@ fn toast_keeps_undo_while_history_remains(cx: &mut gpui_kit::TestAppContext) {
                 .items
                 .iter()
                 .any(|toast| matches!(toast.redo, Some(UndoAction::StackRedo))),
-            "the undone step must also offer Redo"
+            "the undone step must offer Redo"
         );
     });
     assert!(
-        cx.debug_bounds("toast-undo").is_some(),
-        "Undo must still paint while history remains"
+        cx.debug_bounds("toast-undo").is_none(),
+        "Undo must not linger beside Redo after an undo"
     );
     assert!(
         cx.debug_bounds("toast-redo").is_some(),
-        "Redo must paint after the first Undo"
+        "Redo must paint after Undo"
     );
 }
 

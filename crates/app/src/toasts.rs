@@ -425,16 +425,25 @@ mod tests {
     }
 
     #[test]
-    fn stack_toast_keeps_undo_and_redo() {
+    fn stack_toast_after_undo_offers_redo_only() {
         let mut toasts = Toasts::default();
-        toasts.push_stack(
-            "Undone moved A",
-            Some(UndoAction::StackUndo),
-            Some(UndoAction::StackRedo),
-        );
+        toasts.push_stack("Undone moved A", None, Some(UndoAction::StackRedo));
         assert_eq!(toasts.items.len(), 1);
-        assert!(matches!(toasts.items[0].undo, Some(UndoAction::StackUndo)));
+        assert!(toasts.items[0].undo.is_none());
         assert!(matches!(toasts.items[0].redo, Some(UndoAction::StackRedo)));
+        toasts.push_undo(
+            "Moved B",
+            UndoAction::RestoreDates {
+                id: 2,
+                start_date: None,
+                target_date: None,
+                rev: 1,
+            },
+        );
+        assert_eq!(toasts.items.len(), 1, "a new action must replace Undone");
+        assert_eq!(toasts.items[0].message, "Moved B");
+        assert!(toasts.items[0].undo.is_some());
+        assert!(toasts.items[0].redo.is_none());
     }
 
     #[test]
