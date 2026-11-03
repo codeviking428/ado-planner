@@ -4,10 +4,10 @@ use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
-    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, PARALLEL_VERT_MIN,
-    ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
-    bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px, insert_index_for_child,
-    outside_label_is_beside_bar,
+    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, OUTSIDE_LABEL_H,
+    PARALLEL_VERT_MIN, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
+    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px,
+    insert_index_for_child, outside_label_is_beside_bar, today_line_chip_skips,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -161,6 +161,23 @@ fn grab_link_handle(
     )
 }
 
+fn painted_x_gap(
+    a: gpui_kit::Bounds<gpui_kit::Pixels>,
+    b: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> f32 {
+    let a0 = f32::from(a.origin.x);
+    let a1 = a0 + f32::from(a.size.width);
+    let b0 = f32::from(b.origin.x);
+    let b1 = b0 + f32::from(b.size.width);
+    if a1 <= b0 {
+        b0 - a1
+    } else if b1 <= a0 {
+        a0 - b1
+    } else {
+        0.0
+    }
+}
+
 #[gpui_kit::test]
 fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
@@ -190,9 +207,14 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
             .is_some_and(|bounds| bounds.size.height > gpui_kit::px(0.)),
         "tree header should align with the timeline header"
     );
-    assert!(
+    let today_on_screen = view.update(cx, |view, _| {
+        let x = view.state.gantt.today_x(jiff::Zoned::now().date());
+        x >= 0.0 && x <= view.state.gantt.timeline_width
+    });
+    assert_eq!(
         cx.debug_bounds("gantt-today").is_some(),
-        "today marker should be painted"
+        today_on_screen,
+        "Today must paint only when it sits on the chart"
     );
     assert!(
         cx.debug_bounds("gantt-bar-1").is_some(),
@@ -1378,6 +1400,203 @@ fn runtime_shared_source_outgoing_jogs_paint_sixteen_apart(cx: &mut gpui_kit::Te
 }
 
 #[gpui_kit::test]
+fn runtime_drag_persist_cart_to_go_live_stays_eight_apart(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    if let Some(spike) = state.nodes.iter_mut().find(|node| node.id == 1012) {
+        spike.predecessors = vec![1003];
+    }
+    if let Some(go_live) = state.nodes.iter_mut().find(|node| node.id == 1013) {
+        go_live.predecessors.clear();
+    }
+    let nodes = state.nodes.clone();
+    // Running-app camera: apply_hierarchy auto_fit at 800, then a 1280 window.
+    state.gantt.auto_fit(&nodes, &[], 800.0);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-dep-inv-1003-1012").is_some(),
+        "live fixture: Persist cart → spike must paint before the drag"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dep-inv-1003-1013").is_none(),
+        "Persist cart → Go-live is created by the handle drop"
+    );
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1003-link-end")
+        .expect("Persist cart link handle");
+    cx.simulate_mouse_down(
+        grab_link_handle(handle),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    let target = cx.debug_bounds("gantt-bar-1013").expect("Go-live bar");
+    cx.simulate_mouse_move(
+        target.center(),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.as_ref().expect("still linking");
+        assert_eq!(
+            gesture.link_to,
+            Some(1013),
+            "dropping on Go-live must arm Persist cart → Go-live"
+        );
+    });
+    cx.simulate_mouse_up(target.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    // Mock PAT has no ADO; apply the same optimistic predecessor add_dependency does.
+    view.update(cx, |view, cx| {
+        if let Some(go_live) = view.state.nodes.iter_mut().find(|node| node.id == 1013)
+            && !go_live.predecessors.contains(&1003)
+        {
+            go_live.predecessors.push(1003);
+        }
+        cx.notify();
+    });
+    draw(cx);
+    let live = cx
+        .debug_bounds("gantt-dep-inv-1003-1013")
+        .expect("runtime Persist cart → Go-live inbound");
+    let spike = cx
+        .debug_bounds("gantt-dep-inv-1003-1012")
+        .expect("Persist cart → spike inbound");
+    let edge = painted_x_gap(live, spike);
+    let live_x = f32::from(live.origin.x) + f32::from(live.size.width) / 2.0;
+    let spike_x = f32::from(spike.origin.x) + f32::from(spike.size.width) / 2.0;
+    assert!(
+        edge >= 8.0,
+        "drag-created Persist cart → Go-live inv at {live_x} must sit ≥8px from spike at {spike_x} (edge gap={edge})"
+    );
+    assert!(
+        (live_x - spike_x).abs() >= 8.0,
+        "drag-created inbound centres must sit ≥8px apart, live={live_x} spike={spike_x}"
+    );
+    if let Some(cart) = cx.debug_bounds("gantt-bar-1005") {
+        let cart_left = f32::from(cart.origin.x);
+        assert!(
+            live_x < cart_left - 1.0,
+            "runtime Persist cart → Go-live inbound at {live_x} must drop before Cart UI at {cart_left}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn month_hides_today_when_off_the_chart(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today = jiff::Zoned::now().date();
+    let on_screen = view.update(cx, |view, _| {
+        let x = view.state.gantt.today_x(today);
+        x >= 0.0 && x <= view.state.gantt.timeline_width
+    });
+    if on_screen {
+        let today_line = cx.debug_bounds("gantt-today").expect("on-screen Today");
+        let body = cx
+            .debug_bounds("gantt-timeline-body")
+            .expect("timeline body");
+        let x = f32::from(today_line.origin.x);
+        let left = f32::from(body.origin.x);
+        let right = left + f32::from(body.size.width);
+        assert!(
+            x >= left - 1.0 && x <= right,
+            "on-screen Today at {x} must sit inside the chart {left}..{right}"
+        );
+    } else {
+        assert!(
+            cx.debug_bounds("gantt-today").is_none(),
+            "Month must not paint an out-of-range Today line at the chart edge"
+        );
+        assert!(
+            cx.debug_bounds("gantt-today-body").is_none(),
+            "Month must not paint an out-of-range Today body at the chart edge"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn year_before_today_click_gaps_under_sliver_pills(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    let nodes = state.nodes.clone();
+    state.gantt.auto_fit(&nodes, &[], 800.0);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let year = cx.debug_bounds("gantt-scale-Year").expect("Year toolbar");
+    cx.simulate_click(year.center(), Modifiers::default());
+    draw(cx);
+    if cx.debug_bounds("gantt-today").is_none() {
+        return;
+    }
+    view.update(cx, |view, _| {
+        let today = jiff::Zoned::now().date();
+        let today_px = view.state.gantt.today_x(today);
+        let tw = view.state.gantt.timeline_width;
+        if !(today_px >= 0.0 && today_px <= tw) {
+            return;
+        }
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        let skips = today_line_chip_skips(&bars, today_px, tw, GanttScale::Year);
+        for id in [1005_i64, 1012, 1013] {
+            let bar = bars.iter().find(|bar| bar.id == id).unwrap();
+            let chip_top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
+            let chip_bottom = chip_top + OUTSIDE_LABEL_H;
+            let Some((x, w)) = ado_planner::gantt::bar_outside_label_frame(
+                bar,
+                tw,
+                true,
+                Some(today_px),
+                bar.overflow_badge,
+            ) else {
+                continue;
+            };
+            if x >= today_px + 5.0 || x + w <= today_px - 2.0 {
+                continue;
+            }
+            let gapped = skips
+                .iter()
+                .any(|&(top, bottom)| top <= chip_top + 1.0 && bottom >= chip_bottom - 1.0);
+            assert!(
+                gapped,
+                "Year before Today: {} must skip Today under the pill, label={x}..{} today={today_px} skips={skips:?}",
+                bar.title,
+                x + w
+            );
+        }
+    });
+}
+
+#[gpui_kit::test]
 fn inbound_arrowhead_paints_at_the_target_not_the_elbow(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -1686,10 +1905,6 @@ fn lighter_toasts_and_today_label_paint(cx: &mut gpui_kit::TestAppContext) {
     assert!(
         cx.debug_bounds("planner-toast").is_some(),
         "toasts should paint"
-    );
-    assert!(
-        cx.debug_bounds("gantt-today").is_some(),
-        "today marker should paint"
     );
     let toast = cx.debug_bounds("planner-toast").expect("toast");
     let toast_top = f32::from(toast.origin.y);
@@ -2684,6 +2899,7 @@ fn empty_team_keeps_the_gantt_toolbar(cx: &mut gpui_kit::TestAppContext) {
     let mut state = idle_state(&dir);
     state.nodes.clear();
     state.prefs.planner.team = "Empty".into();
+    state.gantt.origin = jiff::Zoned::now().date();
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
     assert!(
@@ -3038,6 +3254,7 @@ fn filtered_empty_keeps_the_timeline_header_and_grid(cx: &mut gpui_kit::TestAppC
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
     state.hide_all_roots();
+    state.gantt.origin = jiff::Zoned::now().date();
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),

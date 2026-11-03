@@ -4441,21 +4441,33 @@ impl PlannerView {
                         // After arrows/cues so the line stays continuous
                         // through links; before labels so chips still cover
                         // it. `today_line_chip_skips` already gaps those bands.
-                        let skips = today_line_chip_skips(bars, today_x, width);
-                        today_line_segments(0.0, content_h, &skips)
-                            .into_iter()
-                            .enumerate()
-                            .map(move |(index, (top, height))| {
-                                div()
-                                    .id(("gantt-today-body", index as u64))
-                                    .debug_selector(|| "gantt-today-body".into())
-                                    .absolute()
-                                    .left(px(today_x))
-                                    .top(px(top))
-                                    .h(px(height))
-                                    .w(px(3.))
-                                    .bg(today_color)
-                            })
+                        // Hide when Today is off the clip so Month does not
+                        // paint a stray 3px at the chart's left edge.
+                        if !today_on_screen {
+                            Vec::new()
+                        } else {
+                            let skips = today_line_chip_skips(
+                                bars,
+                                today_x,
+                                width,
+                                self.state.gantt.scale,
+                            );
+                            today_line_segments(0.0, content_h, &skips)
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, (top, height))| {
+                                    div()
+                                        .id(("gantt-today-body", index as u64))
+                                        .debug_selector(|| "gantt-today-body".into())
+                                        .absolute()
+                                        .left(px(today_x))
+                                        .top(px(top))
+                                        .h(px(height))
+                                        .w(px(3.))
+                                        .bg(today_color)
+                                })
+                                .collect()
+                        }
                     })
                     .children(bars.iter().filter_map(|bar| {
                         self.render_offscreen_edge(bar, cx)
@@ -4630,17 +4642,19 @@ impl PlannerView {
                             .collect::<Vec<_>>()
                     }),
             )
-            .child(
-                div()
-                    .id("gantt-today")
-                    .debug_selector(|| "gantt-today".into())
-                    .absolute()
-                    .left(px(today_x))
-                    .top_0()
-                    .h(px(TIMELINE_HEADER_H))
-                    .w(px(3.))
-                    .bg(today_color),
-            )
+            .when(today_on_screen, |el| {
+                el.child(
+                    div()
+                        .id("gantt-today")
+                        .debug_selector(|| "gantt-today".into())
+                        .absolute()
+                        .left(px(today_x))
+                        .top_0()
+                        .h(px(TIMELINE_HEADER_H))
+                        .w(px(3.))
+                        .bg(today_color),
+                )
+            })
             .when(today_on_screen, |el| {
                 el.child(
                     div()
@@ -6042,8 +6056,20 @@ impl PlannerView {
         cx: &Context<Self>,
     ) -> AnyElement {
         const HIT: f32 = 14.0;
-        let hit_w = width.max(HIT);
-        let hit_h = height.max(HIT);
+        // Verticals use an 8px hit so 16px centres still leave ≥8px between
+        // boxes (a 14px hit on 16px centres was a 2px gap). Horizontals keep
+        // the 14px lane so a 2px stroke stays clickable.
+        let vertical = height >= width;
+        let hit_w = if vertical {
+            width.max(8.0)
+        } else {
+            width.max(HIT)
+        };
+        let hit_h = if vertical {
+            height.max(HIT)
+        } else {
+            height.max(8.0)
+        };
         let segment_id = if role == "h" {
             format!("gantt-dep-arrow-{from_id}-{to_id}")
         } else {
