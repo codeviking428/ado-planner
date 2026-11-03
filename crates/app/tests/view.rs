@@ -501,6 +501,18 @@ fn typed_milestone_diamond_is_not_a_parse_error() {
         "◆ Aug 15 must stay target-only, not become a start date"
     );
     assert_eq!(picked.1, Some(Date::new(2026, 8, 15).unwrap()));
+    let calendar = PickerDate::Range(
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 6).unwrap()),
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap()),
+    );
+    let from_calendar = dates_from_range_picker(calendar, "◆ Aug 15", "◆ Aug 15")
+        .expect("unchanged diamond seed must not block a calendar range");
+    assert_eq!(
+        from_calendar.0,
+        Some(Date::new(2026, 7, 6).unwrap()),
+        "a calendar range must win over an unchanged ◆ seed"
+    );
+    assert_eq!(from_calendar.1, Some(Date::new(2026, 8, 18).unwrap()));
 }
 
 #[gpui_kit::test]
@@ -1580,6 +1592,105 @@ fn milestone_details_dialog_parses_the_diamond_prefix(cx: &mut gpui_kit::TestApp
 }
 
 #[gpui_kit::test]
+fn ctrl_a_then_typing_in_details_dates_keeps_the_field(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert(
+        "System.Title".into(),
+        serde_json::json!("Go-live milestone"),
+    );
+    values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-08-15T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1013,
+        rev: 1,
+        work_item_type: "Feature".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![
+                    ado_core::FormControl {
+                        id: ado_core::START_DATE_FIELD.into(),
+                        reference_name: ado_core::START_DATE_FIELD.into(),
+                        label: "Start Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                    ado_core::FormControl {
+                        id: ado_core::TARGET_DATE_FIELD.into(),
+                        reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                        label: "Target Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                ],
+            }],
+        }],
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-dates-typed").is_some(),
+        "precondition: Dates field must paint"
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_form_dates("", window, cx);
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-dates-typed").is_some(),
+        "Ctrl+A must not unmount the Dates field"
+    );
+    assert!(
+        cx.debug_bounds("form-date-picker").is_some(),
+        "the Dates picker must stay painted after select-all"
+    );
+    view.update(cx, |view, cx| {
+        assert!(
+            !view.form_save_is_enabled(cx),
+            "select-all must not enable Save"
+        );
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_form_dates("a", window, cx);
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-dates-typed").is_some(),
+        "typing after Ctrl+A must keep the Dates field"
+    );
+    assert!(
+        cx.debug_bounds("form-date-picker").is_some(),
+        "typing after Ctrl+A must keep the Dates picker"
+    );
+    view.update(cx, |view, cx| {
+        assert!(
+            !view.form_save_is_enabled(cx),
+            "an incomplete Dates edit must not enable Save"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn placeholder_drop_on_august_keeps_august_dates(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -1965,6 +2076,10 @@ fn closing_a_dialog_clears_canvas_hover(cx: &mut gpui_kit::TestAppContext) {
         view.state.close_form();
         assert_eq!(view.state.gantt.hovered_id, None);
         assert_eq!(view.state.gantt.hovered_link, None);
+        assert!(
+            !view.state.gantt.hover_locked,
+            "closing details must let the next hover paint"
+        );
     });
 }
 

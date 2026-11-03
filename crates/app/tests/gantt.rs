@@ -654,16 +654,30 @@ async fn undo_after_an_end_handle_drag_restores_original_target() {
         .unwrap();
     let original_start = node.start_date.clone();
     let original_target = node.target_date.clone();
+    let origin = state.gantt.origin;
+    let scroll = state.gantt.scroll_x;
     let _ = state.begin_bar_gesture(node.id, GestureKind::ResizeEnd, 0.0);
     state.update_bar_gesture(state.gantt.scale.pixels_per_day(state.gantt.zoom) * 4.0);
     state.commit_gesture().await.expect("commit resize");
     let moved = state.nodes.iter().find(|n| n.id == node.id).unwrap();
     assert_eq!(moved.start_date, original_start);
     assert_ne!(moved.target_date, original_target);
+    assert_eq!(
+        state.gantt.origin, origin,
+        "resizing a bar end must not shift the camera origin"
+    );
+    assert_eq!(
+        state.gantt.scroll_x, scroll,
+        "resizing a bar end must not pan the viewport"
+    );
     state.undo().await.expect("undo resize");
     let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
     assert_eq!(restored.start_date, original_start);
     assert_eq!(restored.target_date, original_target);
+    assert_eq!(
+        state.gantt.scroll_x, scroll,
+        "Undo after an end-handle drag must keep the viewport"
+    );
 }
 
 #[tokio::test]
@@ -1800,6 +1814,25 @@ async fn add_item_on_an_epic_creates_a_child_feature() {
     assert!(
         created_at > epic_at,
         "a child of Epic 1001 must land under it, got {rows:?}"
+    );
+    let created_row = state
+        .gantt
+        .flatten(&state.visible_nodes())
+        .into_iter()
+        .find(|row| row.id == created.id)
+        .expect("created child is visible");
+    assert!(
+        created_row.depth > 0,
+        "a child of an Epic must not appear at root, got {created_row:?}"
+    );
+    assert_eq!(
+        state
+            .visible_nodes()
+            .iter()
+            .find(|node| node.id == created.id)
+            .map(|node| node.parent_id),
+        Some(Some(1001)),
+        "visible tree must keep the Epic parent, not strip it to root"
     );
 }
 

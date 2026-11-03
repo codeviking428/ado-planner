@@ -45,8 +45,8 @@ pub const EXPANDER_SLOT: f32 = 18.0;
 pub const TODAY_PILL_W: f32 = 44.0;
 pub const TODAY_PILL_GAP: f32 = 6.0;
 /// Keep year/month majors off the Today pill; "nearly touching" is still a miss.
-const HEADER_TODAY_LABEL_GAP: f32 = 16.0;
-const MAJOR_LABEL_ESTIMATE: f32 = 76.0;
+const HEADER_TODAY_LABEL_GAP: f32 = 32.0;
+const MAJOR_LABEL_ESTIMATE: f32 = 84.0;
 const TICK_MIN_GAP: f32 = 18.0;
 /// Keep edge tick/year labels off the clip.
 const HEADER_EDGE_PAD: f32 = 10.0;
@@ -1324,11 +1324,12 @@ impl GanttView {
         width: f32,
         hide_x: Option<f32>,
     ) -> Vec<(f32, String)> {
+        let hide_year = matches!(self.scale, GanttScale::Year);
         let ticks: Vec<(f32, String)> = self
             .timeline_ticks(width)
             .into_iter()
             .filter(|tick| tick.major)
-            .map(|tick| {
+            .filter_map(|tick| {
                 let mut x = tick.x.max(0.0);
                 if let Some(today) = hide_x {
                     let pill_left = (today + TODAY_PILL_GAP).max(4.0);
@@ -1336,10 +1337,13 @@ impl GanttView {
                     if x < pill_right + HEADER_TODAY_LABEL_GAP
                         && x + MAJOR_LABEL_ESTIMATE > pill_left
                     {
+                        if hide_year {
+                            return None;
+                        }
                         x = pill_right + HEADER_TODAY_LABEL_GAP;
                     }
                 }
-                (x, tick.major_label)
+                Some((x, tick.major_label))
             })
             .collect();
         let labels = Self::sticky_header_labels(ticks, false, 72.0);
@@ -1622,8 +1626,9 @@ impl GanttView {
 
     pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
         const STUB: f32 = 12.0;
-        // Keep the inbound stub left of the successor's link handle.
-        const HEAD_GAP: f32 = HANDLE_WIDTH + LINK_HANDLE_HIT + 4.0;
+        // Keep the inbound stub left of the successor's link handle and
+        // off the painted arrowhead so hover dots do not sit on the tip.
+        const HEAD_GAP: f32 = HANDLE_WIDTH + LINK_HANDLE_HIT + LINK_HANDLE + 8.0;
         const INCOMING_FAN: f32 = 10.0;
         const LANE_SEP: f32 = 6.0;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
@@ -1754,7 +1759,7 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
     if bar_title_is_inside(bar) {
         bar.x + painted_w
     } else {
-        bar.x + painted_w + 10.0 + title_w
+        bar.x + painted_w + HANDLE_WIDTH + LINK_HANDLE_HIT + 16.0 + title_w
     }
 }
 
@@ -4178,7 +4183,7 @@ mod tests {
         let gantt = GanttView {
             origin: today.saturating_sub(20.days()),
             scale: GanttScale::Year,
-            zoom: 1.0,
+            zoom: 0.4,
             timeline_width: 800.0,
             ..Default::default()
         };
@@ -4190,6 +4195,12 @@ mod tests {
                 *x + 1.0 <= pill_right || *x >= pill_right + HEADER_TODAY_LABEL_GAP - 0.1,
                 "Year label {label:?} at {x} must clear the Today pill ending at {pill_right}"
             );
+            if label == "2027" {
+                assert!(
+                    *x >= pill_right + HEADER_TODAY_LABEL_GAP - 0.1,
+                    "2027 must not crowd Today, got {x} pill_right={pill_right}"
+                );
+            }
         }
     }
 

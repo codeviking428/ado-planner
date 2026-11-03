@@ -968,6 +968,7 @@ impl PlannerState {
     pub fn close_form(&mut self) {
         self.form = None;
         self.gantt.clear_hover();
+        self.gantt.hover_locked = false;
     }
 
     /// Copy the live node's rev and dates into the open details dialog.
@@ -1381,9 +1382,6 @@ impl PlannerState {
             .map(iso_date_only)
             .or_else(|| previous.target_date.clone());
         let _ = self.apply_optimistic_partial(gesture.id, start, target);
-        if let Some(date) = start.or(target) {
-            self.gantt.reveal_date(date);
-        }
         if self.history_recording {
             self.record_dates(
                 gesture.id,
@@ -1967,7 +1965,7 @@ impl PlannerState {
             .await
         {
             Ok(mut node) => {
-                if node.parent_id.is_none() {
+                if parent_id.is_some() {
                     node.parent_id = parent_id;
                 }
                 let id = node.id;
