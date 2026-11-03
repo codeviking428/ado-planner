@@ -6370,6 +6370,95 @@ fn mock_tree_node(id: i64, parent: Option<i64>, ty: &str, title: &str) -> WorkIt
 }
 
 #[gpui_kit::test]
+fn add_child_starts_inline_rename(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let created = mock_tree_node(1999, Some(1), "Feature", "New work item");
+    state.nodes.insert(1, created);
+    state.gantt.selected_id = Some(1999);
+    state.history.undo.push(HistoryEntry::Created {
+        id: 1999,
+        title: "New work item".into(),
+        work_item_type: "Feature".into(),
+        placement: "under Epic \"Work Item 0\"".into(),
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    view.update(cx, |view, _| {
+        view.after_io_selection_change_for_test(Some(1));
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_some(),
+        "Add child must focus inline rename on the new row"
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.selected_id, Some(1999));
+        assert!(
+            view.state.gantt.hovered_id.is_none(),
+            "Add child must not leave hover chrome on the parent name cell"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn add_child_undo_clears_title_focus_ticks(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let created = mock_tree_node(1999, Some(1), "Feature", "New work item");
+    state.nodes.insert(1, created);
+    state.gantt.selected_id = Some(1999);
+    state.gantt.hovered_id = Some(1);
+    state.history.undo.push(HistoryEntry::Created {
+        id: 1999,
+        title: "New work item".into(),
+        work_item_type: "Feature".into(),
+        placement: "under Epic \"Work Item 0\"".into(),
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    view.update(cx, |view, _| {
+        view.after_io_selection_change_for_test(Some(1));
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_some(),
+        "new child must open rename before undo"
+    );
+    view.update(cx, |view, _| {
+        view.state.nodes.retain(|node| node.id != 1999);
+        view.state.gantt.selected_id = None;
+        view.state.history.undo.clear();
+        view.after_io_selection_change_for_test(Some(1999));
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_none(),
+        "Undo of Add child must close inline rename"
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |view, _| {
+            assert!(
+                view.state.gantt.hovered_id.is_none(),
+                "Undo must not leave hover chrome on the Cart name cell"
+            );
+            assert!(
+                view.planner_keys_are_focused(window),
+                "Undo must blur the title button so corner ticks do not persist"
+            );
+        });
+    });
+}
+
+#[gpui_kit::test]
 fn add_item_under_epic_paints_at_child_indent(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();

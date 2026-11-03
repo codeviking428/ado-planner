@@ -55,7 +55,7 @@ use crate::paths::AppPaths;
 use crate::state::{
     DateSaveRole, PendingDateSave, PlannerState, undone_message as undone_toast_message,
 };
-use crate::toasts::{ToastExtra, ToastKind, UndoAction};
+use crate::toasts::{HistoryEntry, ToastExtra, ToastKind, UndoAction};
 
 actions!(
     ado_planner,
@@ -85,6 +85,18 @@ enum InlineEdit {
     Target(i64),
     Dates(i64),
     Assignee(i64),
+}
+
+impl InlineEdit {
+    fn item_id(self) -> i64 {
+        match self {
+            Self::Title(id)
+            | Self::Start(id)
+            | Self::Target(id)
+            | Self::Dates(id)
+            | Self::Assignee(id) => id,
+        }
+    }
 }
 
 pub struct PlannerView {
@@ -158,6 +170,10 @@ pub struct PlannerView {
     /// True while a non-date toast Undo spawn is in flight, so a second
     /// click (mouse-down + click) cannot dismiss the toast as a no-op.
     toast_undo_inflight: bool,
+    /// After Add item I/O, Render opens inline rename on this id.
+    pending_inline_title: Option<i64>,
+    /// After Add/Undo I/O, Render blurs leftover title-button focus ticks.
+    pending_focus_planner: bool,
     /// Painted top of `gantt-timeline-body`, used so link-drop hit-testing
     /// matches the row bands instead of the toolbar-sized origin estimate.
     timeline_body_origin_y: Rc<Cell<f32>>,
@@ -408,6 +424,8 @@ impl PlannerView {
             toast_pointer: false,
             pending_toast_undo: None,
             toast_undo_inflight: false,
+            pending_inline_title: None,
+            pending_focus_planner: false,
             timeline_body_origin_y: Rc::new(Cell::new(0.0)),
             timeline_body_origin_x: Rc::new(Cell::new(None)),
             painted_bar_bounds: Rc::new(RefCell::new(HashMap::new())),
@@ -893,12 +911,7 @@ impl PlannerView {
                         if let Err(err) = result {
                             tracing::warn!("planner action failed: {err}");
                         }
-                        if this.state.gantt.selected_id != prev_selected {
-                            this.state.gantt.clear_hover();
-                            this.state.gantt.hover_locked = true;
-                            let rows = this.state.gantt.flatten(&this.state.nodes);
-                            this.state.gantt.select_relative(&rows, 0);
-                        }
+                        this.after_io_selection_change(prev_selected);
                     }
                     Err(_) => tracing::warn!("planner action cancelled"),
                 }
@@ -918,6 +931,54 @@ impl PlannerView {
         .detach();
         cx.notify();
         true
+    }
+
+    fn after_io_selection_change(&mut self, prev_selected: Option<i64>) {
+        self.drop_stale_inline_edit();
+        if self.state.gantt.selected_id == prev_selected {
+            return;
+        }
+        self.state.gantt.clear_hover();
+        self.state.gantt.hover_locked = true;
+        if self.state.gantt.selected_id.is_some() {
+            let rows = self.state.gantt.flatten(&self.state.nodes);
+            self.state.gantt.select_relative(&rows, 0);
+        }
+        if let Some(id) = self.state.gantt.selected_id
+            && matches!(
+                self.state.history.undo.last(),
+                Some(HistoryEntry::Created { id: created, .. }) if *created == id
+            )
+        {
+            self.pending_inline_title = Some(id);
+            self.pending_focus_planner = false;
+        } else {
+            self.pending_inline_title = None;
+            self.pending_focus_planner = true;
+        }
+    }
+
+    fn drop_stale_inline_edit(&mut self) {
+        let Some(edit) = self.inline_edit else {
+            return;
+        };
+        let id = edit.item_id();
+        if self.state.nodes.iter().any(|node| node.id == id) {
+            return;
+        }
+        self.inline_edit = None;
+        self.inline_dates = None;
+        self.inline_dates_typed_seed.clear();
+        self.inline_dates_error = None;
+        self.pending_typed_preview = None;
+        self.pending_inline_title = None;
+        self.pending_focus_planner = true;
+        self.state.gantt.clear_hover();
+        self.state.gantt.hover_locked = true;
+    }
+
+    pub fn after_io_selection_change_for_test(&mut self, prev_selected: Option<i64>) {
+        self.after_io_selection_change(prev_selected);
     }
 
     fn spawn_unbounded<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
@@ -1781,9 +1842,11 @@ impl PlannerView {
                 this.toast_undo_inflight = false;
                 match outcome {
                     Ok((working, Ok(()))) => {
+                        let prev_selected = this.state.gantt.selected_id;
                         this.state.merge_undo_action(&working, &merge_action);
                         this.state.toasts.dismiss_undo();
                         this.state.toasts.push(ToastKind::Success, undid);
+                        this.after_io_selection_change(prev_selected);
                     }
                     Ok((working, Err(err))) => {
                         tracing::warn!("toast undo failed: {err}");
@@ -3263,6 +3326,8 @@ impl PlannerView {
                                                         Button::new(("expand", id as u64))
                                                             .ghost()
                                                             .compact()
+                                                            .tab_stop(false)
+                                                            .focus_ring(false)
                                                             .with_size(Size::XSmall)
                                                             .label(if !has_children {
                                                                 " "
@@ -3355,6 +3420,8 @@ impl PlannerView {
                 Button::new(("open-details", id as u64))
                     .ghost()
                     .compact()
+                    .tab_stop(false)
+                    .focus_ring(false)
                     .with_size(Size::Small)
                     .label("ⓘ")
                     .when(!self.details_overlay(), |btn| {
@@ -3440,6 +3507,7 @@ impl PlannerView {
                     .ghost()
                     .compact()
                     .tab_stop(false)
+                    .focus_ring(false)
                     .w_full()
                     .px_0()
                     .label(title_owned)
@@ -5563,7 +5631,12 @@ impl PlannerView {
                 }),
             )
             .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(Button::new(label).label(label))
+            .child(
+                Button::new(label)
+                    .tab_stop(false)
+                    .focus_ring(false)
+                    .label(label),
+            )
     }
 
     fn render_form_skeleton(&self, id: i64, title: String, cx: &Context<Self>) -> AnyElement {
@@ -7251,6 +7324,23 @@ impl PlannerView {
             return;
         }
         if self.inline_edit.is_some() {
+            if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+                if key == "z" && event.keystroke.modifiers.shift {
+                    self.inline_edit = None;
+                    self.redo_last(cx);
+                    return;
+                }
+                if key == "z" {
+                    self.inline_edit = None;
+                    self.undo_last(cx);
+                    return;
+                }
+                if key == "y" {
+                    self.inline_edit = None;
+                    self.redo_last(cx);
+                    return;
+                }
+            }
             return;
         }
         if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
@@ -7857,6 +7947,16 @@ impl Focusable for PlannerView {
 
 impl Render for PlannerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(id) = self.pending_inline_title.take()
+            && self.state.nodes.iter().any(|node| node.id == id)
+        {
+            self.open_inline_title(id, window, cx);
+            self.pending_focus_planner = false;
+        }
+        if self.pending_focus_planner {
+            self.pending_focus_planner = false;
+            self.focus_planner(window, cx);
+        }
         if let Some(preview) = self.pending_typed_preview.take() {
             self.inline_input.update(cx, |input, cx| {
                 input.set_value(&preview, window, cx);
