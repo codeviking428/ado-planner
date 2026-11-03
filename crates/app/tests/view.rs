@@ -1340,6 +1340,26 @@ fn runtime_shared_source_outgoing_jogs_paint_sixteen_apart(cx: &mut gpui_kit::Te
         dx >= PARALLEL_VERT_MIN,
         "painted shared-source jogs must sit ≥{PARALLEL_VERT_MIN}px apart, spike={spike_x} live={live_x} dx={dx}"
     );
+    let spike_in = cx
+        .debug_bounds("gantt-dep-inv-1003-1012")
+        .expect("painted Persist cart → spike inbound");
+    let live_in = cx
+        .debug_bounds("gantt-dep-inv-1003-1013")
+        .expect("painted Persist cart → Go-live inbound");
+    let spike_in_x = f32::from(spike_in.origin.x) + f32::from(spike_in.size.width) / 2.0;
+    let live_in_x = f32::from(live_in.origin.x) + f32::from(live_in.size.width) / 2.0;
+    let inbound_dx = (spike_in_x - live_in_x).abs();
+    assert!(
+        inbound_dx >= 12.0,
+        "painted shared-source inbounds must sit ≥12px apart, spike={spike_in_x} live={live_in_x} dx={inbound_dx}"
+    );
+    if let Some(cart) = cx.debug_bounds("gantt-bar-1005") {
+        let cart_left = f32::from(cart.origin.x);
+        assert!(
+            live_in_x < cart_left - 1.0,
+            "painted Persist cart → Go-live inbound at {live_in_x} must drop before Cart UI at {cart_left}"
+        );
+    }
     let label = cx
         .debug_bounds("gantt-bar-label-1003")
         .expect("zoomed-out Month Persist cart must paint an outside label");
@@ -4486,6 +4506,36 @@ fn year_persist_cart_label_and_go_live_link_clear_today(cx: &mut gpui_kit::TestA
             assert!(
                 arrow_left >= persist_right + 6.0 || arrow_right <= persist_left - 6.0,
                 "Persist cart → Go-live horizontal must clear the Persist cart label, arrow={arrow_left}..{arrow_right} label={persist_left}..{persist_right}"
+            );
+        }
+    }
+    if let (Some(cart_label), Some(today_line), Some(today_body)) = (
+        cx.debug_bounds("gantt-bar-label-1005"),
+        cx.debug_bounds("gantt-today"),
+        cx.debug_bounds("gantt-today-body"),
+    ) {
+        let label_left = f32::from(cart_label.origin.x);
+        let label_right = label_left + f32::from(cart_label.size.width);
+        let line = today_body;
+        let line_x = f32::from(line.origin.x);
+        let line_right = line_x + f32::from(line.size.width).max(3.0);
+        let header_x = f32::from(today_line.origin.x);
+        let today_x = line_x.min(header_x);
+        let today_right = line_right.max(header_x + 3.0);
+        let overlap = label_left < today_right && label_right > today_x;
+        if overlap {
+            let label_top = f32::from(cart_label.origin.y);
+            let label_bottom = label_top + f32::from(cart_label.size.height);
+            let body_top = f32::from(today_body.origin.y);
+            let body_bottom = body_top + f32::from(today_body.size.height);
+            assert!(
+                body_bottom <= label_top + 1.0 || body_top >= label_bottom - 1.0,
+                "Year Today must skip the Cart UI label, line={body_top}..{body_bottom} label={label_top}..{label_bottom} x={label_left}..{label_right} today={today_x}..{today_right}"
+            );
+        } else {
+            assert!(
+                label_right <= today_x - 2.0 || label_left >= today_right + 2.0,
+                "Year Cart UI label {label_left}..{label_right} must sit ≥2px off Today {today_x}..{today_right}"
             );
         }
     }
