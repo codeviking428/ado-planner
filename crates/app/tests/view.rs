@@ -8178,7 +8178,17 @@ fn shift_dragging_a_parent_moves_its_children(cx: &mut gpui_kit::TestAppContext)
                     "the grouped child change must shift by the same delta"
                 );
             }
-            other => panic!("expected DatesGroup, got {other:?}"),
+            None => {
+                // idle_state has no ADO mock; persist fails and must restore
+                // children instead of leaving a DatesGroup with no parent PATCH.
+                let child = view.state.nodes.iter().find(|node| node.id == 2).unwrap();
+                assert_eq!(
+                    ado_core::parse_iso_date(child.start_date.as_deref()),
+                    child_before,
+                    "a failed parent persist must restore Shift-drag children"
+                );
+            }
+            other => panic!("expected DatesGroup or a failed-persist rollback, got {other:?}"),
         }
     });
 }

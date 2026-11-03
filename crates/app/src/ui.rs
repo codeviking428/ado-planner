@@ -144,6 +144,9 @@ pub struct PlannerView {
     skip_saving_hold: bool,
     date_save_busy: HashSet<i64>,
     date_save_queue: VecDeque<PendingDateSave>,
+    /// Shift-drag children wait for the parent PATCH so a failed parent
+    /// does not leave descendants saved on ADO.
+    pending_cascade: HashMap<i64, Vec<PendingDateSave>>,
     pending_team: Option<String>,
     update_checked: bool,
     toast_expiry_armed: bool,
@@ -425,6 +428,7 @@ impl PlannerView {
             skip_saving_hold: false,
             date_save_busy: HashSet::new(),
             date_save_queue: VecDeque::new(),
+            pending_cascade: HashMap::new(),
             pending_team: None,
             update_checked: false,
             toast_expiry_armed: false,
@@ -7291,9 +7295,7 @@ impl PlannerView {
             self.last_committed_target_for_test = pending.target;
             if shift_children {
                 let kids = self.state.shift_children_with_committed_move(&pending);
-                for save in kids {
-                    self.enqueue_date_save(cx, save);
-                }
+                self.pending_cascade.insert(pending.id, kids);
             }
             self.enqueue_date_save(cx, pending);
         }
@@ -7372,6 +7374,11 @@ impl PlannerView {
         let runtime = self.state.runtime.clone();
         let mut working = self.state.clone();
         let id = pending.id;
+        if pending.role == DateSaveRole::Commit {
+            // Clone already has the Shift-drag child restores for the toast.
+            // Drop them on live so a later non-Shift move cannot reuse them.
+            let _ = self.state.take_shifted_children(id);
+        }
         self.date_save_busy.insert(id);
         self.arm_saving_status(cx);
         let after_start = pending.after_start.clone();
@@ -7444,12 +7451,26 @@ impl PlannerView {
                                     PlannerState::follow_up_date_save(&live, &persisted),
                                 );
                             }
+                            if role == DateSaveRole::Commit
+                                && let Some(kids) = this.pending_cascade.remove(&id)
+                            {
+                                for save in kids {
+                                    this.enqueue_date_save(cx, save);
+                                }
+                            }
                         }
                         Err(err) => {
                             if still_after {
                                 this.state.restore_node(previous);
                                 this.state.revert_date_save_history(&revert);
                                 this.state.restore_date_save_failed(&revert);
+                                if role == DateSaveRole::Commit
+                                    && let Some(kids) = this.pending_cascade.remove(&id)
+                                {
+                                    this.state.restore_cascade_saves(&kids);
+                                }
+                            } else if role == DateSaveRole::Commit {
+                                let _ = this.pending_cascade.remove(&id);
                             }
                             if let Some(msg) = working.toasts.last_error_message() {
                                 this.state.toasts.push(ToastKind::Error, msg.to_string());

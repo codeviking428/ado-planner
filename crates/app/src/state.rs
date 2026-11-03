@@ -1262,24 +1262,33 @@ impl PlannerState {
         }
     }
 
-    /// Drop the matching Dates undo entry, not merely the last one for `id`.
-    /// A failed second persist must not swallow the first drag.
+    /// Drop the matching Dates or DatesGroup undo entry, not merely the last
+    /// one for `id`. A failed second persist must not swallow the first drag.
+    /// Shift-drag folds the parent into a DatesGroup; matching only `Dates`
+    /// would leave children on the stack after a failed parent PATCH.
     pub fn discard_dates_after(
         &mut self,
         id: i64,
         after_start: &Option<String>,
         after_target: &Option<String>,
     ) {
-        if let Some(index) = self.history.undo.iter().rposition(|entry| {
-            matches!(
-                entry,
-                HistoryEntry::Dates {
-                    id: entry_id,
-                    after_start: start,
-                    after_target: target,
-                    ..
-                } if *entry_id == id && start == after_start && target == after_target
-            )
+        if let Some(index) = self.history.undo.iter().rposition(|entry| match entry {
+            HistoryEntry::Dates {
+                id: entry_id,
+                after_start: start,
+                after_target: target,
+                ..
+            } if *entry_id == id && start == after_start && target == after_target => true,
+            HistoryEntry::DatesGroup { items }
+                if items.first().is_some_and(|item| {
+                    item.id == id
+                        && item.after_start == *after_start
+                        && item.after_target == *after_target
+                }) =>
+            {
+                true
+            }
+            _ => false,
         }) {
             self.history.undo.remove(index);
         }
@@ -1697,6 +1706,10 @@ impl PlannerState {
                         && node.start_date == pending.after_start
                         && node.target_date == pending.after_target
                 }) {
+                    if pending.role == DateSaveRole::Commit {
+                        let kids = self.take_shifted_children(pending.id);
+                        self.restore_cascade_saves(&kids);
+                    }
                     self.restore_node(pending.previous.clone());
                     self.revert_date_save_history(&pending);
                     self.restore_date_save_failed(&pending);
@@ -2989,6 +3002,19 @@ impl PlannerState {
             })
             .cloned()
             .collect()
+    }
+
+    /// Child restores stashed for the persist clone's parent toast. Take
+    /// them off the live state after that clone is made so a later move
+    /// cannot reuse leftovers.
+    pub fn take_shifted_children(&mut self, parent_id: i64) -> Vec<PendingDateSave> {
+        self.shifted_children.remove(&parent_id).unwrap_or_default()
+    }
+
+    pub fn restore_cascade_saves(&mut self, children: &[PendingDateSave]) {
+        for child in children {
+            self.restore_node(child.previous.clone());
+        }
     }
 
     fn push_dates_moved_toast(
@@ -4448,5 +4474,125 @@ mod toast_copy_tests {
             }
             other => panic!("expected DatesGroup, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shifted_children_are_taken_off_live_after_the_persist_clone() {
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-shift-leak")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        state.history_recording = true;
+        let parent_before = state.nodes[0].clone();
+        let start = Date::new(2026, 7, 9).unwrap();
+        let target = Date::new(2026, 7, 23).unwrap();
+        let _ = state.apply_optimistic_partial(1, Some(start), Some(target));
+        state.record_dates(
+            1,
+            &parent_before,
+            Some("2026-07-09T00:00:00Z".into()),
+            Some("2026-07-23T00:00:00Z".into()),
+        );
+        let pending = super::PendingDateSave {
+            id: 1,
+            start: Some(start),
+            target: Some(target),
+            after_start: Some("2026-07-09T00:00:00Z".into()),
+            after_target: Some("2026-07-23T00:00:00Z".into()),
+            previous: parent_before,
+            role: super::DateSaveRole::Commit,
+            rev: 1,
+        };
+        let kids = state.shift_children_with_committed_move(&pending);
+        assert!(!kids.is_empty());
+        let mut working = state.clone();
+        assert!(
+            !working.take_shifted_children(1).is_empty(),
+            "the persist clone needs the child restores for the parent toast"
+        );
+        // Spawn takes them off live after the clone is made.
+        assert!(
+            !state.take_shifted_children(1).is_empty(),
+            "live still holds leftovers until the persist task is spawned"
+        );
+        assert!(
+            state.take_shifted_children(1).is_empty(),
+            "a later parent move must not see Shift-drag leftovers"
+        );
+    }
+
+    #[test]
+    fn failed_parent_commit_restores_shifted_children_and_drops_the_group() {
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-shift-fail")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        state.history_recording = true;
+        let parent_before = state.nodes[0].clone();
+        let start = Date::new(2026, 7, 9).unwrap();
+        let target = Date::new(2026, 7, 23).unwrap();
+        let _ = state.apply_optimistic_partial(1, Some(start), Some(target));
+        state.record_dates(
+            1,
+            &parent_before,
+            Some("2026-07-09T00:00:00Z".into()),
+            Some("2026-07-23T00:00:00Z".into()),
+        );
+        let pending = super::PendingDateSave {
+            id: 1,
+            start: Some(start),
+            target: Some(target),
+            after_start: Some("2026-07-09T00:00:00Z".into()),
+            after_target: Some("2026-07-23T00:00:00Z".into()),
+            previous: parent_before.clone(),
+            role: super::DateSaveRole::Commit,
+            rev: 1,
+        };
+        let kids = state.shift_children_with_committed_move(&pending);
+        let child_before = kids
+            .iter()
+            .find(|save| save.id == 2)
+            .unwrap()
+            .previous
+            .clone();
+        assert_eq!(
+            state
+                .nodes
+                .iter()
+                .find(|node| node.id == 2)
+                .unwrap()
+                .start_date
+                .as_deref(),
+            Some("2026-07-09T00:00:00Z")
+        );
+        state.restore_cascade_saves(&kids);
+        state.restore_node(parent_before);
+        state.discard_dates_after(
+            1,
+            &Some("2026-07-09T00:00:00Z".into()),
+            &Some("2026-07-23T00:00:00Z".into()),
+        );
+        let child = state.nodes.iter().find(|node| node.id == 2).unwrap();
+        assert_eq!(child.start_date, child_before.start_date);
+        assert_eq!(child.target_date, child_before.target_date);
+        assert!(
+            state.history.undo.is_empty(),
+            "a failed parent persist must drop the DatesGroup, got {:?}",
+            state.history.undo
+        );
+        let parent = state.nodes.iter().find(|node| node.id == 1).unwrap();
+        assert_eq!(parent.start_date.as_deref(), Some("2026-07-06T00:00:00Z"));
     }
 }

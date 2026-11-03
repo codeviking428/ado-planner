@@ -2120,6 +2120,66 @@ async fn remove_link_after_undo_succeeds() {
     );
 }
 
+#[tokio::test]
+async fn failed_shift_drag_parent_persist_restores_children() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let parent = state
+        .nodes
+        .iter()
+        .find(|node| {
+            node.has_date_fields
+                && node.start_date.is_some()
+                && node.target_date.is_some()
+                && state.nodes.iter().any(|child| {
+                    child.parent_id == Some(node.id)
+                        && child.has_date_fields
+                        && child.start_date.is_some()
+                })
+        })
+        .cloned()
+        .expect("parent with dated children");
+    let child = state
+        .nodes
+        .iter()
+        .find(|node| node.parent_id == Some(parent.id) && node.start_date.is_some())
+        .cloned()
+        .unwrap();
+    let child_start = child.start_date.clone();
+    let parent_start = parent.start_date.clone();
+    mock.fail_next(&format!("/workitems/{}", parent.id), 503, "save failed");
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+    let _ = state.begin_bar_gesture(parent.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 3.0);
+    let pending = state.commit_date_gesture_now().expect("parent move");
+    let kids = state.shift_children_with_committed_move(&pending);
+    assert!(
+        kids.iter().any(|save| save.id == child.id),
+        "Shift-drag must queue the child persist, got {:?}",
+        kids.iter().map(|save| save.id).collect::<Vec<_>>()
+    );
+    let _ = state.persist_pending_dates(pending).await;
+    let live_child = state.nodes.iter().find(|node| node.id == child.id).unwrap();
+    assert_eq!(
+        live_child.start_date, child_start,
+        "a failed parent persist must restore Shift-drag children"
+    );
+    let live_parent = state
+        .nodes
+        .iter()
+        .find(|node| node.id == parent.id)
+        .unwrap();
+    assert_eq!(live_parent.start_date, parent_start);
+    assert!(
+        !matches!(
+            state.history.undo.last(),
+            Some(HistoryEntry::DatesGroup { items })
+                if items.first().is_some_and(|item| item.id == parent.id)
+        ),
+        "a failed parent persist must drop the DatesGroup, got {:?}",
+        state.history.undo.last()
+    );
+}
+
 #[gpui_kit::test]
 fn gpui_gantt_scale_and_zoom(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
