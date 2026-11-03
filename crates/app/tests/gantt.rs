@@ -216,6 +216,39 @@ async fn empty_picker_enter_clears_dates_and_start_only_is_exact() {
 }
 
 #[tokio::test]
+async fn clear_dates_clears_the_open_form_fields() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    state.open_form(node.id).await.expect("open form");
+    state.clear_dates(node.id).await.expect("clear");
+    let form = state.form.as_ref().expect("form stays open");
+    assert!(
+        form.values
+            .get(START_DATE_FIELD)
+            .is_none_or(|value| value.is_null()),
+        "Clear dates must wipe the dialog Start Date, got {:?}",
+        form.values.get(START_DATE_FIELD)
+    );
+    assert!(
+        form.values
+            .get(TARGET_DATE_FIELD)
+            .is_none_or(|value| value.is_null()),
+        "Clear dates must wipe the dialog Target Date, got {:?}",
+        form.values.get(TARGET_DATE_FIELD)
+    );
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.starts_with("Cleared dates on \""),
+        "clear toast must quote the name, got {message}"
+    );
+}
+
+#[tokio::test]
 async fn nudge_coalesces_five_presses_into_one_patch() {
     let (mock, mut state, _dir) = signed_in().await;
     let node = state
@@ -1071,9 +1104,18 @@ async fn switching_to_growth_fits_the_epic_on_screen() {
         state.gantt.zoom
     );
     assert!(
-        (state.gantt.zoom - 0.6).abs() > 0.01
-            || state.gantt.origin != Date::new(2026, 9, 1).unwrap(),
-        "Growth must not keep Platform's Sep–Jan 60% camera"
+        (state.gantt.zoom - 0.6).abs() < 0.01,
+        "team switch must not change zoom unasked, got {}",
+        state.gantt.zoom
+    );
+    assert_eq!(
+        state.gantt.scale,
+        GanttScale::Month,
+        "team switch must not change the scale unasked"
+    );
+    assert!(
+        state.gantt.origin != Date::new(2026, 9, 1).unwrap(),
+        "Growth must not keep Platform's September origin"
     );
 }
 

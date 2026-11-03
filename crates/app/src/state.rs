@@ -897,9 +897,12 @@ impl PlannerState {
             .map(|saved| saved.scroll_y);
         let width = self.gantt.timeline_width.max(800.0);
         let nodes = self.visible_nodes();
-        // Fit the new team's span. Restoring origin/zoom from another team
-        // (Platform Month 60% → Growth) left bars clipped off the left edge.
+        let keep_zoom = self.gantt.zoom;
+        let keep_scale = self.gantt.scale;
+        // Pan to the new team's span without changing zoom/scale unasked.
         self.gantt.auto_fit(&nodes, &self.iterations, width);
+        self.gantt.zoom = keep_zoom;
+        self.gantt.scale = keep_scale;
         if let Some(y) = saved_y {
             self.gantt.scroll_y = y;
             let rows = self.gantt.flatten(&nodes).len();
@@ -2229,6 +2232,11 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
+                if let Some(form) = self.form.as_mut()
+                    && form.model.id == id
+                {
+                    form.set_exact_range_dates(None, None);
+                }
                 if self.history_recording {
                     self.record_dates(id, &previous, None, None);
                     self.toasts.push_undo(
@@ -2963,6 +2971,7 @@ fn dates_undo_message(
     after_target: Option<Date>,
 ) -> String {
     let was_clear = before_start.is_none() && before_target.is_none();
+    let now_clear = after_start.is_none() && after_target.is_none();
     if was_clear {
         dates_changed_message(
             title,
@@ -2971,6 +2980,8 @@ fn dates_undo_message(
             after_start,
             after_target,
         )
+    } else if now_clear {
+        format!("Cleared dates on {}", quote_name(title))
     } else {
         dates_moved_message(title, before_start, before_target)
     }
@@ -3423,6 +3434,18 @@ mod toast_copy_tests {
         assert_eq!(
             undone_message("Renamed \"Cart\" to \"Basket\""),
             "Undone renamed \"Cart\" to \"Basket\""
+        );
+    }
+
+    #[test]
+    fn undo_clear_dates_names_the_clear() {
+        use super::{dates_undo_message, undone_message};
+        let start = Date::new(2026, 7, 21).unwrap();
+        let original = dates_undo_message("Cart UI", Some(start), None, None, None);
+        assert_eq!(original, "Cleared dates on \"Cart UI\"");
+        assert_eq!(
+            undone_message(&original),
+            "Undone cleared dates on \"Cart UI\""
         );
     }
 }

@@ -470,6 +470,16 @@ fn typed_unparseable_dates_do_not_clear_the_range() {
         start_only.1.is_none(),
         "typed start-only must not invent a target"
     );
+    let start_only_over_range = dates_from_range_picker(calendar, "Jul 6", seed)
+        .expect("typed start-only over a leftover calendar range");
+    assert_eq!(
+        start_only_over_range.0,
+        Some(Date::new(2026, 7, 6).unwrap())
+    );
+    assert!(
+        start_only_over_range.1.is_none(),
+        "typing a start date only must clear Target Date even when the calendar still holds a range"
+    );
 }
 
 #[gpui_kit::test]
@@ -2404,6 +2414,130 @@ fn clicking_an_empty_unscheduled_row_does_not_schedule(cx: &mut gpui_kit::TestAp
 }
 
 #[gpui_kit::test]
+fn link_handle_press_works_without_hovering_first(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.selected_id = None;
+    state.gantt.hovered_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1-link-end")
+        .expect("link handle hit area must exist without a prior hover");
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "pressing a link handle must start a link without hovering first"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn releasing_a_link_drag_on_empty_space_clears_the_rubber_band(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.hovered_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1-link-end")
+        .expect("link handle");
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let away = point(handle.center().x + px(80.), handle.center().y - px(80.));
+    cx.simulate_mouse_move(away, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-preview").is_some(),
+        "rubber-band must paint while dragging"
+    );
+    cx.simulate_mouse_up(away, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "releasing on empty space must drop the link gesture"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-preview").is_none(),
+        "the stray rubber-band must not stay after release"
+    );
+}
+
+#[gpui_kit::test]
+fn zoom_percent_is_not_shown_in_the_toolbar(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-zoom-pct").is_none(),
+        "the zoom percent was not meaningful across scales; show +/− only"
+    );
+}
+
+#[gpui_kit::test]
+fn dragging_an_unscheduled_row_shows_a_schedule_ghost(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 3) {
+        node.start_date = None;
+        node.target_date = None;
+        node.has_date_fields = true;
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let band = cx
+        .debug_bounds("gantt-row-band-3")
+        .expect("unscheduled gantt row");
+    let start = point(
+        gpui_kit::px(f32::from(band.origin.x) + f32::from(band.size.width) * 0.4),
+        band.center().y,
+    );
+    let moved = point(start.x + px(48.), start.y);
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(moved, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-schedule-ghost").is_some(),
+        "dragging on an unscheduled row must show a ghost preview"
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.schedule_drag, Some(3));
+    });
+}
+
+#[gpui_kit::test]
 fn mouse_up_clears_hover_even_when_the_pointer_stays_on_the_bar(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -2684,8 +2818,8 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
     });
     draw(cx);
     assert!(
-        cx.debug_bounds("gantt-link-handle-2-link-end").is_none(),
-        "selection alone must not show link handles"
+        cx.debug_bounds("gantt-link-handle-2-link-end").is_some(),
+        "a selected bar must expose a hittable link handle without hovering first"
     );
     view.update(cx, |view, cx| {
         view.state.gantt.hovered_id = Some(2);
@@ -3372,7 +3506,7 @@ fn inline_placeholder_resets_when_switching_edit_kind(cx: &mut gpui_kit::TestApp
             view.open_inline_dates(1, window, cx);
             assert_eq!(
                 view.inline_placeholder(cx),
-                "Start → Target",
+                "Start → Target, or start only",
                 "empty date edits must hint at a range, not a sample like Jul 6 → Jul 20"
             );
             assert_eq!(
@@ -4010,10 +4144,12 @@ fn unscheduled_picker_does_not_keep_the_previous_range(cx: &mut gpui_kit::TestAp
         );
         let typed = view.inline_input_value(cx);
         assert!(
-            typed.is_empty() || typed == "Start → Target",
+            typed.is_empty()
+                || typed == "Start → Target"
+                || typed == "Start → Target, or start only",
             "unscheduled typed field must be empty, got {typed:?}"
         );
-        assert_eq!(view.inline_placeholder(cx), "Start → Target");
+        assert_eq!(view.inline_placeholder(cx), "Start → Target, or start only");
         assert!(
             !typed.contains("Jul 6"),
             "stale scheduled range must not prefill the unscheduled picker, got {typed:?}"
