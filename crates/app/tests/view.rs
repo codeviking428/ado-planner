@@ -4313,12 +4313,20 @@ fn year_persist_cart_label_and_go_live_link_clear_today(cx: &mut gpui_kit::TestA
         let arrow_left = f32::from(arrow.origin.x);
         let arrow_right = arrow_left + f32::from(arrow.size.width);
         let arrow_top = f32::from(arrow.origin.y);
+        let arrow_mid_y = arrow_top + f32::from(arrow.size.height) / 2.0;
         let overlaps_x = arrow_left < persist_right && arrow_right > persist_left;
         if overlaps_x {
             assert!(
-                arrow_top >= persist_bottom + 6.0,
-                "Persist cart → Go-live horizontal must sit ≥6px below the Persist cart label, arrow_top={arrow_top} label_bottom={persist_bottom}"
+                arrow_mid_y + 0.5 >= persist_bottom + 6.0,
+                "Persist cart → Go-live stroke must sit ≥6px below the Persist cart label, stroke={arrow_mid_y} label_bottom={persist_bottom}"
             );
+            if let Some(cart_ui) = cx.debug_bounds("gantt-bar-1005") {
+                let cart_top = f32::from(cart_ui.origin.y);
+                assert!(
+                    arrow_mid_y < cart_top - 1.0,
+                    "Persist cart → Go-live must stay in the Persist cart row, stroke={arrow_mid_y} Cart UI={cart_top}"
+                );
+            }
         } else {
             assert!(
                 arrow_left >= persist_right + 8.0 || arrow_right <= persist_left - 8.0,

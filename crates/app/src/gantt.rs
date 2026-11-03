@@ -49,8 +49,13 @@ pub const OVERFLOW_BADGE_GAP: f32 = 4.0;
 /// the `!` as well as the letters).
 pub const OUTSIDE_LABEL_GAP: f32 =
     LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0;
+/// Handles-only gap before an outside title (no `!`). Matches the painted
+/// chip start so occupancy does not treat the handle gap as letters.
+const OUTSIDE_TITLE_HANDLE_GAP: f32 = LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
 /// Outside title chip height, matching `render_gantt_bar_label`.
 pub const OUTSIDE_LABEL_H: f32 = 16.0;
+/// Readable outside-chip floor; matches `clip_outside_frame` in `ui.rs`.
+const MIN_OUTSIDE_TITLE: f32 = 40.0;
 /// Gap from an outside title's painted right edge to a long finish-to-start
 /// outgoing vertical. Reviewer floor is 6px; 8px covers antialiasing.
 const SOURCE_LABEL_CLEARANCE: f32 = 8.0;
@@ -2427,9 +2432,11 @@ fn arrow_lane_y(pred: &BarLayout, succ: &BarLayout) -> f32 {
         let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
         if !bar_title_is_inside(pred) {
             let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-            // 12px = 6px hit-box overhang on the 2px stroke + 6px visual gap
-            // (live measure was 3px under "Persist cart").
-            below_bar.max(label_top + OUTSIDE_LABEL_H + 12.0)
+            // 12px below the centered chip is exactly ROW_HEIGHT, so the
+            // 2px stroke rides Cart UI. 8px still clears the letters and
+            // stays in Persist cart's row.
+            let label_clear = label_top + OUTSIDE_LABEL_H + 8.0;
+            below_bar.max(label_clear).min(in_row)
         } else {
             below_bar.min(in_row)
         }
@@ -2759,11 +2766,19 @@ fn separate_shared_source_outgoing(
     }
 }
 
+#[cfg(test)]
 fn bar_outside_title_span(bar: &BarLayout) -> Option<(f32, f32)> {
+    bar_outside_title_span_clipped(bar, f32::MAX)
+}
+
+/// Occupancy of the painted outside chip. Uses the handles-only gap so the
+/// link-handle band is not treated as letters, and clips to `clip_right`
+/// the way `clip_outside_frame` does (inside-fallback when < 40px remains).
+fn bar_outside_title_span_clipped(bar: &BarLayout, clip_right: f32) -> Option<(f32, f32)> {
     if bar_title_is_inside(bar) || bar_is_gutter(bar) {
         return None;
     }
-    let title_w = bar_title_paint_px(&bar.title);
+    let title_w = bar_title_paint_px(&bar.title).max(24.0);
     if title_w < 4.0 {
         return None;
     }
@@ -2772,15 +2787,18 @@ fn bar_outside_title_span(bar: &BarLayout) -> Option<(f32, f32)> {
     } else {
         bar.width.max(8.0)
     };
-    // Start just past the bar so a stub 0–3px from the painted chip
-    // (handles-only gap is 30px, overflow gap is 54px) still counts as a hit.
-    let left = bar.x + painted_w + 6.0;
-    let right = if bar.milestone || bar.marker {
-        left + title_w
+    let bar_right = bar.x + painted_w;
+    let gap = if bar.milestone || bar.marker {
+        6.0
     } else {
-        bar.x + painted_w + OUTSIDE_LABEL_GAP + title_w
+        OUTSIDE_TITLE_HANDLE_GAP
     };
-    Some((left, right))
+    let left = bar_right + gap;
+    let max_w = (clip_right - 4.0 - left).max(0.0);
+    if max_w < MIN_OUTSIDE_TITLE {
+        return None;
+    }
+    Some((left, left + title_w.min(max_w)))
 }
 
 /// The outgoing vertical at `x1` must miss the source's own outside title
@@ -2799,7 +2817,7 @@ fn dodge_outgoing_off_source_labels(
         let Some(pred) = by_id.get(&arrow.from_id) else {
             continue;
         };
-        let Some((left, right)) = bar_outside_title_span(pred) else {
+        let Some((left, right)) = bar_outside_title_span_clipped(pred, clip_right) else {
             continue;
         };
         let painted_w = if pred.milestone || pred.marker {
@@ -2813,7 +2831,10 @@ fn dodge_outgoing_off_source_labels(
         if arrow.x_head <= pred.x + painted_w + 12.0 {
             continue;
         }
-        let on_chip = x_hits_span(arrow.x1, left, right);
+        // 6px pad so a stub 0–3px from the letters still counts; the handle
+        // gap itself (stub at bar_right+12) is not the chip.
+        let hit_left = left - 6.0;
+        let on_chip = x_hits_span(arrow.x1, hit_left, right);
         let under_chip = x_spans_overlap(
             (arrow.x1.min(arrow.x2), arrow.x1.max(arrow.x2)),
             (left, right),
@@ -2821,10 +2842,20 @@ fn dodge_outgoing_off_source_labels(
         if !on_chip && !under_chip {
             continue;
         }
-        // Don't flip a forward FS into wrap-around past the successor.
         let desired = right + SOURCE_LABEL_CLEARANCE;
         let wrap_limit = arrow.x_head - 1.0;
-        let target = desired.min(wrap_limit).clamp(clip_left, clip_right);
+        // Capping at x_head-1 parks the stub on the letters when the
+        // successor sits under the chip (Year Persist cart → Go-live).
+        // Leave (or pull back into) the handle gap instead.
+        if desired > wrap_limit {
+            let gap_x = pred.x + painted_w + 12.0;
+            let clear_left = (left - 6.0).max(gap_x);
+            if arrow.x1 > left - 0.5 {
+                arrow.x1 = clear_left.min(arrow.x1).clamp(clip_left, clip_right);
+            }
+            continue;
+        }
+        let target = desired.clamp(clip_left, clip_right);
         if target <= arrow.x1 + 0.5 {
             continue;
         }
@@ -5986,6 +6017,98 @@ mod tests {
             persist_live.x1 >= right + 6.0,
             "runtime Persist cart → Go-live must sit ≥6px past the Persist cart label, x1={} label={left}..{right}",
             persist_live.x1
+        );
+    }
+
+    #[test]
+    fn year_persist_go_live_outgoing_stays_off_the_source_title() {
+        let nodes = mock_fixture_nodes();
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        let live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Year Persist cart → Go-live");
+        let (left, right) =
+            bar_outside_title_span(pred).expect("Year Persist cart paints an outside title");
+        assert!(
+            go_live.x < right + SOURCE_LABEL_CLEARANCE,
+            "fixture: Go-live must sit under the Persist cart title so wrap-limit cannot clear it, diamond={} label={left}..{right}",
+            go_live.x
+        );
+        assert!(
+            !x_hits_span(live.x1, left, right),
+            "Year Persist cart → Go-live must not park its outgoing vertical on the title, x1={} label={left}..{right} x_head={}",
+            live.x1,
+            live.x_head
+        );
+        assert!(
+            live.x1 < left - 0.5,
+            "when the successor sits under the title, keep the stub in the handle gap, x1={} label_left={left}",
+            live.x1
+        );
+        assert!(
+            (live.x_head - go_live.x).abs() < 1.0,
+            "Go-live ▶ must stay on the diamond, x_head={} diamond={}",
+            live.x_head,
+            go_live.x
+        );
+    }
+
+    #[test]
+    fn year_persist_go_live_lane_stays_in_the_source_row() {
+        let nodes = mock_fixture_nodes();
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Year Persist cart → Go-live");
+        assert!(
+            (cart_ui.y - (pred.y + ROW_HEIGHT)).abs() < 0.5,
+            "fixture: Cart UI is the next row under Persist cart, persist.y={} cart.y={}",
+            pred.y,
+            cart_ui.y
+        );
+        assert!(
+            live.lane_y >= pred.y && live.lane_y < pred.y + ROW_HEIGHT - 1.0,
+            "outside-title Persist cart → Go-live must stay in the Persist cart row, lane={} persist={}..{}",
+            live.lane_y,
+            pred.y,
+            pred.y + ROW_HEIGHT
+        );
+        assert!(
+            live.lane_y < cart_ui.y,
+            "must not ride Cart UI, lane={} cart.y={}",
+            live.lane_y,
+            cart_ui.y
+        );
+        let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
+        assert!(
+            live.lane_y + 1.0 >= label_top + OUTSIDE_LABEL_H + 6.0,
+            "horizontal must still sit ≥6px below the Persist cart chip, lane={} chip_bottom={}",
+            live.lane_y,
+            label_top + OUTSIDE_LABEL_H
         );
     }
 
