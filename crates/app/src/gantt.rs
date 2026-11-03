@@ -341,6 +341,8 @@ pub struct DependencyArrow {
     pub y2: f32,
     pub x_head: f32,
     pub lane_y: f32,
+    /// Head sits on the successor's right; inbound runs left into the bar.
+    pub inbound_right: bool,
 }
 
 impl DependencyArrow {
@@ -349,14 +351,14 @@ impl DependencyArrow {
     /// Wrap-around routing ends to the right of the successor; the last run
     /// into the bar must stay a short inbound stub instead of crossing it.
     pub fn wraps_around_successor(&self) -> bool {
-        self.x2 > self.x_head + Self::WRAP_STUB
+        !self.inbound_right && self.x2 > self.x_head + Self::WRAP_STUB
     }
 
     pub fn stub_start(&self) -> f32 {
         if self.wraps_around_successor() {
             self.x_head - Self::WRAP_STUB
         } else {
-            self.x2.min(self.x_head)
+            self.x2
         }
     }
 
@@ -1710,6 +1712,7 @@ impl GanttView {
                     y2,
                     x_head,
                     lane_y,
+                    inbound_right: backward,
                 });
             }
         }
@@ -3320,6 +3323,7 @@ mod tests {
             y2: 220.0,
             x_head: 412.0,
             lane_y: 200.0,
+            inbound_right: false,
         };
         let (x, y) = arrow.remove_control_pos();
         assert!(
@@ -4167,6 +4171,22 @@ mod tests {
         assert!(
             !arrows[0].wraps_around_successor(),
             "backward links must stay a local elbow, not a wrap-around rectangle"
+        );
+        assert!(
+            arrows[0].inbound_right,
+            "a backward FS link must inbound from the successor's right"
+        );
+        assert!(
+            (arrows[0].stub_start() - arrows[0].x2).abs() < 0.5,
+            "the inbound stub must start at x2 so it reaches the head, stub={} x2={}",
+            arrows[0].stub_start(),
+            arrows[0].x2
+        );
+        assert!(
+            arrows[0].x2 - arrows[0].x_head >= 8.0,
+            "the inbound run must not collapse to a 2px stub, x2={} x_head={}",
+            arrows[0].x2,
+            arrows[0].x_head
         );
     }
 

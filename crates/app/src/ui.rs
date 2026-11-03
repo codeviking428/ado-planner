@@ -5076,7 +5076,11 @@ impl PlannerView {
             )))
             .debug_selector(|| "gantt-dep-arrowhead".into())
             .absolute()
-            .left(px(arrow.x_head - min_x - 14.0))
+            .left(px(if arrow.inbound_right {
+                arrow.x_head - min_x - 4.0
+            } else {
+                arrow.x_head - min_x - 14.0
+            }))
             .top(px(arrow.y2 - min_y - 10.0))
             .w(px(18.))
             .h(px(20.))
@@ -5103,7 +5107,7 @@ impl PlannerView {
                     cx.notify();
                 }),
             )
-            .child("▶")
+            .child(if arrow.inbound_right { "◀" } else { "▶" })
             .into_any_element()
     }
 
