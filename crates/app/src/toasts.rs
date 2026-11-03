@@ -6,6 +6,7 @@ const TOAST_CAP: usize = 2;
 const SUCCESS_TTL: Duration = Duration::from_secs(7);
 const UNDO_TTL: Duration = Duration::from_secs(8);
 const WARNING_TTL: Duration = Duration::from_secs(8);
+const ERROR_TTL: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -191,7 +192,7 @@ impl Toasts {
         }
         let now = Instant::now();
         self.items.retain(|toast| match toast.kind {
-            ToastKind::Error => true,
+            ToastKind::Error => now.saturating_duration_since(toast.created_at) < ERROR_TTL,
             ToastKind::Success => {
                 let ttl = if toast.undo.is_some() {
                     UNDO_TTL
@@ -336,6 +337,18 @@ mod tests {
         toasts.paused = false;
         toasts.expire();
         assert!(toasts.items.is_empty());
+    }
+
+    #[test]
+    fn error_toasts_expire_after_ttl() {
+        let mut toasts = Toasts::default();
+        toasts.push(ToastKind::Error, "rev mismatch");
+        toasts.items[0].created_at = Instant::now() - Duration::from_secs(20);
+        toasts.expire();
+        assert!(
+            toasts.items.is_empty(),
+            "error toasts must not stick forever"
+        );
     }
 
     #[test]

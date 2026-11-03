@@ -2485,6 +2485,98 @@ fn releasing_a_link_drag_on_empty_space_clears_the_rubber_band(cx: &mut gpui_kit
 }
 
 #[gpui_kit::test]
+fn releasing_a_link_drag_on_empty_space_clears_link_selection(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.predecessors = vec![1];
+        node.start_date = Some("2026-07-21T00:00:00Z".into());
+        node.target_date = Some("2026-08-04T00:00:00Z".into());
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.hovered_id = Some(1);
+    state.gantt.selected_link = Some((1, 2));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-remove").is_some(),
+        "precondition: selected link shows ×"
+    );
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1-link-end")
+        .expect("link handle");
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let away = point(handle.center().x + px(80.), handle.center().y - px(80.));
+    cx.simulate_mouse_move(away, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(away, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.selected_link.is_none(),
+            "releasing a handle drag on empty space must drop the stuck link selection"
+        );
+        assert!(view.state.gantt.gesture.is_none());
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-remove").is_none(),
+        "the × must leave the handle after a cancelled link drag"
+    );
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1-link-end")
+        .expect("link handle after cancel");
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "the handle must still start a link after a cancelled drag; × must not cover it"
+        );
+        assert!(view.state.gantt.selected_link.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn clicking_a_tree_row_clears_link_selection(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.predecessors = vec![1];
+        node.start_date = Some("2026-07-21T00:00:00Z".into());
+        node.target_date = Some("2026-08-04T00:00:00Z".into());
+    }
+    state.gantt.selected_link = Some((1, 2));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let row = cx.debug_bounds("gantt-tree-row-1").expect("tree row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.selected_id, Some(1));
+        assert!(
+            view.state.gantt.selected_link.is_none(),
+            "row select must clear the stuck link selection so × does not cover the handle"
+        );
+    });
+    assert!(cx.debug_bounds("gantt-link-remove").is_none());
+}
+
+#[gpui_kit::test]
 fn zoom_percent_is_not_shown_in_the_toolbar(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -2498,6 +2590,42 @@ fn zoom_percent_is_not_shown_in_the_toolbar(cx: &mut gpui_kit::TestAppContext) {
     assert!(
         cx.debug_bounds("gantt-zoom-pct").is_none(),
         "the zoom percent was not meaningful across scales; show +/− only"
+    );
+    assert!(
+        cx.debug_bounds("gantt-zoom-level").is_some(),
+        "the zoom level name must sit next to −/+"
+    );
+}
+
+#[gpui_kit::test]
+fn error_toast_copy_and_dismiss_do_not_overlap_the_title(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.toasts.push(
+        ToastKind::Error,
+        "The work item revision does not match the expected value from the last save. Refresh and try again.",
+    );
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let title = cx.debug_bounds("toast-title").expect("toast title");
+    let copy = cx.debug_bounds("toast-copy").expect("Copy");
+    let dismiss = cx.debug_bounds("toast-dismiss").expect("dismiss");
+    let title_right = f32::from(title.origin.x) + f32::from(title.size.width);
+    let copy_left = f32::from(copy.origin.x);
+    let copy_right = copy_left + f32::from(copy.size.width);
+    let dismiss_left = f32::from(dismiss.origin.x);
+    assert!(
+        title_right <= copy_left + 1.0,
+        "Copy must not overlap the toast text: title_right={title_right} copy_left={copy_left}"
+    );
+    assert!(
+        copy_right <= dismiss_left + 1.0,
+        "× must not overlap Copy: copy_right={copy_right} dismiss_left={dismiss_left}"
     );
 }
 
@@ -4341,6 +4469,13 @@ fn details_picker_previews_the_start_before_the_end(cx: &mut gpui_kit::TestAppCo
         assert!(
             start.is_none() || start.is_some_and(|value| value.is_null()),
             "an incomplete range must not write Start Date into the form, got {start:?}"
+        );
+        let typed = view
+            .form_input_value(ado_core::START_DATE_FIELD, cx)
+            .unwrap_or_default();
+        assert!(
+            typed.contains("Aug 4") || typed.contains("2026-08-04"),
+            "the calendar field must update after the first click, got {typed:?}"
         );
     });
 }

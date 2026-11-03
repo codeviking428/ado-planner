@@ -227,6 +227,11 @@ async fn clear_dates_clears_the_open_form_fields() {
     state.open_form(node.id).await.expect("open form");
     state.clear_dates(node.id).await.expect("clear");
     let form = state.form.as_ref().expect("form stays open");
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(
+        form.model.rev, live.rev,
+        "Clear dates must refresh the cached form rev so Save does not 412"
+    );
     assert!(
         form.values
             .get(START_DATE_FIELD)
@@ -283,6 +288,100 @@ async fn failed_clear_dates_keeps_the_open_form_fields() {
         "failed clear must not leave the dialog empty and dirty"
     );
     assert_eq!(form.values.get(TARGET_DATE_FIELD), form_target.as_ref());
+}
+
+#[tokio::test]
+async fn undo_after_clear_dates_keeps_form_rev_in_sync() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    state.open_form(node.id).await.expect("open form");
+    let opened_rev = state.form.as_ref().unwrap().model.rev;
+    state.clear_dates(node.id).await.expect("clear");
+    let after_clear = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(
+        state.form.as_ref().unwrap().model.rev,
+        after_clear.rev,
+        "clear must bump the cached form rev"
+    );
+    assert_ne!(after_clear.rev, opened_rev);
+    let pending = state.undo_dates_now().expect("undo clear");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist undo");
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    let form = state.form.as_mut().expect("form stays open");
+    assert_eq!(
+        form.model.rev, live.rev,
+        "Undo must refresh the cached form rev so Save does not 412"
+    );
+    form.set_string("System.Title", "After undo save".into());
+    state
+        .save_form()
+        .await
+        .expect("save after undo must not 412");
+}
+
+#[tokio::test]
+async fn undo_after_picker_resyncs_open_form_dates() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let original_start = node.start_date.clone();
+    let original_target = node.target_date.clone();
+    state.open_form(node.id).await.expect("open form");
+    let start = Date::new(2026, 8, 4).unwrap();
+    let target = Date::new(2026, 8, 21).unwrap();
+    let pending = state
+        .commit_range_dates_now(node.id, Some(start), Some(target))
+        .expect("picker save");
+    state
+        .persist_pending_dates(pending)
+        .await
+        .expect("persist picker");
+    let after_pick = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(
+        state.form.as_ref().unwrap().model.rev,
+        after_pick.rev,
+        "picker persist must refresh the cached form rev"
+    );
+    let pending_undo = state.undo_dates_now().expect("undo picker");
+    let form = state.form.as_ref().expect("form stays open");
+    assert_eq!(
+        form.values
+            .get(START_DATE_FIELD)
+            .and_then(serde_json::Value::as_str),
+        original_start.as_deref(),
+        "undo must resync the open dialog Start Date"
+    );
+    assert_eq!(
+        form.values
+            .get(TARGET_DATE_FIELD)
+            .and_then(serde_json::Value::as_str),
+        original_target.as_deref(),
+        "undo must resync the open dialog Target Date"
+    );
+    state
+        .persist_pending_dates(pending_undo)
+        .await
+        .expect("persist undo");
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    let form = state.form.as_mut().expect("form stays open");
+    assert_eq!(form.model.rev, live.rev);
+    form.set_string("System.Title", "Picker undo save".into());
+    state
+        .save_form()
+        .await
+        .expect("save after picker undo must not 412");
 }
 
 #[tokio::test]
@@ -1143,10 +1242,11 @@ async fn growth_team_loads_its_epic_and_empty_team_has_no_items() {
 }
 
 #[tokio::test]
-async fn switching_to_growth_fits_the_epic_on_screen() {
+async fn switching_to_growth_keeps_the_camera() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.timeline_width = 800.0;
-    state.gantt.origin = Date::new(2026, 9, 1).unwrap();
+    let origin = Date::new(2026, 9, 1).unwrap();
+    state.gantt.origin = origin;
     state.gantt.scale = GanttScale::Month;
     state.gantt.zoom = 0.6;
     state.begin_team_switch("Growth".into());
@@ -1154,21 +1254,6 @@ async fn switching_to_growth_fits_the_epic_on_screen() {
         .set_team("Growth".into())
         .await
         .expect("switch to Growth");
-    let visible = state.visible_nodes();
-    let rows = state.gantt.flatten(&visible);
-    let bars = state
-        .gantt
-        .layout_bars(&visible, &rows, &state.iterations, 720.0);
-    let bar = bars.iter().find(|bar| bar.id == 1020).expect("Growth epic");
-    let width = state.gantt.timeline_width.max(800.0);
-    assert!(
-        bar.x >= -1.0 && bar.x + bar.width <= width + 1.0,
-        "team switch must fit Growth's Aug–Sep bar, origin={} x={} width={} zoom={}",
-        state.gantt.origin,
-        bar.x,
-        bar.width,
-        state.gantt.zoom
-    );
     assert!(
         (state.gantt.zoom - 0.6).abs() < 0.01,
         "team switch must not change zoom unasked, got {}",
@@ -1179,9 +1264,9 @@ async fn switching_to_growth_fits_the_epic_on_screen() {
         GanttScale::Month,
         "team switch must not change the scale unasked"
     );
-    assert!(
-        state.gantt.origin != Date::new(2026, 9, 1).unwrap(),
-        "Growth must not keep Platform's September origin"
+    assert_eq!(
+        state.gantt.origin, origin,
+        "team switch must not pan the range unasked"
     );
 }
 
@@ -1503,14 +1588,10 @@ async fn add_item_keeps_the_selected_parent_after_reload() {
     state.gantt.selected_id = Some(1005);
     state.add_item().await.expect("create");
     let created = created_item(&state);
-    let selected_parent = state
-        .nodes
-        .iter()
-        .find(|node| node.id == 1005)
-        .and_then(|node| node.parent_id);
     assert_eq!(
-        created.parent_id, selected_parent,
-        "new items must be siblings of the selected work item, not nested under it"
+        created.parent_id,
+        Some(1005),
+        "new items must nest under the selected work item"
     );
     state.load_hierarchy().await.expect("reload");
     let reloaded = state
@@ -1519,7 +1600,8 @@ async fn add_item_keeps_the_selected_parent_after_reload() {
         .find(|node| node.id == created.id)
         .expect("created item survives reload");
     assert_eq!(
-        reloaded.parent_id, selected_parent,
+        reloaded.parent_id,
+        Some(1005),
         "Hierarchy-Reverse must persist System.Parent after refetch"
     );
 }
@@ -1658,27 +1740,38 @@ async fn undo_create_drops_date_history_for_that_item() {
 }
 
 #[tokio::test]
-async fn add_item_next_to_a_user_story_creates_a_user_story() {
+async fn add_item_on_a_user_story_creates_a_child_task() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.selected_id = Some(1003);
-    let parent = state
-        .nodes
-        .iter()
-        .find(|node| node.id == 1003)
-        .and_then(|node| node.parent_id);
     state.add_item().await.expect("create");
     let created = created_item(&state);
     assert_eq!(
-        created.parent_id, parent,
-        "new items must share the selected row's parent"
+        created.parent_id,
+        Some(1003),
+        "new items must nest under the selected User Story"
     );
     assert_eq!(
-        created.work_item_type, "User Story",
-        "a sibling of a User Story must be a User Story, not a nested Task"
+        created.work_item_type, "Task",
+        "a child of a User Story must be a Task"
+    );
+    let rows: Vec<i64> = state
+        .gantt
+        .flatten(&state.nodes)
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    let parent_at = rows.iter().position(|id| *id == 1003).expect("story");
+    let created_at = rows
+        .iter()
+        .position(|id| *id == created.id)
+        .expect("created child");
+    assert!(
+        created_at > parent_at,
+        "a new child must appear under its parent, got {rows:?}"
     );
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message.contains("Created User Story")
+        message.contains("Created Task")
             && message.contains(&format!("\"{}\"", created.title))
             && message.contains("under"),
         "create toast must state type and placement, got {message}"
@@ -1686,26 +1779,13 @@ async fn add_item_next_to_a_user_story_creates_a_user_story() {
 }
 
 #[tokio::test]
-async fn add_item_next_to_an_epic_appends_a_root_sibling() {
+async fn add_item_on_an_epic_creates_a_child_feature() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.selected_id = Some(1001);
-    let before: Vec<i64> = state
-        .gantt
-        .flatten(&state.nodes)
-        .into_iter()
-        .filter(|row| {
-            state
-                .nodes
-                .iter()
-                .any(|node| node.id == row.id && node.parent_id.is_none())
-        })
-        .map(|row| row.id)
-        .collect();
-    assert!(before.contains(&1001), "Epic 1001 should already be a root");
     state.add_item().await.expect("create");
     let created = created_item(&state);
-    assert_eq!(created.parent_id, None);
-    assert_eq!(created.work_item_type, "Epic");
+    assert_eq!(created.parent_id, Some(1001));
+    assert_eq!(created.work_item_type, "Feature");
     let rows: Vec<i64> = state
         .gantt
         .flatten(&state.nodes)
@@ -1716,14 +1796,10 @@ async fn add_item_next_to_an_epic_appends_a_root_sibling() {
     let created_at = rows
         .iter()
         .position(|id| *id == created.id)
-        .expect("created sibling");
+        .expect("created child");
     assert!(
         created_at > epic_at,
-        "a sibling of Epic 1001 must land after it, got {rows:?}"
-    );
-    assert!(
-        before.contains(&1001),
-        "the selected Epic must still be a root"
+        "a child of Epic 1001 must land under it, got {rows:?}"
     );
 }
 

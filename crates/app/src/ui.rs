@@ -491,7 +491,7 @@ impl PlannerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.state.gantt.selected_id = Some(id);
+        self.state.gantt.select_row(id);
         if click_count >= 2 {
             self.open_inline_title(id, window, cx);
             return;
@@ -599,13 +599,16 @@ impl PlannerView {
     }
 
     fn flush_pending_form_dates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(date) = self.pending_form_picker.take() {
-            let pickers: Vec<_> = self.form_dates.values().cloned().collect();
-            for picker in pickers {
-                picker.update(cx, |picker, cx| {
-                    picker.set_date(date, window, cx);
-                });
-            }
+        if let Some(date) = self.pending_form_picker.take()
+            && let Some(picker) = self
+                .form_dates
+                .get(ado_core::START_DATE_FIELD)
+                .cloned()
+                .or_else(|| self.form_dates.get(ado_core::TARGET_DATE_FIELD).cloned())
+        {
+            picker.update(cx, |picker, cx| {
+                picker.set_date(date, window, cx);
+            });
         }
         let Some(text) = self.pending_form_dates_text.take() else {
             return;
@@ -641,10 +644,15 @@ impl PlannerView {
         self.pending_form_dates_text = Some(text.clone());
         self.form_dates_typed_seed = text;
         self.form_dates_preview = None;
-        self.pending_form_picker = Some(PickerDate::Range(
-            start.and_then(jiff_to_naive),
-            target.and_then(jiff_to_naive),
-        ));
+        let range = self.form_dates.contains_key(ado_core::START_DATE_FIELD);
+        self.pending_form_picker = Some(if range {
+            PickerDate::Range(
+                start.and_then(jiff_to_naive),
+                target.and_then(jiff_to_naive),
+            )
+        } else {
+            PickerDate::Single(target.or(start).and_then(jiff_to_naive))
+        });
     }
 
     fn form_date_picker_focused(&self, window: &Window, cx: &App) -> bool {
@@ -967,6 +975,7 @@ impl PlannerView {
         self.dates_anchor = None;
         self.pending_delete = None;
         self.state.gantt.context_menu = None;
+        self.state.gantt.selected_link = None;
     }
 
     fn dismiss_all_overlays(&mut self) {
@@ -1446,22 +1455,29 @@ impl PlannerView {
                     .child(
                         div()
                             .id(("toast-title", id))
+                            .debug_selector(|| "toast-title".into())
                             .flex_1()
                             .min_w(px(0.))
+                            .overflow_hidden()
                             .text_sm()
-                            .whitespace_nowrap()
                             .child(message.clone()),
                     )
                     .when(copyable, |el| {
-                        el.child(Button::new(("copy-toast", id)).label("Copy").on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.state.copy_toast(id);
-                                if let Some(text) = this.state.copied.clone() {
-                                    this.write_clipboard(cx, text);
-                                }
-                                cx.notify();
-                            }),
-                        ))
+                        el.child(
+                            div()
+                                .id(("toast-copy-wrap", id))
+                                .debug_selector(|| "toast-copy".into())
+                                .flex_shrink_0()
+                                .child(Button::new(("copy-toast", id)).label("Copy").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.state.copy_toast(id);
+                                        if let Some(text) = this.state.copied.clone() {
+                                            this.write_clipboard(cx, text);
+                                        }
+                                        cx.notify();
+                                    }),
+                                )),
+                        )
                     })
                     .when_some(undo.clone(), |el, action| {
                         let action_down = action.clone();
@@ -1570,6 +1586,7 @@ impl PlannerView {
                 self.state.toasts.dismiss(toast_id);
                 self.clamp_toast_hover();
                 let already_toasted = pending.role == DateSaveRole::Undo;
+                self.queue_form_dates_from_draft();
                 self.enqueue_date_save(cx, pending);
                 if !already_toasted {
                     self.state.toasts.push(ToastKind::Success, undid);
@@ -1635,6 +1652,7 @@ impl PlannerView {
             return;
         }
         if let Some(pending) = self.state.undo_dates_now() {
+            self.queue_form_dates_from_draft();
             self.enqueue_date_save(cx, pending);
             self.note_toasts_changed(cx);
             cx.notify();
@@ -1651,6 +1669,7 @@ impl PlannerView {
             return;
         }
         if let Some(pending) = self.state.redo_dates_now() {
+            self.queue_form_dates_from_draft();
             self.enqueue_date_save(cx, pending);
             self.note_toasts_changed(cx);
             cx.notify();
@@ -2571,7 +2590,7 @@ impl PlannerView {
                         Button::new("add-item")
                             .primary()
                             .label("+ Add item")
-                            .tooltip("Add a work item at the same level as the selected row.")
+                            .tooltip("Add a child work item under the selected row.")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.spawn_state(cx, |mut state| async move {
                                     let result = state.add_item().await;
@@ -2683,6 +2702,16 @@ impl PlannerView {
                                 cx.notify();
                             })),
                     ),
+            )
+            .child(
+                div()
+                    .id("gantt-zoom-level")
+                    .debug_selector(|| "gantt-zoom-level".into())
+                    .flex_shrink_0()
+                    .px_1()
+                    .text_xs()
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .child(self.state.gantt.scale.label()),
             )
             .child(
                 div()
@@ -2877,7 +2906,7 @@ impl PlannerView {
                                             {
                                                 this.state.discard_nudge();
                                             }
-                                            this.state.gantt.selected_id = Some(id);
+                                            this.state.gantt.select_row(id);
                                             if this.inline_edit.is_none() {
                                                 window.focus(&this.form_focus, cx);
                                             }
@@ -2898,7 +2927,7 @@ impl PlannerView {
                                             }
                                             if can_schedule {
                                                 this.state.gantt.schedule_drag = Some(id);
-                                                this.state.gantt.selected_id = Some(id);
+                                                this.state.gantt.select_row(id);
                                                 this.saw_pressed_drag = false;
                                                 this.schedule_origin_x = None;
                                                 this.schedule_live_x = None;
@@ -3167,7 +3196,7 @@ impl PlannerView {
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.state.gantt.selected_id = Some(id);
+                this.state.gantt.select_row(id);
                 this.begin_inline(InlineEdit::Assignee(id), assigned_owned.clone(), window, cx);
                 cx.stop_propagation();
             }))
@@ -3233,7 +3262,7 @@ impl PlannerView {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    this.state.gantt.selected_id = Some(id);
+                    this.state.gantt.select_row(id);
                     let x: f32 = event.position.x.into();
                     let y: f32 = event.position.y.into();
                     this.dates_anchor = Some((x, y + 18.0));
@@ -3514,8 +3543,11 @@ impl PlannerView {
         let dragging = self.state.gantt.gesture.is_some();
         let show_weekends = self.state.gantt.scale.shows_weekend_bands();
         let weekend_w = self.state.gantt.scale.pixels_per_day(self.state.gantt.zoom);
-        let hide_today =
-            matches!(self.state.gantt.scale, GanttScale::Day | GanttScale::Week).then_some(today_x);
+        let hide_today = matches!(
+            self.state.gantt.scale,
+            GanttScale::Day | GanttScale::Week | GanttScale::Month | GanttScale::Quarter
+        )
+        .then_some(today_x);
         let major_labels = self
             .state
             .gantt
@@ -3572,8 +3604,9 @@ impl PlannerView {
                 cx.listener(|this, _, _, cx| {
                     if this.state.gantt.context_menu.is_some() {
                         this.state.gantt.context_menu = None;
-                        cx.notify();
                     }
+                    this.state.gantt.selected_link = None;
+                    cx.notify();
                 }),
             )
             .child(
@@ -3689,7 +3722,7 @@ impl PlannerView {
                                             if can_schedule {
                                                 let x: f32 = event.position.x.into();
                                                 this.state.gantt.schedule_drag = Some(id);
-                                                this.state.gantt.selected_id = Some(id);
+                                                this.state.gantt.select_row(id);
                                                 this.state.gantt.hovered_id = Some(id);
                                                 this.saw_pressed_drag = false;
                                                 this.schedule_origin_x = Some(x);
@@ -3710,7 +3743,7 @@ impl PlannerView {
                                             ) else {
                                                 return;
                                             };
-                                            this.state.gantt.selected_id = Some(id);
+                                            this.state.gantt.select_row(id);
                                             this.focus_planner(window, cx);
                                             this.dismiss_overlays();
                                             let _ = this
@@ -3754,6 +3787,9 @@ impl PlannerView {
                     })
                     .children(bars.iter().filter_map(|bar| {
                         self.render_gantt_bar_label(bar, dragging, muted_fg, cx)
+                    }))
+                    .children(bars.iter().filter_map(|bar| {
+                        self.render_gantt_link_handles(bar, dragging, cx)
                     }))
                     .child(
                         div()
@@ -3996,11 +4032,13 @@ impl PlannerView {
             && visible_w >= title_width.max(40.0);
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
-        let show_handles =
-            !summary && !unscheduled && !milestone && !marker && hovered && !dragging;
-        let show_link_handles_hit = !unscheduled && !marker && !dragging;
-        let show_link_handles =
-            show_link_handles_hit && (hovered || selected || (summary && selected));
+        let show_handles = !summary
+            && !unscheduled
+            && !milestone
+            && !marker
+            && !open_ended
+            && hovered
+            && !dragging;
         let bar_h = if milestone || marker {
             MILESTONE_SIZE
         } else if summary {
@@ -4016,6 +4054,7 @@ impl PlannerView {
         } else {
             6.0
         };
+        let open_ended_link_origin = bar.x + bar.width;
         let progress_value = bar.progress.unwrap_or(0.0);
         let show_progress = !open_ended && (summary || progress_value > 0.0);
         let progress_w =
@@ -4091,6 +4130,23 @@ impl PlannerView {
                                 .flex()
                                 .items_center()
                                 .text_color(rgb(bar.color))
+                                .occlude()
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.state.gantt.select_row(id);
+                                        this.focus_planner(window, cx);
+                                        this.dismiss_overlays();
+                                        let _ = this.state.begin_bar_gesture(
+                                            id,
+                                            GestureKind::Link,
+                                            open_ended_link_origin,
+                                        );
+                                        cx.notify();
+                                    }),
+                                )
                                 .child("▸"),
                         )
                 })
@@ -4144,7 +4200,7 @@ impl PlannerView {
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        this.state.gantt.selected_id = Some(id);
+                        this.state.gantt.select_row(id);
                         this.focus_planner(window, cx);
                         if event.click_count >= 2 {
                             this.open_form(id, cx);
@@ -4189,58 +4245,6 @@ impl PlannerView {
                 )
                 .into_any_element(),
         ];
-        if show_link_handles_hit {
-            let start_x = bar.x - LINK_HANDLE_HIT - HANDLE_WIDTH;
-            let end_x = bar.x + bar.width + HANDLE_WIDTH;
-            let handle_top = ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
-            for (handle_id, handle_x) in [("link-start", start_x), ("link-end", end_x)] {
-                let selector = format!("gantt-link-handle-{id}-{handle_id}");
-                let origin = handle_x + LINK_HANDLE_HIT / 2.0;
-                let show_dot = show_link_handles;
-                items.push(
-                    div()
-                        .id((handle_id, id as u64))
-                        .debug_selector(move || selector.clone())
-                        .absolute()
-                        .left(px(handle_x))
-                        .top(px(handle_top))
-                        .size(px(LINK_HANDLE_HIT))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .occlude()
-                        .bg(gpui_kit::hsla(0., 0., 0., 0.01))
-                        .cursor_pointer()
-                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            if *hovered {
-                                this.set_hovered(Some(id), cx);
-                            }
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.state.gantt.selected_id = Some(id);
-                                this.focus_planner(window, cx);
-                                this.dismiss_overlays();
-                                let _ = this.state.begin_bar_gesture(id, GestureKind::Link, origin);
-                                cx.notify();
-                            }),
-                        )
-                        .child(div().size_full().when(show_dot, |el| {
-                            el.flex().items_center().justify_center().child(
-                                div()
-                                    .size(px(LINK_HANDLE))
-                                    .rounded_full()
-                                    .bg(cx.theme().background)
-                                    .border_2()
-                                    .border_color(cx.theme().danger),
-                            )
-                        }))
-                        .into_any_element(),
-                );
-            }
-        }
         if show_handles {
             for (name, handle_id, handle_x, kind) in [
                 (
@@ -4283,7 +4287,7 @@ impl PlannerView {
                             cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.dismiss_overlays();
-                                this.state.gantt.selected_id = Some(id);
+                                this.state.gantt.select_row(id);
                                 this.focus_planner(window, cx);
                                 let _ = this.state.begin_bar_gesture(id, kind, origin);
                                 cx.notify();
@@ -4314,6 +4318,80 @@ impl PlannerView {
             .size_full()
             .children(items)
             .into_any_element()
+    }
+
+    /// Paint after arrows so a selected link's × / stub cannot steal the handle.
+    fn render_gantt_link_handles(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        dragging: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let id = bar.id;
+        let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
+        if unscheduled || bar.marker || dragging {
+            return None;
+        }
+        let hovered = self.state.gantt.hovered_id == Some(id);
+        let selected = self.state.gantt.selected_id == Some(id);
+        let show_dot = hovered || selected || (bar.summary && selected);
+        let start_x = bar.x - LINK_HANDLE_HIT - HANDLE_WIDTH;
+        let end_x = bar.x + bar.width + HANDLE_WIDTH;
+        let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
+        let handles =
+            [("link-start", start_x), ("link-end", end_x)].map(|(handle_id, handle_x)| {
+                let selector = format!("gantt-link-handle-{id}-{handle_id}");
+                let origin = handle_x + LINK_HANDLE_HIT / 2.0;
+                div()
+                    .id((handle_id, id as u64))
+                    .debug_selector(move || selector.clone())
+                    .absolute()
+                    .left(px(handle_x))
+                    .top(px(handle_top))
+                    .size(px(LINK_HANDLE_HIT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .occlude()
+                    .bg(gpui_kit::hsla(0., 0., 0., 0.01))
+                    .cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.set_hovered(Some(id), cx);
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.state.gantt.select_row(id);
+                            this.focus_planner(window, cx);
+                            this.dismiss_overlays();
+                            let _ = this.state.begin_bar_gesture(id, GestureKind::Link, origin);
+                            cx.notify();
+                        }),
+                    )
+                    .child(div().size_full().when(show_dot, |el| {
+                        el.flex().items_center().justify_center().child(
+                            div()
+                                .size(px(LINK_HANDLE))
+                                .rounded_full()
+                                .bg(cx.theme().background)
+                                .border_2()
+                                .border_color(cx.theme().danger),
+                        )
+                    }))
+            });
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .w(px(0.))
+                .h(px(0.))
+                .children(handles)
+                .into_any_element(),
+        )
     }
 
     fn bar_title_fits_inside(bar: &crate::gantt::BarLayout) -> bool {
@@ -4398,7 +4476,7 @@ impl PlannerView {
                 .child(label)
                 .on_click(
                     cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
-                        this.state.gantt.selected_id = Some(id);
+                        this.state.gantt.select_row(id);
                         if this.inline_edit.is_none() {
                             window.focus(&this.form_focus, cx);
                         }
@@ -4725,12 +4803,18 @@ impl PlannerView {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
+                    if this.state.gantt.gesture.is_some() {
+                        return;
+                    }
                     this.state.gantt.selected_link = Some((from_id, to_id));
                     cx.notify();
                 }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
+                if this.state.gantt.gesture.is_some() {
+                    return;
+                }
                 this.state.gantt.selected_link = Some((from_id, to_id));
                 cx.notify();
             }))
@@ -4772,7 +4856,7 @@ impl PlannerView {
             )))
             .debug_selector(|| "gantt-dep-arrowhead".into())
             .absolute()
-            .left(px(arrow.x_head - min_x - 16.0))
+            .left(px(arrow.x_head - min_x - 14.0))
             .top(px(arrow.y2 - min_y - 10.0))
             .w(px(18.))
             .h(px(20.))
@@ -5824,6 +5908,7 @@ impl PlannerView {
             .is_some_and(|gesture| gesture.kind == GestureKind::Link);
         if linking {
             let pair = self.state.gantt.take_link_gesture();
+            self.state.gantt.selected_link = None;
             self.state.gantt.clear_hover();
             cx.notify();
             if let Some((from_id, Some(to_id))) = pair
@@ -5915,6 +6000,8 @@ impl PlannerView {
                                 {
                                     live.rev = rev;
                                 }
+                                this.state.sync_open_form_from_node(id);
+                                this.queue_form_dates_from_draft();
                                 if role == DateSaveRole::Commit
                                     && let Some(toast) = working.toasts.items.last()
                                 {
@@ -6088,6 +6175,7 @@ impl PlannerView {
                         let CalendarEvent::Selected(date) = event;
                         this.form_dates_preview = pending_range_typed(*date);
                         if !range_picker_is_complete(*date) {
+                            this.pending_form_dates_text = pending_range_typed(*date);
                             cx.notify();
                             return;
                         }
@@ -6125,6 +6213,9 @@ impl PlannerView {
                         }
                         let date = picker.read(cx).date();
                         this.form_dates_preview = pending_range_typed(date);
+                        if !range_picker_is_complete(date) {
+                            this.pending_form_dates_text = pending_range_typed(date);
+                        }
                         cx.notify();
                     }));
                 let initial_dates = format_date_range(

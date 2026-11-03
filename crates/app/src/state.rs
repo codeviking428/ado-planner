@@ -20,7 +20,7 @@ use crate::error::AppError;
 use crate::form::FormDraft;
 use crate::gantt::{
     GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView, VisibleRow,
-    insert_index_for_sibling,
+    insert_index_for_child,
 };
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
@@ -891,25 +891,18 @@ impl PlannerState {
         self.team_settings_error = result.warning.clone();
         self.nodes = result.nodes.clone();
         self.hierarchy = Some(result);
-        let saved_y = self
-            .team_views
-            .get(&self.prefs.planner.team)
-            .map(|saved| saved.scroll_y);
-        let width = self.gantt.timeline_width.max(800.0);
-        let nodes = self.visible_nodes();
-        let keep_zoom = self.gantt.zoom;
-        let keep_scale = self.gantt.scale;
-        // Pan to the new team's span without changing zoom/scale unasked.
-        self.gantt.auto_fit(&nodes, &self.iterations, width);
-        self.gantt.zoom = keep_zoom;
-        self.gantt.scale = keep_scale;
-        if let Some(y) = saved_y {
-            self.gantt.scroll_y = y;
-            let rows = self.gantt.flatten(&nodes).len();
+        if let Some(saved) = self.team_views.get(&self.prefs.planner.team).cloned() {
+            self.gantt.restore(saved);
+            let rows = self.gantt.flatten(&self.visible_nodes()).len();
             self.gantt.clamp_scroll(rows, self.gantt.viewport_h);
+        } else if self.team_views.is_empty() {
+            let width = self.gantt.timeline_width.max(800.0);
+            let nodes = self.visible_nodes();
+            self.gantt.auto_fit(&nodes, &self.iterations, width);
         } else {
             self.gantt.scroll_y = 0.0;
         }
+        // A team switch without a saved camera keeps the live date range and scale.
     }
 
     fn cache_identity(&self) -> String {
@@ -975,6 +968,16 @@ impl PlannerState {
     pub fn close_form(&mut self) {
         self.form = None;
         self.gantt.clear_hover();
+    }
+
+    /// Copy the live node's rev and dates into the open details dialog.
+    pub fn sync_open_form_from_node(&mut self, id: i64) {
+        let Some(node) = self.nodes.iter().find(|node| node.id == id).cloned() else {
+            return;
+        };
+        if let Some(form) = self.form.as_mut() {
+            form.adopt_live_node(&node);
+        }
     }
 
     pub async fn save_form(&mut self) -> Result<(), AppError> {
@@ -1429,6 +1432,7 @@ impl PlannerState {
         };
         self.history.redo.push(entry.clone());
         self.push_history_toast(&entry, true);
+        self.sync_open_form_from_node(id);
         Some(PendingDateSave {
             id,
             start: parse_iso_date(before_start.as_deref()),
@@ -1468,6 +1472,7 @@ impl PlannerState {
         };
         self.history.undo.push(entry.clone());
         self.push_history_toast(&entry, false);
+        self.sync_open_form_from_node(id);
         Some(PendingDateSave {
             id,
             start: parse_iso_date(after_start.as_deref()),
@@ -1518,6 +1523,7 @@ impl PlannerState {
                 if let Some(live) = self.nodes.iter_mut().find(|node| node.id == pending.id) {
                     live.rev = rev;
                 }
+                self.sync_open_form_from_node(pending.id);
                 self.persist_hierarchy_cache();
                 if pending.role == DateSaveRole::Commit {
                     self.push_dates_moved_toast(
@@ -1744,6 +1750,7 @@ impl PlannerState {
                 if let Some(live) = self.nodes.iter_mut().find(|item| item.id == id) {
                     live.rev = rev;
                 }
+                self.sync_open_form_from_node(id);
                 self.persist_hierarchy_cache();
                 if self.history_recording {
                     self.push_dates_moved_toast(id, start, target, &previous);
@@ -1803,6 +1810,7 @@ impl PlannerState {
                 if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
                     live.rev = rev;
                 }
+                self.sync_open_form_from_node(successor_id);
                 self.persist_hierarchy_cache();
                 if self.history_recording {
                     self.record(HistoryEntry::Link {
@@ -1872,6 +1880,7 @@ impl PlannerState {
                 if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
                     live.rev = rev;
                 }
+                self.sync_open_form_from_node(successor_id);
                 self.gantt.selected_link = None;
                 self.gantt.clear_hover();
                 self.persist_hierarchy_cache();
@@ -1910,10 +1919,9 @@ impl PlannerState {
         let selected_id = self.gantt.selected_id;
         let (parent_id, work_item_type, area, iteration) = {
             let selected = selected_id.and_then(|id| self.nodes.iter().find(|node| node.id == id));
-            let parent_id = selected.and_then(|node| node.parent_id);
-            let parent = parent_id.and_then(|id| self.nodes.iter().find(|node| node.id == id));
+            let parent_id = selected.map(|node| node.id);
             let work_item_type =
-                child_work_item_type(parent.map(|node| node.work_item_type.as_str()), &types);
+                child_work_item_type(selected.map(|node| node.work_item_type.as_str()), &types);
             let area = selected
                 .map(|node| node.area_path.clone())
                 .or_else(|| self.nodes.first().map(|node| node.area_path.clone()))
@@ -1964,8 +1972,11 @@ impl PlannerState {
                 }
                 let id = node.id;
                 let title = node.title.clone();
-                let insert_at = insert_index_for_sibling(&self.nodes, selected_id);
+                let insert_at = insert_index_for_child(&self.nodes, parent_id);
                 self.nodes.insert(insert_at, node);
+                if let Some(pid) = parent_id {
+                    self.gantt.collapsed.remove(&pid);
+                }
                 self.gantt.selected_id = Some(id);
                 let rows = self.gantt.flatten(&self.nodes);
                 self.gantt.select_relative(&rows, 0);
@@ -2069,6 +2080,7 @@ impl PlannerState {
                 if let Some(live) = self.nodes.iter_mut().find(|n| n.id == id) {
                     live.rev = rev;
                 }
+                self.sync_open_form_from_node(id);
                 self.persist_hierarchy_cache();
                 if (reference == ado_core::START_DATE_FIELD
                     || reference == ado_core::TARGET_DATE_FIELD)
@@ -2251,11 +2263,7 @@ impl PlannerState {
                     live.rev = rev;
                 }
                 self.persist_hierarchy_cache();
-                if let Some(form) = self.form.as_mut()
-                    && form.model.id == id
-                {
-                    form.set_exact_range_dates(None, None);
-                }
+                self.sync_open_form_from_node(id);
                 if self.history_recording {
                     self.record_dates(id, &previous, None, None);
                     self.toasts.push_undo(
@@ -2429,6 +2437,7 @@ impl PlannerState {
             node.start_date = start_date.clone();
             node.target_date = target_date.clone();
         }
+        self.sync_open_form_from_node(id);
         Some(PendingDateSave {
             id,
             start: parse_iso_date(start_date.as_deref()),

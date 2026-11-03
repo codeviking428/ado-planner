@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use ado_core::{
     DEFAULT_BAR_DAYS, GanttBarKind, IterationHint, IterationNode, WorkItemNode, compact_date,
-    dates_column_text, gantt_bar_display, iteration_hint_for_path, parse_iso_date,
+    dates_column_text, from_gantt_exclusive_end, gantt_bar_display, iteration_hint_for_path,
+    parse_iso_date,
 };
 use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
@@ -27,6 +28,8 @@ pub const SCALE_BUTTON_WIDTH: f32 = 132.0;
 /// Toolbar zoom, Today, scale, period, Auto Fit, and team-switch camera easing.
 pub const CAMERA_EASE_MS: u64 = 150;
 pub const PLACEHOLDER_MIN_WIDTH: f32 = 48.0;
+/// Start-only stubs stay wide enough to read the ▸ at Quarter/Year.
+pub const OPEN_ENDED_MIN_WIDTH: f32 = 56.0;
 pub const MILESTONE_SIZE: f32 = 16.0;
 pub const SUMMARY_BAR_H: f32 = 14.0;
 pub const PLACEHOLDER_BAR_H: f32 = 24.0;
@@ -347,10 +350,12 @@ impl DependencyArrow {
         }
     }
 
-    /// × sits on the predecessor row, not at the polyline midpoint (which
-    /// lands on other rows for wrap-around links).
+    /// Keep × on the predecessor bar, left of the outgoing stub. The stub
+    /// shares its pixel with the link handle; putting × there blocks drags.
+    const REMOVE_INSET: f32 = 28.0;
+
     pub fn remove_control_pos(&self) -> (f32, f32) {
-        (self.x1, self.y1)
+        (self.x1 - Self::REMOVE_INSET, self.y1)
     }
 
     pub fn gutter_y(&self) -> f32 {
@@ -725,9 +730,16 @@ impl GanttView {
     }
 
     pub fn zoom_step_keeping(&mut self, direction: i32, keep_x: f32) {
+        let old = self.scale.pixels_per_day(self.zoom);
         let next = Self::next_zoom(self.zoom, direction);
-        if self.zoom > 0.0 {
-            self.zoom_at(next / self.zoom, keep_x, 0.0);
+        if (next - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.zoom = next;
+        let new = self.scale.pixels_per_day(self.zoom);
+        if old > 0.0 {
+            let world = (self.scroll_x + keep_x) / old;
+            self.scroll_x = world * new - keep_x;
         }
     }
 
@@ -885,6 +897,11 @@ impl GanttView {
         self.set_tree_width(DEFAULT_TREE_WIDTH);
     }
 
+    pub fn select_row(&mut self, id: i64) {
+        self.selected_id = Some(id);
+        self.selected_link = None;
+    }
+
     pub fn select_relative(&mut self, rows: &[VisibleRow], delta: i32) {
         if rows.is_empty() {
             return;
@@ -901,7 +918,7 @@ impl GanttView {
         {
             self.pending_nudge = None;
         }
-        self.selected_id = Some(rows[next].id);
+        self.select_row(rows[next].id);
         let y = next as f32 * ROW_HEIGHT;
         let body_h = (self.viewport_h - TIMELINE_HEADER_H).max(0.0);
         if y < self.scroll_y {
@@ -928,15 +945,17 @@ impl GanttView {
         self.date_for_x(window_x - self.timeline_origin_x)
     }
 
-    /// Inclusive Start/Target for an unscheduled-row drag. A same-day drop
-    /// keeps the default two-week bar so a tiny drag still schedules work.
+    /// Inclusive Start/Target for an unscheduled-row drag. The pointer's right
+    /// edge is the exclusive Gantt end (same as painted bars); convert it so
+    /// Target Date does not include an extra day. A same-day drop keeps the
+    /// default two-week bar so a tiny drag still schedules work.
     pub fn schedule_span_from_window_xs(&self, a: f32, b: f32) -> (Date, Date) {
         let start = self.drop_date(a.min(b));
-        let end = self.drop_date(a.max(b));
-        if end <= start {
+        let exclusive_end = self.drop_date(a.max(b));
+        if exclusive_end <= start {
             (start, start.saturating_add(13.days()))
         } else {
-            (start, end)
+            (start, from_gantt_exclusive_end(exclusive_end))
         }
     }
 
@@ -989,6 +1008,8 @@ impl GanttView {
                     x -= MILESTONE_SIZE / 2.0;
                 } else if display.kind == GanttBarKind::Unscheduled {
                     width = width.max(PLACEHOLDER_MIN_WIDTH);
+                } else if open_ended {
+                    width = width.max(OPEN_ENDED_MIN_WIDTH);
                 }
                 Some(BarLayout {
                     id: node.id,
@@ -1019,6 +1040,7 @@ impl GanttView {
         nodes: &[WorkItemNode],
         iterations: &[IterationNode],
     ) -> Result<(), &'static str> {
+        self.selected_link = None;
         if kind == GestureKind::Link {
             self.selected_id = Some(bar.id);
             let node = nodes.iter().find(|node| node.id == bar.id);
@@ -1546,6 +1568,8 @@ impl GanttView {
             GestureKind::Move
         } else if x <= bar.x + HANDLE_WIDTH {
             GestureKind::ResizeStart
+        } else if bar.open_ended && x >= bar.x + bar.width - LINK_HANDLE {
+            GestureKind::Link
         } else if x >= bar.x + bar.width - HANDLE_WIDTH {
             GestureKind::ResizeEnd
         } else {
@@ -1556,6 +1580,7 @@ impl GanttView {
 
     pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
         const STUB: f32 = 12.0;
+        const HEAD_GAP: f32 = 4.0;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
         let mut out = Vec::new();
         for bar in bars {
@@ -1572,10 +1597,19 @@ impl GanttView {
                 };
                 // monday.com-style short elbows off the painted bars, never a
                 // loop out past every title to the far right edge of the chart.
+                let x_head = bar.x - HEAD_GAP;
                 let x_out = pred_end + STUB;
-                let x_in = bar.x - STUB;
+                let x_in = x_head - STUB;
                 let same_row = (pred.y - bar.y).abs() < 1.0;
-                let lane_y = if same_row { y1 } else { y2 };
+                // Travel in the gutter between rows so the lane does not
+                // cross in-between titles such as a Go-live milestone.
+                let lane_y = if same_row {
+                    y1
+                } else if bar.y > pred.y {
+                    bar.y
+                } else {
+                    pred.y
+                };
                 out.push(DependencyArrow {
                     from_id: *pred_id,
                     to_id: bar.id,
@@ -1583,7 +1617,7 @@ impl GanttView {
                     y1,
                     x2: x_in,
                     y2,
-                    x_head: bar.x,
+                    x_head,
                     lane_y,
                 });
             }
@@ -2327,6 +2361,63 @@ mod tests {
         );
         assert!(!bars[0].marker);
         assert_eq!(bars[0].kind, GanttBarKind::Scheduled);
+        assert!(
+            bars[0].width >= OPEN_ENDED_MIN_WIDTH - 0.1,
+            "start-only stubs must stay readable, width={}",
+            bars[0].width
+        );
+    }
+
+    #[test]
+    fn start_only_stubs_stay_readable_in_quarter_and_year() {
+        let mut item = node(1, None);
+        item.target_date = None;
+        for scale in [GanttScale::Quarter, GanttScale::Year] {
+            let gantt = GanttView {
+                origin: Date::new(2026, 7, 1).unwrap(),
+                scale,
+                zoom: 0.4,
+                timeline_width: 800.0,
+                ..Default::default()
+            };
+            let rows = gantt.flatten(std::slice::from_ref(&item));
+            let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+            assert_eq!(bars.len(), 1, "{scale:?}");
+            assert!(
+                bars[0].width >= OPEN_ENDED_MIN_WIDTH - 0.1,
+                "{scale:?} start-only width {} must stay readable",
+                bars[0].width
+            );
+        }
+    }
+
+    #[test]
+    fn open_ended_right_edge_starts_a_link() {
+        let bar = BarLayout {
+            id: 1,
+            kind: GanttBarKind::Scheduled,
+            x: 100.0,
+            width: 80.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "bar".into(),
+            title: "bar".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: true,
+        };
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&bar), 176.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::Link),
+            "the ▸ at the right of a start-only bar must start a link"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&[bar], 140.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::Move)
+        );
     }
 
     #[test]
@@ -2796,8 +2887,8 @@ mod tests {
         assert_eq!(start, Date::new(2026, 8, 3).unwrap());
         assert_eq!(
             target,
-            Date::new(2026, 8, 7).unwrap(),
-            "a 4-day drag must save 4 days, not a default-length bar"
+            Date::new(2026, 8, 6).unwrap(),
+            "a 4-day pointer span must save 4 inclusive days, not an extra exclusive day"
         );
         let (point_start, point_target) =
             gantt.schedule_span_from_window_xs(day * 2.0, day * 2.0 + 3.0);
@@ -2937,8 +3028,8 @@ mod tests {
             succ.x
         );
         assert!(
-            (arrows[0].x_head - succ.x).abs() < 1.0,
-            "arrowhead must sit on the target start, got {} vs {}",
+            arrows[0].x_head <= succ.x - 3.0,
+            "arrowhead must stop short of the target bar, got {} vs {}",
             arrows[0].x_head,
             succ.x
         );
@@ -2974,7 +3065,11 @@ mod tests {
             lane_y: 200.0,
         };
         let (x, y) = arrow.remove_control_pos();
-        assert_eq!(x, arrow.x1);
+        assert!(
+            x <= arrow.x1 - 20.0,
+            "× must sit left of the outgoing stub so it does not cover the link handle, got x={x} x1={}",
+            arrow.x1
+        );
         assert_eq!(y, arrow.y1);
         assert!(
             (y - arrow.y2).abs() > ROW_HEIGHT,
@@ -3584,10 +3679,27 @@ mod tests {
             pred.x + pred.width
         );
         assert!(
-            (arrows[0].x2 - (succ.x - 12.0)).abs() < 0.5,
-            "incoming stub must sit just left of the successor, got x2={} succ.x={}",
+            arrows[0].x2 <= succ.x - 12.0,
+            "incoming stub must sit left of the successor, got x2={} succ.x={}",
             arrows[0].x2,
             succ.x
+        );
+        assert!(
+            arrows[0].x_head <= succ.x - 3.0,
+            "arrowhead must not overlap the target bar, got {} vs {}",
+            arrows[0].x_head,
+            succ.x
+        );
+        let mid_label_left = mid.x;
+        let mid_label_right = bar_label_right(mid);
+        let crosses_label = arrows[0].x1 >= mid_label_left - 1.0
+            && arrows[0].x1 <= mid_label_right + 1.0
+            && arrows[0].lane_y >= mid.y
+            && arrows[0].lane_y < mid.y + ROW_HEIGHT;
+        assert!(
+            !crosses_label,
+            "the lane must not cross the Go-live label, x1={} lane_y={} mid_y={} label={mid_label_left}..{mid_label_right}",
+            arrows[0].x1, arrows[0].lane_y, mid.y
         );
         assert!(
             arrows[0].x1.max(arrows[0].x2) < bar_label_right(mid) - 8.0 || arrows[0].x2 < 400.0,
@@ -3733,6 +3845,60 @@ mod tests {
             (gantt.zoom - 0.6).abs() < 0.01,
             "scale change must keep zoom"
         );
+    }
+
+    #[test]
+    fn zoom_round_trip_restores_range_and_scale() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 0.6,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let origin = gantt.origin;
+        let scroll = gantt.scroll_x;
+        let title = gantt.viewport_range_title();
+        gantt.zoom_step_keeping(1, 400.0);
+        gantt.zoom_step_keeping(-1, 400.0);
+        assert!(
+            (gantt.zoom - 0.6).abs() < 0.0001,
+            "zoom in then out must restore zoom, got {}",
+            gantt.zoom
+        );
+        assert_eq!(gantt.scale, GanttScale::Month);
+        assert_eq!(gantt.origin, origin);
+        assert!(
+            (gantt.scroll_x - scroll).abs() < 1.0,
+            "zoom round trip must not pan, scroll {} vs {scroll}",
+            gantt.scroll_x
+        );
+        assert_eq!(
+            gantt.viewport_range_title(),
+            title,
+            "zoom round trip must not change the range title"
+        );
+    }
+
+    #[test]
+    fn quarter_today_label_does_not_sit_on_ticks() {
+        let today = Date::new(2026, 11, 2).unwrap();
+        let gantt = GanttView {
+            origin: today.saturating_sub(40.days()),
+            scale: GanttScale::Quarter,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let today_x = gantt.today_x(today);
+        let ticks = gantt.header_tick_labels_except(800.0, Some(today_x));
+        let majors = gantt.header_major_labels_except(800.0, Some(today_x));
+        for (x, label) in ticks.iter().chain(majors.iter()) {
+            assert!(
+                (x - today_x).abs() >= 14.0 || *x <= 1.0,
+                "Quarter label {label:?} at {x} must not sit on Today at {today_x}"
+            );
+        }
     }
 
     #[test]

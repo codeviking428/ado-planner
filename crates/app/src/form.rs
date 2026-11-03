@@ -116,6 +116,26 @@ impl FormDraft {
         );
     }
 
+    /// Keep the open dialog's cached `/rev` and dates aligned with the live
+    /// Gantt node so a later Save does not 412 after Undo or Clear dates.
+    pub fn adopt_live_node(&mut self, node: &WorkItemNode) {
+        if self.model.id != node.id {
+            return;
+        }
+        self.model.rev = node.rev;
+        self.set_exact_range_dates(node.start_date.clone(), node.target_date.clone());
+        if let Some(start) = self.values.get(ado_core::START_DATE_FIELD).cloned() {
+            self.model
+                .values
+                .insert(ado_core::START_DATE_FIELD.into(), start);
+        }
+        if let Some(target) = self.values.get(ado_core::TARGET_DATE_FIELD).cloned() {
+            self.model
+                .values
+                .insert(ado_core::TARGET_DATE_FIELD.into(), target);
+        }
+    }
+
     /// Write Start/Target from a range picker. A missing side is left as-is
     /// unless both sides are empty (the user cleared the range).
     pub fn set_range_dates(&mut self, start: Option<String>, end: Option<String>) {
