@@ -366,6 +366,12 @@ impl BarLayout {
         HANDLE_WIDTH.min(self.width / 2.0).max(1.0)
     }
 
+    /// 8px rollup edges only when they leave a Move body in the center.
+    /// Target-only diamonds (16px) and year-scale slivers (6px) stay all-Move.
+    pub fn shows_rollup_edges(&self) -> bool {
+        self.summary && !self.milestone && !self.marker && self.width > HANDLE_WIDTH * 2.0
+    }
+
     /// Classify a timeline-x on this painted bar. `None` is the move body.
     pub fn resize_kind_at(&self, x: f32) -> Option<GestureKind> {
         match self.hit_zone_at_window_x(x, self.x, self.x + self.width) {
@@ -391,7 +397,9 @@ impl BarLayout {
         let on_start = window_x <= painted_left + grip;
         let on_end = window_x >= painted_right - grip;
         if self.summary {
-            if on_start || on_end {
+            // Two 8px edges meet on a 16px bar; skip them so a short parent
+            // (diamond, year sliver) still has a Move body.
+            if self.shows_rollup_edges() && width > HANDLE_WIDTH * 2.0 && (on_start || on_end) {
                 return BarHitZone::RollupEdge;
             }
             return BarHitZone::Move;
@@ -2465,6 +2473,43 @@ mod tests {
             summary.hit_zone_at_window_x(177.0, summary.x, summary.x + summary.width),
             BarHitZone::RollupEdge,
             "3px inside a summary end must stay RollupEdge"
+        );
+        let diamond = BarLayout {
+            summary: true,
+            milestone: false,
+            marker: false,
+            width: MILESTONE_SIZE,
+            ..summary.clone()
+        };
+        assert!(
+            !diamond.shows_rollup_edges(),
+            "a 16px parent diamond must not grow rollup edges that cover the bar"
+        );
+        assert_eq!(
+            diamond.hit_zone_at_window_x(108.0, 100.0, 116.0),
+            BarHitZone::Move,
+            "the center of a 16px summary must still move"
+        );
+        assert_eq!(
+            diamond.hit_zone_at_window_x(100.0, 100.0, 116.0),
+            BarHitZone::Move,
+            "a 16px summary edge must stay Move, not RollupEdge"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&diamond), 100.0, 4.0)
+                .map(|(_, kind)| kind),
+            Some(GestureKind::Move),
+            "hit-test on a short parent must still pick Move"
+        );
+        let sliver = BarLayout {
+            width: YEAR_MIN_BAR_WIDTH,
+            ..diamond
+        };
+        assert!(!sliver.shows_rollup_edges());
+        assert_eq!(
+            sliver.hit_zone_at_window_x(103.0, 100.0, 106.0),
+            BarHitZone::Move,
+            "a year-scale 6px parent must still move"
         );
     }
 

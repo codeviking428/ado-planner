@@ -4160,6 +4160,42 @@ fn summary_edge_does_not_silently_move(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn selected_summary_edge_overlay_does_not_start_a_move(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1").expect("summary bar");
+    // Inner 1px of the 8px start overlay: the 2px selection border would
+    // reclassify this as Move if overlay mouse-down went through hit_zone.
+    let inner = point(bar.origin.x + px(7.), bar.origin.y + bar.size.height / 2.0);
+    cx.simulate_mouse_down(inner, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "selected summary-edge overlay must not start a move, got {:?}",
+            view.state.gantt.gesture.as_ref().map(|g| g.kind)
+        );
+        let hit = view
+            .last_bar_hit_for_test()
+            .expect("overlay press must record a rollup-edge hit");
+        assert_eq!(
+            hit.zone,
+            BarHitZone::RollupEdge,
+            "forced overlay press must stay rollup-edge, got {}",
+            hit.zone.as_str()
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn resize_starts_on_mouse_down_without_hover(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -4783,8 +4819,7 @@ fn move_children_too_undo_restores_parent_and_child(cx: &mut gpui_kit::TestAppCo
         match view.state.history.undo.last() {
             Some(HistoryEntry::DatesGroup { items }) => {
                 assert!(
-                    items.iter().any(|item| item.id == 1)
-                        && items.iter().any(|item| item.id == 2),
+                    items.iter().any(|item| item.id == 1) && items.iter().any(|item| item.id == 2),
                     "parent move + children must be one history step, got {items:?}"
                 );
             }

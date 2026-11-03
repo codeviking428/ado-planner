@@ -4750,7 +4750,7 @@ impl PlannerView {
         dragging: bool,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
-        if !bar.summary || dragging {
+        if !bar.shows_rollup_edges() || dragging {
             return Vec::new();
         }
         let id = bar.id;
@@ -4802,7 +4802,10 @@ impl PlannerView {
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         let x: f32 = event.position.x.into();
-                        this.begin_classified_bar_gesture(id, &layout, x, window, cx);
+                        // Force RollupEdge: do not reclassify against the
+                        // 2px selection border, which would turn the inner
+                        // overlay pixels into Move (leaf grips force Resize*).
+                        this.begin_rollup_edge_press(id, &layout, x, window, cx);
                     }),
                 )
                 .child(
@@ -6618,6 +6621,47 @@ impl PlannerView {
         }
         let origin = self.pointer_layout_x(window_x, Some(id));
         let _ = self.state.begin_bar_gesture(id, kind, origin);
+        cx.notify();
+    }
+
+    /// Overlay mouse-down on a summary edge. Always RollupEdge; never a drag.
+    fn begin_rollup_edge_press(
+        &mut self,
+        id: i64,
+        layout: &crate::gantt::BarLayout,
+        window_x: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_toast_pointer_for_new_press();
+        if self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link)
+        {
+            self.state.gantt.set_link_target(id);
+            cx.notify();
+            return;
+        }
+        let painted = self.painted_bar_for(id, layout);
+        self.last_bar_hit = Some(BarHitDebug {
+            event_x: window_x,
+            painted_left: painted.left,
+            painted_right: painted.right,
+            zone: BarHitZone::RollupEdge,
+            kind: GestureKind::Move,
+        });
+        if debug_hit_enabled() {
+            eprintln!(
+                "ADO_PLANNER_DEBUG_HIT id={id} event_x={window_x:.2} painted_left={:.2} painted_right={:.2} zone=rollup-edge kind=forced",
+                painted.left, painted.right
+            );
+        }
+        self.state.gantt.select_row(id);
+        self.focus_planner(window, cx);
+        self.dismiss_overlays();
         cx.notify();
     }
 
