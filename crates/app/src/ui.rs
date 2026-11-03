@@ -159,6 +159,9 @@ pub struct PlannerView {
     /// Window-x where an unscheduled row press began; a click without travel
     /// must not auto-schedule.
     schedule_origin_x: Option<f32>,
+    /// Window-x where an unscheduled gutter-pill press began. A release with
+    /// no movement must not PATCH dates to the date under the gutter.
+    pill_press_window_x: Option<f32>,
     /// Live window-x while dragging to schedule an unscheduled row.
     schedule_live_x: Option<f32>,
     /// Nested hover count so moving onto Undo does not unpause expiry.
@@ -419,6 +422,7 @@ impl PlannerView {
             skip_camera_anim: false,
             saw_pressed_drag: false,
             schedule_origin_x: None,
+            pill_press_window_x: None,
             schedule_live_x: None,
             toast_hover_depth: 0,
             toast_pointer: false,
@@ -1178,6 +1182,7 @@ impl PlannerView {
         self.state.cancel_gesture();
         self.state.gantt.schedule_drag = None;
         self.schedule_origin_x = None;
+        self.pill_press_window_x = None;
         self.schedule_live_x = None;
         self.state.gantt.clear_hover();
         self.dates_anchor = None;
@@ -1788,6 +1793,7 @@ impl PlannerView {
         self.state.gantt.schedule_drag = None;
         self.saw_pressed_drag = false;
         self.schedule_origin_x = None;
+        self.pill_press_window_x = None;
         self.schedule_live_x = None;
     }
 
@@ -3350,6 +3356,7 @@ impl PlannerView {
                                                 this.state.gantt.select_row(id);
                                                 this.saw_pressed_drag = false;
                                                 this.schedule_origin_x = None;
+                                                this.pill_press_window_x = None;
                                                 this.schedule_live_x = None;
                                                 cx.notify();
                                             }
@@ -4811,12 +4818,13 @@ impl PlannerView {
                             this.clear_toast_pointer_for_new_press();
                             this.dismiss_overlays();
                             let _ = this.classify_bar_hit(id, &layout, x);
-                            // Live dates start at Today (`dates_from_painted_bar`).
-                            // Origin is the click's layout x so a no-move release
-                            // keeps live == start and does not PATCH the gutter
-                            // as the viewport's left edge.
-                            let origin = this.pointer_layout_x(x, Some(id));
-                            let _ = this.state.begin_bar_gesture(id, GestureKind::Move, origin);
+                            // Live dates start at Today. Origin is Today on the
+                            // date axis so a drag follows the cursor x. A
+                            // no-move release is cancelled from pill_press_window_x
+                            // instead of PATCHing the gutter as a date.
+                            this.pill_press_window_x = Some(x);
+                            let today_x = this.state.gantt.x_for_date(jiff::Zoned::now().date());
+                            let _ = this.state.begin_bar_gesture(id, GestureKind::Move, today_x);
                             cx.notify();
                             return;
                         }
@@ -4901,7 +4909,8 @@ impl PlannerView {
         }
         let id = bar.id;
         let hovered = self.state.gantt.hovered_id == Some(id);
-        let show_handles = hovered && !dragging;
+        let selected = self.state.gantt.selected_id == Some(id);
+        let show_handles = (hovered || selected) && !dragging;
         let linking = self
             .state
             .gantt
@@ -5056,13 +5065,16 @@ impl PlannerView {
             return None;
         }
         let hovered = self.state.gantt.hovered_id == Some(id);
-        let show_dot = hovered;
+        let selected = self.state.gantt.selected_id == Some(id);
+        let show_dot = (hovered || selected) && !dragging;
         let can_resize = bar.can_resize();
         let (local_left, local_right) = self.painted_timeline_edges(bar);
-        // Pink start dot sits on the left edge so it resizes (and beats an
-        // incoming ▶). The end hit stays just past the bar so a drag still
-        // starts a link; the inner 8px grip covers the painted right edge.
-        let start_x = local_left - LINK_HANDLE_HIT / 2.0;
+        // Start hit covers the left edge so a click just outside still
+        // resizes; the visible circle sits a few px inside so it does not
+        // bury the incoming ▶. End hit stays just past the bar (overlapping
+        // occlude on the painted end hangs zoom/pan). The half of that hit
+        // closer to the bar resizes; the outer half still starts a link.
+        let start_x = local_left - 4.0;
         let end_x = local_right + 2.0;
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
         let layout = bar.clone();
@@ -5107,6 +5119,8 @@ impl PlannerView {
                             let painted = this.painted_bar_for(id, &layout);
                             let kind = if can_resize && at_start {
                                 GestureKind::ResizeStart
+                            } else if can_resize && !at_start && x <= painted.right + LINK_HANDLE {
+                                GestureKind::ResizeEnd
                             } else if x >= painted.left && x <= painted.right {
                                 this.begin_classified_bar_gesture(id, &layout, x, window, cx);
                                 return;
@@ -5367,9 +5381,7 @@ impl PlannerView {
                 "stub",
                 cx,
             ))
-            .when(self.state.gantt.hovered_id != Some(to_id), |el| {
-                el.child(self.arrow_head_hit(arrow, min_x, min_y, color, cx))
-            })
+            .child(self.arrow_head_hit(arrow, min_x, min_y, color, cx))
             .when(selected, |el| {
                 el.child(self.link_remove_button(arrow, min_x, min_y, cx))
             })
@@ -5641,8 +5653,7 @@ impl PlannerView {
             .left(px(if arrow.inbound_right {
                 arrow.x_head - min_x - 4.0
             } else {
-                // Sit on the inbound stub, left of the successor's start
-                // handle so ▶ is not buried under the hover dot.
+                // Sit on the inbound stub, left of the inset start handle.
                 arrow.stub_start() - min_x - 16.0
             }))
             .top(px(arrow.y2 - min_y - 10.0))
@@ -6994,7 +7005,18 @@ impl PlannerView {
             window.refresh();
         }
         cx.refresh_windows();
+        // Mouse-up can land during a frame so the first refresh is a no-op;
+        // tick twice so the committed bar and toast paint without waiting
+        // for the next mouse-move.
         cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(0))
+                .await;
+            let _ = this.update(cx, |_, cx| {
+                cx.notify();
+                cx.refresh_windows();
+            });
+            cx.refresh();
             cx.background_executor()
                 .timer(Duration::from_millis(16))
                 .await;
@@ -8219,12 +8241,27 @@ impl Render for PlannerView {
                 if this.state.gantt.gesture.is_some() {
                     let x: f32 = event.position.x.into();
                     let y: f32 = event.position.y.into();
-                    let id = this.state.gantt.gesture.as_ref().map(|gesture| gesture.id);
-                    let local_x = this.pointer_layout_x(x, id);
-                    this.state.update_bar_gesture(local_x);
-                    this.arm_link_target_from_pointer(x, y);
-                    this.saw_pressed_drag = true;
-                    this.commit_gesture(window, cx);
+                    let unscheduled_no_move =
+                        this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+                            gesture.kind == GestureKind::Move
+                                && !gesture.had_start
+                                && !gesture.had_target
+                        }) && this
+                            .pill_press_window_x
+                            .is_some_and(|origin| (x - origin).abs() < 6.0);
+                    this.pill_press_window_x = None;
+                    if unscheduled_no_move {
+                        this.state.cancel_gesture();
+                        this.saw_pressed_drag = false;
+                        this.request_repaint(Some(window), cx);
+                    } else {
+                        let id = this.state.gantt.gesture.as_ref().map(|gesture| gesture.id);
+                        let local_x = this.pointer_layout_x(x, id);
+                        this.state.update_bar_gesture(local_x);
+                        this.arm_link_target_from_pointer(x, y);
+                        this.saw_pressed_drag = true;
+                        this.commit_gesture(window, cx);
+                    }
                 }
                 if this.state.gantt.splitter_drag.take().is_some() {
                     this.state.persist_tree_width();

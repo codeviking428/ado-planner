@@ -1315,6 +1315,10 @@ impl GanttView {
     }
 
     pub fn update_gesture(&mut self, x: f32) {
+        let snap_unscheduled = self.gesture.as_ref().is_some_and(|gesture| {
+            gesture.kind == GestureKind::Move && !gesture.had_start && !gesture.had_target
+        });
+        let snapped = snap_unscheduled.then(|| self.date_for_x(x));
         let Some(gesture) = &mut self.gesture else {
             return;
         };
@@ -1323,8 +1327,15 @@ impl GanttView {
             ((x - gesture.origin_x) / self.scale.pixels_per_day(self.zoom)).round() as i32;
         match gesture.kind {
             GestureKind::Move => {
-                gesture.live_start = gesture.start.saturating_add(delta_days.days());
-                gesture.live_target = gesture.target.saturating_add(delta_days.days());
+                if let Some(start) = snapped {
+                    // Unscheduled gutter pills: the drop date is the date
+                    // under the cursor, not Today + (cursor − gutter).
+                    gesture.live_start = start;
+                    gesture.live_target = start.saturating_add((DEFAULT_BAR_DAYS - 1).days());
+                } else {
+                    gesture.live_start = gesture.start.saturating_add(delta_days.days());
+                    gesture.live_target = gesture.target.saturating_add(delta_days.days());
+                }
             }
             GestureKind::Link => {}
             GestureKind::ResizeStart => {
@@ -1838,7 +1849,13 @@ impl GanttView {
                 // tens of days away (stray line at x≈532). Occupy the
                 // body only at those zooms.
                 let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
-                if !intervening.is_empty() && !wrap_around {
+                if wrap_around && !intervening.is_empty() {
+                    // Keep the local loop; slide the drop into a gap so the
+                    // long vertical does not run through intervening bar
+                    // bodies. Skip labels: a title to the right of a short
+                    // marker must not shove the drop away from the source.
+                    x_in = clear_wrap_drop_x(x_out, &intervening, false, x_head);
+                } else if !intervening.is_empty() && !wrap_around {
                     let x_vert =
                         clear_vertical_x(x_in, &intervening, bar.x, true, x_head, include_labels);
                     if (x_vert - x_in).abs() > 0.5 {
@@ -2107,6 +2124,37 @@ fn clear_vertical_x(
     pref.max(x_head + 4.0)
 }
 
+/// Slide a wrap-around drop just past intervening bars so the long vertical
+/// runs in a gap, without sending the loop to the chart left edge.
+fn clear_wrap_drop_x(
+    pref: f32,
+    intervening: &[&BarLayout],
+    include_labels: bool,
+    x_head: f32,
+) -> f32 {
+    let blocked: Vec<(f32, f32)> = intervening
+        .iter()
+        .map(|bar| bar_occupied_x(bar, include_labels))
+        .collect();
+    if blocked
+        .iter()
+        .all(|(left, right)| !x_hits_span(pref, *left, *right))
+    {
+        return pref;
+    }
+    let hit_right = blocked
+        .iter()
+        .filter(|(left, right)| x_hits_span(pref, *left, *right))
+        .map(|(_, right)| *right)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let cand = hit_right + 6.0;
+    if cand > x_head + DependencyArrow::WRAP_STUB {
+        cand
+    } else {
+        pref.max(x_head + DependencyArrow::WRAP_STUB + 1.0)
+    }
+}
+
 /// Keep a 12px inbound stub when it stays in the clear lane; otherwise keep
 /// the already-cleared `x_in` so the vertical does not recross a bar.
 fn clamp_inbound_stub(
@@ -2335,7 +2383,9 @@ mod tests {
             bar_end(pred)
         );
         let short_stub = (arrow.x2 - (arrow.x_head - 12.0)).abs() < 2.5;
-        let wrap_drop = arrow.wraps_around_successor() && (arrow.x2 - arrow.x1).abs() < 1.5;
+        let wrap_drop = arrow.wraps_around_successor()
+            && (arrow.x1 - expected_x1).abs() < 1.5
+            && arrow.x2 + 0.5 >= arrow.x1;
         assert!(
             short_stub || wrap_drop,
             "later source must use a short inbound or a wrap drop, x1={} x2={} x_head={} wrap={}",
@@ -3300,10 +3350,12 @@ mod tests {
         let bars = gantt.layout_bars(&[item.clone()], &rows, &[], 720.0);
         let bar = bars[0].clone();
         assert!(bar.marker);
+        let today = jiff::Zoned::now().date();
+        let today_x = gantt.x_for_date(today);
         gantt
-            .begin_gesture(&bar, GestureKind::Move, bar.x, &[item], &[])
+            .begin_gesture(&bar, GestureKind::Move, today_x, &[item], &[])
             .expect("move");
-        gantt.update_gesture(bar.x);
+        gantt.update_gesture(today_x);
         assert!(
             gantt.finish_gesture().is_none(),
             "a release with no movement must not commit dates"
@@ -3780,13 +3832,8 @@ mod tests {
         let (start, target) = GanttView::gesture_patch_dates(&gesture);
         let start = start.expect("start");
         assert_eq!(
-            start.month(),
-            8,
-            "dragging the Today marker to Aug 20 must not save November (got {start}–{target:?})"
-        );
-        assert!(
-            start >= Date::new(2026, 8, 1).unwrap() && start <= Date::new(2026, 8, 31).unwrap(),
-            "placeholder drop around Aug 20 saved {start}–{target:?}"
+            start, drop,
+            "dragging the gutter pill to Aug 20 must save Aug 20, not Today+(cursor−gutter) (got {start}–{target:?})"
         );
         assert_eq!(gantt.drop_date(gantt.timeline_origin_x + drop_x), drop);
     }
@@ -4812,8 +4859,8 @@ mod tests {
             arrow.x_head
         );
         assert!(
-            (arrow.x2 - arrow.x1).abs() < 1.5,
-            "the drop must stay at the source stub, x1={} x2={}",
+            arrow.x2 + 0.5 >= arrow.x1,
+            "the drop must stay at the source stub or slide into a local gap, x1={} x2={}",
             arrow.x1,
             arrow.x2
         );
@@ -4823,11 +4870,61 @@ mod tests {
             arrow.x2
         );
         assert!(
-            (arrow.x2 - (pred.x + pred.width + 12.0)).abs() < 2.0
-                || (arrow.x1 - arrow.x2).abs() < 1.5,
-            "the loop must drop a few px past the source end, x2={} pred_end={}",
+            arrow.x2 + 0.5 >= pred.x + pred.width + 10.0,
+            "the loop must drop at or past the source end, x2={} pred_end={}",
             arrow.x2,
             pred.x + pred.width
+        );
+    }
+
+    #[test]
+    fn wrap_vertical_runs_in_a_gap_not_through_intervening_bars() {
+        let mut pred = node(1003, Some(1002));
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-08-04T00:00:00Z".into());
+        pred.target_date = Some("2026-08-21T00:00:00Z".into());
+        let mut child = node(1005, Some(1003));
+        child.title = "Cart UI".into();
+        child.start_date = Some("2026-08-10T00:00:00Z".into());
+        child.target_date = Some("2026-08-28T00:00:00Z".into());
+        let mut succ = node(1012, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1003];
+        let nodes = vec![node(1001, None), node(1002, Some(1001)), pred, child, succ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+            .expect("#1003→#1012");
+        let mid = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let (left, right) = bar_occupied_x(mid, false);
+        assert!(
+            arrow.wraps_around_successor(),
+            "must keep a local loop, x1={} x2={} x_head={}",
+            arrow.x1,
+            arrow.x2,
+            arrow.x_head
+        );
+        assert!(
+            !x_hits_span(arrow.x2, left, right),
+            "wrap drop x2={} must miss #1005 occupied {left}..{right}, pred_end={}",
+            arrow.x2,
+            pred.x + pred.width
+        );
+        assert!(
+            arrow.x2 > 80.0,
+            "must not detour to the chart left edge, x2={}",
+            arrow.x2
         );
     }
 

@@ -2038,6 +2038,75 @@ fn unscheduled_pill_click_without_drag_does_not_schedule(cx: &mut gpui_kit::Test
 }
 
 #[gpui_kit::test]
+fn unscheduled_pill_drop_at_known_x_follows_the_cursor(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = None;
+        node.target_date = None;
+        node.title = "Backlog grooming".into();
+        node.iteration_path = "Shop\\FY26\\Sprint 12".into();
+    }
+    state.iterations = vec![ado_core::IterationNode {
+        path: "Shop\\FY26\\Sprint 12".into(),
+        name: "Sprint 12".into(),
+        start_date: Some("2026-08-10T00:00:00Z".into()),
+        finish_date: Some("2026-08-21T00:00:00Z".into()),
+        children: Vec::new(),
+    }];
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.origin = Date::new(2026, 8, 1).unwrap();
+    let drop = Date::new(2026, 8, 25).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let pill = cx
+        .debug_bounds("gantt-bar-2")
+        .expect("unscheduled gutter pill");
+    let timeline = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let drop_window_x = view.update(cx, |view, _| {
+        f32::from(timeline.origin.x) + view.state.gantt.x_for_date(drop)
+    });
+    cx.simulate_mouse_down(pill.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_some(),
+            "pill press must start a move gesture"
+        );
+    });
+    let drop_at = point(px(drop_window_x), pill.center().y);
+    cx.simulate_mouse_move(drop_at, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("drag must keep the move gesture");
+        assert_eq!(
+            gesture.live_start, drop,
+            "dropping the gutter pill at x for {drop} must follow the cursor, got {}",
+            gesture.live_start
+        );
+        let pending = view.state.commit_date_gesture_now();
+        let start = pending.as_ref().and_then(|save| save.start);
+        assert_eq!(
+            start,
+            Some(drop),
+            "committing that drop must PATCH Start={drop}, got {start:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn empty_team_keeps_the_gantt_toolbar(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -4765,6 +4834,28 @@ fn start_handle_dot_is_part_of_the_resize_hit_zone(cx: &mut gpui_kit::TestAppCon
             gesture.kind,
             GestureKind::ResizeEnd,
             "clicking the bar's right edge must resize, got {:?}",
+            gesture.kind
+        );
+        view.state.cancel_gesture();
+        view.state.gantt.hovered_id = Some(2);
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-2-link-end")
+        .expect("end handle");
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("the end handle dot must begin a resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "clicking the end handle dot must resize, not only select, got {:?}",
             gesture.kind
         );
     });
