@@ -47,9 +47,10 @@ use crate::gantt::{
     ASSIGNEE_COL_WIDTH, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH, DependencyArrow,
     EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H,
     LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis,
-    PLACEHOLDER_BAR_H, RESIZE_END_HIT, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ROW_TINT,
+    PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT,
     SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TODAY_PILL_GAP, TODAY_PILL_W,
-    TREE_INDENT, TYPE_COL_WIDTH, bar_title_is_inside, parent_date_overflow,
+    TREE_INDENT, TYPE_COL_WIDTH, bar_title_is_inside, parent_date_overflow, resize_end_handle,
+    resize_start_handle,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -2821,7 +2822,19 @@ impl PlannerView {
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(Icon::new(self.sync_status_icon()).with_size(Size::XSmall))
+                            .child(
+                                div()
+                                    .id("gantt-sync-status-icon")
+                                    .debug_selector(|| "gantt-sync-status-icon".into())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::new(self.sync_status_icon())
+                                            .with_size(Size::Small)
+                                            .text_color(sync_color),
+                                    ),
+                            )
                             .child(sync_label),
                     ),
             )
@@ -3003,6 +3016,7 @@ impl PlannerView {
                                     .debug_selector(move || row_selector.clone())
                                     .role(Role::Row)
                                     .aria_label(format!("#{id} {}", node.title))
+                                    .relative()
                                     .w_full()
                                     .h(px(ROW_HEIGHT))
                                     .min_h(px(ROW_HEIGHT))
@@ -3089,6 +3103,9 @@ impl PlannerView {
                                             cx.notify();
                                         }),
                                     )
+                                    .when(selected && !dim_selection, |el| {
+                                        el.child(Self::selected_row_accent(id, cx))
+                                    })
                                     .child(
                                         h_flex()
                                             .h_full()
@@ -3855,6 +3872,9 @@ impl PlannerView {
                                     } else {
                                         gpui_kit::hsla(0., 0., 0., 0.)
                                     })
+                                    .when(selected && !dim_selection, |el| {
+                                        el.child(Self::selected_row_accent(id, cx))
+                                    })
                                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                                         this.set_hovered(
                                             if *hovered { Some(id) } else { None },
@@ -3965,6 +3985,9 @@ impl PlannerView {
                     }))
                     .children(bars.iter().filter_map(|bar| {
                         self.render_gantt_link_handles(bar, dragging, cx)
+                    }))
+                    .children(bars.iter().filter_map(|bar| {
+                        self.render_gantt_resize_handles(bar, dragging, cx)
                     }))
                     .child(
                         div()
@@ -4200,14 +4223,7 @@ impl PlannerView {
         let inside = Self::bar_title_fits_inside(bar);
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
-        let can_resize = !summary && !unscheduled && !milestone && !marker && !open_ended;
-        let show_handles = can_resize && hovered && !dragging;
-        let linking = self
-            .state
-            .gantt
-            .gesture
-            .as_ref()
-            .is_some_and(|gesture| gesture.kind == GestureKind::Link);
+        let can_resize = bar.can_resize();
         let bar_h = if milestone || marker {
             MILESTONE_SIZE
         } else if summary {
@@ -4446,68 +4462,6 @@ impl PlannerView {
                 )
                 .into_any_element(),
         ];
-        if can_resize {
-            for (name, handle_id, handle_x, handle_w, kind) in [
-                (
-                    "start",
-                    "resize-start",
-                    bar.x - HANDLE_WIDTH,
-                    HANDLE_WIDTH,
-                    GestureKind::ResizeStart,
-                ),
-                (
-                    "end",
-                    "resize-end",
-                    bar.x + bar.width - RESIZE_END_HIT,
-                    RESIZE_END_HIT,
-                    GestureKind::ResizeEnd,
-                ),
-            ] {
-                let selector = format!("gantt-resize-handle-{id}-{name}");
-                let origin = if kind == GestureKind::ResizeStart {
-                    bar.x
-                } else {
-                    bar.x + bar.width
-                };
-                items.push(
-                    div()
-                        .id((handle_id, id as u64))
-                        .when(show_handles, |el| {
-                            el.debug_selector(move || selector.clone())
-                        })
-                        .absolute()
-                        .left(px(handle_x))
-                        .top(px(bar_top))
-                        .h(px(bar_h))
-                        .w(px(handle_w))
-                        .when(!linking, |el| el.occlude())
-                        .when(show_handles, |el| el.bg(cx.theme().primary))
-                        .when(!show_handles, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.01)))
-                        .cursor_col_resize()
-                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            if *hovered {
-                                this.set_hovered(Some(id), cx);
-                            }
-                        }))
-                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                            if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
-                                gesture.kind == GestureKind::Link && gesture.id != id
-                            }) {
-                                this.state.gantt.set_link_target(id);
-                            }
-                            this.on_bar_drag_move(event, cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.continue_or_begin_bar_gesture(id, kind, origin, window, cx);
-                            }),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
         if parent_date_overflow(&self.state.nodes, id) {
             let warn = cx.theme().warning;
             items.push(
@@ -4529,6 +4483,109 @@ impl PlannerView {
             .size_full()
             .children(items)
             .into_any_element()
+    }
+
+    fn selected_row_accent(id: i64, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id(("row-accent", id as u64))
+            .debug_selector(move || format!("gantt-row-accent-{id}"))
+            .absolute()
+            .left_0()
+            .top_0()
+            .bottom_0()
+            .w(px(SELECTED_ACCENT_W))
+            .bg(cx.theme().primary)
+            .into_any_element()
+    }
+
+    /// Paint after bars, labels, and link handles so the end grip wins hit-testing.
+    fn render_gantt_resize_handles(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        dragging: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if !bar.can_resize() {
+            return None;
+        }
+        let id = bar.id;
+        let hovered = self.state.gantt.hovered_id == Some(id);
+        let show_handles = hovered && !dragging;
+        let linking = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link);
+        let bar_h = bar.paint_h();
+        let bar_top = bar.y + bar.paint_top();
+        let (start_x, start_w) = resize_start_handle(bar);
+        let (end_x, end_w) = resize_end_handle(bar);
+        let handles = [
+            (
+                "start",
+                "resize-start",
+                start_x,
+                start_w,
+                GestureKind::ResizeStart,
+                bar.x,
+            ),
+            (
+                "end",
+                "resize-end",
+                end_x,
+                end_w,
+                GestureKind::ResizeEnd,
+                bar.x + bar.width,
+            ),
+        ]
+        .map(|(name, handle_id, handle_x, handle_w, kind, origin)| {
+            let selector = format!("gantt-resize-handle-{id}-{name}");
+            div()
+                .id((handle_id, id as u64))
+                .when(show_handles, |el| {
+                    el.debug_selector(move || selector.clone())
+                })
+                .absolute()
+                .left(px(handle_x))
+                .top(px(bar_top))
+                .h(px(bar_h))
+                .w(px(handle_w))
+                .when(!linking, |el| el.occlude())
+                .when(show_handles, |el| el.bg(cx.theme().primary))
+                .when(!show_handles, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.01)))
+                .cursor_ew_resize()
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.set_hovered(Some(id), cx);
+                    }
+                }))
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+                        gesture.kind == GestureKind::Link && gesture.id != id
+                    }) {
+                        this.state.gantt.set_link_target(id);
+                    }
+                    this.on_bar_drag_move(event, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.continue_or_begin_bar_gesture(id, kind, origin, window, cx);
+                    }),
+                )
+        });
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .w(px(0.))
+                .h(px(0.))
+                .children(handles)
+                .into_any_element(),
+        )
     }
 
     /// Paint after arrows so a selected link's × / stub cannot steal the handle.
@@ -5079,7 +5136,7 @@ impl PlannerView {
             .left(px(if arrow.inbound_right {
                 arrow.x_head - min_x - 4.0
             } else {
-                arrow.x_head - min_x - 14.0
+                arrow.x_head - min_x - 16.0
             }))
             .top(px(arrow.y2 - min_y - 10.0))
             .w(px(18.))
@@ -5156,6 +5213,13 @@ impl PlannerView {
                 }))
             })
             .child(self.menu_item("Open", cx, move |this, cx| this.open_form(id, cx)))
+            .child(self.menu_item("Add child", cx, move |this, cx| {
+                this.state.gantt.select_row(id);
+                this.spawn_state(cx, |mut state| async move {
+                    let result = state.add_item().await;
+                    (state, result)
+                });
+            }))
             .child(self.menu_item("Delete", cx, move |this, cx| {
                 this.request_delete(id, cx);
             }))

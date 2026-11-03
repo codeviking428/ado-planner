@@ -1546,8 +1546,8 @@ async fn resize_end_toasts_only_target_date() {
         .expect("save target");
     let message = state.toasts.last_message().unwrap_or_default();
     assert!(
-        message.starts_with("Moved "),
-        "end-only save must name the item, got {message}"
+        message.starts_with("Resized "),
+        "end-only save must say Resized, got {message}"
     );
     assert!(
         state

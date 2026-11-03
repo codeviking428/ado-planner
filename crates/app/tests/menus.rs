@@ -306,6 +306,7 @@ fn gpui_context_menu_action_labels(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let labels = [
         "Open",
+        "Add child",
         "Open in Azure DevOps",
         "Copy ID",
         "Copy link",

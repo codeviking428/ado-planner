@@ -18,8 +18,14 @@ pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
 /// Extra-wide end-cap so grabbing a bar's right edge is not an 8px hunt.
 pub const RESIZE_END_HIT: f32 = 16.0;
-/// Selected tree/timeline row tint. Stronger than hover so the current row reads.
-pub const SELECTED_ROW_TINT: f32 = 0.4;
+/// Extra pixels past the bar (into the link-handle gap) so the end grip wins.
+pub const RESIZE_END_OVERLAP: f32 = 6.0;
+/// Selected tree/timeline row tint. Stronger than zebra stripes so the row reads.
+pub const SELECTED_ROW_TINT: f32 = 0.65;
+/// Left accent on the selected tree/timeline row.
+pub const SELECTED_ACCENT_W: f32 = 3.0;
+/// Year-scale bars shorter than this still paint a hittable sliver.
+pub const YEAR_MIN_BAR_WIDTH: f32 = 6.0;
 /// Pixels per tree depth. A spacer child, not padding, so painted x matches depth.
 pub const TREE_INDENT: f32 = 20.0;
 pub const LINK_HANDLE: f32 = 14.0;
@@ -327,8 +333,48 @@ pub struct BarLayout {
     pub predecessors: Vec<i64>,
     /// Diamond at Today for unscheduled items with no iteration/rollup span.
     pub marker: bool,
-    /// Start-only: an open-ended ghost, not a fake 7-day scheduled bar.
+    /// Start-only used to paint as a ▸ marker; kept for hit-test compat.
     pub open_ended: bool,
+}
+
+impl BarLayout {
+    pub fn paint_h(&self) -> f32 {
+        if self.milestone || self.marker {
+            MILESTONE_SIZE
+        } else if self.summary {
+            SUMMARY_BAR_H
+        } else if self.kind == GanttBarKind::Unscheduled {
+            PLACEHOLDER_BAR_H
+        } else {
+            LEAF_BAR_H
+        }
+    }
+
+    pub fn paint_top(&self) -> f32 {
+        ((ROW_HEIGHT - self.paint_h()) / 2.0).max(2.0)
+    }
+
+    pub fn can_resize(&self) -> bool {
+        !self.summary
+            && self.kind != GanttBarKind::Unscheduled
+            && !self.milestone
+            && !self.marker
+            && !self.open_ended
+    }
+}
+
+/// Start grip sits just left of the bar body.
+pub fn resize_start_handle(bar: &BarLayout) -> (f32, f32) {
+    (bar.x - HANDLE_WIDTH, HANDLE_WIDTH)
+}
+
+/// End grip covers the last `RESIZE_END_HIT` of the bar and overlaps the
+/// link-handle gap so it wins hit-testing over the bar body and link handle.
+pub fn resize_end_handle(bar: &BarLayout) -> (f32, f32) {
+    (
+        bar.x + bar.width - RESIZE_END_HIT,
+        RESIZE_END_HIT + HANDLE_WIDTH + RESIZE_END_OVERLAP,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1005,10 +1051,6 @@ impl GanttView {
                     .as_ref()
                     .filter(|gesture| gesture.id == node.id && gesture.kind != GestureKind::Link);
                 let mut marker = false;
-                let had_start = parse_iso_date(node.start_date.as_deref()).is_some();
-                let had_target = parse_iso_date(node.target_date.as_deref()).is_some();
-                let open_ended =
-                    had_start && !had_target && display.kind == GanttBarKind::Scheduled;
                 let (start, target) = if let Some(gesture) = live {
                     (gesture.live_start, gesture.live_target)
                 } else if display.kind == GanttBarKind::Unscheduled {
@@ -1027,14 +1069,14 @@ impl GanttView {
                 };
                 let mut x = self.x_for_date(start);
                 let end = ado_core::to_gantt_inclusive_target(target);
-                let mut width = (self.x_for_date(end) - x).max(6.0);
+                let mut width = (self.x_for_date(end) - x).max(YEAR_MIN_BAR_WIDTH);
                 if display.milestone || marker {
                     width = MILESTONE_SIZE;
                     x -= MILESTONE_SIZE / 2.0;
                 } else if display.kind == GanttBarKind::Unscheduled {
                     width = width.max(PLACEHOLDER_MIN_WIDTH);
-                } else if open_ended {
-                    width = OPEN_ENDED_MARKER_WIDTH;
+                } else if matches!(self.scale, GanttScale::Year) {
+                    width = width.max(YEAR_MIN_BAR_WIDTH);
                 }
                 Some(BarLayout {
                     id: node.id,
@@ -1051,7 +1093,7 @@ impl GanttView {
                         .or_else(|| Some(state_progress(&node.state))),
                     predecessors: node.predecessors.clone(),
                     marker,
-                    open_ended,
+                    open_ended: false,
                 })
             })
             .collect()
@@ -1633,9 +1675,8 @@ impl GanttView {
 
     pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
         const STUB: f32 = 12.0;
-        // Keep the inbound stub left of the successor's link handle and
-        // off the painted arrowhead so hover dots do not sit on the tip.
-        const HEAD_GAP: f32 = HANDLE_WIDTH + LINK_HANDLE_HIT + LINK_HANDLE + 8.0;
+        // Backward inbound stays off the successor's right-side link handle.
+        const BACKWARD_HEAD_GAP: f32 = HANDLE_WIDTH + LINK_HANDLE_HIT + LINK_HANDLE + 8.0;
         const INCOMING_FAN: f32 = 10.0;
         const LANE_SEP: f32 = 6.0;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
@@ -1663,7 +1704,7 @@ impl GanttView {
                 // instead of running out to the far-left chart edge.
                 let backward = pred_end > bar.x + 1.0;
                 let (x_head, x_out, mut x_in) = if backward {
-                    let x_head = succ_right + HEAD_GAP;
+                    let x_head = succ_right + BACKWARD_HEAD_GAP;
                     let x_out = if pred.x >= succ_right - 1.0 {
                         pred.x - STUB
                     } else {
@@ -1671,7 +1712,8 @@ impl GanttView {
                     };
                     (x_head, x_out, x_head + STUB)
                 } else {
-                    let x_head = bar.x - HEAD_GAP;
+                    // Terminate at the successor's start edge, not 48px short.
+                    let x_head = bar.x;
                     (x_head, pred_end + STUB, x_head - STUB)
                 };
                 let lo = pred.y.min(bar.y);
@@ -2240,6 +2282,18 @@ mod tests {
             Some(GestureKind::ResizeEnd),
             "end grip hit area must stay wide of the bar's right edge"
         );
+        let (end_x, end_w) = resize_end_handle(&bar);
+        assert!(
+            end_x < bar.x + bar.width,
+            "end grip must overlap the bar body"
+        );
+        assert!(
+            end_x + end_w > bar.x + bar.width + HANDLE_WIDTH,
+            "end grip must overlap the link handle, grip {}..{} link {}",
+            end_x,
+            end_x + end_w,
+            bar.x + bar.width + HANDLE_WIDTH
+        );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 91.0, 4.0).map(|(_, kind)| kind),
             None
@@ -2267,6 +2321,64 @@ mod tests {
             GanttView::hit_test_bar(&[summary], 176.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::Move),
             "a parent summary bar has no resize handles"
+        );
+    }
+
+    #[test]
+    fn end_grip_wins_hit_test_over_move_on_a_wide_bar() {
+        let bar = BarLayout {
+            id: 1002,
+            kind: GanttBarKind::Scheduled,
+            x: 80.0,
+            width: 920.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "Cart".into(),
+            title: "Cart".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let (end_x, end_w) = resize_end_handle(&bar);
+        let link_x = bar.x + bar.width + HANDLE_WIDTH;
+        assert!(
+            end_x < bar.x + bar.width - 1.0,
+            "end grip must cover the bar's right interior"
+        );
+        assert!(
+            end_x + end_w > link_x,
+            "end grip must overlap the link handle, grip {}..{} link {link_x}",
+            end_x,
+            end_x + end_w
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width - 1.0, 4.0)
+                .map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "the last pixel of a Week-scale bar must resize, not move"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(
+                std::slice::from_ref(&bar),
+                bar.x + bar.width - RESIZE_END_HIT + 1.0,
+                4.0
+            )
+            .map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd)
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width / 2.0, 4.0)
+                .map(|(_, kind)| kind),
+            Some(GestureKind::Move),
+            "the body of a wide bar must still move"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&[bar], end_x + end_w - 2.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "the grip's overlap with the link handle must still be a resize"
         );
     }
 
@@ -2572,7 +2684,7 @@ mod tests {
     }
 
     #[test]
-    fn start_only_item_is_an_open_ended_ghost() {
+    fn start_only_item_paints_a_normal_scheduled_bar() {
         let mut item = node(1, None);
         item.target_date = None;
         let gantt = GanttView {
@@ -2583,51 +2695,64 @@ mod tests {
         let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
         assert_eq!(bars.len(), 1);
         assert!(
-            bars[0].open_ended,
-            "start-only must not look like a complete scheduled bar"
+            !bars[0].open_ended,
+            "start-only Cart UI-style items must paint as a normal bar, not a ▸ marker"
         );
         assert!(!bars[0].marker);
         assert_eq!(bars[0].kind, GanttBarKind::Scheduled);
         assert!(
-            (bars[0].width - OPEN_ENDED_MARKER_WIDTH).abs() < 0.1,
-            "start-only must be a small marker, width={}",
+            bars[0].width > OPEN_ENDED_MARKER_WIDTH + 1.0,
+            "start-only must use the default-length bar, width={}",
             bars[0].width
+        );
+        assert!(
+            bars[0].can_resize(),
+            "a start-only scheduled bar must expose resize grips"
         );
     }
 
     #[test]
-    fn start_only_stubs_stay_readable_in_quarter_and_year() {
+    fn start_only_and_short_year_bars_keep_a_minimum_width() {
         let mut item = node(1, None);
         item.target_date = None;
         for scale in [GanttScale::Quarter, GanttScale::Year] {
             let gantt = GanttView {
                 origin: Date::new(2026, 7, 1).unwrap(),
                 scale,
-                zoom: 0.4,
+                zoom: 0.2,
                 timeline_width: 800.0,
                 ..Default::default()
             };
             let rows = gantt.flatten(std::slice::from_ref(&item));
             let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
             assert_eq!(bars.len(), 1, "{scale:?}");
-            let scheduled = {
-                let mut full = item.clone();
-                full.target_date = Some("2026-10-01T00:00:00Z".into());
-                let rows = gantt.flatten(std::slice::from_ref(&full));
-                gantt.layout_bars(std::slice::from_ref(&full), &rows, &[], 720.0)
-            };
             assert!(
-                (bars[0].width - OPEN_ENDED_MARKER_WIDTH).abs() < 0.1,
-                "{scale:?} start-only must be a fixed marker, width={}",
+                !bars[0].open_ended,
+                "{scale:?} start-only must stay a normal bar, not a ▸ marker"
+            );
+            assert!(
+                bars[0].width + 0.1 >= YEAR_MIN_BAR_WIDTH,
+                "{scale:?} bar must stay visible, width={}",
                 bars[0].width
             );
-            assert!(
-                bars[0].width + 1.0 < scheduled[0].width,
-                "{scale:?} start-only marker {} must stay smaller than a real short bar {}",
-                bars[0].width,
-                scheduled[0].width
-            );
         }
+        let mut one_day = node(1, None);
+        one_day.target_date = one_day.start_date.clone();
+        let gantt = GanttView {
+            origin: Date::new(2026, 1, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 0.2,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(std::slice::from_ref(&one_day));
+        let bars = gantt.layout_bars(std::slice::from_ref(&one_day), &rows, &[], 720.0);
+        assert_eq!(bars.len(), 1);
+        assert!(
+            bars[0].width + 0.1 >= YEAR_MIN_BAR_WIDTH,
+            "Year-view bars must keep a ~6px sliver, width={}",
+            bars[0].width
+        );
     }
 
     #[test]
@@ -3316,8 +3441,8 @@ mod tests {
             succ.x
         );
         assert!(
-            arrows[0].x_head <= succ.x - 3.0,
-            "arrowhead must stop short of the target bar, got {} vs {}",
+            (arrows[0].x_head - succ.x).abs() < 3.0,
+            "arrowhead must terminate at the target start edge, got {} vs {}",
             arrows[0].x_head,
             succ.x
         );
@@ -3414,8 +3539,8 @@ mod tests {
                 );
             } else {
                 assert!(
-                    arrow.x_head <= succ.x - HANDLE_WIDTH - LINK_HANDLE_HIT,
-                    "inbound stub must stay left of the successor handle, x_head={} bar.x={}",
+                    (arrow.x_head - succ.x).abs() < 3.0,
+                    "inbound arrowhead must terminate at the bar start edge, x_head={} bar.x={}",
                     arrow.x_head,
                     succ.x
                 );
@@ -4076,8 +4201,8 @@ mod tests {
             succ.x
         );
         assert!(
-            arrows[0].x_head <= succ.x - 3.0,
-            "arrowhead must not overlap the target bar, got {} vs {}",
+            (arrows[0].x_head - succ.x).abs() < 3.0,
+            "arrowhead must terminate at the target start edge, got {} vs {}",
             arrows[0].x_head,
             succ.x
         );

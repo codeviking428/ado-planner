@@ -95,6 +95,10 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
         cx.debug_bounds("gantt-sync-status").is_some(),
         "the toolbar must show a subtle save/sync status"
     );
+    assert!(
+        cx.debug_bounds("gantt-sync-status-icon").is_some(),
+        "Synced / Saving… must show a status icon in the pill"
+    );
     view.update(cx, |view, _| {
         assert_eq!(view.sync_status_for_test(), "Synced");
         view.set_busy_for_test(true);
@@ -857,6 +861,10 @@ fn context_menu_opens_at_the_click_not_the_window_origin(cx: &mut gpui_kit::Test
     assert!(
         menu.origin.x > gpui_kit::px(100.) && menu.origin.y > gpui_kit::px(100.),
         "context menu should open near the click, not over the Org/Project header"
+    );
+    assert!(
+        cx.debug_bounds("gantt-menu-Add child").is_some(),
+        "right-click must offer Add child"
     );
 }
 
@@ -3541,13 +3549,17 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         f32::from(link.size.height)
     );
     assert!(
-        (f32::from(resize.size.width) - RESIZE_END_HIT).abs() < 0.5,
-        "end resize grip hit area must be {RESIZE_END_HIT}px, got {}",
+        f32::from(resize.size.width) > RESIZE_END_HIT + HANDLE_WIDTH - 0.5,
+        "end resize grip must cover the bar edge and overlap the link handle, got {}",
         f32::from(resize.size.width)
     );
     assert!(
         (f32::from(link.size.width) - HANDLE_WIDTH).abs() > 4.0,
         "link handles must not share the start-resize size"
+    );
+    assert!(
+        cx.debug_bounds("gantt-row-accent-2").is_some(),
+        "the selected row must show a left accent bar"
     );
     let bar = cx.debug_bounds("gantt-bar-2").expect("hovered bar");
     let start = cx
@@ -4127,6 +4139,64 @@ fn hovered_end_grip_wins_hit_test_over_move(cx: &mut gpui_kit::TestAppContext) {
             gesture.kind,
             GestureKind::ResizeEnd,
             "the end grip must win the hit-test over Move, got {:?}",
+            gesture.kind
+        );
+        assert_eq!(gesture.id, 2);
+    });
+}
+
+#[gpui_kit::test]
+fn end_grip_wins_hit_test_over_bar_body_and_link_handle(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.state.gantt.hovered_id = Some(2);
+        cx.notify();
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let handle = cx
+        .debug_bounds("gantt-resize-handle-2-end")
+        .expect("hovered leaf bar must show an end grip");
+    let link = cx
+        .debug_bounds("gantt-link-handle-2-link-end")
+        .expect("hovered leaf bar must show a link handle");
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+    let handle_left = f32::from(handle.origin.x);
+    let handle_right = handle_left + f32::from(handle.size.width);
+    let link_left = f32::from(link.origin.x);
+    assert!(
+        handle_left < bar_right - 1.0,
+        "end grip must overlap the bar body, grip {handle_left}..{handle_right} bar right {bar_right}"
+    );
+    assert!(
+        handle_right > link_left,
+        "end grip must overlap the link handle, grip {handle_left}..{handle_right} link {link_left}"
+    );
+    let on_bar = point(
+        bar.origin.x + bar.size.width - px(2.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(on_bar, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("mouse-down on the bar's right edge must start a resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "the end grip must win over the bar body, got {:?}",
             gesture.kind
         );
         assert_eq!(gesture.id, 2);

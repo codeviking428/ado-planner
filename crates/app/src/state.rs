@@ -2950,15 +2950,28 @@ pub(crate) fn dates_moved_message(
     start: Option<Date>,
     target: Option<Date>,
 ) -> String {
+    dates_range_message("Moved", title, start, target)
+}
+
+fn dates_resized_message(title: &str, start: Option<Date>, target: Option<Date>) -> String {
+    dates_range_message("Resized", title, start, target)
+}
+
+fn dates_range_message(
+    verb: &str,
+    title: &str,
+    start: Option<Date>,
+    target: Option<Date>,
+) -> String {
     let title = quote_name(title);
     match (start, target) {
         (Some(start), Some(target)) => format!(
-            "Moved {title} to {} → {}",
+            "{verb} {title} to {} → {}",
             toast_date(start),
             toast_date(target)
         ),
-        (Some(start), None) => format!("Moved {title} to {}", toast_date(start)),
-        (None, Some(target)) => format!("Moved {title} to {}", toast_date(target)),
+        (Some(start), None) => format!("{verb} {title} to {}", toast_date(start)),
+        (None, Some(target)) => format!("{verb} {title} to {}", toast_date(target)),
         (None, None) => format!("Cleared dates on {title}"),
     }
 }
@@ -2984,6 +2997,8 @@ fn dates_changed_message(
             (None, Some(target)) => format!("Scheduled {title} {}", toast_date(target)),
             _ => format!("Scheduled {title}"),
         }
+    } else if (before_start != after_start) != (before_target != after_target) {
+        dates_resized_message(title, after_start, after_target)
     } else {
         dates_moved_message(title, after_start, after_target)
     }
@@ -3448,6 +3463,48 @@ mod toast_copy_tests {
         assert!(
             message.contains('\u{00a0}'),
             "the range must use a non-breaking space so '18' cannot wrap alone, got {message}"
+        );
+    }
+
+    #[test]
+    fn left_edge_resize_toast_says_resized() {
+        use super::dates_changed_message;
+        let start = Date::new(2026, 7, 6).unwrap();
+        let target = Date::new(2026, 8, 14).unwrap();
+        let resized_start = Date::new(2026, 7, 9).unwrap();
+        let message = dates_changed_message(
+            "Cart",
+            Some(start),
+            Some(target),
+            Some(resized_start),
+            Some(target),
+        );
+        assert!(
+            message.starts_with("Resized \"Cart\" to"),
+            "a left-edge resize must not read as a move, got {message}"
+        );
+        let resized_end = Date::new(2026, 8, 17).unwrap();
+        let end_message = dates_changed_message(
+            "Cart",
+            Some(start),
+            Some(target),
+            Some(start),
+            Some(resized_end),
+        );
+        assert!(
+            end_message.starts_with("Resized \"Cart\" to"),
+            "a right-edge resize must not read as a move, got {end_message}"
+        );
+        let moved = dates_changed_message(
+            "Cart",
+            Some(start),
+            Some(target),
+            Some(resized_start),
+            Some(resized_end),
+        );
+        assert!(
+            moved.starts_with("Moved \"Cart\" to"),
+            "shifting both dates must still say Moved, got {moved}"
         );
     }
 
