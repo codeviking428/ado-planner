@@ -1705,6 +1705,75 @@ fn ctrl_a_then_typing_in_details_dates_keeps_the_field(cx: &mut gpui_kit::TestAp
 }
 
 #[gpui_kit::test]
+fn emptying_a_non_range_datetime_enables_save(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Cart"));
+    values.insert(
+        "Custom.ReviewBy".into(),
+        serde_json::json!("2026-08-01T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1002,
+        rev: 1,
+        work_item_type: "Feature".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![ado_core::FormControl {
+                    id: "Custom.ReviewBy".into(),
+                    reference_name: "Custom.ReviewBy".into(),
+                    label: "Review By".into(),
+                    kind: ado_core::FormControlKind::DateTime,
+                    required: false,
+                    read_only: false,
+                    visible: true,
+                    options: None,
+                }],
+            }],
+        }],
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, cx| {
+        assert!(
+            view.form_input_value("Custom.ReviewBy", cx).is_some(),
+            "standalone DateTime must paint an editable field"
+        );
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_form_field("Custom.ReviewBy", "", window, cx);
+        });
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        let live = view.form_input_value("Custom.ReviewBy", cx);
+        let value = view
+            .state
+            .form
+            .as_ref()
+            .and_then(|form| form.values.get("Custom.ReviewBy"));
+        assert_eq!(
+            value,
+            Some(&serde_json::Value::Null),
+            "an emptied standalone DateTime must write null, live={live:?} value={value:?}"
+        );
+        assert!(
+            view.form_save_is_enabled(cx),
+            "clearing a standalone DateTime must enable Save, live={live:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn placeholder_drop_on_august_keeps_august_dates(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();

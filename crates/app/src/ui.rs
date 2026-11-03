@@ -578,6 +578,24 @@ impl PlannerView {
             .map(|input| input.read(cx).value().to_string())
     }
 
+    /// Tests type into a named form field and sync the draft.
+    pub fn type_form_field(
+        &mut self,
+        field: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.form_inputs.get(field).cloned() else {
+            return;
+        };
+        input.update(cx, |input, cx| {
+            input.replace_all(text, window, cx);
+        });
+        self.sync_form_inputs(cx);
+        cx.notify();
+    }
+
     /// Tests type a range into the details Dates field and sync the draft.
     pub fn type_form_dates(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(input) = self
@@ -5896,12 +5914,20 @@ impl PlannerView {
                     .cloned()
                     .unwrap_or_default()
             } else if control.kind == FormControlKind::DateTime {
-                if live.trim().is_empty() {
+                // Ctrl+A on the combined Dates field fires an empty Change
+                // first; that must not enable Save. Other DateTime fields
+                // treat a blank as a real clear.
+                if live.trim().is_empty()
+                    && (control.reference_name == ado_core::START_DATE_FIELD
+                        || control.reference_name == ado_core::TARGET_DATE_FIELD)
+                {
                     continue;
                 }
                 date_field_text(
                     &control.reference_name,
-                    &serde_json::Value::Null,
+                    form.values
+                        .get(&control.reference_name)
+                        .unwrap_or(&serde_json::Value::Null),
                     &form.values,
                 )
             } else {
@@ -5956,7 +5982,15 @@ impl PlannerView {
                 FormControlKind::Identity => {
                     form.identity_query = text;
                 }
-                FormControlKind::DateTime => {}
+                FormControlKind::DateTime => {
+                    if text.trim().is_empty()
+                        && control.reference_name != ado_core::START_DATE_FIELD
+                        && control.reference_name != ado_core::TARGET_DATE_FIELD
+                    {
+                        form.values
+                            .insert(control.reference_name.clone(), serde_json::Value::Null);
+                    }
+                }
                 _ => form.set_string(&control.reference_name, text),
             }
         }
@@ -5972,9 +6006,23 @@ impl PlannerView {
             else {
                 continue;
             };
-            // Ctrl+A then typing fires an empty Change first. Do not wipe the
-            // draft (and flip the Dates layout) until the user has a range.
+            // Ctrl+A then typing fires an empty Change first on the combined
+            // Dates field. Do not wipe that draft (and flip the layout). Other
+            // DateTime pickers write null so an emptied field actually clears.
+            let gantt_range = reference == ado_core::START_DATE_FIELD
+                || reference == ado_core::TARGET_DATE_FIELD
+                || matches!(date, PickerDate::Range(_, _));
             if start.is_none() && target.is_none() {
+                if gantt_range {
+                    continue;
+                }
+                form.values
+                    .insert(reference.clone(), serde_json::Value::Null);
+                continue;
+            }
+            if !gantt_range && typed.trim().is_empty() {
+                form.values
+                    .insert(reference.clone(), serde_json::Value::Null);
                 continue;
             }
             if matches!(date, PickerDate::Range(_, _))
