@@ -848,6 +848,7 @@ impl GanttView {
             }
             GanttScale::Day | GanttScale::Week => compact_date_span(start, end),
             GanttScale::Quarter => {
+                let (start, end) = self.painted_quarter_range();
                 let left = quarter_title(start);
                 let right = quarter_title(end);
                 if left == right {
@@ -864,6 +865,35 @@ impl GanttView {
                 }
             }
         }
+    }
+
+    /// First and last painted Quarter columns, matching `header_tick_labels`
+    /// (48px gap, leftover dropped when cramped). `viewport_axis_start_date`
+    /// uses `TICK_MIN_GAP` and would title a leftover Q2 the axis did not paint.
+    fn painted_quarter_range(&self) -> (Date, Date) {
+        let width = self.timeline_width.max(1.0);
+        let labels = self.header_tick_labels(width);
+        let ticks = self.timeline_ticks(width);
+        let resolve = |x: f32, label: &str| -> Option<Date> {
+            ticks
+                .iter()
+                .filter(|tick| tick.label == label)
+                .min_by(|a, b| {
+                    let da = (a.x.max(0.0) - x).abs();
+                    let db = (b.x.max(0.0) - x).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|tick| tick.date)
+        };
+        let start = labels
+            .first()
+            .and_then(|(x, label)| resolve(*x, label))
+            .unwrap_or_else(|| self.viewport_axis_start_date());
+        let end = labels
+            .last()
+            .and_then(|(x, label)| resolve(*x, label))
+            .unwrap_or_else(|| self.date_for_x((width - 1.0).max(0.0)));
+        (start, end)
     }
 
     /// Date of the leftover sticky tick when it is painted; otherwise the first
@@ -1781,10 +1811,12 @@ impl GanttView {
         self.header_tick_labels_except(width, None)
     }
 
-    /// Year ticks are months on the row *below* the Today pill. Show every
-    /// other month so names do not jam. Day/Week still shift the in-month
-    /// number off the Today line so "2" stays readable. Year/Quarter dodge
-    /// labels around the pill instead of sliding the pill off the Today line.
+    /// Year ticks are months on the row *below* the Today pill. Thin every
+    /// other month from the first painted tick so leftover Jul yields
+    /// Jul, Sep, Nov, Jan, Mar — not calendar-odd names that skip Jan.
+    /// Day/Week still shift the in-month number off the Today line so "2"
+    /// stays readable. Quarter dodges labels around the pill; Year ticks
+    /// keep their month x (different row) so the interval stays even.
     pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 22.0;
         const SHIFT: f32 = 16.0;
@@ -1792,12 +1824,7 @@ impl GanttView {
             .timeline_ticks(width)
             .into_iter()
             .filter_map(|tick| {
-                let skip_even_month = matches!(self.scale, GanttScale::Year)
-                    && !matches!(
-                        tick.label.as_str(),
-                        "Jan" | "Mar" | "May" | "Jul" | "Sep" | "Nov"
-                    );
-                if tick.label.is_empty() || skip_even_month {
+                if tick.label.is_empty() {
                     None
                 } else {
                     Some((tick.x, tick.label))
@@ -1805,7 +1832,7 @@ impl GanttView {
             })
             .collect();
         if let Some(today) = hide_x {
-            if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
+            if matches!(self.scale, GanttScale::Quarter) {
                 let pill_left = today_pill_left(today, width);
                 let pill_right = pill_left + TODAY_PILL_W;
                 for (x, label) in ticks.iter_mut() {
@@ -1814,17 +1841,18 @@ impl GanttView {
                         *x = pill_right + TODAY_PILL_GAP;
                     }
                 }
-            } else if let Some(index) = ticks
-                .iter()
-                .enumerate()
-                .filter(|(_, (x, _))| (x - today).abs() < HIDE_PAD)
-                .min_by(|(_, (a, _)), (_, (b, _))| {
-                    (a - today)
-                        .abs()
-                        .partial_cmp(&(b - today).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(index, _)| index)
+            } else if !matches!(self.scale, GanttScale::Year)
+                && let Some(index) = ticks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (x, _))| (x - today).abs() < HIDE_PAD)
+                    .min_by(|(_, (a, _)), (_, (b, _))| {
+                        (a - today)
+                            .abs()
+                            .partial_cmp(&(b - today).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(index, _)| index)
             {
                 ticks[index].0 = today + SHIFT;
             }
@@ -1834,6 +1862,9 @@ impl GanttView {
         } else {
             TICK_MIN_GAP
         };
+        if matches!(self.scale, GanttScale::Year) {
+            ticks = thin_year_month_labels(ticks);
+        }
         let labels = Self::space_header_labels(
             Self::sticky_header_labels(ticks, false, min_gap),
             min_gap,
@@ -2359,22 +2390,6 @@ fn separate_parallel_lanes(arrows: &mut [DependencyArrow]) {
     }
 }
 
-/// Full polyline Y, not per-segment. After lane_y split, inbound verticals
-/// can miss a segment-overlap check while still occupying the same X corridor.
-fn arrow_y_span(arrow: &DependencyArrow) -> (f32, f32) {
-    let mut lo = arrow.y1.min(arrow.y2).min(arrow.lane_y);
-    let mut hi = arrow.y1.max(arrow.y2).max(arrow.lane_y);
-    if arrow.wraps_around_successor() {
-        lo = lo.min(arrow.gutter_y());
-        hi = hi.max(arrow.gutter_y());
-    }
-    (lo, hi)
-}
-
-fn y_spans_overlap(a: (f32, f32), b: (f32, f32)) -> bool {
-    a.0 <= b.1 + 8.0 && b.0 <= a.1 + 8.0
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VertKind {
     Outgoing,
@@ -2433,9 +2448,9 @@ fn shift_vertical(
 }
 
 /// Keep long inbound/wrap verticals from stacking 1–3px apart (Persist cart
-/// → Go-live vs Cart UI → spike at x≈601). Uses the whole arrow Y span so
-/// a newly created link is offset against existing ones even when their
-/// inbound segments no longer overlap after lane_y split.
+/// → Go-live vs Cart UI → spike at x≈601). Separate ANY pair whose vertical
+/// Xs are within `PARALLEL_VERT_MIN`, regardless of endpoints or Y span —
+/// a Y-overlap gate missed this Month-view pair (different source/target).
 fn separate_parallel_verticals(arrows: &mut [DependencyArrow], clip_left: f32, clip_right: f32) {
     if arrows.len() < 2 {
         return;
@@ -2444,9 +2459,6 @@ fn separate_parallel_verticals(arrows: &mut [DependencyArrow], clip_left: f32, c
         let mut moved = false;
         for i in 0..arrows.len() {
             for j in i + 1..arrows.len() {
-                if !y_spans_overlap(arrow_y_span(&arrows[i]), arrow_y_span(&arrows[j])) {
-                    continue;
-                }
                 let verts_i = movable_verticals(&arrows[i]);
                 let verts_j = movable_verticals(&arrows[j]);
                 let frozen_i = arrows[i]
@@ -2561,6 +2573,26 @@ pub(crate) fn today_pill_left(today_x: f32, width: f32) -> f32 {
     } else {
         (today_x + TODAY_PILL_GAP).max(4.0)
     }
+}
+
+/// Keep every other Year month, phased from the leftover (last x≤0) tick so
+/// leftover Jul yields Jul, Sep, Nov, Jan, Mar. Thinning before sticky
+/// means the next kept month is two months out and the leftover is not
+/// dropped for sitting on the skipped in-view month.
+fn thin_year_month_labels(labels: Vec<(f32, String)>) -> Vec<(f32, String)> {
+    let phase = labels
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (x, _))| *x <= 0.0)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    labels
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| index % 2 == phase % 2)
+        .map(|(_, item)| item)
+        .collect()
 }
 
 fn dodge_majors_off_today_pill(
@@ -4996,17 +5028,14 @@ mod tests {
         );
     }
 
-    fn overlapping_vertical_gap(a: &DependencyArrow, b: &DependencyArrow) -> Option<f32> {
-        if !y_spans_overlap(arrow_y_span(a), arrow_y_span(b)) {
-            return None;
-        }
+    fn closest_vertical_gap(a: &DependencyArrow, b: &DependencyArrow) -> f32 {
         let mut min_dx = f32::MAX;
         for xa in [a.x1, a.x2] {
             for xb in [b.x1, b.x2] {
                 min_dx = min_dx.min((xa - xb).abs());
             }
         }
-        (min_dx < f32::MAX).then_some(min_dx)
+        min_dx
     }
 
     #[test]
@@ -5035,10 +5064,45 @@ mod tests {
         };
         let mut arrows = vec![a, b];
         separate_parallel_verticals(&mut arrows, 0.0, 800.0);
-        let dx = overlapping_vertical_gap(&arrows[0], &arrows[1]).expect("Y-overlapping verticals");
+        let dx = closest_vertical_gap(&arrows[0], &arrows[1]);
         assert!(
             dx >= PARALLEL_VERT_MIN,
             "1px-stacked inbound verticals must separate, dx={dx} x2={},{}",
+            arrows[0].x2,
+            arrows[1].x2
+        );
+    }
+
+    #[test]
+    fn parallel_verticals_separate_even_when_y_spans_miss() {
+        let a = DependencyArrow {
+            from_id: 1003,
+            to_id: 1013,
+            x1: 200.0,
+            y1: 20.0,
+            x2: 600.0,
+            y2: 40.0,
+            x_head: 640.0,
+            lane_y: 30.0,
+            inbound_right: false,
+        };
+        let b = DependencyArrow {
+            from_id: 1005,
+            to_id: 1012,
+            x1: 210.0,
+            y1: 400.0,
+            x2: 602.0,
+            y2: 480.0,
+            x_head: 360.0,
+            lane_y: 440.0,
+            inbound_right: false,
+        };
+        let mut arrows = vec![a, b];
+        separate_parallel_verticals(&mut arrows, 0.0, 800.0);
+        let dx = closest_vertical_gap(&arrows[0], &arrows[1]);
+        assert!(
+            dx >= PARALLEL_VERT_MIN,
+            "disjoint-Y verticals at x≈600/602 must still separate, dx={dx} x2={},{}",
             arrows[0].x2,
             arrows[1].x2
         );
@@ -5175,16 +5239,7 @@ mod tests {
             .iter()
             .find(|arrow| arrow.from_id == 1005 && arrow.to_id == 1012)
             .expect("Cart UI → spike");
-        let dx = overlapping_vertical_gap(persist_live, cart_spike).unwrap_or_else(|| {
-            [
-                (persist_live.x1 - cart_spike.x1).abs(),
-                (persist_live.x1 - cart_spike.x2).abs(),
-                (persist_live.x2 - cart_spike.x1).abs(),
-                (persist_live.x2 - cart_spike.x2).abs(),
-            ]
-            .into_iter()
-            .fold(f32::MAX, f32::min)
-        });
+        let dx = closest_vertical_gap(persist_live, cart_spike);
         assert!(
             dx >= 8.0,
             "{:?}: Persist cart → Go-live vertical must sit ≥8px from Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={} lanes={},{}",
@@ -5247,16 +5302,7 @@ mod tests {
             .iter()
             .find(|arrow| arrow.from_id == 1005 && arrow.to_id == 1012)
             .expect("Cart UI → spike");
-        let dx = overlapping_vertical_gap(persist_live, cart_spike).unwrap_or_else(|| {
-            [
-                (persist_live.x1 - cart_spike.x1).abs(),
-                (persist_live.x1 - cart_spike.x2).abs(),
-                (persist_live.x2 - cart_spike.x1).abs(),
-                (persist_live.x2 - cart_spike.x2).abs(),
-            ]
-            .into_iter()
-            .fold(f32::MAX, f32::min)
-        });
+        let dx = closest_vertical_gap(persist_live, cart_spike);
         assert!(
             dx >= 8.0,
             "a newly created Persist cart → Go-live must sit ≥8px off Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={}",
@@ -7324,6 +7370,45 @@ mod tests {
     }
 
     #[test]
+    fn quarter_title_matches_painted_columns() {
+        // Mid-June: leftover Q2 is sticky at x=0 while Q3 sits ~44px in, under
+        // the Quarter 48px gap, so the axis drops Q2. Title must follow Q3.
+        let gantt = GanttView {
+            origin: Date::new(2026, 6, 20).unwrap(),
+            scale: GanttScale::Quarter,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let labels = gantt.header_tick_labels(800.0);
+        let title = gantt.viewport_range_title();
+        let first = labels
+            .first()
+            .map(|(_, label)| label.as_str())
+            .unwrap_or("");
+        assert!(
+            first.starts_with('Q'),
+            "Quarter axis must paint Q labels, got {labels:?}"
+        );
+        assert!(
+            title.contains(first),
+            "Quarter title {title:?} must name the first painted column {first:?}, labels={labels:?}"
+        );
+        assert!(
+            !title.contains("Q2") || first == "Q2" || title.matches("Q2").count() == 1,
+            "title must not claim leftover Q2 when the axis starts at {first}: {title} vs {labels:?}"
+        );
+        let q3 = Date::new(2026, 7, 1).unwrap();
+        let q3_x = gantt.x_for_date(q3);
+        if q3_x > 0.0 && q3_x < 48.0 {
+            assert!(
+                title.starts_with("2026 Q3"),
+                "cramped leftover Q2 must not title the range, got {title:?} Q3_x={q3_x} labels={labels:?}"
+            );
+        }
+    }
+
+    #[test]
     fn year_major_labels_stay_inside_the_timeline() {
         let gantt = GanttView {
             origin: Date::new(2025, 1, 1).unwrap(),
@@ -7555,27 +7640,59 @@ mod tests {
                 ticks.iter().any(|(_, label)| label == "Nov"),
                 "Year ticks at zoom {zoom} must keep Nov next to Today, got {ticks:?}"
             );
-            for (_, label) in &ticks {
-                assert!(
-                    matches!(
-                        label.as_str(),
-                        "Jan" | "Mar" | "May" | "Jul" | "Sep" | "Nov"
-                    ),
-                    "Year ticks skip even months, got {ticks:?}"
+            fn month_num(label: &str) -> Option<i32> {
+                [
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                    "Dec",
+                ]
+                .iter()
+                .position(|name| *name == label)
+                .map(|index| index as i32)
+            }
+            for pair in ticks.windows(2) {
+                let Some(a) = month_num(&pair[0].1) else {
+                    continue;
+                };
+                let Some(b) = month_num(&pair[1].1) else {
+                    continue;
+                };
+                let step = (b - a + 12) % 12;
+                assert_eq!(
+                    step, 2,
+                    "Year ticks must thin at a 2-month interval from the first painted month, got {ticks:?}"
                 );
             }
-            let pill = today_pill_left(today_x, 800.0);
-            for name in ["Nov", "Jan"] {
-                if let Some((tick_x, label)) = ticks.iter().find(|(_, label)| label == name) {
-                    let tick_right = *tick_x + header_label_px(label);
-                    let overlaps = tick_right >= pill - 0.5 && *tick_x <= pill + TODAY_PILL_W + 0.5;
-                    assert!(
-                        !overlaps,
-                        "Today pill at {pill}..{} must clear {name} at {tick_x}..{tick_right}, zoom={zoom}",
-                        pill + TODAY_PILL_W
-                    );
-                }
-            }
+            // Nov sits on the tick row under Today; do not require a horizontal
+            // dodge that used to drop Jan (Jul, Sep, Nov, Mar).
+            assert!(
+                ticks.iter().any(|(_, label)| label == "Jan"),
+                "Year ticks must keep Jan two months after Nov, got {ticks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn year_ticks_from_leftover_jul_keep_a_two_month_step() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let ticks = gantt.header_tick_labels(800.0);
+        let names: Vec<&str> = ticks.iter().map(|(_, label)| label.as_str()).collect();
+        assert!(
+            names.first() == Some(&"Jul"),
+            "leftover Jul must be the first Year tick, got {names:?}"
+        );
+        let expected = ["Jul", "Sep", "Nov", "Jan", "Mar"];
+        for (index, want) in expected.iter().enumerate() {
+            assert_eq!(
+                names.get(index),
+                Some(want),
+                "Year ticks from leftover Jul must stay on a 2-month step, got {names:?}"
+            );
         }
     }
 
@@ -7881,9 +7998,31 @@ mod tests {
         gantt.snap_cramped_leading_column();
         let labels = gantt.header_tick_labels(800.0);
         assert!(
-            labels.iter().any(|(_, label)| *label == "Jul"),
+            labels.iter().any(|(_, label)| matches!(
+                label.as_str(),
+                "Jan"
+                    | "Feb"
+                    | "Mar"
+                    | "Apr"
+                    | "May"
+                    | "Jun"
+                    | "Jul"
+                    | "Aug"
+                    | "Sep"
+                    | "Oct"
+                    | "Nov"
+                    | "Dec"
+            )),
             "Year view must show month labels, got {labels:?}"
         );
+        fn month_num(label: &str) -> Option<i32> {
+            [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ]
+            .iter()
+            .position(|name| *name == label)
+            .map(|index| index as i32)
+        }
         for pair in labels.windows(2) {
             let (x0, l0) = &pair[0];
             let (x1, l1) = &pair[1];
@@ -7892,6 +8031,13 @@ mod tests {
                 x1 - x0 >= need - 0.5,
                 "Year ticks {l0:?}@{x0} and {l1:?}@{x1} are cramped (need {need})"
             );
+            if let (Some(a), Some(b)) = (month_num(l0), month_num(l1)) {
+                assert_eq!(
+                    (b - a + 12) % 12,
+                    2,
+                    "Year ticks must stay on a 2-month step, got {labels:?}"
+                );
+            }
         }
     }
 

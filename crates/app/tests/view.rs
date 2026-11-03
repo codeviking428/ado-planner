@@ -1228,6 +1228,36 @@ fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext)
 }
 
 #[gpui_kit::test]
+fn mock_fixture_month_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let persist = cx
+        .debug_bounds("gantt-dep-inv-1003-1013")
+        .expect("painted Persist cart → Go-live inbound (Month)");
+    let spike = cx
+        .debug_bounds("gantt-dep-inv-1005-1012")
+        .expect("painted Cart UI → spike inbound (Month)");
+    let persist_x = f32::from(persist.origin.x) + f32::from(persist.size.width) / 2.0;
+    let spike_x = f32::from(spike.origin.x) + f32::from(spike.size.width) / 2.0;
+    let dx = (persist_x - spike_x).abs();
+    assert!(
+        dx >= 8.0,
+        "Month mock fixture: Persist cart → Go-live inv at {persist_x} must sit ≥8px from Cart UI → spike at {spike_x} (dx={dx})"
+    );
+}
+
+#[gpui_kit::test]
 fn inbound_arrowhead_paints_at_the_target_not_the_elbow(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -5722,20 +5752,50 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
         );
     });
     cx.simulate_mouse_up(dest, MouseButton::Left, Modifiers::default());
-    draw(cx);
     view.update(cx, |view, _| {
         assert_eq!(
-            view.state.gantt.pin_bar_tooltip, None,
-            "mouse-up must not pin the pre-drag tooltip"
+            view.state.gantt.pin_bar_tooltip,
+            Some(2),
+            "after a resize the live tooltip must stay pinned while the cursor is on the bar"
         );
         assert!(
             !view.state.gantt.hover_locked,
             "drop must not lock hover or the first tooltip after a drag waits ~1s"
         );
+        let committed = view.last_committed_target_for_test();
+        assert!(
+            committed.is_some_and(|day| day > Date::new(2026, 7, 20).unwrap()),
+            "resize must commit a later Target Date, got {committed:?}"
+        );
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .expect("leaf node");
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 2).expect("leaf");
+        let tip = bar_hover_tooltip(bar, &view.state.nodes);
+        if node
+            .target_date
+            .as_deref()
+            .is_none_or(|value| !value.contains("2026-07-20"))
+        {
+            assert!(
+                !tip.contains("Jul 20"),
+                "after a resize the tooltip must follow the live node dates while the cursor stays, got {tip:?} node={:?}",
+                node.target_date
+            );
+        }
     });
+    draw(cx);
     assert!(
-        cx.debug_bounds("gantt-bar-tooltip").is_none(),
-        "a stale pinned tooltip must not remain after drop"
+        cx.debug_bounds("gantt-bar-tooltip").is_some(),
+        "the live bar tooltip must paint after a resize while the cursor stays on the bar"
     );
 }
 

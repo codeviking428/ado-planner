@@ -1228,8 +1228,13 @@ impl PlannerView {
 
     fn set_bar_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
         if id.is_none() {
+            if self.state.gantt.pin_ignore_leave {
+                // Remount after a date commit fires hover-leave while the
+                // pointer is still on the bar. Keep the live pinned tooltip.
+                self.state.gantt.pin_ignore_leave = false;
+                return;
+            }
             self.state.gantt.pin_bar_tooltip = None;
-            self.state.gantt.pin_ignore_leave = false;
             if self.state.gantt.hover_locked {
                 self.state.gantt.hover_locked = false;
                 cx.notify();
@@ -7239,6 +7244,7 @@ impl PlannerView {
             && window_x <= painted.right
             && self.state.gantt.pointer_in_rows(window_x, window_y);
         if on_bar {
+            self.state.gantt.pin_ignore_leave = false;
             return;
         }
         self.state.gantt.pin_bar_tooltip = None;
@@ -7420,7 +7426,13 @@ impl PlannerView {
             if shift_children {
                 pending.cascade = self.state.shift_children_with_committed_move(&pending);
             }
+            let id = pending.id;
             self.enqueue_date_save(cx, pending);
+            // Cursor is still on the bar. Pin a live tooltip so GPUI cannot
+            // keep the pre-resize end date. Leave row hover cleared so a
+            // finished drag does not keep the highlight or link handles.
+            self.state.gantt.pin_bar_tooltip = Some(id);
+            self.state.gantt.pin_ignore_leave = true;
         }
         self.request_repaint(Some(window), cx);
     }
