@@ -30,6 +30,11 @@ const MIN_BAR_WIDTH: f32 = 6.0;
 pub const TREE_INDENT: f32 = 20.0;
 pub const LINK_HANDLE: f32 = 14.0;
 pub const LINK_HANDLE_HIT: f32 = 18.0;
+/// Parent-overflow `!` on the bar. Matches the Dates-column badge so the
+/// glyph reads at ~14px instead of shrinking to a 9px mark.
+pub const OVERFLOW_BADGE: f32 = 16.0;
+/// Gap between the painted bar end and the overflow badge.
+pub const OVERFLOW_BADGE_GAP: f32 = 2.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
@@ -384,14 +389,15 @@ impl BarLayout {
     }
 
     pub fn can_resize(&self) -> bool {
-        !self.summary
-            && self.kind != GanttBarKind::Unscheduled
+        self.kind != GanttBarKind::Unscheduled
             && self.kind != GanttBarKind::NoFields
             && !self.milestone
             && !self.marker
             && !self.open_ended
             // Strictly wider than two grips so a YEAR_MIN_BAR_WIDTH (16px)
             // bar keeps a Move body. `>= 16` would cover the whole bar.
+            // Parents with their own dates resize too; rollup-only bars
+            // (unscheduled / no-fields) never reach this path.
             && self.width > HANDLE_WIDTH * 2.0
     }
 
@@ -402,8 +408,13 @@ impl BarLayout {
 
     /// 8px rollup edges only when they leave a Move body in the center.
     /// Target-only diamonds (16px) and year-scale slivers stay all-Move.
+    /// Parents with their own dates resize instead of showing a not-allowed edge.
     pub fn shows_rollup_edges(&self) -> bool {
-        self.summary && !self.milestone && !self.marker && self.width > HANDLE_WIDTH * 2.0
+        self.summary
+            && !self.can_resize()
+            && !self.milestone
+            && !self.marker
+            && self.width > HANDLE_WIDTH * 2.0
     }
 
     /// Classify a timeline-x on this painted bar. `None` is the move body.
@@ -430,7 +441,7 @@ impl BarLayout {
         let grip = HANDLE_WIDTH.min(width / 2.0).max(1.0);
         let on_start = window_x <= painted_left + grip;
         let on_end = window_x >= painted_right - grip;
-        if self.summary {
+        if self.summary && !self.can_resize() {
             // Two 8px edges meet on a 16px bar; skip them so a short parent
             // (diamond, year sliver) still has a Move body.
             if self.shows_rollup_edges() && width > HANDLE_WIDTH * 2.0 && (on_start || on_end) {
@@ -1760,10 +1771,9 @@ impl GanttView {
         self.header_tick_labels_except(width, None)
     }
 
-    /// Year ticks are months. Shift the Day number off the Today line so "2"
-    /// stays readable instead of hiding it. Year/Quarter month ticks sit ~1px
-    /// from Today; a 16px shift still parks "Nov" under the pill, so drop
-    /// any tick that would paint on the pill instead of crowding it.
+    /// Year ticks are months on the row *below* the Today pill. Keep "Nov"
+    /// visible; hiding it left Today covering the month. Day/Week still
+    /// shift the in-month number off the Today line so "2" stays readable.
     pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 22.0;
         const SHIFT: f32 = 16.0;
@@ -1778,10 +1788,9 @@ impl GanttView {
                 }
             })
             .collect();
-        if let Some(today) = hide_x {
-            if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
-                ticks = hide_ticks_under_today_pill(ticks, today, width);
-            } else if let Some(index) = ticks
+        if let Some(today) = hide_x
+            && !matches!(self.scale, GanttScale::Year | GanttScale::Quarter)
+            && let Some(index) = ticks
                 .iter()
                 .enumerate()
                 .filter(|(_, (x, _))| (x - today).abs() < HIDE_PAD)
@@ -1792,9 +1801,8 @@ impl GanttView {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(index, _)| index)
-            {
-                ticks[index].0 = today + SHIFT;
-            }
+        {
+            ticks[index].0 = today + SHIFT;
         }
         let labels = Self::space_header_labels(
             Self::sticky_header_labels(ticks, false, TICK_MIN_GAP),
@@ -2004,7 +2012,7 @@ impl GanttView {
             .clone();
         let kind = if bar.milestone || bar.marker {
             GestureKind::Move
-        } else if bar.summary {
+        } else if bar.summary && !bar.can_resize() {
             match bar.hit_zone_at_window_x(x, bar.x, bar.x + bar.width) {
                 BarHitZone::Move => GestureKind::Move,
                 _ => return None,
@@ -2198,6 +2206,30 @@ impl GanttView {
                 out[index].lane_y += dir * lane_shift;
             }
         }
+        let mut outgoing: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (index, arrow) in out.iter().enumerate() {
+            outgoing.entry(arrow.from_id).or_default().push(index);
+        }
+        for indexes in outgoing.values_mut() {
+            indexes.sort_by_key(|&index| out[index].to_id);
+            if indexes.len() < 2 {
+                continue;
+            }
+            for (rank, &index) in indexes.iter().enumerate() {
+                if rank == 0 {
+                    continue;
+                }
+                let x_shift = rank as f32 * INCOMING_FAN;
+                let lane_shift = rank as f32 * LANE_SEP.max(8.0);
+                out[index].x1 += x_shift;
+                let dir = if out[index].y2 >= out[index].y1 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                out[index].lane_y += dir * lane_shift;
+            }
+        }
         let clip_right = (self.timeline_width - 10.0).max(24.0);
         let clip_left = gutter_clear_x(bars);
         for arrow in &mut out {
@@ -2260,25 +2292,6 @@ pub(crate) fn today_pill_left(today_x: f32, width: f32) -> f32 {
     }
 }
 
-/// Drop Year/Quarter month ticks whose glyphs would sit on the Today pill.
-/// Shifting "Nov" by 16px still crowds it; hiding the overlapping tick leaves
-/// Today as the in-month marker and keeps Oct/Dec in their own columns.
-fn hide_ticks_under_today_pill(
-    labels: Vec<(f32, String)>,
-    today_x: f32,
-    width: f32,
-) -> Vec<(f32, String)> {
-    let pill_left = today_pill_left(today_x, width);
-    let pill_right = pill_left + TODAY_PILL_W;
-    labels
-        .into_iter()
-        .filter(|(x, label)| {
-            let text_w = header_label_px(label);
-            x + text_w <= pill_left + 1.0 || *x >= pill_right + 4.0
-        })
-        .collect()
-}
-
 fn dodge_majors_off_today_pill(
     labels: Vec<(f32, String)>,
     today_x: f32,
@@ -2324,22 +2337,31 @@ fn gutter_clear_x(bars: &[BarLayout]) -> f32 {
 }
 
 /// Hover copy for a Gantt bar: title, dates, assignee.
+/// Prefer the node's current dates so a just-committed drag does not keep
+/// the pre-drag range after `bar.label` was captured for a GPUI tooltip.
 pub fn bar_hover_tooltip(bar: &BarLayout, nodes: &[WorkItemNode]) -> String {
-    let assignee = nodes
-        .iter()
-        .find(|node| node.id == bar.id)
+    let node = nodes.iter().find(|node| node.id == bar.id);
+    let assignee = node
         .and_then(|node| node.assigned_to.as_ref())
         .map(|identity| identity.display_name.trim())
         .filter(|name| !name.is_empty())
         .unwrap_or("Unassigned");
     let dates = if bar.kind == GanttBarKind::NoFields {
-        "No dates"
+        "No dates".to_string()
     } else if bar.marker || bar.kind == GanttBarKind::Unscheduled {
-        "Unscheduled"
-    } else if bar.label.is_empty() {
-        "No dates"
+        "Unscheduled".to_string()
+    } else if !bar.label.is_empty() {
+        // Live gesture layouts write the in-flight range onto `bar.label`.
+        bar.label.clone()
+    } else if let Some(node) = node {
+        let text = dates_column_text(node, nodes, None);
+        if text.is_empty() {
+            "No dates".into()
+        } else {
+            text
+        }
     } else {
-        bar.label.as_str()
+        "No dates".into()
     };
     format!("{} · {} · {assignee}", bar.title, dates)
 }
@@ -2418,6 +2440,11 @@ pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
         0.0
     };
     let inner = (visible_w - grip * 2.0 - h_pad - cue).max(0.0);
+    if clip_pad > 0.0 && inner < BAR_LABEL_INSIDE_MIN {
+        // A clipped-left sliver at the viewport edge (Quarter Checkout /
+        // Cart) must not pin two titles on top of each other at x = 0.
+        return false;
+    }
     inner >= bar_title_px(&bar.title)
 }
 
@@ -3079,17 +3106,17 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&summary), 176.0, 4.0)
                 .map(|(_, kind)| kind),
-            None,
-            "a parent summary edge must not silently move"
+            Some(GestureKind::ResizeEnd),
+            "a parent with its own dates resizes at the right edge"
         );
         assert_eq!(
             summary.hit_zone_at_window_x(176.0, summary.x, summary.x + summary.width),
-            BarHitZone::RollupEdge
+            BarHitZone::ResizeEnd
         );
         assert_eq!(
             summary.hit_zone_at_window_x(177.0, summary.x, summary.x + summary.width),
-            BarHitZone::RollupEdge,
-            "3px inside a summary end must stay RollupEdge"
+            BarHitZone::ResizeEnd,
+            "3px inside a summary end must resize, not sit under a link dot"
         );
         let diamond = BarLayout {
             summary: true,
@@ -4586,6 +4613,44 @@ mod tests {
                 pred.y
             );
         }
+    }
+
+    #[test]
+    fn two_links_from_persist_cart_do_not_share_a_vertical() {
+        let mut pred = node(1003, None);
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-07-06T00:00:00Z".into());
+        pred.target_date = Some("2026-07-20T00:00:00Z".into());
+        let mut spike = node(1012, None);
+        spike.title = "Unparented spike".into();
+        spike.start_date = Some("2026-07-21T00:00:00Z".into());
+        spike.target_date = Some("2026-08-04T00:00:00Z".into());
+        spike.predecessors = vec![1003];
+        let mut go_live = node(1013, None);
+        go_live.title = "Go-live milestone".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        go_live.predecessors = vec![1003];
+        let nodes = vec![pred, spike, go_live];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 2);
+        let dx = (arrows[0].x1 - arrows[1].x1).abs();
+        let dy = (arrows[0].lane_y - arrows[1].lane_y).abs();
+        assert!(
+            dx >= 8.0 || dy >= 6.0,
+            "Persist cart → spike and Persist cart → Go-live must not share one vertical, dx={dx} dy={dy} x1={},{} lane={},{}",
+            arrows[0].x1,
+            arrows[1].x1,
+            arrows[0].lane_y,
+            arrows[1].lane_y
+        );
     }
 
     #[test]
@@ -6717,12 +6782,16 @@ mod tests {
         let today_x = gantt.today_x(today);
         let ticks = gantt.header_tick_labels_except(800.0, Some(today_x));
         let majors = gantt.header_major_labels_except(800.0, Some(today_x));
-        for (x, label) in ticks.iter().chain(majors.iter()) {
+        for (x, label) in &majors {
             assert!(
                 (x - today_x).abs() >= 14.0 || *x <= 1.0,
-                "Quarter label {label:?} at {x} must not sit on Today at {today_x}"
+                "Quarter major {label:?} at {x} must not sit on Today at {today_x}"
             );
         }
+        assert!(
+            ticks.iter().any(|(_, label)| label.starts_with('Q')),
+            "Quarter ticks live on the row below Today and must stay, got {ticks:?}"
+        );
     }
 
     #[test]
@@ -6763,16 +6832,25 @@ mod tests {
                     );
                 }
             }
-            let ticks = gantt.header_tick_labels_except(timeline_width, Some(today_x));
-            for (x, label) in &ticks {
-                let text_w = header_label_px(label);
-                assert!(
-                    x + text_w <= pill_left + 1.0 || *x >= pill_right + 4.0,
-                    "Year tick {label:?} at {x}..{} must not crowd the Today pill {pill_left}..{pill_right}",
-                    x + text_w
-                );
-            }
         }
+    }
+
+    #[test]
+    fn year_view_keeps_the_nov_tick_under_today() {
+        let today = Date::new(2026, 11, 2).unwrap();
+        let gantt = GanttView {
+            origin: today.saturating_sub(40.days()),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let today_x = gantt.today_x(today);
+        let ticks = gantt.header_tick_labels_except(800.0, Some(today_x));
+        assert!(
+            ticks.iter().any(|(_, label)| label == "Nov"),
+            "Year ticks sit on the row below Today and must keep Nov, got {ticks:?}"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH,
     MIN_TIMELINE_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
-    insert_index_for_child,
+    bar_hover_tooltip, insert_index_for_child,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -3561,8 +3561,7 @@ fn year_today_label_does_not_overlap_month_ticks(cx: &mut gpui_kit::TestAppConte
         today_bottom <= tick_top + 1.0,
         "Year Today at {today_top}..{today_bottom} must sit on the year row, not on month ticks at {tick_top}"
     );
-    let today_left = f32::from(today.origin.x);
-    let today_right = today_left + f32::from(today.size.width);
+    let mut tick_count = 0;
     for selector in [
         "gantt-tick-0",
         "gantt-tick-1",
@@ -3578,16 +3577,14 @@ fn year_today_label_does_not_overlap_month_ticks(cx: &mut gpui_kit::TestAppConte
         "gantt-tick-11",
         "gantt-tick-12",
     ] {
-        let Some(bounds) = cx.debug_bounds(selector) else {
-            continue;
-        };
-        let left = f32::from(bounds.origin.x);
-        let right = left + f32::from(bounds.size.width);
-        assert!(
-            right <= today_left + 1.0 || left >= today_right - 1.0,
-            "Year {selector} at {left}..{right} must not sit under Today {today_left}..{today_right}"
-        );
+        if cx.debug_bounds(selector).is_some() {
+            tick_count += 1;
+        }
     }
+    assert!(
+        tick_count >= 6,
+        "Year month ticks sit below Today and must stay visible (including Nov), got {tick_count}"
+    );
 }
 
 #[gpui_kit::test]
@@ -3724,8 +3721,8 @@ fn dates_cell_stays_one_line_with_a_conflict_marker(cx: &mut gpui_kit::TestAppCo
         .debug_bounds("gantt-parent-overflow")
         .expect("bar overflow badge");
     assert!(
-        f32::from(bar_mark.size.width) >= 14.0 && f32::from(bar_mark.size.height) >= 14.0,
-        "the bar ! must be a visible badge, got {:?}",
+        f32::from(bar_mark.size.width) >= 16.0 && f32::from(bar_mark.size.height) >= 16.0,
+        "the bar ! must be a 16px badge (~14px glyph), got {:?}",
         bar_mark.size
     );
 }
@@ -3763,8 +3760,8 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
         "the ! must sit past the bar end so the grip stays hittable, badge_left={badge_left} bar_right={bar_right}"
     );
     assert!(
-        f32::from(badge.size.width) >= 14.0 && f32::from(badge.size.height) >= 14.0,
-        "the bar ! must be a readable 14px badge, got {:?}",
+        f32::from(badge.size.width) >= 16.0 && f32::from(badge.size.height) >= 16.0,
+        "the bar ! must be a readable 16px badge (~14px glyph), got {:?}",
         badge.size
     );
     assert!(
@@ -3789,6 +3786,40 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
             GestureKind::ResizeEnd,
             "clicking the right edge under the ! must resize, got {:?}",
             gesture.kind
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn overflow_badge_wins_hits_over_a_link_elbow(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 1) {
+        node.target_date = Some("2026-07-10T00:00:00Z".into());
+    }
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 3) {
+        node.predecessors = vec![2];
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let badge = cx
+        .debug_bounds("gantt-parent-overflow")
+        .expect("overflow badge");
+    let mid = point(
+        badge.origin.x + badge.size.width / 2.0,
+        badge.origin.y + badge.size.height / 2.0,
+    );
+    cx.simulate_mouse_move(mid, None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_link, None,
+            "the ! badge must win the hit-test over a link elbow under it"
         );
     });
 }
@@ -4770,34 +4801,65 @@ fn team_search_shows_a_placeholder(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn parent_summary_bar_shows_link_handles_without_resize(cx: &mut gpui_kit::TestAppContext) {
+fn parent_summary_bar_resizes_without_the_link_dot_stealing(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
     state.gantt.selected_id = Some(1);
     state.gantt.hovered_id = Some(1);
-    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    state.gantt.bar_hovered_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
         height: px(800.),
     });
     draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1").expect("parent summary bar");
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
     assert!(
         cx.debug_bounds("gantt-link-handle-1-link-end").is_some(),
         "a hovered parent summary bar must show a link handle"
     );
+    let handle = cx
+        .debug_bounds("gantt-resize-handle-1-end")
+        .expect("a parent with its own dates must show a right resize grip");
     assert!(
-        cx.debug_bounds("gantt-resize-handle-1-end").is_none(),
-        "a parent summary bar must not grow resize handles"
+        cx.debug_bounds("gantt-summary-edge-1-end").is_none(),
+        "a dated parent must resize, not show a rollup not-allowed edge"
     );
+    let handle_right = f32::from(handle.origin.x) + f32::from(handle.size.width);
     assert!(
-        cx.debug_bounds("gantt-summary-edge-1-end").is_some(),
-        "a parent summary bar must show a not-allowed edge affordance"
+        handle_right <= bar_right + 0.5,
+        "the end grip must stay inside the bar, handle_right={handle_right} bar_right={bar_right}"
     );
-    assert!(
-        cx.debug_bounds("gantt-summary-edge-1-start").is_some(),
-        "a parent summary bar must show a not-allowed start-edge affordance"
+    if let Some(dot) = cx.debug_bounds("gantt-link-handle-1-link-end") {
+        let dot_left = f32::from(dot.origin.x);
+        assert!(
+            dot_left >= bar_right - 0.5,
+            "the link dot must sit past the bar so it does not steal resize, dot_left={dot_left} bar_right={bar_right}"
+        );
+    }
+    let grip = point(
+        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.y + bar.size.height / 2.0,
     );
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("3px inside a parent end must resize, not start a link");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "Cart-style parent right edge must resize, got {:?}",
+            gesture.kind
+        );
+        assert_eq!(gesture.id, 1);
+    });
 }
 
 #[gpui_kit::test]
@@ -4819,18 +4881,25 @@ fn summary_edge_does_not_silently_move(cx: &mut gpui_kit::TestAppContext) {
     cx.simulate_mouse_down(edge, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
-        assert!(
-            view.state.gantt.gesture.is_none(),
-            "a summary edge must not start a move, got {:?}",
-            view.state.gantt.gesture.as_ref().map(|g| g.kind)
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("a dated parent edge must start a resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "3px inside a summary end must resize, got {:?}",
+            gesture.kind
         );
         let hit = view
             .last_bar_hit_for_test()
             .expect("summary edge must record a window-coord hit");
         assert_eq!(
             hit.zone,
-            BarHitZone::RollupEdge,
-            "3px inside a summary end must be rollup-edge, got {}",
+            BarHitZone::ResizeEnd,
+            "3px inside a summary end must be resize-end, got {}",
             hit.zone.as_str()
         );
     });
@@ -4852,7 +4921,7 @@ fn summary_edge_does_not_silently_move(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn selected_summary_edge_overlay_does_not_start_a_move(cx: &mut gpui_kit::TestAppContext) {
+fn selected_parent_start_grip_resizes_instead_of_moving(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
@@ -4864,24 +4933,31 @@ fn selected_summary_edge_overlay_does_not_start_a_move(cx: &mut gpui_kit::TestAp
     });
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-1").expect("summary bar");
-    // Inner 1px of the 8px start overlay: the 2px selection border would
-    // reclassify this as Move if overlay mouse-down went through hit_zone.
+    // Inner 1px of the 8px start grip: the 2px selection border must not
+    // turn this into Move.
     let inner = point(bar.origin.x + px(7.), bar.origin.y + bar.size.height / 2.0);
     cx.simulate_mouse_down(inner, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
-        assert!(
-            view.state.gantt.gesture.is_none(),
-            "selected summary-edge overlay must not start a move, got {:?}",
-            view.state.gantt.gesture.as_ref().map(|g| g.kind)
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("selected parent start grip must resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeStart,
+            "inner start grip must be ResizeStart, got {:?}",
+            gesture.kind
         );
         let hit = view
             .last_bar_hit_for_test()
-            .expect("overlay press must record a rollup-edge hit");
+            .expect("grip press must record a resize-start hit");
         assert_eq!(
             hit.zone,
-            BarHitZone::RollupEdge,
-            "forced overlay press must stay rollup-edge, got {}",
+            BarHitZone::ResizeStart,
+            "forced grip press must stay resize-start, got {}",
             hit.zone.as_str()
         );
     });
@@ -5270,6 +5346,57 @@ fn drop_undo_and_pointer_leave_clear_the_bar_tooltip(cx: &mut gpui_kit::TestAppC
     assert!(
         cx.debug_bounds("gantt-bar-tooltip").is_none(),
         "a stale tooltip must not stay painted over empty space"
+    );
+}
+
+#[gpui_kit::test]
+fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let grip = point(
+        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    let dest = point(grip.x + px(ppd * 5.0), grip.y);
+    cx.simulate_mouse_move(dest, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 2).expect("leaf");
+        let tip = bar_hover_tooltip(bar, &view.state.nodes);
+        assert!(
+            !tip.contains("Jul 20"),
+            "a live drag tooltip must not keep the pre-drag Target Date, got {tip:?}"
+        );
+    });
+    cx.simulate_mouse_up(dest, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "mouse-up must not pin the pre-drag tooltip"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-bar-tooltip").is_none(),
+        "a stale pinned tooltip must not remain after drop"
     );
 }
 

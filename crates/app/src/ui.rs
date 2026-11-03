@@ -46,11 +46,11 @@ use crate::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH,
     DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
     LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W,
-    NUDGE_IDLE_MS, NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W,
-    SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H,
-    TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside,
-    header_label_px, parent_date_overflow, parent_overflow_tip, timeline_is_empty_of_scheduled,
-    today_pill_left,
+    NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP, PLACEHOLDER_BAR_H, ROW_HEIGHT,
+    SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H,
+    SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT,
+    bar_hover_tooltip, bar_title_is_inside, header_label_px, parent_date_overflow,
+    parent_overflow_tip, timeline_is_empty_of_scheduled, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -4404,6 +4404,9 @@ impl PlannerView {
                     .children(bars.iter().filter_map(|bar| {
                         self.render_open_ended_cue(bar, cx)
                     }))
+                    .children(bars.iter().filter_map(|bar| {
+                        self.render_parent_overflow_badge(bar, cx)
+                    }))
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
                             if gesture.kind != GestureKind::Link {
@@ -4541,7 +4544,14 @@ impl PlannerView {
                             .map(|(index, (x, label))| {
                                 let selector = format!("gantt-tick-{index}");
                                 let next = ticks.get(index + 1).map(|(nx, _)| *nx).unwrap_or(width);
-                                let cap = if *x < today_label_x && today_label_x < next {
+                                // Year/Quarter ticks sit on the row below Today.
+                                // Capping their width to the pill hid "Nov".
+                                let cap = if matches!(
+                                    self.state.gantt.scale,
+                                    GanttScale::Year | GanttScale::Quarter
+                                ) {
+                                    next
+                                } else if *x < today_label_x && today_label_x < next {
                                     (today_label_x - 4.0).max(*x)
                                 } else {
                                     next
@@ -4679,19 +4689,12 @@ impl PlannerView {
         let progress_w =
             (bar.width.max(8.0) * progress_value).max(if progress_value > 0.0 { 4.0 } else { 0.0 });
         let visible_progress_w = (progress_w - clip_pad).max(0.0);
-        let inner_label_fg = inner_bar_label_color(bar.color);
+        let inner_label_fg = painted_bar_title_color(bar);
         let bar_selector = format!("gantt-bar-{id}");
         let progress_selector = format!("gantt-bar-progress-{id}");
         let painted_bars = self.painted_bar_bounds.clone();
         let layout_x = bar.x;
         let grip_w = bar.inner_grip_width();
-        let overflow = parent_date_overflow(&self.state.nodes, id);
-        let overflow_tip = if overflow {
-            parent_overflow_tip(&self.state.nodes, id)
-                .unwrap_or_else(|| "Outside parent's dates".to_string())
-        } else {
-            String::new()
-        };
         // on_prepaint reports the content box; hits use the visible border box.
         let paint_border = if milestone || marker || unscheduled || no_fields || open_ended {
             0.0
@@ -4906,7 +4909,10 @@ impl PlannerView {
                     this.set_bar_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
                 .when(
-                    !self.details_overlay() && self.state.gantt.pin_bar_tooltip != Some(id),
+                    !dragging
+                        && !self.state.gantt.hover_locked
+                        && !self.details_overlay()
+                        && self.state.gantt.pin_bar_tooltip != Some(id),
                     |el| {
                         let tip = bar_hover_tooltip(bar, &self.state.nodes);
                         el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
@@ -4995,39 +5001,6 @@ impl PlannerView {
                 )
                 .into_any_element(),
         ];
-        if overflow {
-            let painted_w = if milestone || marker {
-                MILESTONE_SIZE
-            } else {
-                bar.width.max(8.0)
-            };
-            const BADGE: f32 = 14.0;
-            let overflow_tip = overflow_tip.clone();
-            let warn = cx.theme().warning;
-            // Past the painted end so Month slivers stay unclipped, the
-            // 8px end grip keeps hits, and the glyph is a readable 14px.
-            items.push(
-                div()
-                    .id(("gantt-overflow", id as u64))
-                    .debug_selector(|| "gantt-parent-overflow".into())
-                    .absolute()
-                    .left(px(bar.x + painted_w + 2.0))
-                    .top(px(bar_top + ((bar_h - BADGE) / 2.0).max(0.0)))
-                    .size(px(BADGE))
-                    .rounded_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(warn)
-                    .text_color(cx.theme().background)
-                    .text_xs()
-                    .font_weight(gpui_kit::FontWeight::BOLD)
-                    .occlude()
-                    .tooltip(move |window, cx| Tooltip::new(overflow_tip.clone()).build(window, cx))
-                    .child("!")
-                    .into_any_element(),
-            );
-        }
         if self.state.gantt.pin_bar_tooltip == Some(id) && !dragging && !self.details_overlay() {
             let tip = bar_hover_tooltip(bar, &self.state.nodes);
             items.push(
@@ -5260,9 +5233,15 @@ impl PlannerView {
         let show_dot = hovered && !dragging;
         let (local_left, local_right) = self.painted_timeline_edges(bar);
         // Inner 8px grips resize both ends. These circles sit fully outside
-        // the bar (monday.com connectors) and always start a link.
+        // the bar (monday.com connectors) and always start a link. Skip past
+        // the overflow ! so the badge wins hits and the end grip stays free.
         let start_x = local_left - LINK_HANDLE_HIT - 2.0;
-        let end_x = local_right + 4.0;
+        let overflow_pad = if parent_date_overflow(&self.state.nodes, id) {
+            OVERFLOW_BADGE + OVERFLOW_BADGE_GAP + 4.0
+        } else {
+            4.0
+        };
+        let end_x = local_right + overflow_pad;
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
         let handles =
             [("link-start", start_x), ("link-end", end_x)].map(|(handle_id, handle_x)| {
@@ -5481,6 +5460,50 @@ impl PlannerView {
         Some((label_x, max_w))
     }
 
+    fn render_parent_overflow_badge(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let id = bar.id;
+        if !parent_date_overflow(&self.state.nodes, id) {
+            return None;
+        }
+        let overflow_tip = parent_overflow_tip(&self.state.nodes, id)
+            .unwrap_or_else(|| "Outside parent's dates".to_string());
+        let painted_w = if bar.milestone || bar.marker {
+            MILESTONE_SIZE
+        } else {
+            bar.width.max(8.0)
+        };
+        let warn = cx.theme().warning;
+        Some(
+            div()
+                .id(("gantt-overflow", id as u64))
+                .debug_selector(|| "gantt-parent-overflow".into())
+                .absolute()
+                .left(px(bar.x + painted_w + OVERFLOW_BADGE_GAP))
+                .top(px(bar.y + ((ROW_HEIGHT - OVERFLOW_BADGE) / 2.0).max(0.0)))
+                .w(px(OVERFLOW_BADGE))
+                .h(px(OVERFLOW_BADGE))
+                .min_w(px(OVERFLOW_BADGE))
+                .min_h(px(OVERFLOW_BADGE))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(warn)
+                .text_color(cx.theme().background)
+                .text_sm()
+                .line_height(gpui_kit::relative(1.))
+                .font_weight(gpui_kit::FontWeight::BOLD)
+                .occlude()
+                .tooltip(move |window, cx| Tooltip::new(overflow_tip.clone()).build(window, cx))
+                .child("!")
+                .into_any_element(),
+        )
+    }
+
     fn render_gantt_bar_label(
         &self,
         bar: &crate::gantt::BarLayout,
@@ -5497,8 +5520,15 @@ impl PlannerView {
         }
         let timeline_w = self.state.gantt.timeline_width.max(1.0);
         let today_x = self.state.gantt.today_x(jiff::Zoned::now().date());
+        let cramped = matches!(
+            self.state.gantt.scale,
+            GanttScale::Quarter | GanttScale::Year
+        );
         let (label_x, max_w) =
             Self::bar_external_label_frame(bar, timeline_w, true, Some(today_x))?;
+        if cramped && max_w < 56.0 {
+            return None;
+        }
         let label = bar.title.clone();
         Some(
             div()
@@ -8508,10 +8538,20 @@ fn inner_bar_label_color(color: u32) -> gpui_kit::Hsla {
     let g = ((color >> 8) & 0xff) as f32 / 255.0;
     let b = (color & 0xff) as f32 / 255.0;
     let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    if lum > 0.62 {
+    if lum > 0.55 {
         gpui_kit::hsla(0., 0., 0.10, 1.)
     } else {
         gpui_kit::hsla(0., 0., 0.98, 1.)
+    }
+}
+
+fn painted_bar_title_color(bar: &crate::gantt::BarLayout) -> gpui_kit::Hsla {
+    // Open-ended and summary bars paint a wash, not the solid type color.
+    // Using the saturated type color keeps "Cart UI" readable on Day/Week.
+    if bar.open_ended || bar.summary {
+        rgb(bar.color).into()
+    } else {
+        inner_bar_label_color(bar.color)
     }
 }
 
@@ -8926,6 +8966,17 @@ mod bar_label_tests {
         assert!(
             PlannerView::bar_external_label_frame(&bar, 800.0, false, None).is_none(),
             "must not float the title over the grid to the left of a clipped bar"
+        );
+        let cart = BarLayout {
+            id: 1002,
+            x: -80.0,
+            width: 156.0,
+            title: "Cart".into(),
+            ..bar
+        };
+        assert!(
+            !PlannerView::bar_title_fits_inside(&cart),
+            "a clipped Quarter Cart sliver must not pin its title on top of Checkout rewrite"
         );
     }
 
