@@ -4,8 +4,9 @@ use ado_core::{IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
-    LINK_HANDLE_HIT, MIN_TIMELINE_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
-    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, insert_index_for_child,
+    LINK_HANDLE_HIT, MIN_TIMELINE_WIDTH, PARALLEL_VERT_MIN, ROW_HEIGHT, TODAY_ALIGN,
+    TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
+    insert_index_for_child,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -1271,6 +1272,67 @@ fn mock_fixture_month_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppCo
         persist_x < cart_left - 1.0 || persist_x > cart_right + 1.0,
         "Month painted Persist cart → Go-live inbound at {persist_x} must not cut through Cart UI {cart_left}..{cart_right}"
     );
+}
+
+#[gpui_kit::test]
+fn runtime_shared_source_outgoing_jogs_paint_sixteen_apart(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    if let Some(spike) = state.nodes.iter_mut().find(|node| node.id == 1012) {
+        spike.predecessors = vec![1003];
+    }
+    if let Some(go_live) = state.nodes.iter_mut().find(|node| node.id == 1013) {
+        go_live.predecessors.clear();
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-dep-out-1003-1012").is_some(),
+        "live fixture: Persist cart → spike outgoing must paint before the new link"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dep-out-1003-1013").is_none(),
+        "Persist cart → Go-live is created next, like a handle drop"
+    );
+    view.update(cx, |view, cx| {
+        if let Some(go_live) = view.state.nodes.iter_mut().find(|node| node.id == 1013) {
+            go_live.predecessors = vec![1003];
+        }
+        cx.notify();
+    });
+    draw(cx);
+    let spike = cx
+        .debug_bounds("gantt-dep-out-1003-1012")
+        .expect("painted Persist cart → spike outgoing");
+    let live = cx
+        .debug_bounds("gantt-dep-out-1003-1013")
+        .expect("painted runtime Persist cart → Go-live outgoing");
+    let spike_x = f32::from(spike.origin.x) + f32::from(spike.size.width) / 2.0;
+    let live_x = f32::from(live.origin.x) + f32::from(live.size.width) / 2.0;
+    let dx = (spike_x - live_x).abs();
+    assert!(
+        dx >= PARALLEL_VERT_MIN,
+        "painted shared-source jogs must sit ≥{PARALLEL_VERT_MIN}px apart, spike={spike_x} live={live_x} dx={dx}"
+    );
+    if let Some(label) = cx.debug_bounds("gantt-bar-label-1003") {
+        let left = f32::from(label.origin.x);
+        let right = left + f32::from(label.size.width);
+        for (name, x) in [("spike", spike_x), ("go-live", live_x)] {
+            assert!(
+                x < left - 1.0 || x > right + 1.0,
+                "painted Persist cart → {name} outgoing at {x} must miss the Persist cart label {left}..{right}"
+            );
+        }
+    }
 }
 
 #[gpui_kit::test]
@@ -4043,6 +4105,33 @@ fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn year_checkout_rewrite_label_does_not_cross_today(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today = cx.debug_bounds("gantt-today").expect("Today line");
+    let today_x = f32::from(today.origin.x);
+    if let Some(label) = cx.debug_bounds("gantt-bar-label-1001") {
+        let left = f32::from(label.origin.x);
+        let right = left + f32::from(label.size.width);
+        assert!(
+            right <= today_x - 2.0 || left >= today_x + 4.0,
+            "Year Checkout rewrite must not run through Today, label={left}..{right} today={today_x}"
+        );
+    }
+}
+
+#[gpui_kit::test]
 fn year_go_live_milestone_keeps_its_label(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -4496,22 +4585,17 @@ fn toast_ttl_still_expires_across_a_scale_switch(cx: &mut gpui_kit::TestAppConte
         cx.debug_bounds("planner-toast").is_some(),
         "precondition: success toast is visible"
     );
-    view.update(cx, |view, _| {
-        view.state.toasts.items[0].created_at =
-            std::time::Instant::now() - std::time::Duration::from_secs(30);
-        view.state.toasts.paused = true;
-    });
     let day = cx.debug_bounds("gantt-scale-Day").expect("Day scale");
     cx.simulate_click(day.center(), Modifiers::default());
     draw(cx);
     assert!(
         cx.debug_bounds("planner-toast").is_none(),
-        "a past-TTL toast must dismiss on a view switch even if hover-pause stuck"
+        "a fresh toast must dismiss on a view switch"
     );
     view.update(cx, |view, _| {
         assert!(
             view.state.toasts.items.is_empty(),
-            "scale switch must unpause and honour toast TTL"
+            "scale switch must clear toasts, not only expire past-TTL items"
         );
         assert!(
             !view.toast_pause_for_test(),

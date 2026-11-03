@@ -3,10 +3,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const TOAST_CAP: usize = 2;
-const SUCCESS_TTL: Duration = Duration::from_secs(5);
-const UNDO_TTL: Duration = Duration::from_secs(8);
-const WARNING_TTL: Duration = Duration::from_secs(5);
-const ERROR_TTL: Duration = Duration::from_secs(8);
+const TOAST_TTL: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -255,13 +252,13 @@ impl Toasts {
         let _ = self.take(id);
     }
 
-    fn ttl(toast: &Toast) -> Duration {
-        match toast.kind {
-            ToastKind::Error => ERROR_TTL,
-            ToastKind::Warning => WARNING_TTL,
-            ToastKind::Success if toast.undo.is_some() || toast.redo.is_some() => UNDO_TTL,
-            ToastKind::Success => SUCCESS_TTL,
-        }
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.paused = false;
+    }
+
+    fn ttl() -> Duration {
+        TOAST_TTL
     }
 
     pub fn expire(&mut self) {
@@ -274,7 +271,7 @@ impl Toasts {
         }
         let now = Instant::now();
         self.items
-            .retain(|toast| now.saturating_duration_since(toast.created_at) < Self::ttl(toast));
+            .retain(|toast| now.saturating_duration_since(toast.created_at) < Self::ttl());
         self.cap();
     }
 
@@ -358,16 +355,19 @@ mod tests {
     fn success_toasts_expire_after_five_seconds() {
         let mut toasts = Toasts::default();
         toasts.push(ToastKind::Success, "Saved");
-        toasts.items[0].created_at = Instant::now() - Duration::from_millis(4_500);
+        toasts.items[0].created_at = Instant::now() - (TOAST_TTL - Duration::from_millis(500));
         toasts.expire();
         assert_eq!(
             toasts.items.len(),
             1,
-            "a 4.5s success toast must still show"
+            "a success toast must still show just before TTL"
         );
-        toasts.items[0].created_at = Instant::now() - Duration::from_secs(5);
+        toasts.items[0].created_at = Instant::now() - TOAST_TTL;
         toasts.expire();
-        assert!(toasts.items.is_empty(), "success toasts dismiss at ~5s");
+        assert!(
+            toasts.items.is_empty(),
+            "success toasts dismiss at {TOAST_TTL:?}"
+        );
     }
 
     #[test]
@@ -382,18 +382,18 @@ mod tests {
                 rev: 1,
             },
         );
-        toasts.items[0].created_at = Instant::now() - Duration::from_secs(7);
+        toasts.items[0].created_at = Instant::now() - (TOAST_TTL - Duration::from_millis(500));
         toasts.expire();
         assert_eq!(
             toasts.items.len(),
             1,
-            "an undo toast with an action button stays through 7s"
+            "an undo toast with an action button stays just before TTL"
         );
-        toasts.items[0].created_at = Instant::now() - Duration::from_secs(8);
+        toasts.items[0].created_at = Instant::now() - TOAST_TTL;
         toasts.expire();
         assert!(
             toasts.items.is_empty(),
-            "undo toasts with an action dismiss at ~8s"
+            "undo toasts with an action dismiss at {TOAST_TTL:?}"
         );
     }
 
@@ -508,15 +508,15 @@ mod tests {
     fn every_toast_kind_expires_at_its_ttl() {
         let mut success = Toasts::default();
         success.push(ToastKind::Success, "Saved");
-        assert_expires("success", success, SUCCESS_TTL);
+        assert_expires("success", success, TOAST_TTL);
 
         let mut warning = Toasts::default();
         warning.push(ToastKind::Warning, "Nudge");
-        assert_expires("warning", warning, WARNING_TTL);
+        assert_expires("warning", warning, TOAST_TTL);
 
         let mut error = Toasts::default();
         error.push(ToastKind::Error, "rev mismatch");
-        assert_expires("error", error, ERROR_TTL);
+        assert_expires("error", error, TOAST_TTL);
 
         let mut undo = Toasts::default();
         undo.push_undo(
@@ -528,11 +528,11 @@ mod tests {
                 rev: 1,
             },
         );
-        assert_expires("undo", undo, UNDO_TTL);
+        assert_expires("undo", undo, TOAST_TTL);
 
         let mut redo = Toasts::default();
         redo.push_stack("Undone", None, Some(UndoAction::StackRedo));
-        assert_expires("redo", redo, UNDO_TTL);
+        assert_expires("redo", redo, TOAST_TTL);
     }
 
     #[test]

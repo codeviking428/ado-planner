@@ -1116,12 +1116,11 @@ impl PlannerView {
 
     fn animate_gantt(&mut self, cx: &mut Context<Self>, apply: impl FnOnce(&mut GanttView)) {
         self.state.gantt.clear_hover();
-        // Scale/zoom remounts the toast stack and can drop the hover-leave, which
-        // used to leave `paused` stuck and freeze TTL across view switches.
+        // Scale/zoom remounts the toast stack. Drop every toast so a fresh
+        // success/undo does not survive a Day/Week/… click, and unstick pause.
         self.toast_hover_depth = 0;
         self.toast_pause_ready = false;
-        self.state.toasts.paused = false;
-        self.state.toasts.expire();
+        self.state.toasts.clear();
         self.toast_expiry_gen += 1;
         self.toast_expiry_armed = false;
         self.schedule_toast_expiry(cx);
@@ -1252,7 +1251,7 @@ impl PlannerView {
 
     fn set_bar_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
         if let Some(hovered) = id {
-            self.release_pin_if_other_row(hovered, cx);
+            self.note_hit_target(hovered, cx);
         }
         if id.is_none() {
             if self.state.gantt.pin_bar_tooltip.is_some() {
@@ -1278,7 +1277,7 @@ impl PlannerView {
 
     fn set_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
         if let Some(hovered) = id {
-            self.release_pin_if_other_row(hovered, cx);
+            self.note_hit_target(hovered, cx);
         }
         let linking = self
             .state
@@ -5491,8 +5490,7 @@ impl PlannerView {
         };
         let estimated = title_width.max(24.0);
         let right_x = bar_right + label_gap;
-        let left_x = bar.x - estimated - 6.0;
-        let mut label_x = right_x;
+        let label_x = right_x;
         if label_x >= timeline_w - 8.0 {
             // Don't pull the title onto the handle/`!`. Hide the fragment.
             return None;
@@ -5508,18 +5506,12 @@ impl PlannerView {
             let label_right = label_x + estimated.min(max_w);
             if label_x < today && label_right > today - 4.0 {
                 let before = (today - 8.0 - label_x).max(0.0);
-                let after = today + 8.0;
-                if before >= estimated {
+                if before >= MIN_OUTSIDE {
                     max_w = before;
-                } else if after + 24.0 < timeline_w {
-                    // Don't clip to a letter: jump past Today and keep the title.
-                    label_x = after;
-                    max_w = (timeline_w - label_x - 4.0).max(24.0);
-                } else if left_x >= 0.0 && left_x + estimated <= today - 4.0 {
-                    label_x = left_x;
-                    max_w = (today - 8.0 - label_x).max(24.0);
                 } else {
-                    max_w = before.max(estimated);
+                    // Don't jump past Today (Year "Checkout rewrite") and
+                    // don't draw through the line as a clipped letter.
+                    return None;
                 }
             }
         }
@@ -5637,10 +5629,12 @@ impl PlannerView {
                 .child("!")
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
+                        this.note_hit_target(id, cx);
                         this.set_hovered(Some(id), cx);
                     }
                 }))
                 .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    this.note_hit_target(id, cx);
                     this.set_hovered(Some(id), cx);
                     let x: f32 = event.position.x.into();
                     let y: f32 = event.position.y.into();
@@ -5658,7 +5652,14 @@ impl PlannerView {
                         .occlude()
                         .tooltip(overflow_tip)
                         .tooltip_placement(Placement::Right)
-                        .tooltip_show_delay(Duration::ZERO),
+                        .tooltip_show_delay(Duration::ZERO)
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            this.note_hit_target(id, cx);
+                            this.set_hovered(Some(id), cx);
+                            let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            this.clear_pinned_tooltip_if_pointer_left(x, y, cx);
+                        })),
                 )
                 .into_any_element(),
         )
@@ -5757,19 +5758,13 @@ impl PlannerView {
         }
         let timeline_w = self.state.gantt.timeline_width.max(1.0);
         let today_x = self.state.gantt.today_x(jiff::Zoned::now().date());
-        let cramped = matches!(
-            self.state.gantt.scale,
-            GanttScale::Quarter | GanttScale::Year
-        );
         let overflow = parent_date_overflow(&self.state.nodes, id);
-        // Year/Quarter slivers jump to the Today line when dodged, leaving
-        // the title detached from its bar. Keep the chip on the bar.
-        let today_for_label = if cramped { None } else { Some(today_x) };
+        // Year/Quarter used to skip Today so slivers would not jump off the
+        // bar; clip/hide before Today instead so "Checkout rewrite" cannot
+        // run through the line. `bar_external_label_frame` already hides
+        // when the remainder is under MIN_OUTSIDE (40px).
         let (label_x, max_w) =
-            Self::bar_external_label_frame(bar, timeline_w, true, today_for_label, overflow)?;
-        if cramped && !bar.milestone && max_w < 56.0 {
-            return None;
-        }
+            Self::bar_external_label_frame(bar, timeline_w, true, Some(today_x), overflow)?;
         let label = bar.title.clone();
         Some(
             div()
@@ -6119,6 +6114,9 @@ impl PlannerView {
                 },
             )
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.note_hit_target(0, cx);
+                }
                 this.state.gantt.hovered_link = if *hovered {
                     Some((from_id, to_id))
                 } else if this.state.gantt.hovered_link == Some((from_id, to_id)) {
@@ -6195,6 +6193,9 @@ impl PlannerView {
             .line_height(gpui_kit::relative(1.))
             .text_color(color)
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.note_hit_target(0, cx);
+                }
                 this.state.gantt.hovered_link = if *hovered {
                     Some((from_id, to_id))
                 } else if this.state.gantt.hovered_link == Some((from_id, to_id)) {
@@ -7526,14 +7527,10 @@ impl PlannerView {
         }
     }
 
-    fn release_pin_if_other_row(&mut self, hovered: i64, cx: &mut Context<Self>) {
-        if self
-            .state
-            .gantt
-            .pin_bar_tooltip
-            .is_some_and(|pin| pin != hovered)
-        {
-            self.release_pinned_tooltip(cx);
+    fn note_hit_target(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self.state.gantt.note_hit_target(id) {
+            self.pinned_tooltip_bounds.borrow_mut().take();
+            cx.notify();
         }
     }
 
@@ -9393,6 +9390,39 @@ mod bar_label_tests {
         assert!(
             !PlannerView::bar_title_fits_inside(&cart),
             "a clipped Quarter Cart sliver must not pin its title on top of Checkout rewrite"
+        );
+    }
+
+    #[test]
+    fn year_checkout_rewrite_label_stops_before_today() {
+        let bar = BarLayout {
+            id: 1001,
+            kind: GanttBarKind::Scheduled,
+            x: 40.0,
+            width: 136.0,
+            y: 0.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Checkout rewrite".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let today_x = 250.0;
+        let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false);
+        if let Some((label_x, max_w)) = frame {
+            assert!(
+                label_x + max_w <= today_x - 4.0,
+                "Year Checkout rewrite must not run through Today, label={label_x}+{max_w} today={today_x}"
+            );
+        }
+        let crossing = PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(220.0), false);
+        assert!(
+            crossing.is_none() || crossing.is_some_and(|(x, w)| x + w <= 220.0 - 4.0),
+            "a title that cannot fit before Today must hide instead of jumping through it, got {crossing:?}"
         );
     }
 
