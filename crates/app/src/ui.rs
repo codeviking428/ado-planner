@@ -5691,7 +5691,7 @@ impl PlannerView {
         let today = jiff::Zoned::now().date();
         let today_px = self.state.gantt.x_for_date(today);
         let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
-        let overflow = parent_date_overflow(&self.state.nodes, id);
+        let overflow = bar.overflow_badge;
         // Full title beside a sliver. Prefer the right; flip left when the
         // full glyphs cannot sit on the right (clip or Today); last resort
         // still paints the full title (never "Pers…").
@@ -9317,6 +9317,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: true,
             open_ended: false,
+            overflow_badge: false,
         };
         assert!(
             PlannerView::bar_external_label_frame(&bar, 800.0, false, None, false).is_none(),
@@ -9341,6 +9342,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -9382,6 +9384,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = 250.0;
@@ -9423,6 +9426,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let summary = BarLayout {
             id: 2,
@@ -9458,6 +9462,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -9488,6 +9493,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
@@ -9525,6 +9531,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -9567,6 +9574,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -9611,6 +9619,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let diamond_right = bar.x + MILESTONE_SIZE;
         let estimated = bar_title_paint_px(&bar.title);
@@ -9656,6 +9665,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let diamond_right = bar.x + MILESTONE_SIZE;
@@ -9695,6 +9705,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = 400.0;
@@ -9737,6 +9748,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
@@ -9783,6 +9795,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + MILESTONE_SIZE + 6.0;
@@ -9831,6 +9844,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let diamond_right = bar.x + MILESTONE_SIZE;
@@ -9864,6 +9878,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: true,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = 604.0;
@@ -9897,6 +9912,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let (label_x, max_w) =
@@ -9953,6 +9969,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, None, true);
         if let Some((label_x, max_w)) = frame {
@@ -9984,6 +10001,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let bar_right = bar.x + bar.width.max(8.0);
@@ -10021,6 +10039,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
@@ -10077,6 +10096,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let persist = BarLayout {
             id: 1003,
@@ -10106,6 +10126,7 @@ mod bar_label_tests {
         );
         let cart_ui = BarLayout {
             open_ended: true,
+            overflow_badge: false,
             progress: None,
             ..spike.clone()
         };
@@ -10120,6 +10141,7 @@ mod bar_label_tests {
             title: "Cart".into(),
             color: 0xa6e3a1,
             open_ended: false,
+            overflow_badge: false,
             ..spike.clone()
         };
         let ink = painted_bar_title_color(&cart, canvas);
@@ -10143,6 +10165,7 @@ mod bar_label_tests {
             title: "Persist cart".into(),
             color: 0xa6e3a1,
             open_ended: false,
+            overflow_badge: false,
             ..spike.clone()
         };
         let ink = painted_bar_title_color(&persist_summary, mocha);
@@ -10170,6 +10193,7 @@ mod bar_label_tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: true,
+            overflow_badge: false,
         };
         assert!(
             PlannerView::bar_title_fits_inside(&bar),

@@ -405,6 +405,8 @@ pub struct BarLayout {
     pub marker: bool,
     /// Start-only used to paint as a ▸ marker; kept for hit-test compat.
     pub open_ended: bool,
+    /// Parent-overflow `!` is painted; outside titles use the wider gap.
+    pub overflow_badge: bool,
 }
 
 impl BarLayout {
@@ -1515,6 +1517,7 @@ impl GanttView {
                         predecessors: node.predecessors.clone(),
                         marker: false,
                         open_ended: false,
+                        overflow_badge: false,
                     });
                 } else if display.kind == GanttBarKind::Unscheduled {
                     // Gutter pill, not a fake iteration/rollup bar and not a
@@ -1577,6 +1580,7 @@ impl GanttView {
                     predecessors: node.predecessors.clone(),
                     marker,
                     open_ended,
+                    overflow_badge: parent_date_overflow(nodes, node.id),
                 })
             })
             .collect()
@@ -2442,6 +2446,7 @@ impl GanttView {
             clip_left,
             clip_right,
             today_x,
+            timeline_w,
         );
         separate_parallel_verticals(&mut out, clip_left, clip_right);
         separate_shared_source_outgoing(&mut out, clip_left, clip_right);
@@ -2698,6 +2703,7 @@ fn dodge_forward_inbounds_off_intervening(
     clip_left: f32,
     clip_right: f32,
     today_x: Option<f32>,
+    timeline_w: f32,
 ) {
     let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
     for arrow in arrows.iter_mut() {
@@ -2723,7 +2729,15 @@ fn dodge_forward_inbounds_off_intervening(
         }
         let blocked: Vec<(f32, f32)> = intervening
             .iter()
-            .map(|bar| bar_occupied_x(bar, include_labels, Some(clip_right), today_x))
+            .map(|bar| {
+                bar_occupied_x_on(
+                    bar,
+                    include_labels,
+                    Some(clip_right),
+                    today_x,
+                    Some(timeline_w),
+                )
+            })
             .collect();
         let slide_left = |x: f32| -> f32 {
             let mut x = x.clamp(clip_left, clip_right);
@@ -2831,7 +2845,8 @@ fn bar_outside_title_span_clipped(
     if bar_is_gutter(bar) {
         return None;
     }
-    let (left, width) = bar_outside_label_frame(bar, timeline_w, true, today_x, false)?;
+    let (left, width) =
+        bar_outside_label_frame(bar, timeline_w, true, today_x, bar.overflow_badge)?;
     Some((left, left + width))
 }
 
@@ -3442,6 +3457,16 @@ fn bar_occupied_x(
     cue_right: Option<f32>,
     today_x: Option<f32>,
 ) -> (f32, f32) {
+    bar_occupied_x_on(bar, include_label, cue_right, today_x, None)
+}
+
+fn bar_occupied_x_on(
+    bar: &BarLayout,
+    include_label: bool,
+    cue_right: Option<f32>,
+    today_x: Option<f32>,
+    label_timeline_w: Option<f32>,
+) -> (f32, f32) {
     if bar_is_gutter(bar) {
         return (bar.x - 2.0, bar.x + bar.width + 4.0);
     }
@@ -3456,10 +3481,12 @@ fn bar_occupied_x(
         bar.x + bar.width.max(8.0) + 4.0
     };
     if include_label {
-        let timeline_w = cue_right.unwrap_or(10_000.0).max(1.0);
-        if let Some((x, w)) = bar_outside_label_frame(bar, timeline_w, true, today_x, false) {
-            left = left.min(x);
-            right = right.max(x + w);
+        // Label frame uses the painted timeline, not the arrow inset clip
+        // (`timeline_width - 10`) passed as `cue_right` after clip.
+        let timeline_w = label_timeline_w.or(cue_right).unwrap_or(10_000.0).max(1.0);
+        if let Some((x0, x1)) = bar_outside_title_span_clipped(bar, timeline_w, today_x) {
+            left = left.min(x0);
+            right = right.max(x1);
         } else {
             right = right.max(bar_label_right(bar));
         }
@@ -4024,6 +4051,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let bars = [bar.clone()];
         assert_eq!(
@@ -4166,6 +4194,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let (end_x, end_w) = resize_end_handle(&bar);
         let link_x = bar.x + bar.width + HANDLE_WIDTH;
@@ -4584,6 +4613,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         assert_eq!(bar_offscreen_edge(&on_screen, 512.0), None);
         let peeking = BarLayout {
@@ -4642,6 +4672,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let (x, w, label, side) =
             offscreen_edge_chip(&go_live, 512.0).expect("Go-live past the clip must show a cue");
@@ -4854,6 +4885,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: true,
+            overflow_badge: false,
         };
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&bar), 176.0, 4.0).map(|(_, kind)| kind),
@@ -4883,6 +4915,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: true,
+            overflow_badge: false,
         };
         assert_eq!(
             GanttView::hit_test_bar(
@@ -6542,6 +6575,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         assert!(
             bar_outside_title_span_clipped(&pill, 800.0, None).is_none(),
@@ -6570,6 +6604,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
@@ -6610,6 +6645,101 @@ mod tests {
     }
 
     #[test]
+    fn occupancy_covers_an_overflow_badge_flip() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 300.0,
+            width: 24.0,
+            y: 80.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: true,
+        };
+        let estimated = bar_title_paint_px(&bar.title);
+        let right_plain = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let right_badge = bar.x + bar.width.max(8.0) + OUTSIDE_LABEL_GAP;
+        // Room for the no-badge chip, not the `!`+title chip.
+        let today_x = right_plain + estimated + TODAY_LABEL_CLEARANCE + 8.0;
+        assert!(
+            full_outside_title_fits(right_plain, estimated, 800.0, Some(today_x)),
+            "precondition: no-badge Persist cart still fits before Today"
+        );
+        assert!(
+            !full_outside_title_fits(right_badge, estimated, 800.0, Some(today_x)),
+            "precondition: overflow-badge Persist cart cannot fit before Today"
+        );
+        let (paint_x, paint_w) = bar_outside_label_frame(&bar, 800.0, true, Some(today_x), true)
+            .expect("overflow-badge Today must keep a full Persist cart chip");
+        assert!(
+            paint_x + paint_w <= bar.x + 0.1,
+            "fixture: overflow badge must flip the chip left, paint_x={paint_x} bar.x={}",
+            bar.x
+        );
+        let (occ_left, occ_right) = bar_occupied_x(&bar, true, Some(800.0), Some(today_x));
+        assert!(
+            x_hits_span(paint_x + 8.0, occ_left, occ_right),
+            "occupancy must cover the overflow-flipped letters, paint={paint_x}..{} occ={occ_left}..{occ_right}",
+            paint_x + paint_w
+        );
+    }
+
+    #[test]
+    fn occupancy_uses_the_painted_timeline_not_the_arrow_inset() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 592.0,
+            width: 24.0,
+            y: 80.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        let estimated = bar_title_paint_px(&bar.title);
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        assert!(
+            full_outside_title_fits(right_x, estimated, 800.0, None),
+            "precondition: full title fits on the real 800px timeline"
+        );
+        assert!(
+            !full_outside_title_fits(right_x, estimated, 790.0, None),
+            "precondition: the arrow inset clip (timeline-10) cannot hold the same right chip"
+        );
+        let (paint_x, paint_w) = bar_outside_label_frame(&bar, 800.0, true, None, false)
+            .expect("paint uses the real timeline");
+        assert!(
+            (paint_x - right_x).abs() < 0.5,
+            "fixture: paint keeps the chip on the right, paint_x={paint_x} right_x={right_x}"
+        );
+        let (occ_left, occ_right) = bar_occupied_x_on(&bar, true, Some(790.0), None, Some(800.0));
+        assert!(
+            occ_left <= paint_x + 0.5 && occ_right + 0.5 >= paint_x + paint_w,
+            "post-clip occupancy must match the painted right chip, not a left flip from the inset, occ={occ_left}..{occ_right} paint={paint_x}..{}",
+            paint_x + paint_w
+        );
+        let inset_only = bar_occupied_x(&bar, true, Some(790.0), None);
+        assert!(
+            inset_only.0 < paint_x - 1.0 || inset_only.1 < paint_x + paint_w - 1.0,
+            "precondition: inset-as-timeline occupancy must disagree with paint so the dodge pass needs the real width"
+        );
+    }
+
+    #[test]
     fn today_dodge_does_not_cover_the_bar() {
         let bar = BarLayout {
             id: 1002,
@@ -6626,6 +6756,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
@@ -6884,6 +7015,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         assert_eq!(
             GanttView::hit_test_link_target(std::slice::from_ref(&bar), 200.0, 44.0),
@@ -7812,6 +7944,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let mid1 = BarLayout {
             id: 2,
@@ -7828,6 +7961,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let mid2 = BarLayout {
             id: 3,
@@ -7844,6 +7978,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let blocker = BarLayout {
             id: 5,
@@ -7860,6 +7995,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let succ = BarLayout {
             id: 4,
@@ -7876,6 +8012,7 @@ mod tests {
             predecessors: vec![1],
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
@@ -7943,6 +8080,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let mid = BarLayout {
             id: 2,
@@ -7959,6 +8097,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: true,
+            overflow_badge: false,
         };
         let succ = BarLayout {
             id: 3,
@@ -7975,6 +8114,7 @@ mod tests {
             predecessors: vec![1],
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
@@ -8025,6 +8165,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let pill = BarLayout {
             id: 2,
@@ -8041,6 +8182,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let succ = BarLayout {
             id: 3,
@@ -8057,6 +8199,7 @@ mod tests {
             predecessors: vec![1],
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
@@ -8454,6 +8597,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let mid = BarLayout {
             id: 2,
@@ -8470,6 +8614,7 @@ mod tests {
             predecessors: Vec::new(),
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let succ = BarLayout {
             id: 3,
@@ -8486,6 +8631,7 @@ mod tests {
             predecessors: vec![1],
             marker: false,
             open_ended: false,
+            overflow_badge: false,
         };
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
