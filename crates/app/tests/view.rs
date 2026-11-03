@@ -6446,6 +6446,11 @@ fn add_child_undo_clears_title_focus_ticks(cx: &mut gpui_kit::TestAppContext) {
     );
     cx.update(|window, cx| {
         view.update(cx, |view, _| {
+            assert_eq!(
+                view.state.gantt.selected_id,
+                None,
+                "undo of create must not jump selection to the first row"
+            );
             assert!(
                 view.state.gantt.hovered_id.is_none(),
                 "Undo must not leave hover chrome on the Cart name cell"
