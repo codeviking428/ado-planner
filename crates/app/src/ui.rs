@@ -16,7 +16,6 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::{ElementExt as _, Popup, Selectable};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Disableable;
-use gpui_kit::component::Icon;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::Size;
 use gpui_kit::component::avatar::Avatar;
@@ -33,9 +32,9 @@ use gpui_kit::component::v_flex;
 use gpui_kit::component::{FocusableExt as _, Placement};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, KeystrokeEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Render, Role, ScrollEvent, SharedString,
+    AnyElement, App, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Render, Role, ScrollEvent, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px, rgb,
 };
 use jiff::ToSpan;
@@ -49,8 +48,7 @@ use crate::gantt::{
     LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis,
     PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT,
     SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TODAY_PILL_GAP, TODAY_PILL_W,
-    TREE_INDENT, TYPE_COL_WIDTH, bar_title_is_inside, parent_date_overflow, resize_end_handle,
-    resize_start_handle,
+    TREE_INDENT, TYPE_COL_WIDTH, bar_title_is_inside, parent_date_overflow,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -153,6 +151,9 @@ pub struct PlannerView {
     /// Painted top of `gantt-timeline-body`, used so link-drop hit-testing
     /// matches the row bands instead of the toolbar-sized origin estimate.
     timeline_body_origin_y: Rc<Cell<f32>>,
+    /// Painted left of `gantt-timeline-body`. Tree flex-shrink makes
+    /// `tree_width + splitter` a miss, so bar mouse-down uses this.
+    timeline_body_origin_x: Rc<Cell<Option<f32>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -374,6 +375,7 @@ impl PlannerView {
             pending_toast_undo: None,
             toast_undo_inflight: false,
             timeline_body_origin_y: Rc::new(Cell::new(0.0)),
+            timeline_body_origin_x: Rc::new(Cell::new(None)),
             _subscriptions: vec![keystrokes],
         };
         this.scope_query.update(cx, |input, cx| {
@@ -793,9 +795,11 @@ impl PlannerView {
             return false;
         }
         self.io_busy = true;
+        self.state.gantt.context_menu = None;
         self.arm_saving_status(cx);
         let runtime = self.state.runtime.clone();
-        let working = self.state.clone();
+        let mut working = self.state.clone();
+        working.gantt.context_menu = None;
         let rx = runtime.spawn_result(async move { work(working).await });
         cx.spawn(async move |this, cx| {
             let outcome = rx.await;
@@ -807,6 +811,7 @@ impl PlannerView {
                         let shown_at = this.loading_shown_at;
                         let discard_form = this.form_loading.is_none() && this.state.form.is_none();
                         this.state.adopt_spawned(working);
+                        this.state.gantt.context_menu = None;
                         if discard_form {
                             this.state.form = None;
                         }
@@ -1619,6 +1624,7 @@ impl PlannerView {
         {
             return;
         }
+        self.state.gantt.context_menu = None;
         let original = self.state.history_action_message_for_undo(&action);
         let undid = undone_toast_message(&original);
         if matches!(action, UndoAction::RestoreDates { .. }) {
@@ -1695,6 +1701,7 @@ impl PlannerView {
         if self.history_hotkey_is_duplicate(true) || self.state.history.undo.is_empty() {
             return;
         }
+        self.state.gantt.context_menu = None;
         if let Some(pending) = self.state.undo_dates_now() {
             self.queue_form_dates_from_draft();
             self.enqueue_date_save(cx, pending);
@@ -1737,7 +1744,7 @@ impl PlannerView {
         if mods.control || mods.platform {
             // After invert, wheel-up (negative dy) zooms in, matching the + button.
             let direction = if dy < 0.0 { 1 } else { -1 };
-            let pointer = f32::from(event.position.x) - self.state.gantt.timeline_origin_x;
+            let pointer = self.timeline_local_x(f32::from(event.position.x));
             let timeline_width = self.state.gantt.timeline_width;
             self.animate_gantt(cx, |gantt| {
                 let next = GanttView::next_zoom(gantt.zoom, direction);
@@ -2826,14 +2833,15 @@ impl PlannerView {
                                 div()
                                     .id("gantt-sync-status-icon")
                                     .debug_selector(|| "gantt-sync-status-icon".into())
+                                    .w(px(14.))
+                                    .h(px(14.))
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(
-                                        Icon::new(self.sync_status_icon())
-                                            .with_size(Size::Small)
-                                            .text_color(sync_color),
-                                    ),
+                                    .text_sm()
+                                    .line_height(gpui_kit::relative(1.))
+                                    .text_color(sync_color)
+                                    .child(self.sync_status_glyph()),
                             )
                             .child(sync_label),
                     ),
@@ -2850,6 +2858,7 @@ impl PlannerView {
         if self.io_saving() {
             if self.saving_shown_at.is_none() {
                 self.saving_shown_at = Some(Instant::now());
+                cx.notify();
             }
             self.saving_hold_gen += 1;
             return;
@@ -2899,11 +2908,11 @@ impl PlannerView {
         }
     }
 
-    fn sync_status_icon(&self) -> IconName {
+    fn sync_status_glyph(&self) -> &'static str {
         match self.sync_status_text().as_str() {
-            "Error" => IconName::CircleAlert,
-            "Saving…" | "Loading…" => IconName::Loader,
-            _ => IconName::CloudCheck,
+            "Error" => "⚠",
+            "Saving…" | "Loading…" => "↻",
+            _ => "☁",
         }
     }
 
@@ -3745,6 +3754,11 @@ impl PlannerView {
             .gantt
             .header_tick_labels_except(width, hide_today);
         let today_on_screen = today_x >= 0.0 && today_x <= width;
+        let today_label_top = if matches!(self.state.gantt.scale, GanttScale::Year) {
+            22.0
+        } else {
+            2.0
+        };
         let today_label_x = if today_on_screen {
             if today_x + TODAY_PILL_GAP + TODAY_PILL_W > width - 4.0 {
                 (today_x - TODAY_PILL_W - 4.0).max(4.0)
@@ -3765,7 +3779,7 @@ impl PlannerView {
                 .map(|(index, (x, label))| {
                     let next = filtered.get(index + 1).map(|(nx, _)| *nx).unwrap_or(width);
                     let cap = if *x < today_label_x && today_label_x < next {
-                        today_label_x
+                        (today_label_x - 8.0).max(*x)
                     } else {
                         next
                     };
@@ -3798,7 +3812,8 @@ impl PlannerView {
                 }),
             )
             .child({
-                let body_origin = self.timeline_body_origin_y.clone();
+                let body_origin_y = self.timeline_body_origin_y.clone();
+                let body_origin_x = self.timeline_body_origin_x.clone();
                 div()
                     .id("gantt-timeline-body")
                     .debug_selector(|| "gantt-timeline-body".into())
@@ -3809,7 +3824,8 @@ impl PlannerView {
                     .h(px(content_h))
                     .overflow_hidden()
                     .on_prepaint(move |bounds, _, _| {
-                        body_origin.set(f32::from(bounds.origin.y));
+                        body_origin_y.set(f32::from(bounds.origin.y));
+                        body_origin_x.set(Some(f32::from(bounds.origin.x)));
                     })
                     .children(
                         ticks
@@ -3930,7 +3946,7 @@ impl PlannerView {
                                                 return;
                                             };
                                             let x: f32 = event.position.x.into();
-                                            let local_x = x - this.state.gantt.timeline_origin_x;
+                                            let local_x = this.timeline_local_x(x);
                                             let Some((_, kind)) = GanttView::hit_test_bar(
                                                 std::slice::from_ref(bar),
                                                 local_x,
@@ -3985,9 +4001,6 @@ impl PlannerView {
                     }))
                     .children(bars.iter().filter_map(|bar| {
                         self.render_gantt_link_handles(bar, dragging, cx)
-                    }))
-                    .children(bars.iter().filter_map(|bar| {
-                        self.render_gantt_resize_handles(bar, dragging, cx)
                     }))
                     .child(
                         div()
@@ -4144,7 +4157,7 @@ impl PlannerView {
                         .debug_selector(|| "gantt-today-label".into())
                         .absolute()
                         .left(px(today_label_x))
-                        .top(px(2.))
+                        .top(px(today_label_top))
                         .whitespace_nowrap()
                         .text_xs()
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
@@ -4370,9 +4383,11 @@ impl PlannerView {
                             .bottom_0()
                             .w(px(visible_progress_w))
                             .when(summary, |el| {
-                                el.bg(rgb(bar.color)).tooltip(move |window, cx| {
-                                    Tooltip::new(PROGRESS_ROLLUP_TIP).build(window, cx)
-                                })
+                                el.bg(rgb(bar.color))
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(PROGRESS_ROLLUP_TIP).build(window, cx)
+                                    })
+                                    .tooltip_show_delay(Duration::from_millis(450))
                             })
                             .when(!summary, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.22))),
                     )
@@ -4393,6 +4408,7 @@ impl PlannerView {
                             .child(bar.title.clone()),
                     )
                 })
+                .children(self.bar_inner_resize_grips(bar, dragging, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.set_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
@@ -4426,20 +4442,14 @@ impl PlannerView {
                         if unscheduled {
                             this.dismiss_overlays();
                             let x: f32 = event.position.x.into();
-                            let local_x = x - this.state.gantt.timeline_origin_x;
+                            let local_x = this.timeline_local_x(x);
                             let _ = this.state.begin_bar_gesture(id, GestureKind::Move, local_x);
                             cx.notify();
                             return;
                         }
                         let x: f32 = event.position.x.into();
-                        let local_x = x - this.state.gantt.timeline_origin_x;
-                        let kind = GanttView::hit_test_bar(
-                            std::slice::from_ref(&layout),
-                            local_x,
-                            layout.y + 1.0,
-                        )
-                        .map(|(_, kind)| kind)
-                        .unwrap_or(GestureKind::Move);
+                        let local_x = this.timeline_local_x(x);
+                        let kind = layout.resize_kind_at(local_x).unwrap_or(GestureKind::Move);
                         this.dismiss_overlays();
                         let _ = this.state.begin_bar_gesture(id, kind, local_x);
                         cx.notify();
@@ -4498,15 +4508,16 @@ impl PlannerView {
             .into_any_element()
     }
 
-    /// Paint after bars, labels, and link handles so the end grip wins hit-testing.
-    fn render_gantt_resize_handles(
+    /// Inner 8px of each painted end. Last children of the bar so they win
+    /// mouse-down over the title, progress fill, and bar body.
+    fn bar_inner_resize_grips(
         &self,
         bar: &crate::gantt::BarLayout,
         dragging: bool,
         cx: &Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> Vec<AnyElement> {
         if !bar.can_resize() {
-            return None;
+            return Vec::new();
         }
         let id = bar.id;
         let hovered = self.state.gantt.hovered_id == Some(id);
@@ -4517,44 +4528,27 @@ impl PlannerView {
             .gesture
             .as_ref()
             .is_some_and(|gesture| gesture.kind == GestureKind::Link);
-        let bar_h = bar.paint_h();
-        let bar_top = bar.y + bar.paint_top();
-        let (start_x, start_w) = resize_start_handle(bar);
-        let (end_x, end_w) = resize_end_handle(bar);
-        let handles = [
-            (
-                "start",
-                "resize-start",
-                start_x,
-                start_w,
-                GestureKind::ResizeStart,
-                bar.x,
-            ),
-            (
-                "end",
-                "resize-end",
-                end_x,
-                end_w,
-                GestureKind::ResizeEnd,
-                bar.x + bar.width,
-            ),
+        let grip_w = bar.inner_grip_width();
+        [
+            ("start", "resize-start", true, GestureKind::ResizeStart),
+            ("end", "resize-end", false, GestureKind::ResizeEnd),
         ]
-        .map(|(name, handle_id, handle_x, handle_w, kind, origin)| {
+        .into_iter()
+        .map(|(name, handle_id, at_start, kind)| {
             let selector = format!("gantt-resize-handle-{id}-{name}");
             div()
                 .id((handle_id, id as u64))
-                .when(show_handles, |el| {
-                    el.debug_selector(move || selector.clone())
-                })
+                .debug_selector(move || selector.clone())
                 .absolute()
-                .left(px(handle_x))
-                .top(px(bar_top))
-                .h(px(bar_h))
-                .w(px(handle_w))
+                .when(at_start, |el| el.left_0())
+                .when(!at_start, |el| el.right_0())
+                .top_0()
+                .bottom_0()
+                .w(px(grip_w))
                 .when(!linking, |el| el.occlude())
                 .when(show_handles, |el| el.bg(cx.theme().primary))
                 .when(!show_handles, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.01)))
-                .cursor_ew_resize()
+                .cursor(CursorStyle::ResizeLeftRight)
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_hovered(Some(id), cx);
@@ -4570,22 +4564,16 @@ impl PlannerView {
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        this.continue_or_begin_bar_gesture(id, kind, origin, window, cx);
+                        let x: f32 = event.position.x.into();
+                        let local_x = this.timeline_local_x(x);
+                        this.continue_or_begin_bar_gesture(id, kind, local_x, window, cx);
                     }),
                 )
-        });
-        Some(
-            div()
-                .absolute()
-                .left_0()
-                .top_0()
-                .w(px(0.))
-                .h(px(0.))
-                .children(handles)
-                .into_any_element(),
-        )
+                .into_any_element()
+        })
+        .collect()
     }
 
     /// Paint after arrows so a selected link's × / stub cannot steal the handle.
@@ -6205,8 +6193,8 @@ impl PlannerView {
         }
         let x: f32 = event.position.x.into();
         let y: f32 = event.position.y.into();
-        self.state
-            .update_bar_gesture(x - self.state.gantt.timeline_origin_x);
+        let local_x = self.timeline_local_x(x);
+        self.state.update_bar_gesture(local_x);
         self.arm_link_target_from_pointer(x, y);
         if event.dragging() || event.pressed_button.is_some() {
             self.saw_pressed_drag = true;
@@ -6232,7 +6220,7 @@ impl PlannerView {
             return;
         }
         let source = self.state.gantt.gesture.as_ref().map(|gesture| gesture.id);
-        let local_x = window_x - self.state.gantt.timeline_origin_x;
+        let local_x = self.timeline_local_x(window_x);
         let local_y = self.link_target_local_y(window_y);
         let visible = self.state.visible_nodes();
         let rows = self.state.gantt.flatten(&visible);
@@ -6254,6 +6242,13 @@ impl PlannerView {
         } else {
             window_y - self.state.gantt.timeline_origin_y - TIMELINE_HEADER_H
         }
+    }
+
+    fn timeline_local_x(&mut self, window_x: f32) -> f32 {
+        if let Some(origin) = self.timeline_body_origin_x.get() {
+            self.state.gantt.timeline_origin_x = origin;
+        }
+        window_x - self.state.gantt.timeline_origin_x
     }
 
     fn continue_or_begin_bar_gesture(
@@ -7421,7 +7416,10 @@ impl Render for PlannerView {
         self.state.gantt.viewport_h = (viewport_h - 200.0).max(120.0);
         self.state.gantt.viewport_w = viewport_w;
         self.state.gantt.clamp_tree_width();
-        self.state.gantt.timeline_origin_x = self.state.gantt.tree_width + SPLITTER_WIDTH;
+        self.state.gantt.timeline_origin_x = self
+            .timeline_body_origin_x
+            .get()
+            .unwrap_or(self.state.gantt.tree_width + SPLITTER_WIDTH);
         self.state.gantt.timeline_origin_y = (viewport_h - self.state.gantt.viewport_h).max(0.0);
         if self.state.toasts.items.is_empty() {
             self.toast_hover_depth = 0;
@@ -7464,8 +7462,8 @@ impl Render for PlannerView {
                 if this.state.gantt.gesture.is_some() {
                     let x: f32 = event.position.x.into();
                     let y: f32 = event.position.y.into();
-                    this.state
-                        .update_bar_gesture(x - this.state.gantt.timeline_origin_x);
+                    let local_x = this.timeline_local_x(x);
+                    this.state.update_bar_gesture(local_x);
                     this.arm_link_target_from_pointer(x, y);
                     this.saw_pressed_drag = true;
                     this.commit_gesture(cx);
@@ -7485,6 +7483,7 @@ impl Render for PlannerView {
                     let dragged = this.saw_pressed_drag
                         || origin.is_some_and(|origin| (x - origin).abs() >= 6.0);
                     this.saw_pressed_drag = false;
+                    let _ = this.timeline_local_x(x);
                     if dragged && x > this.state.gantt.timeline_origin_x {
                         let origin_x = origin.unwrap_or(x);
                         let (start, target) =

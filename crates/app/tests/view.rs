@@ -4,7 +4,7 @@ use ado_core::{IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, MIN_TIMELINE_WIDTH,
-    RESIZE_END_HIT, ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, insert_index_for_child,
+    ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, insert_index_for_child,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -95,9 +95,13 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
         cx.debug_bounds("gantt-sync-status").is_some(),
         "the toolbar must show a subtle save/sync status"
     );
+    let sync_icon = cx
+        .debug_bounds("gantt-sync-status-icon")
+        .expect("Synced / Saving… must show a status icon in the pill");
     assert!(
-        cx.debug_bounds("gantt-sync-status-icon").is_some(),
-        "Synced / Saving… must show a status icon in the pill"
+        f32::from(sync_icon.size.width) >= 8.0 && f32::from(sync_icon.size.height) >= 8.0,
+        "the Synced pill icon must paint, got {:?}",
+        sync_icon.size
     );
     view.update(cx, |view, _| {
         assert_eq!(view.sync_status_for_test(), "Synced");
@@ -866,6 +870,33 @@ fn context_menu_opens_at_the_click_not_the_window_origin(cx: &mut gpui_kit::Test
         cx.debug_bounds("gantt-menu-Add child").is_some(),
         "right-click must offer Add child"
     );
+}
+
+#[gpui_kit::test]
+fn context_menu_closes_after_an_action_is_chosen(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.context_menu = Some(ContextTarget {
+        id: 1,
+        from_bar: false,
+        x: 320.0,
+        y: 280.0,
+        link: None,
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let add = cx
+        .debug_bounds("gantt-menu-Add child")
+        .expect("Add child action");
+    cx.simulate_mouse_down(add.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.context_menu.is_none(),
+            "choosing Add child must close the context menu"
+        );
+    });
 }
 
 #[gpui_kit::test]
@@ -3549,8 +3580,8 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         f32::from(link.size.height)
     );
     assert!(
-        f32::from(resize.size.width) > RESIZE_END_HIT + HANDLE_WIDTH - 0.5,
-        "end resize grip must cover the bar edge and overlap the link handle, got {}",
+        (f32::from(resize.size.width) - HANDLE_WIDTH).abs() < 1.0,
+        "end resize grip must be the inner 8px of the bar, got {}",
         f32::from(resize.size.width)
     );
     assert!(
@@ -3566,8 +3597,9 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         .debug_bounds("gantt-resize-handle-2-start")
         .expect("hovered leaf bar must show a start resize handle");
     assert!(
-        f32::from(start.origin.x) < f32::from(bar.origin.x) - 1.0,
-        "start resize grip must extend outside the bar, handle x {} vs bar x {}",
+        f32::from(start.origin.x) + 0.5 >= f32::from(bar.origin.x)
+            && f32::from(start.origin.x) <= f32::from(bar.origin.x) + 4.0,
+        "start resize grip must sit on the inner left of the bar, handle x {} vs bar x {}",
         f32::from(start.origin.x),
         f32::from(bar.origin.x)
     );
@@ -3579,8 +3611,8 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         "end resize grip must overlap the bar's right interior, handle x {handle_left} vs bar right {bar_right}"
     );
     assert!(
-        handle_right >= bar_right - 1.0,
-        "end resize grip must cover the bar's right edge, handle right {handle_right} vs bar right {bar_right}"
+        handle_right <= bar_right + 0.5 && handle_right + 4.0 >= bar_right,
+        "end resize grip must stay inside the painted bar, handle right {handle_right} vs bar right {bar_right}"
     );
 }
 
@@ -4080,12 +4112,12 @@ fn resize_starts_on_mouse_down_without_hover(cx: &mut gpui_kit::TestAppContext) 
     });
     draw(cx);
     assert!(
-        cx.debug_bounds("gantt-resize-handle-2-end").is_none(),
-        "resize grips stay hidden until hover"
+        cx.debug_bounds("gantt-resize-handle-2-end").is_some(),
+        "end grip must be hittable without hovering first"
     );
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
     let grip = point(
-        bar.origin.x + bar.size.width + px(4.),
+        bar.origin.x + bar.size.width - px(3.),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
@@ -4177,11 +4209,11 @@ fn end_grip_wins_hit_test_over_bar_body_and_link_handle(cx: &mut gpui_kit::TestA
         "end grip must overlap the bar body, grip {handle_left}..{handle_right} bar right {bar_right}"
     );
     assert!(
-        handle_right > link_left,
-        "end grip must overlap the link handle, grip {handle_left}..{handle_right} link {link_left}"
+        handle_right <= link_left + 0.5,
+        "end grip must stay inside the bar, grip {handle_left}..{handle_right} link {link_left}"
     );
     let on_bar = point(
-        bar.origin.x + bar.size.width - px(2.),
+        bar.origin.x + bar.size.width - px(3.),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(on_bar, MouseButton::Left, Modifiers::default());
@@ -4200,6 +4232,73 @@ fn end_grip_wins_hit_test_over_bar_body_and_link_handle(cx: &mut gpui_kit::TestA
             gesture.kind
         );
         assert_eq!(gesture.id, 2);
+    });
+}
+
+#[gpui_kit::test]
+fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let start_before = Date::new(2026, 7, 6).unwrap();
+    let target_before = Date::new(2026, 7, 20).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let grip = point(
+        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("mouse-down 3px inside the right end must start a resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "inner-end grip mouse-down must be ResizeEnd, got {:?}",
+            gesture.kind
+        );
+    });
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(grip.x + px(ppd * 4.0), grip.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.clone().expect("live resize");
+        let (start, target) = GanttView::gesture_patch_dates(&gesture);
+        assert_eq!(
+            start, None,
+            "resizing the end must not patch Start Date, got {start:?}"
+        );
+        assert_eq!(
+            target,
+            Some(target_before.saturating_add(4.days())),
+            "dragging 4 days from the inner right grip must move Target Date, got {target:?}"
+        );
+        assert_eq!(
+            gesture.live_start, start_before,
+            "Start Date must stay {start_before}, got {}",
+            gesture.live_start
+        );
+        assert_ne!(
+            gesture.live_target, target_before,
+            "Target Date must change"
+        );
     });
 }
 

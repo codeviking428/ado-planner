@@ -2998,7 +2998,14 @@ fn dates_changed_message(
             _ => format!("Scheduled {title}"),
         }
     } else if (before_start != after_start) != (before_target != after_target) {
-        dates_resized_message(title, after_start, after_target)
+        let one_sided_move = (before_start.is_some() != before_target.is_some())
+            && (after_start.is_none() == before_start.is_none())
+            && (after_target.is_none() == before_target.is_none());
+        if one_sided_move {
+            dates_moved_message(title, after_start, after_target)
+        } else {
+            dates_resized_message(title, after_start, after_target)
+        }
     } else {
         dates_moved_message(title, after_start, after_target)
     }
@@ -3505,6 +3512,12 @@ mod toast_copy_tests {
         assert!(
             moved.starts_with("Moved \"Cart\" to"),
             "shifting both dates must still say Moved, got {moved}"
+        );
+        let start_only =
+            dates_changed_message("Cart UI", Some(start), None, Some(resized_start), None);
+        assert!(
+            start_only.starts_with("Moved \"Cart UI\" to"),
+            "moving a start-only bar must not read as a resize, got {start_only}"
         );
     }
 

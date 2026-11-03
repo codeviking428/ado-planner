@@ -15,11 +15,9 @@ pub const MIN_TIMELINE_WIDTH: f32 = 240.0;
 pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
 pub const SPLITTER_WIDTH: f32 = 8.0;
 pub const SPLITTER_STEP: f32 = 16.0;
+/// Inner grip on each painted end. Hits stay inside the bar, not in the
+/// link-handle gap, so a click on the bar's last pixels resizes.
 pub const HANDLE_WIDTH: f32 = 8.0;
-/// Extra-wide end-cap so grabbing a bar's right edge is not an 8px hunt.
-pub const RESIZE_END_HIT: f32 = 16.0;
-/// Extra pixels past the bar (into the link-handle gap) so the end grip wins.
-pub const RESIZE_END_OVERLAP: f32 = 6.0;
 /// Selected tree/timeline row tint. Stronger than zebra stripes so the row reads.
 pub const SELECTED_ROW_TINT: f32 = 0.65;
 /// Left accent on the selected tree/timeline row.
@@ -56,8 +54,8 @@ pub const ASSIGNEE_COL_WIDTH: f32 = 88.0;
 pub const EXPANDER_SLOT: f32 = 18.0;
 pub const TODAY_PILL_W: f32 = 44.0;
 pub const TODAY_PILL_GAP: f32 = 6.0;
-/// Keep year/month majors off the Today pill; "nearly touching" is still a miss.
-const HEADER_TODAY_LABEL_GAP: f32 = 40.0;
+/// Keep year/month majors off the Today pill; Year "2027" must not crowd it.
+const HEADER_TODAY_LABEL_GAP: f32 = 72.0;
 const MAJOR_LABEL_ESTIMATE: f32 = 84.0;
 const TICK_MIN_GAP: f32 = 18.0;
 /// Keep edge tick/year labels off the clip.
@@ -360,21 +358,43 @@ impl BarLayout {
             && !self.milestone
             && !self.marker
             && !self.open_ended
+            && self.width + 0.1 >= HANDLE_WIDTH * 2.0
+    }
+
+    /// Inner 8px of each end, split at the midpoint on bars shorter than 16px.
+    pub fn inner_grip_width(&self) -> f32 {
+        HANDLE_WIDTH.min(self.width / 2.0).max(1.0)
+    }
+
+    /// Classify a timeline-x on this painted bar. `None` is the move body.
+    pub fn resize_kind_at(&self, x: f32) -> Option<GestureKind> {
+        if !self.can_resize() {
+            return None;
+        }
+        let grip = self.inner_grip_width();
+        if x < self.x || x > self.x + self.width {
+            return None;
+        }
+        if x <= self.x + grip {
+            Some(GestureKind::ResizeStart)
+        } else if x >= self.x + self.width - grip {
+            Some(GestureKind::ResizeEnd)
+        } else {
+            None
+        }
     }
 }
 
-/// Start grip sits just left of the bar body.
+/// Inner start grip: the first `HANDLE_WIDTH` of the painted bar.
 pub fn resize_start_handle(bar: &BarLayout) -> (f32, f32) {
-    (bar.x - HANDLE_WIDTH, HANDLE_WIDTH)
+    let width = bar.inner_grip_width();
+    (bar.x, width)
 }
 
-/// End grip covers the last `RESIZE_END_HIT` of the bar and overlaps the
-/// link-handle gap so it wins hit-testing over the bar body and link handle.
+/// Inner end grip: the last `HANDLE_WIDTH` of the painted bar.
 pub fn resize_end_handle(bar: &BarLayout) -> (f32, f32) {
-    (
-        bar.x + bar.width - RESIZE_END_HIT,
-        RESIZE_END_HIT + HANDLE_WIDTH + RESIZE_END_OVERLAP,
-    )
+    let width = bar.inner_grip_width();
+    (bar.x + bar.width - width, width)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1078,6 +1098,17 @@ impl GanttView {
                 } else if matches!(self.scale, GanttScale::Year) {
                     width = width.max(YEAR_MIN_BAR_WIDTH);
                 }
+                let start_only = parse_iso_date(node.target_date.as_deref()).is_none()
+                    && parse_iso_date(node.start_date.as_deref()).is_some()
+                    && !display.milestone
+                    && live.is_none();
+                if start_only && x < 0.0 {
+                    // Week/Day can leave a start-only bar entirely left of the
+                    // clip. Pin the visible fragment to x = 0 so it still paints.
+                    let visible = (x + width).max(HANDLE_WIDTH * 2.0).max(8.0);
+                    width = visible.min(width.max(HANDLE_WIDTH * 2.0));
+                    x = 0.0;
+                }
                 Some(BarLayout {
                     id: node.id,
                     kind: display.kind,
@@ -1212,7 +1243,11 @@ impl GanttView {
             GestureKind::Link => {}
             GestureKind::ResizeStart => {
                 let next = gesture.start.saturating_add(delta_days.days());
-                if next <= gesture.target {
+                if !gesture.had_target {
+                    gesture.live_start = next;
+                    gesture.live_target =
+                        next.saturating_add((DEFAULT_BAR_DAYS - 1).days()).max(next);
+                } else if next <= gesture.target {
                     gesture.live_start = next;
                 }
             }
@@ -1383,13 +1418,13 @@ impl GanttView {
                 if let Some(today) = hide_x {
                     let pill_left = (today + TODAY_PILL_GAP).max(4.0);
                     let pill_right = pill_left + TODAY_PILL_W;
-                    if x < pill_right + HEADER_TODAY_LABEL_GAP
-                        && x + MAJOR_LABEL_ESTIMATE.max(header_label_px(&tick.major_label))
-                            > pill_left
-                    {
-                        // Shift, never drop — Year still needs "2027" to the
-                        // right of Today instead of hiding the next year.
-                        x = pill_right + HEADER_TODAY_LABEL_GAP;
+                    let text_w = MAJOR_LABEL_ESTIMATE.max(header_label_px(&tick.major_label));
+                    if x < pill_right + HEADER_TODAY_LABEL_GAP && x + text_w > pill_left {
+                        // Year paints Today on the tick row, so a sticky year
+                        // at x = 0 can stay. Other scales shift off the pill.
+                        if !(matches!(self.scale, GanttScale::Year) && x < HEADER_LEFT_PAD) {
+                            x = pill_right + HEADER_TODAY_LABEL_GAP;
+                        }
                     }
                 }
                 (x, tick.major_label)
@@ -1630,10 +1665,7 @@ impl GanttView {
         let bar = bars
             .iter()
             .find(|bar| {
-                y >= bar.y
-                    && y < bar.y + ROW_HEIGHT
-                    && x >= bar.x - HANDLE_WIDTH
-                    && x <= bar.x + bar.width + RESIZE_END_HIT
+                y >= bar.y && y < bar.y + ROW_HEIGHT && x >= bar.x && x <= bar.x + bar.width
             })?
             .clone();
         let kind = if bar.milestone || bar.summary || bar.marker {
@@ -1644,12 +1676,8 @@ impl GanttView {
             } else {
                 GestureKind::Move
             }
-        } else if x <= bar.x + HANDLE_WIDTH {
-            GestureKind::ResizeStart
-        } else if x >= bar.x + bar.width - RESIZE_END_HIT {
-            GestureKind::ResizeEnd
         } else {
-            GestureKind::Move
+            bar.resize_kind_at(x).unwrap_or(GestureKind::Move)
         };
         Some((bar, kind))
     }
@@ -2291,31 +2319,31 @@ mod tests {
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 96.0, 4.0).map(|(_, kind)| kind),
-            Some(GestureKind::ResizeStart),
-            "an 8px hit area must extend outside the start edge"
+            None,
+            "the start grip stays inside the painted bar"
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 184.0, 4.0).map(|(_, kind)| kind),
-            Some(GestureKind::ResizeEnd),
-            "the end grip must extend outside the bar"
+            None,
+            "the end grip stays inside the painted bar"
         );
         assert_eq!(
-            GanttView::hit_test_bar(&bars, 100.0 + 80.0 + RESIZE_END_HIT - 1.0, 4.0)
-                .map(|(_, kind)| kind),
+            GanttView::hit_test_bar(&bars, 100.0 + 80.0 - 3.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::ResizeEnd),
-            "end grip hit area must stay wide of the bar's right edge"
+            "3px inside the right end must resize, not move"
         );
         let (end_x, end_w) = resize_end_handle(&bar);
         assert!(
-            end_x < bar.x + bar.width,
-            "end grip must overlap the bar body"
+            (end_x - (bar.x + bar.width - HANDLE_WIDTH)).abs() < 0.1,
+            "end grip must start 8px inside the painted bar, got {end_x}"
         );
         assert!(
-            end_x + end_w > bar.x + bar.width + HANDLE_WIDTH,
-            "end grip must overlap the link handle, grip {}..{} link {}",
-            end_x,
-            end_x + end_w,
-            bar.x + bar.width + HANDLE_WIDTH
+            (end_w - HANDLE_WIDTH).abs() < 0.1,
+            "end grip must be the inner 8px, got {end_w}"
+        );
+        assert!(
+            end_x + end_w <= bar.x + bar.width + 0.1,
+            "end grip must not spill into the link-handle gap"
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 91.0, 4.0).map(|(_, kind)| kind),
@@ -2372,8 +2400,8 @@ mod tests {
             "end grip must cover the bar's right interior"
         );
         assert!(
-            end_x + end_w > link_x,
-            "end grip must overlap the link handle, grip {}..{} link {link_x}",
+            end_x + end_w <= link_x,
+            "end grip must stay inside the bar, grip {}..{} link {link_x}",
             end_x,
             end_x + end_w
         );
@@ -2386,7 +2414,7 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(
                 std::slice::from_ref(&bar),
-                bar.x + bar.width - RESIZE_END_HIT + 1.0,
+                bar.x + bar.width - HANDLE_WIDTH + 1.0,
                 4.0
             )
             .map(|(_, kind)| kind),
@@ -2399,9 +2427,15 @@ mod tests {
             "the body of a wide bar must still move"
         );
         assert_eq!(
-            GanttView::hit_test_bar(&[bar], end_x + end_w - 2.0, 4.0).map(|(_, kind)| kind),
+            GanttView::hit_test_bar(std::slice::from_ref(&bar), end_x + end_w + 2.0, 4.0)
+                .map(|(_, kind)| kind),
+            None,
+            "the link-handle gap past the bar must not be a resize"
+        );
+        assert_eq!(
+            bar.resize_kind_at(bar.x + bar.width - 3.0),
             Some(GestureKind::ResizeEnd),
-            "the grip's overlap with the link handle must still be a resize"
+            "3px inside the right end must be ResizeEnd"
         );
     }
 
@@ -2735,6 +2769,37 @@ mod tests {
     }
 
     #[test]
+    fn start_only_bar_with_off_screen_start_clamps_to_the_visible_edge() {
+        let mut item = node(1, None);
+        item.start_date = Some("2026-07-21T00:00:00Z".into());
+        item.target_date = None;
+        let gantt = GanttView {
+            origin: Date::new(2026, 11, 1).unwrap(),
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+        assert_eq!(bars.len(), 1);
+        assert!(
+            bars[0].x >= 0.0,
+            "an off-screen start-only bar must clamp to the visible edge, x={}",
+            bars[0].x
+        );
+        assert!(
+            bars[0].width >= HANDLE_WIDTH * 2.0,
+            "clamped start-only must stay wide enough to hit, width={}",
+            bars[0].width
+        );
+        assert!(
+            bars[0].x + bars[0].width > 0.0,
+            "the clamped fragment must paint inside the viewport"
+        );
+    }
+
+    #[test]
     fn start_only_and_short_year_bars_keep_a_minimum_width() {
         let mut item = node(1, None);
         item.target_date = None;
@@ -2774,6 +2839,11 @@ mod tests {
         assert!(
             bars[0].width + 0.1 >= YEAR_MIN_BAR_WIDTH,
             "Year-view bars must keep a ~6px sliver, width={}",
+            bars[0].width
+        );
+        assert!(
+            !bars[0].can_resize(),
+            "a Year sliver narrower than two grips must stay a move, width={}",
             bars[0].width
         );
     }
