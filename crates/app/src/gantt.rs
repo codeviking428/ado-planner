@@ -368,19 +368,64 @@ impl BarLayout {
 
     /// Classify a timeline-x on this painted bar. `None` is the move body.
     pub fn resize_kind_at(&self, x: f32) -> Option<GestureKind> {
+        match self.hit_zone_at_window_x(x, self.x, self.x + self.width) {
+            BarHitZone::ResizeStart => Some(GestureKind::ResizeStart),
+            BarHitZone::ResizeEnd => Some(GestureKind::ResizeEnd),
+            BarHitZone::Move | BarHitZone::Outside => None,
+        }
+    }
+
+    /// Classify a pointer against the bar's painted left/right in the SAME
+    /// coordinate space as `window_x` (window pixels, not layout-local x).
+    pub fn hit_zone_at_window_x(
+        &self,
+        window_x: f32,
+        painted_left: f32,
+        painted_right: f32,
+    ) -> BarHitZone {
+        if window_x < painted_left || window_x > painted_right {
+            return BarHitZone::Outside;
+        }
         if !self.can_resize() {
-            return None;
+            return BarHitZone::Move;
         }
-        let grip = self.inner_grip_width();
-        if x < self.x || x > self.x + self.width {
-            return None;
-        }
-        if x <= self.x + grip {
-            Some(GestureKind::ResizeStart)
-        } else if x >= self.x + self.width - grip {
-            Some(GestureKind::ResizeEnd)
+        let width = (painted_right - painted_left).max(1.0);
+        let grip = HANDLE_WIDTH.min(width / 2.0).max(1.0);
+        if window_x <= painted_left + grip {
+            BarHitZone::ResizeStart
+        } else if window_x >= painted_right - grip {
+            BarHitZone::ResizeEnd
         } else {
-            None
+            BarHitZone::Move
+        }
+    }
+}
+
+/// Hit classification for a pointer vs a painted bar, in one coordinate space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarHitZone {
+    ResizeStart,
+    ResizeEnd,
+    Move,
+    Outside,
+}
+
+impl BarHitZone {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ResizeStart => "resize-start",
+            Self::ResizeEnd => "resize-end",
+            Self::Move => "move",
+            Self::Outside => "outside",
+        }
+    }
+
+    pub fn gesture_kind(self) -> Option<GestureKind> {
+        match self {
+            Self::ResizeStart => Some(GestureKind::ResizeStart),
+            Self::ResizeEnd => Some(GestureKind::ResizeEnd),
+            Self::Move => Some(GestureKind::Move),
+            Self::Outside => None,
         }
     }
 }
@@ -1102,9 +1147,10 @@ impl GanttView {
                     && parse_iso_date(node.start_date.as_deref()).is_some()
                     && !display.milestone
                     && live.is_none();
-                if start_only && x < 0.0 {
-                    // Week/Day can leave a start-only bar entirely left of the
-                    // clip. Pin the visible fragment to x = 0 so it still paints.
+                if start_only && live.is_none() && x + width <= 0.0 {
+                    // Fully left of the clip: pin a hittable sliver at x = 0.
+                    // Peeking bars (`x < 0` but `x + width > 0`) keep real
+                    // geometry so the visible fragment is not a fake start grip.
                     let visible = (x + width).max(HANDLE_WIDTH * 2.0).max(8.0);
                     width = visible.min(width.max(HANDLE_WIDTH * 2.0));
                     x = 0.0;
@@ -2437,6 +2483,31 @@ mod tests {
             Some(GestureKind::ResizeEnd),
             "3px inside the right end must be ResizeEnd"
         );
+        // Painted window edges can sit far from layout.x (tree, gutter, label).
+        // Classification must use those edges, not layout-local x.
+        let painted_left = 412.0;
+        let painted_right = painted_left + bar.width;
+        for inset in [2.0, 3.0, 4.0, 6.0] {
+            assert_eq!(
+                bar.hit_zone_at_window_x(painted_left + inset, painted_left, painted_right),
+                BarHitZone::ResizeStart,
+                "{inset}px inside the painted start must resize, not move"
+            );
+            assert_eq!(
+                bar.hit_zone_at_window_x(painted_right - inset, painted_left, painted_right),
+                BarHitZone::ResizeEnd,
+                "{inset}px inside the painted end must resize, not move"
+            );
+            assert_eq!(
+                bar.resize_kind_at(painted_left + inset),
+                None,
+                "layout-local x must not be used as a window coordinate"
+            );
+        }
+        assert_eq!(
+            bar.hit_zone_at_window_x(painted_left + bar.width / 2.0, painted_left, painted_right),
+            BarHitZone::Move
+        );
     }
 
     #[test]
@@ -2796,6 +2867,32 @@ mod tests {
         assert!(
             bars[0].x + bars[0].width > 0.0,
             "the clamped fragment must paint inside the viewport"
+        );
+    }
+
+    #[test]
+    fn peeking_start_only_bar_keeps_real_geometry() {
+        let mut item = node(1, None);
+        item.start_date = Some("2026-07-06T00:00:00Z".into());
+        item.target_date = None;
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 10).unwrap(),
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+        assert_eq!(bars.len(), 1);
+        assert!(
+            bars[0].x < 0.0,
+            "a peeking start-only bar must keep its true start, x={}",
+            bars[0].x
+        );
+        assert!(
+            bars[0].x + bars[0].width > 0.0,
+            "the visible fragment must still peek into the viewport"
         );
     }
 

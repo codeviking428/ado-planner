@@ -3,8 +3,8 @@
 use ado_core::{IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
-    ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, MIN_TIMELINE_WIDTH,
-    ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, insert_index_for_child,
+    BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH,
+    MIN_TIMELINE_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, insert_index_for_child,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -18,8 +18,8 @@ use ado_planner::ui::{
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use gpui_kit::component::calendar::Date as PickerDate;
 use gpui_kit::{
-    KeyDownEvent, Keystroke, Modifiers, MouseButton, ScrollDelta, ScrollEvent, VisualTestContext,
-    point, px,
+    Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, ScrollDelta, ScrollEvent,
+    VisualTestContext, point, px,
 };
 use jiff::ToSpan;
 use jiff::civil::Date;
@@ -4299,6 +4299,146 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
             gesture.live_target, target_before,
             "Target Date must change"
         );
+    });
+}
+
+fn click_painted_bar_inset(
+    cx: &mut VisualTestContext,
+    view: &Entity<PlannerView>,
+    selector: &'static str,
+    inset: f32,
+    at_start: bool,
+) {
+    draw(cx);
+    view.update(cx, |view, _| {
+        view.state.cancel_gesture();
+        view.state.gantt.gesture = None;
+        view.state.gantt.hover_locked = false;
+    });
+    let bar = cx.debug_bounds(selector).expect("painted bar");
+    let x = if at_start {
+        bar.origin.x + px(inset)
+    } else {
+        bar.origin.x + bar.size.width - px(inset)
+    };
+    let y = bar.origin.y + bar.size.height / 2.0;
+    cx.simulate_mouse_down(point(x, y), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let hit = view
+            .last_bar_hit_for_test()
+            .expect("bar mouse-down must record a window-coord hit");
+        let bar_left = f32::from(bar.origin.x);
+        let bar_right = bar_left + f32::from(bar.size.width);
+        assert!(
+            (hit.painted_left - bar_left).abs() < 2.5
+                && (hit.painted_right - bar_right).abs() < 2.5,
+            "hit must use painted window bounds, event_x={:.1} painted={:.1}..{:.1} debug={bar_left:.1}..{bar_right:.1}",
+            hit.event_x,
+            hit.painted_left,
+            hit.painted_right
+        );
+        let expected = if at_start {
+            GestureKind::ResizeStart
+        } else {
+            GestureKind::ResizeEnd
+        };
+        assert_eq!(
+            hit.kind, expected,
+            "{inset}px inside the {} must be {expected:?} (zone {}), not {:?}",
+            if at_start { "start" } else { "end" },
+            hit.zone.as_str(),
+            hit.kind
+        );
+        assert_eq!(
+            view.state.gantt.gesture.as_ref().map(|g| g.kind),
+            Some(expected),
+            "{inset}px inside the painted {} must start {expected:?}",
+            if at_start { "start" } else { "end" }
+        );
+        assert_ne!(
+            hit.zone,
+            BarHitZone::Move,
+            "{inset}px inside must not classify as move"
+        );
+    });
+    cx.simulate_mouse_up(point(x, y), MouseButton::Left, Modifiers::default());
+    draw(cx);
+}
+
+#[gpui_kit::test]
+fn week_and_month_painted_end_insets_resize_not_move(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.scale = GanttScale::Week;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    for scale in [GanttScale::Week, GanttScale::Month] {
+        view.update(cx, |view, cx| {
+            view.state.gantt.scale = scale;
+            cx.notify();
+        });
+        draw(cx);
+        for inset in [2.0, 3.0, 4.0, 6.0] {
+            click_painted_bar_inset(cx, &view, "gantt-bar-2", inset, false);
+            click_painted_bar_inset(cx, &view, "gantt-bar-2", inset, true);
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn toast_undo_does_not_eat_the_next_bar_click(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.toasts.push_undo(
+        "Moved \"Work Item 1\"",
+        UndoAction::RestoreDates {
+            id: 2,
+            start_date: Some("2026-07-06T00:00:00Z".into()),
+            target_date: Some("2026-07-20T00:00:00Z".into()),
+            rev: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let undo = cx.debug_bounds("toast-undo").expect("Undo");
+    cx.simulate_mouse_down(undo.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.toast_pointer_for_test()
+                || view.state.toasts.items.iter().all(|t| t.undo.is_none()),
+            "Undo press arms toast_pointer or dismisses the undo toast"
+        );
+    });
+    cx.simulate_mouse_up(undo.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            !view.toast_pointer_for_test(),
+            "the next press after Undo must clear toast_pointer"
+        );
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("first click after Undo must start a bar gesture, not be ignored");
+        assert_eq!(gesture.id, 2);
+        assert_eq!(gesture.kind, GestureKind::Move);
     });
 }
 
