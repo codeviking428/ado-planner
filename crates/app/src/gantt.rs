@@ -1332,11 +1332,14 @@ impl GanttView {
                 let start_only = parse_iso_date(node.target_date.as_deref()).is_none()
                     && parse_iso_date(node.start_date.as_deref()).is_some()
                     && !display.milestone
-                    && live.is_none();
+                    && live.as_ref().is_none_or(|gesture| !gesture.had_target);
+                let open_ended = start_only;
                 if start_only && live.is_none() && x + width <= 0.0 {
                     // Fully left of the clip: pin a hittable sliver at x = 0.
                     // Peeking bars (`x < 0` but `x + width > 0`) keep real
                     // geometry so the visible fragment is not a fake start grip.
+                    // The open-ended cue paints the continuation to the
+                    // viewport edge so this sliver is not the only visual.
                     let visible = (x + width).max(HANDLE_WIDTH * 2.0).max(8.0);
                     width = visible.min(width.max(HANDLE_WIDTH * 2.0));
                     x = 0.0;
@@ -1356,7 +1359,7 @@ impl GanttView {
                         .or_else(|| Some(state_progress(&node.state))),
                     predecessors: node.predecessors.clone(),
                     marker,
-                    open_ended: false,
+                    open_ended,
                 })
             })
             .collect()
@@ -1685,7 +1688,9 @@ impl GanttView {
     }
 
     /// Year ticks are months. Shift the Day number off the Today line so "2"
-    /// stays readable instead of hiding it.
+    /// stays readable instead of hiding it. Year/Quarter month ticks sit ~1px
+    /// from Today; a 16px shift still parks "Nov" under the pill, so drop
+    /// any tick that would paint on the pill instead of crowding it.
     pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 22.0;
         const SHIFT: f32 = 16.0;
@@ -1700,8 +1705,10 @@ impl GanttView {
                 }
             })
             .collect();
-        if let Some(today) = hide_x
-            && let Some(index) = ticks
+        if let Some(today) = hide_x {
+            if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
+                ticks = hide_ticks_under_today_pill(ticks, today, width);
+            } else if let Some(index) = ticks
                 .iter()
                 .enumerate()
                 .filter(|(_, (x, _))| (x - today).abs() < HIDE_PAD)
@@ -1712,8 +1719,9 @@ impl GanttView {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(index, _)| index)
-        {
-            ticks[index].0 = today + SHIFT;
+            {
+                ticks[index].0 = today + SHIFT;
+            }
         }
         let labels = Self::space_header_labels(
             Self::sticky_header_labels(ticks, false, TICK_MIN_GAP),
@@ -2016,13 +2024,14 @@ impl GanttView {
                 // tens of days away (stray line at x≈532). Occupy the
                 // body only at those zooms.
                 let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
-                if wrap_around && inbound_x_hits_intervening(x_in, &intervening, include_labels) {
-                    // Short inbound would cross a row body. Wrap at the
-                    // source stub and slide into a gap that misses every
-                    // intervening span (skip labels so a title to the
-                    // right of a short marker does not shove the drop).
+                if wrap_around {
+                    // Backward FS: always loop at the source stub. A short
+                    // inbound at succ.x-12 is a gap, but routing there draws
+                    // a long left run on the predecessor gutter (the detour
+                    // after a left-dot resize of #1012). Keep the wrap drop
+                    // next to the source; the inbound stub stays at the head.
                     x_in = clear_wrap_drop_x(x_out, &intervening, false, x_head);
-                } else if !inbound_right && !intervening.is_empty() && !wrap_around {
+                } else if !inbound_right && !intervening.is_empty() {
                     let x_vert =
                         clear_vertical_x(x_in, &intervening, bar.x, true, x_head, include_labels);
                     if (x_vert - x_in).abs() > 0.5 {
@@ -2040,7 +2049,7 @@ impl GanttView {
                 } else {
                     pred.y + 1.0
                 };
-                if !succ_gutter {
+                if !succ_gutter && !wrap_around {
                     let clear = gutter_clear_x(bars);
                     if x_in < clear && x_head > clear + 4.0 {
                         x_in = clear;
@@ -2149,6 +2158,25 @@ pub(crate) fn today_pill_left(today_x: f32, width: f32) -> f32 {
     } else {
         (today_x + TODAY_PILL_GAP).max(4.0)
     }
+}
+
+/// Drop Year/Quarter month ticks whose glyphs would sit on the Today pill.
+/// Shifting "Nov" by 16px still crowds it; hiding the overlapping tick leaves
+/// Today as the in-month marker and keeps Oct/Dec in their own columns.
+fn hide_ticks_under_today_pill(
+    labels: Vec<(f32, String)>,
+    today_x: f32,
+    width: f32,
+) -> Vec<(f32, String)> {
+    let pill_left = today_pill_left(today_x, width);
+    let pill_right = pill_left + TODAY_PILL_W;
+    labels
+        .into_iter()
+        .filter(|(x, label)| {
+            let text_w = header_label_px(label);
+            x + text_w <= pill_left + 1.0 || *x >= pill_right + 4.0
+        })
+        .collect()
 }
 
 fn dodge_majors_off_today_pill(
@@ -2326,13 +2354,6 @@ fn bar_occupied_x(bar: &BarLayout, include_label: bool) -> (f32, f32) {
 
 fn x_hits_span(x: f32, left: f32, right: f32) -> bool {
     x >= left - 1.0 && x <= right + 1.0
-}
-
-fn inbound_x_hits_intervening(x: f32, intervening: &[&BarLayout], include_labels: bool) -> bool {
-    intervening.iter().any(|bar| {
-        let (left, right) = bar_occupied_x(bar, include_labels);
-        x_hits_span(x, left, right)
-    })
 }
 
 /// Keep an inbound vertical in a gap that misses intervening bars and labels,
@@ -3369,19 +3390,40 @@ mod tests {
         let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
         assert_eq!(bars.len(), 1);
         assert!(
-            !bars[0].open_ended,
-            "start-only Cart UI-style items must paint as a normal bar, not a ▸ marker"
+            bars[0].open_ended,
+            "start-only Cart UI-style items stay a default-length bar with an open-ended cue"
         );
         assert!(!bars[0].marker);
         assert_eq!(bars[0].kind, GanttBarKind::Scheduled);
         assert!(
             bars[0].width > OPEN_ENDED_MARKER_WIDTH + 1.0,
-            "start-only must use the default-length bar, width={}",
+            "start-only must use the default-length bar, not a tiny ▸ box, width={}",
             bars[0].width
         );
         assert!(
-            bars[0].can_resize(),
-            "a start-only scheduled bar must expose resize grips"
+            !bars[0].can_resize(),
+            "open-ended bars keep Move/start-resize, not a fake end grip"
+        );
+    }
+
+    #[test]
+    fn start_only_open_ended_bar_leaves_room_for_a_right_edge_cue() {
+        let mut item = node(1, None);
+        item.target_date = None;
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+        assert_eq!(bars.len(), 1);
+        assert!(bars[0].open_ended);
+        assert!(
+            bars[0].x + bars[0].width < gantt.timeline_width - 8.0,
+            "the default-length body must stop short of the clip so a continuation cue can paint, right={} width={}",
+            bars[0].x + bars[0].width,
+            gantt.timeline_width
         );
     }
 
@@ -3458,8 +3500,8 @@ mod tests {
             let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
             assert_eq!(bars.len(), 1, "{scale:?}");
             assert!(
-                !bars[0].open_ended,
-                "{scale:?} start-only must stay a normal bar, not a ▸ marker"
+                bars[0].open_ended,
+                "{scale:?} start-only must keep an open-ended continuation cue"
             );
             let min = if scale == GanttScale::Year {
                 YEAR_MIN_BAR_WIDTH
@@ -5248,8 +5290,8 @@ mod tests {
         let (child_left, child_right) = bar_occupied_x(child, false);
         let (live_left, live_right) = bar_occupied_x(go_live, false);
         assert!(
-            !arrow.wraps_around_successor(),
-            "after Move children too the inbound column is a gap, so the route must stay short, x1={} x2={} x_head={}",
+            arrow.wraps_around_successor(),
+            "after Move children too the wrap must stay at the source stub, x1={} x2={} x_head={}",
             arrow.x1,
             arrow.x2,
             arrow.x_head
@@ -5265,10 +5307,17 @@ mod tests {
             arrow.x2
         );
         assert!(
-            (arrow.x2 - (succ.x - 12.0)).abs() < 2.5,
-            "the drop must sit in the gap next to the successor, not past #1005/#1013, x2={} succ.x={}",
-            arrow.x2,
+            (arrow.stub_start() - (succ.x - 12.0)).abs() < 2.5,
+            "inbound must sit just before the target start, stub={} x_head={} succ.x={}",
+            arrow.stub_start(),
+            arrow.x_head,
             succ.x
+        );
+        assert!(
+            (arrow.x2 - arrow.x1).abs() < 120.0,
+            "the wrap drop must stay next to the source, not a chart-width loop, x1={} x2={}",
+            arrow.x1,
+            arrow.x2
         );
         assert!(
             arrow.x2 > 80.0,
@@ -5535,6 +5584,90 @@ mod tests {
             "arrowhead must not park on the gutter, inbound_right={} x_head={}",
             arrows[0].inbound_right,
             arrows[0].x_head
+        );
+    }
+
+    #[test]
+    fn left_dot_resize_of_successor_keeps_the_backward_loop_short() {
+        // After dragging #1012's start from Jul 21 back to Jul 6, #1003
+        // (Jul 6→20) still ends after the successor starts. The inbound
+        // column at succ.x-12 is a gap, but routing there is a long left
+        // run on the predecessor gutter. Keep the wrap at the source stub.
+        let mut pred = node(1003, Some(1002));
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-07-06T00:00:00Z".into());
+        pred.target_date = Some("2026-07-20T00:00:00Z".into());
+        let mut child = node(1005, Some(1003));
+        child.title = "Cart UI".into();
+        child.start_date = Some("2026-07-21T00:00:00Z".into());
+        child.target_date = None;
+        let mut unscheduled = node(1014, Some(1002));
+        unscheduled.title = "Backlog grooming".into();
+        unscheduled.start_date = None;
+        unscheduled.target_date = None;
+        let mut go_live = node(1013, Some(1001));
+        go_live.title = "Go-live milestone".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        let mut succ = node(1012, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-06T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1003];
+        let nodes = vec![
+            node(1001, None),
+            node(1002, Some(1001)),
+            pred,
+            child,
+            unscheduled,
+            go_live,
+            succ,
+        ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+            .expect("#1003→#1012");
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1012).unwrap();
+        assert!(
+            pred.x + pred.width > succ.x + 12.0,
+            "fixture must overlap after the left-dot resize, pred_end={} succ.x={}",
+            pred.x + pred.width,
+            succ.x
+        );
+        assert_later_source_inbounds_from_left(arrow, pred, succ, gantt.timeline_width);
+        assert!(
+            arrow.wraps_around_successor(),
+            "must loop at the source instead of a long left run, x1={} x2={} x_head={}",
+            arrow.x1,
+            arrow.x2,
+            arrow.x_head
+        );
+        assert!(
+            (arrow.x2 - arrow.x1).abs() < 120.0,
+            "the wrap drop must stay next to the source stub, x1={} x2={}",
+            arrow.x1,
+            arrow.x2
+        );
+        assert!(
+            arrow.x2 > 80.0 && arrow.x2 > succ.x,
+            "must not detour to the chart left / gutter, x2={} succ.x={}",
+            arrow.x2,
+            succ.x
+        );
+        assert!(
+            (arrow.stub_start() - (succ.x - 12.0)).abs() < 2.5,
+            "inbound must sit just before the target start, stub={} x_head={}",
+            arrow.stub_start(),
+            arrow.x_head
         );
     }
 
@@ -6296,6 +6429,15 @@ mod tests {
                         "2027 must sit to the right of Today, got {x} pill_right={pill_right}"
                     );
                 }
+            }
+            let ticks = gantt.header_tick_labels_except(timeline_width, Some(today_x));
+            for (x, label) in &ticks {
+                let text_w = header_label_px(label);
+                assert!(
+                    x + text_w <= pill_left + 1.0 || *x >= pill_right + 4.0,
+                    "Year tick {label:?} at {x}..{} must not crowd the Today pill {pill_left}..{pill_right}",
+                    x + text_w
+                );
             }
         }
     }

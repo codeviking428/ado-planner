@@ -55,7 +55,7 @@ fn draw(cx: &mut VisualTestContext) {
     });
 }
 
-/// Outer half of the end handle (past the pink resize dot) starts a link.
+/// Visible end-dot / outer handle pixel starts a link.
 fn grab_link_handle(
     handle: gpui_kit::Bounds<gpui_kit::Pixels>,
 ) -> gpui_kit::Point<gpui_kit::Pixels> {
@@ -3561,6 +3561,33 @@ fn year_today_label_does_not_overlap_month_ticks(cx: &mut gpui_kit::TestAppConte
         today_bottom <= tick_top + 1.0,
         "Year Today at {today_top}..{today_bottom} must sit on the year row, not on month ticks at {tick_top}"
     );
+    let today_left = f32::from(today.origin.x);
+    let today_right = today_left + f32::from(today.size.width);
+    for selector in [
+        "gantt-tick-0",
+        "gantt-tick-1",
+        "gantt-tick-2",
+        "gantt-tick-3",
+        "gantt-tick-4",
+        "gantt-tick-5",
+        "gantt-tick-6",
+        "gantt-tick-7",
+        "gantt-tick-8",
+        "gantt-tick-9",
+        "gantt-tick-10",
+        "gantt-tick-11",
+        "gantt-tick-12",
+    ] {
+        let Some(bounds) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        let left = f32::from(bounds.origin.x);
+        let right = left + f32::from(bounds.size.width);
+        assert!(
+            right <= today_left + 1.0 || left >= today_right - 1.0,
+            "Year {selector} at {left}..{right} must not sit under Today {today_left}..{today_right}"
+        );
+    }
 }
 
 #[gpui_kit::test]
@@ -5252,11 +5279,11 @@ fn start_handle_dot_is_part_of_the_resize_hit_zone(cx: &mut gpui_kit::TestAppCon
             .gantt
             .gesture
             .as_ref()
-            .expect("the end handle dot must begin a resize");
+            .expect("the end handle dot must begin a link");
         assert_eq!(
             gesture.kind,
-            GestureKind::ResizeEnd,
-            "clicking the end handle dot must resize, not only select, got {:?}",
+            GestureKind::Link,
+            "clicking the visible end dot must start a link, got {:?}",
             gesture.kind
         );
     });
@@ -5277,8 +5304,8 @@ fn right_dot_resize_commits_on_mouse_up_at_release_x(cx: &mut gpui_kit::TestAppC
     });
     draw(cx);
     let handle = cx
-        .debug_bounds("gantt-link-handle-2-link-end")
-        .expect("end handle");
+        .debug_bounds("gantt-resize-handle-2-end")
+        .expect("end grip");
     let timeline = cx
         .debug_bounds("gantt-timeline-body")
         .expect("timeline body");
@@ -5359,8 +5386,8 @@ fn right_dot_missed_mouseup_does_not_commit_a_later_move_x(cx: &mut gpui_kit::Te
     });
     draw(cx);
     let handle = cx
-        .debug_bounds("gantt-link-handle-2-link-end")
-        .expect("end handle");
+        .debug_bounds("gantt-resize-handle-2-end")
+        .expect("end grip");
     let timeline = cx
         .debug_bounds("gantt-timeline-body")
         .expect("timeline body");
@@ -5413,8 +5440,8 @@ fn right_dot_missed_mouseup_does_not_commit_a_later_move_x(cx: &mut gpui_kit::Te
     });
     draw(cx);
     let handle = cx
-        .debug_bounds("gantt-link-handle-2-link-end")
-        .expect("end handle after cancel");
+        .debug_bounds("gantt-resize-handle-2-end")
+        .expect("end grip after cancel");
     let mid_y = handle.origin.y + handle.size.height / 2.0;
     cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
     draw(cx);
@@ -8045,4 +8072,172 @@ fn theme_icon_opens_a_flavor_menu(cx: &mut gpui_kit::TestAppContext) {
         f32::from(logout.origin.x) > f32::from(theme.origin.x),
         "log out must sit to the right of theme"
     );
+}
+
+#[gpui_kit::test]
+fn start_only_bar_paints_a_right_edge_continuation_cue(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.target_date = None;
+        node.title = "Cart UI".into();
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-2").is_some(),
+        "start-only must still paint a default-length bar"
+    );
+    let cue = cx
+        .debug_bounds("gantt-open-ended-cue-2")
+        .expect("open-ended continuation cue");
+    let timeline = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let cue_right = f32::from(cue.origin.x) + f32::from(cue.size.width);
+    let clip_right = f32::from(timeline.origin.x) + f32::from(timeline.size.width);
+    assert!(
+        (cue_right - clip_right).abs() < 8.0,
+        "the continuation cue must reach the viewport edge, cue_right={cue_right} clip={clip_right}"
+    );
+}
+
+#[gpui_kit::test]
+fn shift_dragging_a_parent_moves_its_children(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_hierarchy(3);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let child_before = state
+        .nodes
+        .iter()
+        .find(|node| node.id == 2)
+        .and_then(|node| ado_core::parse_iso_date(node.start_date.as_deref()));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1").expect("parent bar");
+    let start = bar.center();
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    cx.simulate_mouse_down(start, MouseButton::Left, shift);
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("Shift-drag must start a move");
+        assert_eq!(gesture.kind, GestureKind::Move);
+    });
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(start.x + px(ppd * 3.0), start.y),
+        Some(MouseButton::Left),
+        shift,
+    );
+    draw(cx);
+    cx.simulate_mouse_up(
+        point(start.x + px(ppd * 3.0), start.y),
+        MouseButton::Left,
+        shift,
+    );
+    view.update(cx, |view, _| {
+        let expected = child_before.map(|date| date.saturating_add(3.days()));
+        assert_eq!(
+            view.last_committed_start_for_test(),
+            expected,
+            "Shift-dragging the parent must commit the parent move"
+        );
+        match view.state.history.undo.last() {
+            Some(HistoryEntry::DatesGroup { items }) => {
+                assert!(
+                    items.iter().any(|item| item.id == 1) && items.iter().any(|item| item.id == 2),
+                    "Shift-drag must move children in one undo, got {items:?}"
+                );
+                let child = items.iter().find(|item| item.id == 2).unwrap();
+                assert_eq!(
+                    ado_core::parse_iso_date(child.after_start.as_deref()),
+                    expected,
+                    "the grouped child change must shift by the same delta"
+                );
+            }
+            other => panic!("expected DatesGroup, got {other:?}"),
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn dragging_the_end_dot_onto_another_bar_arms_a_dependency(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.hovered_id = Some(2);
+    state.gantt.bar_hovered_id = Some(2);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-2-link-end")
+        .expect("end dot");
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("end-dot drag must start a link");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::Link,
+            "the visible end dot must start a link, got {:?}",
+            gesture.kind
+        );
+    });
+    let target = cx.debug_bounds("gantt-bar-3").expect("target bar");
+    cx.simulate_mouse_move(
+        target.center(),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.as_ref().expect("still linking");
+        assert_eq!(
+            gesture.link_to,
+            Some(3),
+            "dropping the end-dot on another bar must arm the dependency, got {:?}",
+            gesture.link_to
+        );
+    });
+    cx.simulate_mouse_up(target.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "mouse-up on the target bar must commit the link gesture"
+        );
+    });
 }

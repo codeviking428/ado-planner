@@ -67,6 +67,9 @@ pub struct PlannerState {
     last_nudge_at: Option<Instant>,
     history_recording: bool,
     team_views: HashMap<String, SavedGanttView>,
+    /// Child date restores from a Shift-move, applied to the parent toast
+    /// once PATCH succeeds (the toast does not exist at commit time).
+    shifted_children: HashMap<i64, Vec<PendingDateSave>>,
 }
 
 /// Why this date PATCH was queued — so a failed persist can put history back.
@@ -152,6 +155,7 @@ impl PlannerState {
             last_nudge_at: None,
             history_recording: true,
             team_views: HashMap::new(),
+            shifted_children: HashMap::new(),
             prefs,
         }
     }
@@ -2994,6 +2998,12 @@ impl PlannerState {
         target: Option<Date>,
         previous: &WorkItemNode,
     ) {
+        let shifted = self.shifted_children.remove(&previous.id);
+        let extra = if shifted.is_some() {
+            None
+        } else {
+            parent_move_extra(&self.nodes, previous, start, target)
+        };
         self.toasts.push_undo_extra(
             dates_changed_message(
                 &self.item_title(id),
@@ -3008,8 +3018,30 @@ impl PlannerState {
                 target_date: previous.target_date.clone(),
                 rev: previous.rev,
             },
-            parent_move_extra(&self.nodes, previous, start, target),
+            extra,
         );
+        if let Some(children) = shifted {
+            self.attach_children_to_move_toast(previous.id, &children);
+        }
+    }
+
+    /// Shift descendants with the parent move (Shift-drag). One undo.
+    pub fn shift_children_with_committed_move(
+        &mut self,
+        pending: &PendingDateSave,
+    ) -> Vec<PendingDateSave> {
+        match parent_move_extra(
+            &self.nodes,
+            &pending.previous,
+            pending.start,
+            pending.target,
+        ) {
+            Some(ToastExtra::MoveChildren {
+                parent_id,
+                delta_days,
+            }) => self.shift_descendants_now(parent_id, delta_days),
+            _ => Vec::new(),
+        }
     }
 
     /// Shift every descendant's dates by `delta_days` and queue persists.
@@ -3070,7 +3102,9 @@ impl PlannerState {
         if self.history_recording {
             self.fold_descendant_dates(parent_id, child_changes);
         }
-        self.attach_children_to_move_toast(parent_id, &pending);
+        if !self.attach_children_to_move_toast(parent_id, &pending) {
+            self.shifted_children.insert(parent_id, pending.clone());
+        }
         pending
     }
 
@@ -3114,9 +3148,13 @@ impl PlannerState {
         }
     }
 
-    fn attach_children_to_move_toast(&mut self, parent_id: i64, children: &[PendingDateSave]) {
+    fn attach_children_to_move_toast(
+        &mut self,
+        parent_id: i64,
+        children: &[PendingDateSave],
+    ) -> bool {
         if children.is_empty() {
-            return;
+            return false;
         }
         let title = self.item_title(parent_id);
         for toast in &mut self.toasts.items {
@@ -3149,8 +3187,9 @@ impl PlannerState {
             toast.undo = Some(UndoAction::RestoreDatesBatch { items });
             toast.message =
                 named_dates_with_children(toast.message.clone(), &title, children.len());
-            break;
+            return true;
         }
+        false
     }
 
     pub(crate) fn item_title(&self, id: i64) -> String {
@@ -4355,5 +4394,59 @@ mod toast_copy_tests {
             ),
             "the group must leave redo after a failed child persist"
         );
+    }
+
+    #[test]
+    fn shift_drag_parent_moves_children_in_one_undo() {
+        use crate::toasts::HistoryEntry;
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-shift-drag")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        state.history_recording = true;
+        let parent_before = state.nodes[0].clone();
+        let start = Date::new(2026, 7, 9).unwrap();
+        let target = Date::new(2026, 7, 23).unwrap();
+        let _ = state.apply_optimistic_partial(1, Some(start), Some(target));
+        state.record_dates(
+            1,
+            &parent_before,
+            Some("2026-07-09T00:00:00Z".into()),
+            Some("2026-07-23T00:00:00Z".into()),
+        );
+        let pending = super::PendingDateSave {
+            id: 1,
+            start: Some(start),
+            target: Some(target),
+            after_start: Some("2026-07-09T00:00:00Z".into()),
+            after_target: Some("2026-07-23T00:00:00Z".into()),
+            previous: parent_before,
+            role: super::DateSaveRole::Commit,
+            rev: 1,
+        };
+        let kids = state.shift_children_with_committed_move(&pending);
+        assert!(
+            kids.iter().any(|save| save.id == 2),
+            "Shift-drag must move children with the parent, got {:?}",
+            kids.iter().map(|save| save.id).collect::<Vec<_>>()
+        );
+        let child = state.nodes.iter().find(|node| node.id == 2).expect("child");
+        assert_eq!(child.start_date.as_deref(), Some("2026-07-09T00:00:00Z"));
+        assert_eq!(child.target_date.as_deref(), Some("2026-07-23T00:00:00Z"));
+        match state.history.undo.last() {
+            Some(HistoryEntry::DatesGroup { items }) => {
+                assert!(
+                    items.iter().any(|item| item.id == 1) && items.iter().any(|item| item.id == 2),
+                    "Shift-drag must be one undo, got {items:?}"
+                );
+            }
+            other => panic!("expected DatesGroup, got {other:?}"),
+        }
     }
 }
