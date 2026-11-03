@@ -4461,6 +4461,9 @@ impl PlannerView {
                     .children(bars.iter().filter_map(|bar| {
                         self.render_gantt_bar_label(bar, dragging, muted_fg, cx)
                     }))
+                    .children(bars.iter().filter_map(|bar| {
+                        self.render_pinned_bar_tooltip(bar, dragging, cx)
+                    }))
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
                             if gesture.kind != GestureKind::Link {
@@ -4763,7 +4766,7 @@ impl PlannerView {
         } else {
             1.0
         };
-        let mut items = vec![
+        let items = vec![
             div()
                 .id(("gantt-bar", id as u64))
                 .debug_selector(move || bar_selector.clone())
@@ -5065,54 +5068,6 @@ impl PlannerView {
                 )
                 .into_any_element(),
         ];
-        if self.state.gantt.pin_bar_tooltip == Some(id) && !dragging && !self.details_overlay() {
-            let tip = bar_hover_tooltip(bar, &self.state.nodes);
-            let painted_w = if milestone || marker {
-                MILESTONE_SIZE
-            } else {
-                bar.width.max(8.0)
-            };
-            let tip_w = (tip.chars().count() as f32 * 7.0 + 24.0).max(48.0);
-            let overflow = parent_date_overflow(&self.state.nodes, id);
-            let extra = if overflow {
-                LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 8.0
-            } else {
-                LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
-            };
-            let timeline_w = self.state.gantt.timeline_width.max(1.0);
-            let tip_x = row_side_tooltip_left(bar.x, painted_w, extra, tip_w, timeline_w);
-            let tooltip_bounds = self.pinned_tooltip_bounds.clone();
-            items.push(
-                div()
-                    .id(("gantt-bar-tooltip", id as u64))
-                    .debug_selector(|| "gantt-bar-tooltip".into())
-                    .absolute()
-                    .on_prepaint(move |bounds, _, _| {
-                        let left = f32::from(bounds.origin.x);
-                        let top = f32::from(bounds.origin.y);
-                        *tooltip_bounds.borrow_mut() = Some(PaintedTooltip {
-                            id,
-                            left,
-                            right: left + f32::from(bounds.size.width),
-                            top,
-                            bottom: top + f32::from(bounds.size.height),
-                        });
-                    })
-                    .left(px(tip_x))
-                    .top(px(bar_top))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(cx.theme().popover)
-                    .text_color(cx.theme().popover_foreground)
-                    .text_xs()
-                    .whitespace_nowrap()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .child(tip)
-                    .into_any_element(),
-            );
-        }
         div()
             .relative()
             .size_full()
@@ -5709,6 +5664,78 @@ impl PlannerView {
         )
     }
 
+    /// Dates chip after the title overlay so short-bar / milestone titles
+    /// cannot cover the committed range.
+    fn render_pinned_bar_tooltip(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        dragging: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let id = bar.id;
+        if self.state.gantt.pin_bar_tooltip != Some(id) || dragging || self.details_overlay() {
+            return None;
+        }
+        let tip = bar_hover_tooltip(bar, &self.state.nodes);
+        let painted_w = if bar.milestone || bar.marker {
+            MILESTONE_SIZE
+        } else {
+            bar.width.max(8.0)
+        };
+        let bar_h = if bar.milestone || bar.marker {
+            MILESTONE_SIZE
+        } else if bar.summary {
+            SUMMARY_BAR_H
+        } else if bar.kind == ado_core::GanttBarKind::Unscheduled
+            || bar.kind == ado_core::GanttBarKind::NoFields
+        {
+            PLACEHOLDER_BAR_H
+        } else {
+            LEAF_BAR_H
+        };
+        let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
+        let tip_w = (tip.chars().count() as f32 * 7.0 + 24.0).max(48.0);
+        let overflow = parent_date_overflow(&self.state.nodes, id);
+        let extra = if overflow {
+            LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 8.0
+        } else {
+            LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
+        };
+        let timeline_w = self.state.gantt.timeline_width.max(1.0);
+        let tip_x = row_side_tooltip_left(bar.x, painted_w, extra, tip_w, timeline_w);
+        let tooltip_bounds = self.pinned_tooltip_bounds.clone();
+        Some(
+            div()
+                .id(("gantt-bar-tooltip", id as u64))
+                .debug_selector(|| "gantt-bar-tooltip".into())
+                .absolute()
+                .on_prepaint(move |bounds, _, _| {
+                    let left = f32::from(bounds.origin.x);
+                    let top = f32::from(bounds.origin.y);
+                    *tooltip_bounds.borrow_mut() = Some(PaintedTooltip {
+                        id,
+                        left,
+                        right: left + f32::from(bounds.size.width),
+                        top,
+                        bottom: top + f32::from(bounds.size.height),
+                    });
+                })
+                .left(px(tip_x))
+                .top(px(bar.y + bar_top))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(cx.theme().popover)
+                .text_color(cx.theme().popover_foreground)
+                .text_xs()
+                .whitespace_nowrap()
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(tip)
+                .into_any_element(),
+        )
+    }
+
     fn render_gantt_bar_label(
         &self,
         bar: &crate::gantt::BarLayout,
@@ -5721,6 +5748,11 @@ impl PlannerView {
             || bar.kind == ado_core::GanttBarKind::NoFields
             || bar.marker
         {
+            return None;
+        }
+        // The dates chip uses the same outside slot as the title overlay.
+        // Hide the title while pinned so the committed dates are not covered.
+        if self.state.gantt.pin_bar_tooltip == Some(id) {
             return None;
         }
         let timeline_w = self.state.gantt.timeline_width.max(1.0);

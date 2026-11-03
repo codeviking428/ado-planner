@@ -6054,6 +6054,15 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
         beside,
         "pinned tooltip must sit in empty row space beside the bar, tip={tip_left}..{tip_right} bar={bar_left}..{bar_right}"
     );
+    if let Some(label) = cx.debug_bounds("gantt-bar-label-2") {
+        let label_left = f32::from(label.origin.x);
+        let label_right = label_left + f32::from(label.size.width);
+        let overlaps = tip_left < label_right && tip_right > label_left;
+        assert!(
+            !overlaps,
+            "pinned dates chip must not sit under the bar title, tip={tip_left}..{tip_right} title={label_left}..{label_right}"
+        );
+    }
     if let Some(parent) = cx.debug_bounds("gantt-bar-1") {
         let parent_top = f32::from(parent.origin.y);
         let parent_bottom = parent_top + f32::from(parent.size.height);
@@ -6280,6 +6289,42 @@ fn pinned_tooltip_unpins_when_hovering_another_rows_overflow(cx: &mut gpui_kit::
             "moving onto Persist cart's ! must unpin the Cart dates chip"
         );
     });
+}
+
+#[gpui_kit::test]
+fn pinned_tooltip_is_not_covered_by_the_bar_title(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-label-1003").is_some(),
+        "precondition: Persist cart paints an outside title"
+    );
+    view.update(cx, |view, _| {
+        view.state.gantt.pin_bar_tooltip = Some(1003);
+    });
+    draw(cx);
+    let tip = cx
+        .debug_bounds("gantt-bar-tooltip")
+        .expect("pinned Persist cart dates chip");
+    assert!(
+        cx.debug_bounds("gantt-bar-label-1003").is_none(),
+        "the outside title must yield to the dates chip so the committed range is visible"
+    );
+    assert!(
+        f32::from(tip.size.width) >= 48.0,
+        "pinned dates chip must stay readable, width={}",
+        f32::from(tip.size.width)
+    );
 }
 
 #[gpui_kit::test]
