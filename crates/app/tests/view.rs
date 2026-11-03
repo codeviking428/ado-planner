@@ -5718,7 +5718,6 @@ fn drop_undo_and_pointer_leave_clear_the_bar_tooltip(cx: &mut gpui_kit::TestAppC
     draw(cx);
     view.update(cx, |view, _| {
         view.state.gantt.pin_bar_tooltip = Some(2);
-        view.state.gantt.pin_ignore_leave = true;
     });
     let undo = KeyDownEvent {
         keystroke: Keystroke::parse("ctrl-z").unwrap(),
@@ -5732,7 +5731,6 @@ fn drop_undo_and_pointer_leave_clear_the_bar_tooltip(cx: &mut gpui_kit::TestAppC
             "undo must clear a stale bar tooltip"
         );
         view.state.gantt.pin_bar_tooltip = Some(2);
-        view.state.gantt.pin_ignore_leave = true;
     });
     draw(cx);
     cx.simulate_mouse_move(point(px(8.), px(8.)), None, Modifiers::default());
@@ -5912,6 +5910,100 @@ fn drop_off_the_bar_does_not_pin_a_tooltip(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("gantt-bar-tooltip").is_none(),
         "a drop on the toolbar must not paint a pinned tooltip"
     );
+}
+
+#[gpui_kit::test]
+fn drop_on_another_row_does_not_pin_a_tooltip(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let parent = cx.debug_bounds("gantt-bar-1").expect("parent row");
+    let grip = point(
+        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    let dest = point(grip.x + px(ppd * 5.0), grip.y);
+    cx.simulate_mouse_move(dest, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    let off_row = point(dest.x, parent.origin.y + parent.size.height / 2.0);
+    cx.simulate_mouse_up(off_row, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "releasing on another row at the same X must not pin the live tooltip"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn pinned_tooltip_unpins_when_the_pointer_leaves_the_row(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let grip = point(
+        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    let dest = point(grip.x + px(ppd * 5.0), grip.y);
+    cx.simulate_mouse_move(dest, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    cx.simulate_mouse_up(dest, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip,
+            Some(2),
+            "a drop on the bar must pin the live tooltip"
+        );
+        view.state.gantt.clear_row_hover();
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip,
+            Some(2),
+            "a remount hover-leave must not unpin while the pointer is still on the bar"
+        );
+    });
+    let bar_after = cx.debug_bounds("gantt-bar-2").expect("leaf after drop");
+    let parent = cx.debug_bounds("gantt-bar-1").expect("parent row");
+    cx.simulate_mouse_move(
+        point(
+            bar_after.center().x,
+            parent.origin.y + parent.size.height / 2.0,
+        ),
+        None,
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "leaving the bar's row at the same X must unpin the live tooltip"
+        );
+    });
 }
 
 #[gpui_kit::test]

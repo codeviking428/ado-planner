@@ -214,6 +214,8 @@ pub struct PlannerView {
 struct PaintedBar {
     left: f32,
     right: f32,
+    top: f32,
+    bottom: f32,
     layout_x: f32,
     /// Prepaint content origin. Independent of the 1px/2px selection border
     /// so selecting a bar does not shift the live gesture mapping.
@@ -4735,11 +4737,15 @@ impl PlannerView {
                     let content_left = f32::from(bounds.origin.x);
                     let left = content_left - paint_border;
                     let right = content_left + f32::from(bounds.size.width) + paint_border;
+                    let top = f32::from(bounds.origin.y);
+                    let bottom = top + f32::from(bounds.size.height);
                     painted_bars.borrow_mut().insert(
                         id,
                         PaintedBar {
                             left,
                             right,
+                            top,
+                            bottom,
                             layout_x,
                             content_left,
                         },
@@ -7283,9 +7289,29 @@ impl PlannerView {
         } else {
             layout.width.max(8.0)
         };
+        let bar_h = if layout.milestone || layout.marker {
+            MILESTONE_SIZE
+        } else if layout.summary {
+            SUMMARY_BAR_H
+        } else if layout.kind == ado_core::GanttBarKind::Unscheduled
+            || layout.kind == ado_core::GanttBarKind::NoFields
+        {
+            PLACEHOLDER_BAR_H
+        } else {
+            LEAF_BAR_H
+        };
+        let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
+        let body_y = self.timeline_body_origin_y.get();
+        let row_top = if body_y > 0.0 {
+            body_y + layout.y
+        } else {
+            self.state.gantt.timeline_origin_y + TIMELINE_HEADER_H + layout.y
+        };
         PaintedBar {
             left: origin + layout.x,
             right: origin + layout.x + width,
+            top: row_top + bar_top,
+            bottom: row_top + bar_top + bar_h,
             layout_x: layout.x,
             content_left: origin + layout.x,
         }
@@ -7315,7 +7341,8 @@ impl PlannerView {
         Some(
             window_x >= painted.left - SLOP
                 && window_x <= painted.right + SLOP
-                && self.state.gantt.pointer_in_rows(window_x, window_y),
+                && window_y >= painted.top - SLOP
+                && window_y <= painted.bottom + SLOP,
         )
     }
 
@@ -7333,7 +7360,6 @@ impl PlannerView {
             return;
         }
         self.state.gantt.pin_bar_tooltip = None;
-        self.state.gantt.pin_ignore_leave = false;
         cx.notify();
     }
 
@@ -7524,10 +7550,8 @@ impl PlannerView {
             // stays cleared so a finished drag does not keep handles.
             if self.pointer_on_bar(id, window_x, window_y) == Some(true) {
                 self.state.gantt.pin_bar_tooltip = Some(id);
-                self.state.gantt.pin_ignore_leave = true;
             } else {
                 self.state.gantt.pin_bar_tooltip = None;
-                self.state.gantt.pin_ignore_leave = false;
             }
         }
         self.request_repaint(Some(window), cx);

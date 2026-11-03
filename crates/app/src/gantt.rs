@@ -640,11 +640,9 @@ pub struct GanttView {
     pub selected_link: Option<(i64, i64)>,
     pub hovered_link: Option<(i64, i64)>,
     /// After a date drop, keep that bar's tooltip mounted without waiting for
-    /// a new mouse-enter. Cleared when hover leaves the bar.
+    /// a new mouse-enter. Tied to this bar id; cleared when the pointer
+    /// leaves that bar's painted box (or on `clear_hover`).
     pub pin_bar_tooltip: Option<i64>,
-    /// Skip the remount hover-leave that fires right after a date drop so the
-    /// pinned tooltip is not cleared while the pointer is still on the bar.
-    pub pin_ignore_leave: bool,
     pub collapsed: HashSet<i64>,
     pub gesture: Option<Gesture>,
     pub pending_nudge: Option<PendingNudge>,
@@ -692,7 +690,6 @@ impl Default for GanttView {
             selected_link: None,
             hovered_link: None,
             pin_bar_tooltip: None,
-            pin_ignore_leave: false,
             collapsed: HashSet::new(),
             gesture: None,
             pending_nudge: None,
@@ -993,7 +990,6 @@ impl GanttView {
     pub fn clear_hover(&mut self) {
         self.clear_row_hover();
         self.pin_bar_tooltip = None;
-        self.pin_ignore_leave = false;
     }
 
     pub fn pointer_in_canvas(&self, x: f32, y: f32) -> bool {
@@ -7551,14 +7547,12 @@ mod tests {
     fn clear_hover_drops_a_pinned_bar_tooltip() {
         let mut gantt = GanttView {
             pin_bar_tooltip: Some(2),
-            pin_ignore_leave: true,
             hovered_id: Some(2),
             bar_hovered_id: Some(2),
             ..Default::default()
         };
         gantt.clear_hover();
         assert_eq!(gantt.pin_bar_tooltip, None);
-        assert!(!gantt.pin_ignore_leave);
         assert_eq!(gantt.hovered_id, None);
         assert_eq!(gantt.bar_hovered_id, None);
     }
@@ -7567,14 +7561,12 @@ mod tests {
     fn clear_row_hover_keeps_a_pinned_bar_tooltip() {
         let mut gantt = GanttView {
             pin_bar_tooltip: Some(2),
-            pin_ignore_leave: true,
             hovered_id: Some(2),
             bar_hovered_id: Some(2),
             ..Default::default()
         };
         gantt.clear_row_hover();
         assert_eq!(gantt.pin_bar_tooltip, Some(2));
-        assert!(gantt.pin_ignore_leave);
         assert_eq!(gantt.hovered_id, None);
         assert_eq!(gantt.bar_hovered_id, None);
     }
