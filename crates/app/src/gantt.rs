@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use ado_core::{
     DEFAULT_BAR_DAYS, GanttBarKind, IterationHint, IterationNode, WorkItemNode, compact_date,
-    dates_column_text, from_gantt_exclusive_end, gantt_bar_display, iteration_hint_for_path,
-    parse_iso_date,
+    dates_column_text, format_date_range, from_gantt_exclusive_end, gantt_bar_display,
+    iteration_hint_for_path, parse_iso_date,
 };
 use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
@@ -1813,11 +1813,18 @@ impl GanttView {
                 // Wrap-around already skips intervening bodies via the gap
                 // above the target; do not slide x2 onto another bar's end.
                 if !intervening.is_empty() && !wrap_around {
-                    let x_vert = clear_vertical_x(x_in, &intervening, bar.x, true, x_head);
+                    // Year/Quarter bars are slivers; their titles still paint at
+                    // full glyph width and would shove the inbound vertical
+                    // tens of days away (stray line at x≈532). Occupy the
+                    // body only at those zooms.
+                    let include_labels =
+                        !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
+                    let x_vert =
+                        clear_vertical_x(x_in, &intervening, bar.x, true, x_head, include_labels);
                     if (x_vert - x_in).abs() > 0.5 {
                         x_in = x_vert;
                     }
-                    x_in = clamp_inbound_stub(x_in, x_head, true, &intervening);
+                    x_in = clamp_inbound_stub(x_in, x_head, true, &intervening, include_labels);
                 }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
                 // Stay in the predecessor row's gutter so the outgoing
@@ -1914,26 +1921,36 @@ fn header_label_px(label: &str) -> f32 {
 
 /// Child start before the parent, or child target after the parent.
 pub fn parent_date_overflow(nodes: &[WorkItemNode], id: i64) -> bool {
-    let Some(node) = nodes.iter().find(|node| node.id == id) else {
-        return false;
-    };
-    let Some(parent_id) = node.parent_id else {
-        return false;
-    };
-    let Some(parent) = nodes.iter().find(|node| node.id == parent_id) else {
-        return false;
-    };
+    parent_overflow_span(nodes, id).is_some()
+}
+
+/// Hover copy for the amber `!` when a child falls outside its parent.
+pub fn parent_overflow_tip(nodes: &[WorkItemNode], id: i64) -> Option<String> {
+    let (parent_start, parent_end) = parent_overflow_span(nodes, id)?;
+    let range = format_date_range(parent_start, parent_end);
+    if range.is_empty() {
+        Some("Outside parent's dates".into())
+    } else {
+        Some(format!("Outside parent's dates ({range})"))
+    }
+}
+
+fn parent_overflow_span(nodes: &[WorkItemNode], id: i64) -> Option<(Option<Date>, Option<Date>)> {
+    let node = nodes.iter().find(|node| node.id == id)?;
+    let parent_id = node.parent_id?;
+    let parent = nodes.iter().find(|node| node.id == parent_id)?;
     let child_start = parse_iso_date(node.start_date.as_deref());
     let child_end = parse_iso_date(node.target_date.as_deref());
     let parent_start = parse_iso_date(parent.start_date.as_deref());
     let parent_end = parse_iso_date(parent.target_date.as_deref());
-    matches!(
+    let overflow = matches!(
         (child_start, parent_start),
         (Some(child), Some(parent)) if child < parent
     ) || matches!(
         (child_end, parent_end),
         (Some(child), Some(parent)) if child > parent
-    )
+    );
+    overflow.then_some((parent_start, parent_end))
 }
 
 fn bar_title_px(title: &str) -> f32 {
@@ -1971,14 +1988,21 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
     }
 }
 
-/// Body plus an external title, so a vertical drop does not run through a row.
-fn bar_occupied_x(bar: &BarLayout) -> (f32, f32) {
+/// Body, and optionally an external title, so a vertical drop misses the row.
+fn bar_occupied_x(bar: &BarLayout, include_label: bool) -> (f32, f32) {
     let left = if bar.milestone || bar.marker {
         bar.x - 2.0
     } else {
         bar.x - HANDLE_WIDTH
     };
-    (left, bar_label_right(bar))
+    let right = if include_label {
+        bar_label_right(bar)
+    } else if bar.milestone || bar.marker {
+        bar.x + MILESTONE_SIZE + 4.0
+    } else {
+        bar.x + bar.width.max(8.0) + 4.0
+    };
+    (left, right)
 }
 
 fn x_hits_span(x: f32, left: f32, right: f32) -> bool {
@@ -1993,8 +2017,12 @@ fn clear_vertical_x(
     succ_edge: f32,
     inbound_left: bool,
     x_head: f32,
+    include_labels: bool,
 ) -> f32 {
-    let blocked: Vec<(f32, f32)> = intervening.iter().map(|bar| bar_occupied_x(bar)).collect();
+    let blocked: Vec<(f32, f32)> = intervening
+        .iter()
+        .map(|bar| bar_occupied_x(bar, include_labels))
+        .collect();
     if blocked
         .iter()
         .all(|(left, right)| !x_hits_span(pref, *left, *right))
@@ -2061,6 +2089,7 @@ fn clamp_inbound_stub(
     x_head: f32,
     inbound_left: bool,
     intervening: &[&BarLayout],
+    include_labels: bool,
 ) -> f32 {
     const STUB: f32 = 12.0;
     let clamped = if inbound_left {
@@ -2072,7 +2101,7 @@ fn clamp_inbound_stub(
         return clamped;
     }
     if intervening.iter().any(|bar| {
-        let (left, right) = bar_occupied_x(bar);
+        let (left, right) = bar_occupied_x(bar, include_labels);
         x_hits_span(clamped, left, right)
     }) {
         x_in
@@ -3886,8 +3915,8 @@ mod tests {
                     arrow.x_head,
                     succ.x
                 );
-                let expected_x1 = (bar_end(pred) + 12.0)
-                    .clamp(10.0, (gantt.timeline_width - 10.0).max(24.0));
+                let expected_x1 =
+                    (bar_end(pred) + 12.0).clamp(10.0, (gantt.timeline_width - 10.0).max(24.0));
                 assert!(
                     (arrow.x1 - expected_x1).abs() < 1.5,
                     "outgoing stub must leave the source end, x1={} expected={expected_x1}",
@@ -4730,7 +4759,7 @@ mod tests {
         };
         let arrows = gantt.layout_dependency_arrows(&[pred, mid.clone(), succ.clone()]);
         assert_eq!(arrows.len(), 1);
-        let (left, right) = bar_occupied_x(&mid);
+        let (left, right) = bar_occupied_x(&mid, true);
         assert!(
             arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
             "forcing a 12px stub must not recross the intervening bar, x2={} mid={left}..{right} x_head={}",
@@ -4930,6 +4959,58 @@ mod tests {
             "Year links must stay a short elbow, got span {span} x1={} x2={}",
             arrows[0].x1,
             arrows[0].x2
+        );
+        let head_span = (arrows[0].x2 - arrows[0].x_head).abs();
+        assert!(
+            head_span < 40.0,
+            "Year inbound stub must stay next to the head, x2={} x_head={}",
+            arrows[0].x2,
+            arrows[0].x_head
+        );
+    }
+
+    #[test]
+    fn year_view_inbound_vertical_ignores_wide_labels() {
+        let mut parent = node(1003, None);
+        parent.title = "Persist cart".into();
+        parent.start_date = Some("2026-07-06T00:00:00Z".into());
+        parent.target_date = Some("2026-07-20T00:00:00Z".into());
+        let mut child = node(1004, Some(1003));
+        child.title = "Cart UI with a very long label that fills the year chart".into();
+        child.start_date = Some("2026-07-08T00:00:00Z".into());
+        child.target_date = Some("2026-07-18T00:00:00Z".into());
+        let mut succ = node(1012, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1003];
+        let nodes = vec![parent, child, succ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 1, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 1);
+        let pred = bars.iter().find(|bar| bar.id == 1003).expect("pred");
+        let target = bars.iter().find(|bar| bar.id == 1012).expect("succ");
+        let x2 = arrows[0].x2;
+        assert!(
+            (x2 - arrows[0].x_head).abs() < 40.0,
+            "Year inbound vertical must sit by the successor, not past a label, x2={x2} x_head={} pred={}..{} succ={}..{}",
+            arrows[0].x_head,
+            pred.x,
+            pred.x + pred.width,
+            target.x,
+            target.x + target.width
+        );
+        assert!(
+            x2 < 400.0,
+            "Year inbound must not land at a stray mid-chart x, x2={x2}"
         );
     }
 
@@ -5268,6 +5349,10 @@ mod tests {
         child.start_date = Some("2026-07-20T00:00:00Z".into());
         child.target_date = Some("2026-08-15T00:00:00Z".into());
         assert!(parent_date_overflow(&[parent.clone(), child.clone()], 2));
+        assert_eq!(
+            parent_overflow_tip(&[parent.clone(), child.clone()], 2).as_deref(),
+            Some("Outside parent's dates (Jul 1 → Jul 31)")
+        );
         child.target_date = Some("2026-07-25T00:00:00Z".into());
         assert!(!parent_date_overflow(&[parent, child], 2));
     }

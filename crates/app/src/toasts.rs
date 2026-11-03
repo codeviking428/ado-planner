@@ -52,6 +52,10 @@ pub enum UndoAction {
         id: i64,
         fields: Vec<(String, Value)>,
     },
+    /// Undo whatever is currently on the history stack (toast after a prior undo).
+    StackUndo,
+    /// Redo whatever is currently on the redo stack.
+    StackRedo,
 }
 
 /// One row in a batched Dates history entry.
@@ -132,6 +136,7 @@ pub struct Toast {
     pub message: String,
     pub copyable: bool,
     pub undo: Option<UndoAction>,
+    pub redo: Option<UndoAction>,
     pub extra: Option<ToastExtra>,
     pub created_at: Instant,
 }
@@ -161,6 +166,7 @@ impl Toasts {
             message: message.into(),
             copyable,
             undo: None,
+            redo: None,
             extra: None,
             created_at: Instant::now(),
         });
@@ -169,7 +175,8 @@ impl Toasts {
     }
 
     pub fn dismiss_undo(&mut self) {
-        self.items.retain(|toast| toast.undo.is_none());
+        self.items
+            .retain(|toast| toast.undo.is_none() && toast.redo.is_none());
     }
 
     pub fn dismiss_undo_for_item(&mut self, id: i64) {
@@ -186,7 +193,7 @@ impl Toasts {
                 successor_id,
                 predecessor_id,
             }) => *successor_id != id && *predecessor_id != id,
-            None => true,
+            Some(UndoAction::StackUndo | UndoAction::StackRedo) | None => true,
         });
     }
 
@@ -208,7 +215,31 @@ impl Toasts {
             message: message.into(),
             copyable: false,
             undo: Some(undo),
+            redo: None,
             extra,
+            created_at: Instant::now(),
+        });
+        self.cap();
+        self.next_id
+    }
+
+    /// Success toast that can offer Undo and/or Redo from remaining history.
+    pub fn push_stack(
+        &mut self,
+        message: impl Into<String>,
+        undo: Option<UndoAction>,
+        redo: Option<UndoAction>,
+    ) -> u64 {
+        self.dismiss_success();
+        self.next_id += 1;
+        self.items.push(Toast {
+            id: self.next_id,
+            kind: ToastKind::Success,
+            message: message.into(),
+            copyable: false,
+            undo,
+            redo,
+            extra: None,
             created_at: Instant::now(),
         });
         self.cap();
@@ -236,7 +267,7 @@ impl Toasts {
         self.items.retain(|toast| match toast.kind {
             ToastKind::Error => now.saturating_duration_since(toast.created_at) < ERROR_TTL,
             ToastKind::Success => {
-                let ttl = if toast.undo.is_some() {
+                let ttl = if toast.undo.is_some() || toast.redo.is_some() {
                     UNDO_TTL
                 } else {
                     SUCCESS_TTL
@@ -391,6 +422,19 @@ mod tests {
             toasts.items.is_empty(),
             "error toasts must not stick forever"
         );
+    }
+
+    #[test]
+    fn stack_toast_keeps_undo_and_redo() {
+        let mut toasts = Toasts::default();
+        toasts.push_stack(
+            "Undone moved A",
+            Some(UndoAction::StackUndo),
+            Some(UndoAction::StackRedo),
+        );
+        assert_eq!(toasts.items.len(), 1);
+        assert!(matches!(toasts.items[0].undo, Some(UndoAction::StackUndo)));
+        assert!(matches!(toasts.items[0].redo, Some(UndoAction::StackRedo)));
     }
 
     #[test]

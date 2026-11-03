@@ -5342,10 +5342,99 @@ fn toast_undo_click_restores_dates_without_a_hit_through(cx: &mut gpui_kit::Test
             "the Undo control must consume the action instead of a hit-through no-op, got {messages:?}"
         );
         assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .any(|toast| toast.redo.is_some()),
+            "after the last Undo the toast must offer Redo, got {messages:?}"
+        );
+        assert!(
             view.state.gantt.gesture.is_none(),
             "Undo must not start a bar gesture through the toast"
         );
     });
+}
+
+#[gpui_kit::test]
+fn toast_keeps_undo_while_history_remains(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let before_start = Some("2026-07-06T00:00:00Z".to_string());
+    let before_target = Some("2026-07-20T00:00:00Z".to_string());
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 1) {
+        node.start_date = Some("2026-08-04T00:00:00Z".into());
+        node.target_date = Some("2026-08-21T00:00:00Z".into());
+    }
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = Some("2026-08-10T00:00:00Z".into());
+        node.target_date = Some("2026-08-24T00:00:00Z".into());
+    }
+    state.history.push(HistoryEntry::Dates {
+        id: 1,
+        before_start: before_start.clone(),
+        before_target: before_target.clone(),
+        after_start: Some("2026-08-04T00:00:00Z".into()),
+        after_target: Some("2026-08-21T00:00:00Z".into()),
+    });
+    state.history.push(HistoryEntry::Dates {
+        id: 2,
+        before_start: before_start.clone(),
+        before_target: before_target.clone(),
+        after_start: Some("2026-08-10T00:00:00Z".into()),
+        after_target: Some("2026-08-24T00:00:00Z".into()),
+    });
+    state.toasts.push_undo(
+        "Moved \"Work Item 1\" to Aug 10 → Aug 24",
+        UndoAction::RestoreDates {
+            id: 2,
+            start_date: before_start,
+            target_date: before_target,
+            rev: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let undo = cx.debug_bounds("toast-undo").expect("toast Undo");
+    cx.simulate_click(undo.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .any(|toast| matches!(toast.undo, Some(UndoAction::StackUndo))),
+            "Undo must stay while history remains, got {:?}",
+            view.state
+                .toasts
+                .items
+                .iter()
+                .map(|toast| (&toast.message, toast.undo.clone(), toast.redo.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .any(|toast| matches!(toast.redo, Some(UndoAction::StackRedo))),
+            "the undone step must also offer Redo"
+        );
+    });
+    assert!(
+        cx.debug_bounds("toast-undo").is_some(),
+        "Undo must still paint while history remains"
+    );
+    assert!(
+        cx.debug_bounds("toast-redo").is_some(),
+        "Redo must paint after the first Undo"
+    );
 }
 
 #[gpui_kit::test]
@@ -6447,8 +6536,7 @@ fn add_child_undo_clears_title_focus_ticks(cx: &mut gpui_kit::TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, _| {
             assert_eq!(
-                view.state.gantt.selected_id,
-                None,
+                view.state.gantt.selected_id, None,
                 "undo of create must not jump selection to the first row"
             );
             assert!(

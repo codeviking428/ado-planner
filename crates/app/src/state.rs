@@ -2443,11 +2443,10 @@ impl PlannerState {
         let result = self.apply_history_entry(&entry, true).await;
         self.history_recording = true;
         if result.is_ok() {
-            self.push_history_toast(&entry, true);
             if !matches!(entry, HistoryEntry::Created { .. }) {
-                self.history.redo.push(entry);
+                self.history.redo.push(entry.clone());
             }
-            self.toasts.items.retain(|toast| toast.undo.is_none());
+            self.push_history_toast(&entry, true);
         } else {
             self.history.undo.push(entry);
         }
@@ -2595,6 +2594,7 @@ impl PlannerState {
             } => self.add_dependency(*successor_id, *predecessor_id).await,
             UndoAction::DeleteCreated { id, .. } => self.delete_item(*id).await,
             UndoAction::RestoreFields { id, fields } => self.restore_fields(*id, fields).await,
+            UndoAction::StackUndo | UndoAction::StackRedo => Ok(()),
         };
         self.history_recording = true;
         if result.is_ok() {
@@ -2675,6 +2675,7 @@ impl PlannerState {
                 successor_id,
                 predecessor_id,
             } => vec![*successor_id, *predecessor_id],
+            UndoAction::StackUndo | UndoAction::StackRedo => Vec::new(),
         };
         if let UndoAction::DeleteCreated { id, .. } = action {
             self.nodes.retain(|node| node.id != *id);
@@ -2800,6 +2801,7 @@ impl PlannerState {
                     self.history.undo.remove(index);
                 }
             }
+            UndoAction::StackUndo | UndoAction::StackRedo => {}
         }
     }
 
@@ -3249,6 +3251,8 @@ impl PlannerState {
                 successor_id,
                 predecessor_id,
             } => self.link_changed_message("Removed", *predecessor_id, *successor_id),
+            UndoAction::StackUndo => "Undo".into(),
+            UndoAction::StackRedo => "Redo".into(),
         }
     }
 
@@ -3311,7 +3315,14 @@ impl PlannerState {
         } else {
             format!("Redid: {original}")
         };
-        self.toasts.push(ToastKind::Success, message);
+        self.push_stack_toast(message);
+    }
+
+    /// Success toast after Undo/Redo: keep Undo while the stack remains, else Redo.
+    pub fn push_stack_toast(&mut self, message: impl Into<String>) {
+        let undo = (!self.history.undo.is_empty()).then_some(UndoAction::StackUndo);
+        let redo = (!self.history.redo.is_empty()).then_some(UndoAction::StackRedo);
+        self.toasts.push_stack(message, undo, redo);
     }
 
     fn history_undo_message(&self, entry: &HistoryEntry) -> String {
@@ -4006,6 +4017,61 @@ mod toast_copy_tests {
         assert!(
             start_only.starts_with("Moved \"Cart UI\" to"),
             "moving a start-only bar must not read as a resize, got {start_only}"
+        );
+    }
+
+    #[test]
+    fn history_toast_keeps_undo_while_the_stack_remains() {
+        use crate::toasts::{HistoryEntry, UndoAction};
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-stack-toast")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        state.history.push(HistoryEntry::Dates {
+            id: 1,
+            before_start: Some("2026-07-06T00:00:00Z".into()),
+            before_target: Some("2026-07-20T00:00:00Z".into()),
+            after_start: Some("2026-08-04T00:00:00Z".into()),
+            after_target: Some("2026-08-21T00:00:00Z".into()),
+        });
+        state.history.push(HistoryEntry::Dates {
+            id: 2,
+            before_start: Some("2026-07-06T00:00:00Z".into()),
+            before_target: Some("2026-07-20T00:00:00Z".into()),
+            after_start: Some("2026-08-10T00:00:00Z".into()),
+            after_target: Some("2026-08-24T00:00:00Z".into()),
+        });
+        let pending = state.undo_date_stack_now();
+        assert!(!pending.is_empty());
+        let toast = state.toasts.items.last().expect("undone toast");
+        assert!(
+            matches!(toast.undo, Some(UndoAction::StackUndo)),
+            "Undo must stay while history remains, got {:?}",
+            toast.undo
+        );
+        assert!(
+            matches!(toast.redo, Some(UndoAction::StackRedo)),
+            "the undone step must offer Redo, got {:?}",
+            toast.redo
+        );
+        let pending = state.undo_date_stack_now();
+        assert!(!pending.is_empty());
+        let toast = state.toasts.items.last().expect("last undone toast");
+        assert!(
+            toast.undo.is_none(),
+            "Undo must drop when the stack is empty, got {:?}",
+            toast.undo
+        );
+        assert!(
+            matches!(toast.redo, Some(UndoAction::StackRedo)),
+            "Redo must remain after the last Undo, got {:?}",
+            toast.redo
         );
     }
 

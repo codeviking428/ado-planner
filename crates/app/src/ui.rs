@@ -49,7 +49,7 @@ use crate::gantt::{
     NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W,
     SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H,
     TODAY_PILL_GAP, TODAY_PILL_W, TREE_INDENT, TYPE_COL_WIDTH, bar_title_is_inside,
-    parent_date_overflow,
+    parent_date_overflow, parent_overflow_tip,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -1561,6 +1561,7 @@ impl PlannerView {
                 let id = toast.id;
                 let copyable = toast.copyable;
                 let undo = toast.undo.clone();
+                let redo = toast.redo.clone();
                 let message = toast.message.clone();
                 let kind = toast.kind;
                 h_flex()
@@ -1649,6 +1650,31 @@ impl PlannerView {
                                     this.apply_toast_undo(id, action.clone(), cx);
                                 }))
                                 .child(Button::new(("undo-toast", id)).label("Undo")),
+                        )
+                    })
+                    .when_some(redo.clone(), |el, action| {
+                        let action_down = action.clone();
+                        el.child(
+                            div()
+                                .id(("toast-redo-wrap", id))
+                                .debug_selector(|| "toast-redo".into())
+                                .occlude()
+                                .flex_shrink_0()
+                                .min_w(px(52.))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.arm_toast_pointer();
+                                        cx.stop_propagation();
+                                        this.apply_toast_undo(id, action_down.clone(), cx);
+                                    }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.apply_toast_undo(id, action.clone(), cx);
+                                }))
+                                .child(Button::new(("redo-toast", id)).label("Redo")),
                         )
                     })
                     .when_some(toast.extra.clone(), |el, extra| {
@@ -1761,6 +1787,14 @@ impl PlannerView {
         }
         self.state.gantt.context_menu = None;
         self.state.gantt.hover_locked = false;
+        if matches!(action, UndoAction::StackUndo) {
+            self.undo_last(cx);
+            return;
+        }
+        if matches!(action, UndoAction::StackRedo) {
+            self.redo_last(cx);
+            return;
+        }
         let original = self.state.history_action_message_for_undo(&action);
         let undid = undone_toast_message(&original);
         if matches!(
@@ -1769,8 +1803,6 @@ impl PlannerView {
         ) {
             let pending = self.state.toast_restore_or_undo_dates(action);
             if !pending.is_empty() {
-                self.state.toasts.dismiss_undo();
-                self.state.toasts.dismiss(toast_id);
                 self.clamp_toast_hover();
                 let already_toasted = pending.iter().any(|save| save.role == DateSaveRole::Undo);
                 self.queue_form_dates_from_draft();
@@ -1778,6 +1810,10 @@ impl PlannerView {
                     self.enqueue_date_save(cx, save);
                 }
                 if !already_toasted {
+                    // History was not the matching stack entry; don't offer
+                    // StackUndo/Redo against leftover dates.
+                    self.state.toasts.dismiss_undo();
+                    self.state.toasts.dismiss(toast_id);
                     self.state.toasts.push(ToastKind::Success, undid);
                 }
                 self.note_toasts_changed(cx);
@@ -1844,8 +1880,7 @@ impl PlannerView {
                     Ok((working, Ok(()))) => {
                         let prev_selected = this.state.gantt.selected_id;
                         this.state.merge_undo_action(&working, &merge_action);
-                        this.state.toasts.dismiss_undo();
-                        this.state.toasts.push(ToastKind::Success, undid);
+                        this.state.push_stack_toast(undid);
                         this.after_io_selection_change(prev_selected);
                     }
                     Ok((working, Err(err))) => {
@@ -3587,12 +3622,9 @@ impl PlannerView {
         } else {
             full.clone()
         };
-        let tip = if parent_date_overflow(&self.state.nodes, id) {
-            format!("{full} · outside parent dates")
-        } else {
-            full
-        };
         let overflow = parent_date_overflow(&self.state.nodes, id);
+        let overflow_tip = parent_overflow_tip(&self.state.nodes, id);
+        let tip = overflow_tip.clone().unwrap_or(full);
         h_flex()
             .id(("dates", id as u64))
             .debug_selector(move || {
@@ -3620,11 +3652,18 @@ impl PlannerView {
                     .child(display.clone()),
             )
             .when(overflow, |el| {
+                let overflow_tip = overflow_tip
+                    .clone()
+                    .unwrap_or_else(|| "Outside parent's dates".to_string());
                 el.child(
                     div()
                         .id(("dates-overflow", id as u64))
                         .debug_selector(|| "gantt-parent-overflow".into())
                         .flex_shrink_0()
+                        .occlude()
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(overflow_tip.clone()).build(window, cx)
+                        })
                         .child("!"),
                 )
             })
@@ -4713,6 +4752,8 @@ impl PlannerView {
         ];
         if parent_date_overflow(&self.state.nodes, id) {
             let warn = cx.theme().warning;
+            let overflow_tip = parent_overflow_tip(&self.state.nodes, id)
+                .unwrap_or_else(|| "Outside parent's dates".to_string());
             items.push(
                 div()
                     .id(("gantt-overflow", id as u64))
@@ -4724,6 +4765,8 @@ impl PlannerView {
                     .h(px(bar_h + 4.0))
                     .rounded_sm()
                     .bg(warn.opacity(0.85))
+                    .occlude()
+                    .tooltip(move |window, cx| Tooltip::new(overflow_tip.clone()).build(window, cx))
                     .into_any_element(),
             );
         }
