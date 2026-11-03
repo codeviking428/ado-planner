@@ -15,6 +15,15 @@ pub enum ToastKind {
     Warning,
 }
 
+/// One item in a toast Undo that restores dates (parent move + children).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DateRestore {
+    pub id: i64,
+    pub start_date: Option<String>,
+    pub target_date: Option<String>,
+    pub rev: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UndoAction {
     RestoreDates {
@@ -23,6 +32,8 @@ pub enum UndoAction {
         target_date: Option<String>,
         rev: i64,
     },
+    /// Parent move plus "Move children too" as one Undo.
+    RestoreDatesBatch { items: Vec<DateRestore> },
     RemoveLink {
         successor_id: i64,
         predecessor_id: i64,
@@ -43,6 +54,16 @@ pub enum UndoAction {
     },
 }
 
+/// One row in a batched Dates history entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatesChange {
+    pub id: i64,
+    pub before_start: Option<String>,
+    pub before_target: Option<String>,
+    pub after_start: Option<String>,
+    pub after_target: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryEntry {
     Dates {
@@ -52,6 +73,8 @@ pub enum HistoryEntry {
         after_start: Option<String>,
         after_target: Option<String>,
     },
+    /// Parent bar move folded with descendant shifts (one Ctrl+Z).
+    DatesGroup { items: Vec<DatesChange> },
     Link {
         successor_id: i64,
         predecessor_id: i64,
@@ -154,6 +177,7 @@ impl Toasts {
             Some(UndoAction::DeleteCreated { id: item, .. })
             | Some(UndoAction::RestoreDates { id: item, .. })
             | Some(UndoAction::RestoreFields { id: item, .. }) => *item != id,
+            Some(UndoAction::RestoreDatesBatch { items }) => items.iter().all(|item| item.id != id),
             Some(UndoAction::RemoveLink {
                 successor_id,
                 predecessor_id,

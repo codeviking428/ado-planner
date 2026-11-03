@@ -26,7 +26,8 @@ use crate::gantt::{
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
 use crate::toasts::{
-    EditHistory, HistoryEntry, ToastExtra, ToastKind, Toasts, UndoAction, error_text,
+    DateRestore, DatesChange, EditHistory, HistoryEntry, ToastExtra, ToastKind, Toasts, UndoAction,
+    error_text,
 };
 use crate::updater::Updater;
 
@@ -1238,11 +1239,14 @@ impl PlannerState {
     }
 
     pub fn discard_last_dates(&mut self, id: i64) {
-        if matches!(
-            self.history.undo.last(),
-            Some(HistoryEntry::Dates { id: entry_id, .. }) if *entry_id == id
-        ) {
-            self.history.undo.pop();
+        match self.history.undo.last() {
+            Some(HistoryEntry::Dates { id: entry_id, .. }) if *entry_id == id => {
+                self.history.undo.pop();
+            }
+            Some(HistoryEntry::DatesGroup { items }) if items.iter().any(|item| item.id == id) => {
+                self.history.undo.pop();
+            }
+            _ => {}
         }
     }
 
@@ -1413,82 +1417,182 @@ impl PlannerState {
     /// Apply the last Dates undo locally so a second Ctrl+Z is not dropped
     /// while the first PATCH is in flight. Returns the persist to queue.
     pub fn undo_dates_now(&mut self) -> Option<PendingDateSave> {
-        let HistoryEntry::Dates {
-            id,
-            before_start,
-            before_target,
-            after_start,
-            after_target,
-        } = self.history.undo.last().cloned()?
-        else {
-            return None;
-        };
-        let previous = self.nodes.iter().find(|node| node.id == id).cloned()?;
-        let _ = self.history.pop_undo();
-        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
-            node.start_date = before_start.clone();
-            node.target_date = before_target.clone();
+        self.undo_date_stack_now().into_iter().next()
+    }
+
+    /// Undo a Dates or DatesGroup entry. A group restores parent + children
+    /// in one step so "Move children too" is not a separate Undo.
+    pub fn undo_date_stack_now(&mut self) -> Vec<PendingDateSave> {
+        match self.history.undo.last().cloned() {
+            Some(HistoryEntry::Dates {
+                id,
+                before_start,
+                before_target,
+                after_start,
+                after_target,
+            }) => {
+                let Some(previous) = self.nodes.iter().find(|node| node.id == id).cloned() else {
+                    return Vec::new();
+                };
+                let _ = self.history.pop_undo();
+                if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
+                    node.start_date = before_start.clone();
+                    node.target_date = before_target.clone();
+                }
+                let entry = HistoryEntry::Dates {
+                    id,
+                    before_start: before_start.clone(),
+                    before_target: before_target.clone(),
+                    after_start,
+                    after_target,
+                };
+                self.history.redo.push(entry.clone());
+                self.push_history_toast(&entry, true);
+                self.sync_open_form_from_node(id);
+                vec![PendingDateSave {
+                    id,
+                    start: parse_iso_date(before_start.as_deref()),
+                    target: parse_iso_date(before_target.as_deref()),
+                    after_start: before_start,
+                    after_target: before_target,
+                    rev: previous.rev,
+                    previous,
+                    role: DateSaveRole::Undo,
+                }]
+            }
+            Some(HistoryEntry::DatesGroup { items }) => {
+                if items.is_empty() {
+                    return Vec::new();
+                }
+                let _ = self.history.pop_undo();
+                self.history.redo.push(HistoryEntry::DatesGroup {
+                    items: items.clone(),
+                });
+                if let Some(first) = items.first() {
+                    let entry = HistoryEntry::Dates {
+                        id: first.id,
+                        before_start: first.before_start.clone(),
+                        before_target: first.before_target.clone(),
+                        after_start: first.after_start.clone(),
+                        after_target: first.after_target.clone(),
+                    };
+                    self.push_history_toast(&entry, true);
+                }
+                self.pending_from_dates_group(items, true)
+            }
+            _ => Vec::new(),
         }
-        let entry = HistoryEntry::Dates {
-            id,
-            before_start: before_start.clone(),
-            before_target: before_target.clone(),
-            after_start,
-            after_target,
-        };
-        self.history.redo.push(entry.clone());
-        self.push_history_toast(&entry, true);
-        self.sync_open_form_from_node(id);
-        Some(PendingDateSave {
-            id,
-            start: parse_iso_date(before_start.as_deref()),
-            target: parse_iso_date(before_target.as_deref()),
-            after_start: before_start,
-            after_target: before_target,
-            rev: previous.rev,
-            previous,
-            role: DateSaveRole::Undo,
-        })
     }
 
     /// Apply the last Dates redo locally so a second Ctrl+Shift+Z is not dropped.
     pub fn redo_dates_now(&mut self) -> Option<PendingDateSave> {
-        let HistoryEntry::Dates {
-            id,
-            before_start,
-            before_target,
-            after_start,
-            after_target,
-        } = self.history.redo.last().cloned()?
-        else {
-            return None;
-        };
-        let previous = self.nodes.iter().find(|node| node.id == id).cloned()?;
-        let _ = self.history.pop_redo();
-        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
-            node.start_date = after_start.clone();
-            node.target_date = after_target.clone();
+        self.redo_date_stack_now().into_iter().next()
+    }
+
+    pub fn redo_date_stack_now(&mut self) -> Vec<PendingDateSave> {
+        match self.history.redo.last().cloned() {
+            Some(HistoryEntry::Dates {
+                id,
+                before_start,
+                before_target,
+                after_start,
+                after_target,
+            }) => {
+                let Some(previous) = self.nodes.iter().find(|node| node.id == id).cloned() else {
+                    return Vec::new();
+                };
+                let _ = self.history.pop_redo();
+                if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
+                    node.start_date = after_start.clone();
+                    node.target_date = after_target.clone();
+                }
+                let entry = HistoryEntry::Dates {
+                    id,
+                    before_start,
+                    before_target,
+                    after_start: after_start.clone(),
+                    after_target: after_target.clone(),
+                };
+                self.history.undo.push(entry.clone());
+                self.push_history_toast(&entry, false);
+                self.sync_open_form_from_node(id);
+                vec![PendingDateSave {
+                    id,
+                    start: parse_iso_date(after_start.as_deref()),
+                    target: parse_iso_date(after_target.as_deref()),
+                    after_start,
+                    after_target,
+                    rev: previous.rev,
+                    previous,
+                    role: DateSaveRole::Redo,
+                }]
+            }
+            Some(HistoryEntry::DatesGroup { items }) => {
+                if items.is_empty() {
+                    return Vec::new();
+                }
+                let _ = self.history.pop_redo();
+                self.history.undo.push(HistoryEntry::DatesGroup {
+                    items: items.clone(),
+                });
+                if let Some(first) = items.first() {
+                    let entry = HistoryEntry::Dates {
+                        id: first.id,
+                        before_start: first.before_start.clone(),
+                        before_target: first.before_target.clone(),
+                        after_start: first.after_start.clone(),
+                        after_target: first.after_target.clone(),
+                    };
+                    self.push_history_toast(&entry, false);
+                }
+                self.pending_from_dates_group(items, false)
+            }
+            _ => Vec::new(),
         }
-        let entry = HistoryEntry::Dates {
-            id,
-            before_start,
-            before_target,
-            after_start: after_start.clone(),
-            after_target: after_target.clone(),
-        };
-        self.history.undo.push(entry.clone());
-        self.push_history_toast(&entry, false);
-        self.sync_open_form_from_node(id);
-        Some(PendingDateSave {
-            id,
-            start: parse_iso_date(after_start.as_deref()),
-            target: parse_iso_date(after_target.as_deref()),
-            after_start,
-            after_target,
-            rev: previous.rev,
-            previous,
-            role: DateSaveRole::Redo,
-        })
+    }
+
+    fn pending_from_dates_group(
+        &mut self,
+        items: Vec<DatesChange>,
+        is_undo: bool,
+    ) -> Vec<PendingDateSave> {
+        let mut out = Vec::new();
+        for (index, change) in items.into_iter().enumerate() {
+            let Some(previous) = self.nodes.iter().find(|node| node.id == change.id).cloned()
+            else {
+                continue;
+            };
+            let (start_s, target_s) = if is_undo {
+                (change.before_start, change.before_target)
+            } else {
+                (change.after_start, change.after_target)
+            };
+            if let Some(node) = self.nodes.iter_mut().find(|node| node.id == change.id) {
+                node.start_date = start_s.clone();
+                node.target_date = target_s.clone();
+            }
+            self.sync_open_form_from_node(change.id);
+            let role = if index == 0 {
+                if is_undo {
+                    DateSaveRole::Undo
+                } else {
+                    DateSaveRole::Redo
+                }
+            } else {
+                DateSaveRole::Cascade
+            };
+            out.push(PendingDateSave {
+                id: change.id,
+                start: parse_iso_date(start_s.as_deref()),
+                target: parse_iso_date(target_s.as_deref()),
+                after_start: start_s,
+                after_target: target_s,
+                rev: previous.rev,
+                previous,
+                role,
+            });
+        }
+        out
     }
 
     pub async fn persist_pending_dates(
@@ -1918,13 +2022,16 @@ impl PlannerState {
     }
 
     pub async fn add_item(&mut self) -> Result<(), AppError> {
+        self.add_item_under(self.gantt.selected_id).await
+    }
+
+    pub async fn add_item_under(&mut self, parent_id: Option<i64>) -> Result<(), AppError> {
         let Some(scope) = self.scope() else {
             return Err(AppError::message("Choose a Team first"));
         };
         let types = self.types();
-        let selected_id = self.gantt.selected_id;
         let (parent_id, work_item_type, area, iteration) = {
-            let selected = selected_id.and_then(|id| self.nodes.iter().find(|node| node.id == id));
+            let selected = parent_id.and_then(|id| self.nodes.iter().find(|node| node.id == id));
             let parent_id = selected.map(|node| node.id);
             let work_item_type =
                 child_work_item_type(selected.map(|node| node.work_item_type.as_str()), &types);
@@ -2353,6 +2460,28 @@ impl PlannerState {
                 )
                 .await
             }
+            HistoryEntry::DatesGroup { items } => {
+                let mut result = Ok(());
+                for change in items {
+                    let (start, target) = if is_undo {
+                        (&change.before_start, &change.before_target)
+                    } else {
+                        (&change.after_start, &change.after_target)
+                    };
+                    if let Err(err) = self
+                        .save_exact_dates(
+                            change.id,
+                            parse_iso_date(start.as_deref()),
+                            parse_iso_date(target.as_deref()),
+                        )
+                        .await
+                    {
+                        result = Err(err);
+                        break;
+                    }
+                }
+                result
+            }
             HistoryEntry::Link {
                 successor_id,
                 predecessor_id,
@@ -2404,6 +2533,23 @@ impl PlannerState {
                 )
                 .await
             }
+            UndoAction::RestoreDatesBatch { items } => {
+                let mut result = Ok(());
+                for item in items {
+                    if let Err(err) = self
+                        .save_exact_dates(
+                            item.id,
+                            parse_iso_date(item.start_date.as_deref()),
+                            parse_iso_date(item.target_date.as_deref()),
+                        )
+                        .await
+                    {
+                        result = Err(err);
+                        break;
+                    }
+                }
+                result
+            }
             UndoAction::RemoveLink {
                 successor_id,
                 predecessor_id,
@@ -2426,34 +2572,54 @@ impl PlannerState {
     /// Apply a toast RestoreDates locally and queue a persist. History stays
     /// until the persist succeeds so a failed PATCH can still be undone.
     pub fn apply_toast_restore_dates(&mut self, action: UndoAction) -> Option<PendingDateSave> {
-        let UndoAction::RestoreDates {
-            id,
-            start_date,
-            target_date,
-            ..
-        } = &action
-        else {
-            return None;
+        self.apply_toast_restore_dates_all(action)
+            .into_iter()
+            .next()
+    }
+
+    fn apply_toast_restore_dates_all(&mut self, action: UndoAction) -> Vec<PendingDateSave> {
+        let items: Vec<DateRestore> = match action {
+            UndoAction::RestoreDates {
+                id,
+                start_date,
+                target_date,
+                rev,
+            } => vec![DateRestore {
+                id,
+                start_date,
+                target_date,
+                rev,
+            }],
+            UndoAction::RestoreDatesBatch { items } => items,
+            _ => return Vec::new(),
         };
-        let id = *id;
-        let start_date = start_date.clone();
-        let target_date = target_date.clone();
-        let previous = self.nodes.iter().find(|node| node.id == id).cloned()?;
-        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
-            node.start_date = start_date.clone();
-            node.target_date = target_date.clone();
+        let mut out = Vec::new();
+        for (index, item) in items.into_iter().enumerate() {
+            let Some(previous) = self.nodes.iter().find(|node| node.id == item.id).cloned() else {
+                continue;
+            };
+            if let Some(node) = self.nodes.iter_mut().find(|node| node.id == item.id) {
+                node.start_date = item.start_date.clone();
+                node.target_date = item.target_date.clone();
+            }
+            self.sync_open_form_from_node(item.id);
+            let role = if index == 0 {
+                DateSaveRole::Restore
+            } else {
+                DateSaveRole::Cascade
+            };
+            out.push(PendingDateSave {
+                id: item.id,
+                start: parse_iso_date(item.start_date.as_deref()),
+                target: parse_iso_date(item.target_date.as_deref()),
+                after_start: item.start_date,
+                after_target: item.target_date,
+                rev: previous.rev,
+                previous,
+                role,
+            });
         }
-        self.sync_open_form_from_node(id);
-        Some(PendingDateSave {
-            id,
-            start: parse_iso_date(start_date.as_deref()),
-            target: parse_iso_date(target_date.as_deref()),
-            after_start: start_date,
-            after_target: target_date,
-            rev: previous.rev,
-            previous,
-            role: DateSaveRole::Restore,
-        })
+        out
     }
 
     /// Copy predecessors (and rev when dates were not edited) for a toast
@@ -2465,6 +2631,7 @@ impl PlannerState {
             | UndoAction::RestoreFields { id, .. } => {
                 vec![*id]
             }
+            UndoAction::RestoreDatesBatch { items } => items.iter().map(|item| item.id).collect(),
             UndoAction::RemoveLink {
                 successor_id,
                 predecessor_id,
@@ -2521,18 +2688,37 @@ impl PlannerState {
                 target_date,
                 ..
             } => {
-                if let Some(index) = self.history.undo.iter().position(|entry| {
-                    matches!(
-                        entry,
-                        HistoryEntry::Dates {
-                            id: entry_id,
-                            before_start,
-                            before_target,
-                            ..
-                        } if *entry_id == *id
+                if let Some(index) = self.history.undo.iter().position(|entry| match entry {
+                    HistoryEntry::Dates {
+                        id: entry_id,
+                        before_start,
+                        before_target,
+                        ..
+                    } => {
+                        *entry_id == *id
                             && before_start == start_date
                             && before_target == target_date
-                    )
+                    }
+                    HistoryEntry::DatesGroup { items } => items.first().is_some_and(|item| {
+                        item.id == *id
+                            && item.before_start == *start_date
+                            && item.before_target == *target_date
+                    }),
+                    _ => false,
+                }) {
+                    self.history.undo.remove(index);
+                }
+            }
+            UndoAction::RestoreDatesBatch { items } => {
+                let Some(first) = items.first() else {
+                    return;
+                };
+                if let Some(index) = self.history.undo.iter().position(|entry| match entry {
+                    HistoryEntry::DatesGroup { items: group } => {
+                        group.first().is_some_and(|item| item.id == first.id)
+                    }
+                    HistoryEntry::Dates { id, .. } => *id == first.id,
+                    _ => false,
                 }) {
                     self.history.undo.remove(index);
                 }
@@ -2587,6 +2773,7 @@ impl PlannerState {
             HistoryEntry::Created { id: entry_id, .. }
             | HistoryEntry::Dates { id: entry_id, .. }
             | HistoryEntry::Fields { id: entry_id, .. } => *entry_id != id,
+            HistoryEntry::DatesGroup { items } => items.iter().all(|item| item.id != id),
             HistoryEntry::Link {
                 successor_id,
                 predecessor_id,
@@ -2791,6 +2978,7 @@ impl PlannerState {
         }
         let ids = descendant_ids(&self.nodes, parent_id);
         let mut pending = Vec::new();
+        let mut child_changes = Vec::new();
         for id in ids {
             let Some(previous) = self.nodes.iter().find(|node| node.id == id).cloned() else {
                 continue;
@@ -2815,9 +3003,13 @@ impl PlannerState {
                 continue;
             }
             let _ = self.apply_optimistic_partial(id, start, target);
-            if self.history_recording {
-                self.record_dates(id, &previous, after_start.clone(), after_target.clone());
-            }
+            let change = DatesChange {
+                id,
+                before_start: previous.start_date.clone(),
+                before_target: previous.target_date.clone(),
+                after_start: after_start.clone(),
+                after_target: after_target.clone(),
+            };
             pending.push(PendingDateSave {
                 id,
                 start,
@@ -2828,8 +3020,89 @@ impl PlannerState {
                 previous,
                 role: DateSaveRole::Cascade,
             });
+            child_changes.push(change);
         }
+        if self.history_recording {
+            self.fold_descendant_dates(parent_id, child_changes);
+        }
+        self.attach_children_to_move_toast(parent_id, &pending);
         pending
+    }
+
+    /// Fold descendant date shifts into the parent move so one Undo reverts both.
+    fn fold_descendant_dates(&mut self, parent_id: i64, children: Vec<DatesChange>) {
+        if children.is_empty() {
+            return;
+        }
+        match self.history.undo.last() {
+            Some(HistoryEntry::Dates { id, .. }) if *id == parent_id => {
+                if let Some(HistoryEntry::Dates {
+                    id,
+                    before_start,
+                    before_target,
+                    after_start,
+                    after_target,
+                }) = self.history.undo.pop()
+                {
+                    let mut items = vec![DatesChange {
+                        id,
+                        before_start,
+                        before_target,
+                        after_start,
+                        after_target,
+                    }];
+                    items.extend(children);
+                    self.history.undo.push(HistoryEntry::DatesGroup { items });
+                }
+            }
+            Some(HistoryEntry::DatesGroup { items })
+                if items.first().is_some_and(|item| item.id == parent_id) =>
+            {
+                if let Some(HistoryEntry::DatesGroup { mut items }) = self.history.undo.pop() {
+                    items.extend(children);
+                    self.history.undo.push(HistoryEntry::DatesGroup { items });
+                }
+            }
+            _ => {
+                self.record(HistoryEntry::DatesGroup { items: children });
+            }
+        }
+    }
+
+    fn attach_children_to_move_toast(&mut self, parent_id: i64, children: &[PendingDateSave]) {
+        if children.is_empty() {
+            return;
+        }
+        for toast in &mut self.toasts.items {
+            let Some(UndoAction::RestoreDates {
+                id,
+                start_date,
+                target_date,
+                rev,
+            }) = &toast.undo
+            else {
+                continue;
+            };
+            if *id != parent_id {
+                continue;
+            }
+            let mut items = vec![DateRestore {
+                id: *id,
+                start_date: start_date.clone(),
+                target_date: target_date.clone(),
+                rev: *rev,
+            }];
+            for child in children {
+                items.push(DateRestore {
+                    id: child.id,
+                    start_date: child.previous.start_date.clone(),
+                    target_date: child.previous.target_date.clone(),
+                    rev: child.previous.rev,
+                });
+            }
+            toast.undo = Some(UndoAction::RestoreDatesBatch { items });
+            break;
+        }
     }
 
     pub(crate) fn item_title(&self, id: i64) -> String {
@@ -2852,16 +3125,33 @@ impl PlannerState {
 
     /// Toast Undo for dates: prefer the Ctrl+Z path so history and the toast
     /// stay in sync. Fall back to a local restore when that stack entry is gone.
-    pub fn toast_restore_or_undo_dates(&mut self, action: UndoAction) -> Option<PendingDateSave> {
-        if let UndoAction::RestoreDates { id, .. } = &action
-            && matches!(
-                self.history.undo.last(),
-                Some(HistoryEntry::Dates { id: hid, .. }) if *hid == *id
-            )
-        {
-            return self.undo_dates_now();
+    pub fn toast_restore_or_undo_dates(&mut self, action: UndoAction) -> Vec<PendingDateSave> {
+        let matches_stack = match &action {
+            UndoAction::RestoreDates { id, .. } => {
+                matches!(
+                    self.history.undo.last(),
+                    Some(HistoryEntry::Dates { id: hid, .. }) if *hid == *id
+                ) || matches!(
+                    self.history.undo.last(),
+                    Some(HistoryEntry::DatesGroup { items }) if items.first().is_some_and(|item| item.id == *id)
+                )
+            }
+            UndoAction::RestoreDatesBatch { items } => items.first().is_some_and(|first| {
+                matches!(
+                    self.history.undo.last(),
+                    Some(HistoryEntry::Dates { id, .. }) if *id == first.id
+                ) || matches!(
+                    self.history.undo.last(),
+                    Some(HistoryEntry::DatesGroup { items: group })
+                        if group.first().is_some_and(|item| item.id == first.id)
+                )
+            }),
+            _ => false,
+        };
+        if matches_stack {
+            return self.undo_date_stack_now();
         }
-        self.apply_toast_restore_dates(action)
+        self.apply_toast_restore_dates_all(action)
     }
 
     pub(crate) fn history_action_message_for_undo(&self, action: &UndoAction) -> String {
@@ -2877,6 +3167,19 @@ impl PlannerState {
                     &self.item_title(*id),
                     parse_iso_date(start_date.as_deref()),
                     parse_iso_date(target_date.as_deref()),
+                    live.and_then(|node| parse_iso_date(node.start_date.as_deref())),
+                    live.and_then(|node| parse_iso_date(node.target_date.as_deref())),
+                )
+            }
+            UndoAction::RestoreDatesBatch { items } => {
+                let Some(first) = items.first() else {
+                    return "Moved dates".into();
+                };
+                let live = self.nodes.iter().find(|node| node.id == first.id);
+                dates_undo_message(
+                    &self.item_title(first.id),
+                    parse_iso_date(first.start_date.as_deref()),
+                    parse_iso_date(first.target_date.as_deref()),
                     live.and_then(|node| parse_iso_date(node.start_date.as_deref())),
                     live.and_then(|node| parse_iso_date(node.target_date.as_deref())),
                 )
@@ -2930,6 +3233,18 @@ impl PlannerState {
                 parse_iso_date(after_start.as_deref()),
                 parse_iso_date(after_target.as_deref()),
             ),
+            HistoryEntry::DatesGroup { items } => {
+                let Some(first) = items.first() else {
+                    return "Moved dates".into();
+                };
+                dates_changed_message(
+                    &self.item_title(first.id),
+                    parse_iso_date(first.before_start.as_deref()),
+                    parse_iso_date(first.before_target.as_deref()),
+                    parse_iso_date(first.after_start.as_deref()),
+                    parse_iso_date(first.after_target.as_deref()),
+                )
+            }
             HistoryEntry::Link {
                 successor_id,
                 predecessor_id,
@@ -2980,6 +3295,18 @@ impl PlannerState {
                 parse_iso_date(after_start.as_deref()),
                 parse_iso_date(after_target.as_deref()),
             ),
+            HistoryEntry::DatesGroup { items } => {
+                let Some(first) = items.first() else {
+                    return "Moved dates".into();
+                };
+                dates_undo_message(
+                    &self.item_title(first.id),
+                    parse_iso_date(first.before_start.as_deref()),
+                    parse_iso_date(first.before_target.as_deref()),
+                    parse_iso_date(first.after_start.as_deref()),
+                    parse_iso_date(first.after_target.as_deref()),
+                )
+            }
             other => self.history_action_message(other),
         }
     }
@@ -3765,5 +4092,80 @@ mod toast_copy_tests {
             super::DateSaveRole::Cascade,
             "children persist must not replace the parent undo toast"
         );
+    }
+
+    #[test]
+    fn move_children_too_is_one_undo_with_the_parent() {
+        use crate::toasts::{HistoryEntry, UndoAction};
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-batch-undo")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        state.history_recording = true;
+        let parent_before = state.nodes[0].clone();
+        let _ = state.apply_optimistic_partial(
+            1,
+            Some(Date::new(2026, 7, 9).unwrap()),
+            Some(Date::new(2026, 7, 23).unwrap()),
+        );
+        state.record_dates(
+            1,
+            &parent_before,
+            Some("2026-07-09T00:00:00Z".into()),
+            Some("2026-07-23T00:00:00Z".into()),
+        );
+        state.toasts.push_undo_extra(
+            "Moved \"Work Item 0\" to Jul 9 → Jul 23",
+            UndoAction::RestoreDates {
+                id: 1,
+                start_date: parent_before.start_date.clone(),
+                target_date: parent_before.target_date.clone(),
+                rev: parent_before.rev,
+            },
+            Some(crate::toasts::ToastExtra::MoveChildren {
+                parent_id: 1,
+                delta_days: 3,
+            }),
+        );
+        let _ = state.shift_descendants_now(1, 3);
+        assert_eq!(
+            state.history.undo.len(),
+            1,
+            "parent move + children must be one history step, got {:?}",
+            state.history.undo
+        );
+        match state.history.undo.last() {
+            Some(HistoryEntry::DatesGroup { items }) => {
+                assert!(
+                    items.iter().any(|item| item.id == 1) && items.iter().any(|item| item.id == 2),
+                    "group must include parent and child, got {items:?}"
+                );
+            }
+            other => panic!("expected DatesGroup, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                state.toasts.items.last().and_then(|toast| toast.undo.as_ref()),
+                Some(UndoAction::RestoreDatesBatch { items }) if items.len() >= 2
+            ),
+            "toast Undo must restore parent and children together, got {:?}",
+            state.toasts.items.last().map(|toast| &toast.undo)
+        );
+        let pending = state.undo_date_stack_now();
+        assert!(
+            pending.iter().any(|save| save.id == 1) && pending.iter().any(|save| save.id == 2),
+            "one Undo must restore parent and child, got {:?}",
+            pending.iter().map(|save| save.id).collect::<Vec<_>>()
+        );
+        let parent = state.nodes.iter().find(|node| node.id == 1).unwrap();
+        let child = state.nodes.iter().find(|node| node.id == 2).unwrap();
+        assert_eq!(parent.start_date.as_deref(), Some("2026-07-06T00:00:00Z"));
+        assert_eq!(child.start_date.as_deref(), Some("2026-07-06T00:00:00Z"));
     }
 }

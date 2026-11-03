@@ -1876,7 +1876,23 @@ impl GanttView {
                 out[index].lane_y += dir * lane_shift;
             }
         }
+        let clip_right = (self.timeline_width - 10.0).max(24.0);
+        for arrow in &mut out {
+            clip_arrow_to_timeline(arrow, 10.0, clip_right);
+        }
         out
+    }
+}
+
+fn clip_arrow_to_timeline(arrow: &mut DependencyArrow, left: f32, right: f32) {
+    if arrow.x_head > right {
+        let delta = arrow.x_head - right;
+        arrow.x_head = right;
+        arrow.x2 -= delta;
+    } else if arrow.x_head < left {
+        let delta = left - arrow.x_head;
+        arrow.x_head = left;
+        arrow.x2 += delta;
     }
 }
 
@@ -4677,6 +4693,46 @@ mod tests {
             "the inbound run must not collapse to a 2px stub, x2={} x_head={}",
             arrows[0].x2,
             arrows[0].x_head
+        );
+    }
+
+    #[test]
+    fn batch_move_recomputes_link_geometry_on_screen() {
+        let mut pred = node(1005, Some(1));
+        pred.title = "Cart UI".into();
+        pred.start_date = Some("2026-07-21T00:00:00Z".into());
+        pred.target_date = None;
+        let mut succ = node(1012, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1005];
+        let mut nodes = vec![node(1, None), pred, succ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 360.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        if let Some(node) = nodes.iter_mut().find(|node| node.id == 1005) {
+            node.start_date = Some("2026-10-01T00:00:00Z".into());
+        }
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 1, "the #1005→#1012 link must still layout");
+        let pred_bar = bars.iter().find(|bar| bar.id == 1005).expect("pred");
+        assert!(
+            pred_bar.x > gantt.timeline_width,
+            "fixture must place the shifted predecessor off the right edge, got x={}",
+            pred_bar.x
+        );
+        assert!(
+            arrows[0].x_head >= 10.0 && arrows[0].x_head <= gantt.timeline_width - 8.0,
+            "after a batch move the arrowhead must stay on-screen, got x_head={} x1={} x2={} width={}",
+            arrows[0].x_head,
+            arrows[0].x1,
+            arrows[0].x2,
+            gantt.timeline_width
         );
     }
 

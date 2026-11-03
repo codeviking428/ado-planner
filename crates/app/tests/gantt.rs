@@ -773,6 +773,8 @@ async fn toast_undo_after_picker_dates_restores_them() {
         .expect("picker save must offer Undo");
     let pending = state
         .toast_restore_or_undo_dates(action)
+        .into_iter()
+        .next()
         .expect("toast undo");
     assert_eq!(pending.role, DateSaveRole::Undo);
     let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
@@ -821,6 +823,8 @@ async fn scheduling_an_unscheduled_item_says_scheduled() {
         .expect("schedule toast undo");
     let _ = state
         .toast_restore_or_undo_dates(action)
+        .into_iter()
+        .next()
         .expect("undo schedule");
     let undone = state.toasts.last_message().unwrap_or_default();
     assert!(
@@ -1737,6 +1741,7 @@ async fn undo_create_drops_date_history_for_that_item() {
         HistoryEntry::Created { id, .. }
         | HistoryEntry::Dates { id, .. }
         | HistoryEntry::Fields { id, .. } => *id == created.id,
+        HistoryEntry::DatesGroup { items } => items.iter().any(|item| item.id == created.id),
         HistoryEntry::Link {
             successor_id,
             predecessor_id,
@@ -1857,6 +1862,46 @@ async fn add_item_on_an_epic_creates_a_child_feature() {
             .map(|node| node.parent_id),
         Some(Some(1001)),
         "visible tree must keep the Epic parent, not strip it to root"
+    );
+}
+
+#[tokio::test]
+async fn add_item_under_nests_even_when_another_row_is_selected() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.gantt.selected_id = Some(1012);
+    state.add_item_under(Some(1001)).await.expect("create");
+    let created = created_item(&state);
+    assert_eq!(
+        created.parent_id,
+        Some(1001),
+        "context-menu Add child must nest under the right-clicked parent, not the selected row"
+    );
+    assert_eq!(created.work_item_type, "Feature");
+    let rows: Vec<i64> = state
+        .gantt
+        .flatten(&state.nodes)
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    let epic_at = rows.iter().position(|id| *id == 1001).expect("epic");
+    let created_at = rows
+        .iter()
+        .position(|id| *id == created.id)
+        .expect("created");
+    let root_at = rows.iter().position(|id| *id == 1012).expect("root");
+    assert!(
+        epic_at < created_at && created_at < root_at,
+        "new child must sit under the Epic, not at the bottom with #1012, got {rows:?}"
+    );
+    let created_row = state
+        .gantt
+        .flatten(&state.nodes)
+        .into_iter()
+        .find(|row| row.id == created.id)
+        .expect("created row");
+    assert!(
+        created_row.depth > 0,
+        "context-menu Add child must indent under the parent, got {created_row:?}"
     );
 }
 

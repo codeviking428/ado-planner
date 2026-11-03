@@ -64,7 +64,7 @@ actions!(
 
 const DATES_RANGE_HINT: &str = "Start → Target, or start only";
 const DATE_HINT: &str = "Date";
-const DATES_ERROR_SLOT_H: f32 = 32.0;
+const DATES_ERROR_SLOT_H: f32 = 48.0;
 const SAVING_HOLD_MS: u64 = 400;
 const PROGRESS_ROLLUP_TIP: &str =
     "Progress is rolled up from child work-item states. Active counts as half done.";
@@ -1695,20 +1695,26 @@ impl PlannerView {
         self.state.gantt.hover_locked = false;
         let original = self.state.history_action_message_for_undo(&action);
         let undid = undone_toast_message(&original);
-        if matches!(action, UndoAction::RestoreDates { .. }) {
-            if let Some(pending) = self.state.toast_restore_or_undo_dates(action) {
+        if matches!(
+            action,
+            UndoAction::RestoreDates { .. } | UndoAction::RestoreDatesBatch { .. }
+        ) {
+            let pending = self.state.toast_restore_or_undo_dates(action);
+            if !pending.is_empty() {
                 self.state.toasts.dismiss_undo();
                 self.state.toasts.dismiss(toast_id);
                 self.clamp_toast_hover();
-                let already_toasted = pending.role == DateSaveRole::Undo;
+                let already_toasted = pending.iter().any(|save| save.role == DateSaveRole::Undo);
                 self.queue_form_dates_from_draft();
-                self.enqueue_date_save(cx, pending);
+                for save in pending {
+                    self.enqueue_date_save(cx, save);
+                }
                 if !already_toasted {
                     self.state.toasts.push(ToastKind::Success, undid);
                 }
                 self.note_toasts_changed(cx);
             }
-            cx.notify();
+            self.request_repaint(None, cx);
             return;
         }
         // Queue while spawn_state holds io_busy so Undo is not a silent dismiss.
@@ -1747,7 +1753,7 @@ impl PlannerView {
         }
         self.queue_form_dates_from_draft();
         self.note_toasts_changed(cx);
-        cx.notify();
+        self.request_repaint(None, cx);
     }
 
     fn spawn_toast_undo(&mut self, cx: &mut Context<Self>, action: UndoAction, undid: String) {
@@ -1796,11 +1802,14 @@ impl PlannerView {
             return;
         }
         self.state.gantt.context_menu = None;
-        if let Some(pending) = self.state.undo_dates_now() {
+        let pending = self.state.undo_date_stack_now();
+        if !pending.is_empty() {
             self.queue_form_dates_from_draft();
-            self.enqueue_date_save(cx, pending);
+            for save in pending {
+                self.enqueue_date_save(cx, save);
+            }
             self.note_toasts_changed(cx);
-            cx.notify();
+            self.request_repaint(None, cx);
             return;
         }
         self.spawn_state(cx, |mut state| async move {
@@ -1813,11 +1822,14 @@ impl PlannerView {
         if self.history_hotkey_is_duplicate(false) || self.state.history.redo.is_empty() {
             return;
         }
-        if let Some(pending) = self.state.redo_dates_now() {
+        let pending = self.state.redo_date_stack_now();
+        if !pending.is_empty() {
             self.queue_form_dates_from_draft();
-            self.enqueue_date_save(cx, pending);
+            for save in pending {
+                self.enqueue_date_save(cx, save);
+            }
             self.note_toasts_changed(cx);
-            cx.notify();
+            self.request_repaint(None, cx);
             return;
         }
         self.spawn_state(cx, |mut state| async move {
@@ -2847,10 +2859,10 @@ impl PlannerView {
                             .ghost()
                             .compact()
                             .label("−")
+                            .tooltip("Zoom out")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let keep_x = this.focal_gantt_x();
                                 this.animate_gantt(cx, |gantt| {
-                                    gantt.zoom_step_keeping(-1, keep_x);
+                                    gantt.zoom_step_keeping(-1, 0.0);
                                 });
                                 cx.notify();
                             })),
@@ -2876,10 +2888,10 @@ impl PlannerView {
                             .ghost()
                             .compact()
                             .label("+")
+                            .tooltip("Zoom in")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let keep_x = this.focal_gantt_x();
                                 this.animate_gantt(cx, |gantt| {
-                                    gantt.zoom_step_keeping(1, keep_x);
+                                    gantt.zoom_step_keeping(1, 0.0);
                                 });
                                 cx.notify();
                             })),
@@ -3195,6 +3207,7 @@ impl PlannerView {
                                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                             let x: f32 = event.position.x.into();
                                             let y: f32 = event.position.y.into();
+                                            this.state.gantt.select_row(id);
                                             this.state.gantt.context_menu =
                                                 Some(crate::gantt::ContextTarget {
                                                     id,
@@ -3568,7 +3581,7 @@ impl PlannerView {
         let (x, mut y) = self.dates_anchor.unwrap_or((320.0, 160.0));
         let window_h = self.state.gantt.viewport_h + 200.0;
         let window_w = self.state.gantt.viewport_w.max(320.0);
-        let popover_h = 356.0;
+        let popover_h = 380.0;
         let popover_w = 280.0;
         if y + popover_h > window_h {
             y = (y - popover_h).max(8.0);
@@ -3613,6 +3626,13 @@ impl PlannerView {
                                 .text_color(cx.theme().danger)
                                 .whitespace_normal()
                                 .child(self.inline_dates_error.clone().unwrap_or_default()),
+                        )
+                        .child(
+                            div()
+                                .id("gantt-dates-cal-gap")
+                                .w_full()
+                                .h(px(12.))
+                                .flex_shrink_0(),
                         )
                         .child(self.render_calendar_chrome(&state, cx)),
                 )
@@ -4596,6 +4616,7 @@ impl PlannerView {
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         let x: f32 = event.position.x.into();
                         let y: f32 = event.position.y.into();
+                        this.state.gantt.select_row(id);
                         this.state.gantt.context_menu = Some(crate::gantt::ContextTarget {
                             id,
                             from_bar: true,
@@ -5447,8 +5468,8 @@ impl PlannerView {
             .child(self.menu_item("Open", cx, move |this, cx| this.open_form(id, cx)))
             .child(self.menu_item("Add child", cx, move |this, cx| {
                 this.state.gantt.select_row(id);
-                this.spawn_state(cx, |mut state| async move {
-                    let result = state.add_item().await;
+                this.spawn_state(cx, move |mut state| async move {
+                    let result = state.add_item_under(Some(id)).await;
                     (state, result)
                 });
             }))
@@ -6660,9 +6681,26 @@ impl PlannerView {
         if let Some(pending) = self.state.commit_date_gesture_now() {
             self.enqueue_date_save(cx, pending);
         }
+        self.request_repaint(Some(window), cx);
+    }
+
+    /// `Window.refresh` is a no-op while GPUI is drawing, so mouse-up during
+    /// a frame can leave the preview chip and toast stale until the pointer
+    /// moves. Notify now and again on the next turn.
+    fn request_repaint(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         cx.notify();
-        window.refresh();
+        if let Some(window) = window {
+            window.refresh();
+        }
         cx.refresh_windows();
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |_, cx| {
+                cx.notify();
+                cx.refresh_windows();
+            });
+            cx.refresh();
+        })
+        .detach();
     }
 
     fn enqueue_date_save(&mut self, cx: &mut Context<Self>, pending: PendingDateSave) {
@@ -6784,7 +6822,7 @@ impl PlannerView {
                     }
                 }
                 this.drain_date_saves(cx);
-                cx.notify();
+                this.request_repaint(None, cx);
             });
         })
         .detach();

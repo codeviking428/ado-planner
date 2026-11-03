@@ -4699,6 +4699,125 @@ fn parent_move_toast_offers_move_children_too(cx: &mut gpui_kit::TestAppContext)
 }
 
 #[gpui_kit::test]
+fn right_click_selects_the_row(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let row = cx.debug_bounds("gantt-tree-row-2").expect("child row");
+    cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.selected_id,
+            Some(2),
+            "right-click must select the row under the pointer"
+        );
+        assert!(
+            view.state
+                .gantt
+                .context_menu
+                .is_some_and(|target| target.id == 2),
+            "the context menu must target the right-clicked row"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn move_children_too_undo_restores_parent_and_child(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_hierarchy(3);
+    let parent_before = state.nodes[0].clone();
+    let _ = state.apply_optimistic_partial(
+        1,
+        Some(Date::new(2026, 7, 9).unwrap()),
+        Some(Date::new(2026, 7, 23).unwrap()),
+    );
+    state.history.push(HistoryEntry::Dates {
+        id: 1,
+        before_start: parent_before.start_date.clone(),
+        before_target: parent_before.target_date.clone(),
+        after_start: Some("2026-07-09T00:00:00Z".into()),
+        after_target: Some("2026-07-23T00:00:00Z".into()),
+    });
+    state.toasts.push_undo_extra(
+        "Moved \"Work Item 0\" to Jul 9 → Jul 23",
+        UndoAction::RestoreDates {
+            id: 1,
+            start_date: parent_before.start_date.clone(),
+            target_date: parent_before.target_date.clone(),
+            rev: parent_before.rev,
+        },
+        Some(ToastExtra::MoveChildren {
+            parent_id: 1,
+            delta_days: 3,
+        }),
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let extra = cx
+        .debug_bounds("toast-move-children")
+        .expect("Move children too");
+    cx.simulate_mouse_down(extra.center(), MouseButton::Left, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .all(|toast| toast.extra.is_none()),
+            "Move children too must consume the extra action"
+        );
+        match view.state.history.undo.last() {
+            Some(HistoryEntry::DatesGroup { items }) => {
+                assert!(
+                    items.iter().any(|item| item.id == 1)
+                        && items.iter().any(|item| item.id == 2),
+                    "parent move + children must be one history step, got {items:?}"
+                );
+            }
+            other => panic!("expected DatesGroup after Move children too, got {other:?}"),
+        }
+        let pending = view.state.undo_date_stack_now();
+        assert!(
+            pending.iter().any(|save| save.id == 1) && pending.iter().any(|save| save.id == 2),
+            "one Undo must restore parent and child, got {:?}",
+            pending.iter().map(|save| save.id).collect::<Vec<_>>()
+        );
+        let parent = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .expect("parent");
+        let child = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .expect("child");
+        assert_eq!(parent.start_date.as_deref(), Some("2026-07-06T00:00:00Z"));
+        assert_eq!(
+            child.start_date.as_deref(),
+            Some("2026-07-06T00:00:00Z"),
+            "one Undo must restore children shifted by Move children too"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn second_zoom_mid_animation_starts_from_the_interpolated_camera(
     cx: &mut gpui_kit::TestAppContext,
 ) {
