@@ -51,6 +51,9 @@ pub const OUTSIDE_LABEL_GAP: f32 =
     LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0;
 /// Outside title chip height, matching `render_gantt_bar_label`.
 pub const OUTSIDE_LABEL_H: f32 = 16.0;
+/// Gap from an outside title's painted right edge to a long finish-to-start
+/// outgoing vertical. Reviewer floor is 6px; 8px covers antialiasing.
+const SOURCE_LABEL_CLEARANCE: f32 = 8.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
@@ -2405,6 +2408,9 @@ impl GanttView {
         );
         separate_parallel_verticals(&mut out, clip_left, clip_right);
         separate_shared_source_outgoing(&mut out, clip_left, clip_right);
+        // Parallel-vertical pushes can slide a stub back under the source
+        // title; re-apply per-arrow dodge after the last fan.
+        dodge_outgoing_off_source_labels(&mut out, bars, clip_left, clip_right);
         out
     }
 }
@@ -2417,13 +2423,16 @@ impl GanttView {
 fn arrow_lane_y(pred: &BarLayout, succ: &BarLayout) -> f32 {
     const STROKE: f32 = 2.0;
     if succ.y > pred.y {
-        let mut below_bar = pred.y + pred.paint_top() + pred.paint_h() + STROKE;
+        let below_bar = pred.y + pred.paint_top() + pred.paint_h() + STROKE;
+        let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
         if !bar_title_is_inside(pred) {
             let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-            below_bar = below_bar.max(label_top + OUTSIDE_LABEL_H + PARALLEL_LANE_MIN);
+            // 12px = 6px hit-box overhang on the 2px stroke + 6px visual gap
+            // (live measure was 3px under "Persist cart").
+            below_bar.max(label_top + OUTSIDE_LABEL_H + 12.0)
+        } else {
+            below_bar.min(in_row)
         }
-        let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
-        below_bar.min(in_row)
     } else {
         let above_bar = pred.y + pred.paint_top() - STROKE;
         above_bar.max(pred.y + STROKE)
@@ -2699,6 +2708,8 @@ fn dodge_forward_inbounds_off_intervening(
 /// Shared-source outgoing stubs (Persist cart → spike vs Persist cart →
 /// Go-live) can restack to 1–3px after clip even when lanes are apart.
 /// Spread `x1` by `PARALLEL_VERT_MIN` without touching inbound `x2`.
+/// Only push right: a leftward shove walks the new Persist cart → Go-live
+/// stub back onto the source title and onto Persist cart → spike.
 fn separate_shared_source_outgoing(
     arrows: &mut [DependencyArrow],
     clip_left: f32,
@@ -2719,23 +2730,22 @@ fn separate_shared_source_outgoing(
         for _ in 0..indexes.len() * 4 {
             let mut moved = false;
             for pair in indexes.windows(2) {
-                let left = pair[0];
-                let right = pair[1];
-                let dx = arrows[right].x1 - arrows[left].x1;
-                if dx.abs() >= PARALLEL_VERT_MIN {
+                let a = pair[0];
+                let b = pair[1];
+                let dx = (arrows[a].x1 - arrows[b].x1).abs();
+                if dx >= PARALLEL_VERT_MIN {
                     continue;
                 }
-                let push = (PARALLEL_VERT_MIN - dx.abs()).max(1.0);
+                let (keep, slide) = if arrows[a].x1 <= arrows[b].x1 {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                let push = (arrows[keep].x1 + PARALLEL_VERT_MIN - arrows[slide].x1).max(1.0);
                 if shift_vertical(
-                    &mut arrows[right],
+                    &mut arrows[slide],
                     VertKind::Outgoing,
                     push,
-                    clip_left,
-                    clip_right,
-                ) || shift_vertical(
-                    &mut arrows[left],
-                    VertKind::Outgoing,
-                    -push,
                     clip_left,
                     clip_right,
                 ) {
@@ -2753,7 +2763,7 @@ fn bar_outside_title_span(bar: &BarLayout) -> Option<(f32, f32)> {
     if bar_title_is_inside(bar) || bar_is_gutter(bar) {
         return None;
     }
-    let title_w = bar_title_px(&bar.title);
+    let title_w = bar_title_paint_px(&bar.title);
     if title_w < 4.0 {
         return None;
     }
@@ -2762,20 +2772,22 @@ fn bar_outside_title_span(bar: &BarLayout) -> Option<(f32, f32)> {
     } else {
         bar.width.max(8.0)
     };
-    let gap = if bar.milestone || bar.marker {
-        6.0
+    // Start just past the bar so a stub 0–3px from the painted chip
+    // (handles-only gap is 30px, overflow gap is 54px) still counts as a hit.
+    let left = bar.x + painted_w + 6.0;
+    let right = if bar.milestone || bar.marker {
+        left + title_w
     } else {
-        OUTSIDE_LABEL_GAP
+        bar.x + painted_w + OUTSIDE_LABEL_GAP + title_w
     };
-    let left = bar.x + painted_w + gap;
-    Some((left, left + title_w))
+    Some((left, right))
 }
 
 /// The outgoing vertical at `x1` must miss the source's own outside title
 /// (Persist cart → Go-live through "Persist cart"). Intervening-only dodge
-/// never sees the source row. Slide a shared-source group together so the
-/// fan (Persist cart → spike vs Persist cart → Go-live) is not collapsed
-/// onto `right + PARALLEL_VERT_MIN`.
+/// never sees the source row. Move each long finish-to-start stub on its
+/// own so an already-past Persist cart → spike does not zero the shift and
+/// leave Persist cart → Go-live under the chip.
 fn dodge_outgoing_off_source_labels(
     arrows: &mut [DependencyArrow],
     bars: &[BarLayout],
@@ -2783,54 +2795,46 @@ fn dodge_outgoing_off_source_labels(
     clip_right: f32,
 ) {
     let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
-    let mut by_from: HashMap<i64, Vec<usize>> = HashMap::new();
-    for (index, arrow) in arrows.iter().enumerate() {
-        by_from.entry(arrow.from_id).or_default().push(index);
-    }
-    for (from_id, indexes) in by_from {
-        let Some(pred) = by_id.get(&from_id) else {
+    for arrow in arrows.iter_mut() {
+        let Some(pred) = by_id.get(&arrow.from_id) else {
             continue;
         };
         let Some((left, right)) = bar_outside_title_span(pred) else {
             continue;
         };
-        // Slide when the stub sits on the chip, or when a long horizontal
-        // would run under it toward a successor that is past the title.
-        // Adjacent FS links (successor still under the chip) stay on the
-        // 12px stub so routing does not wrap to the label edge.
-        if !indexes.iter().any(|&index| {
-            let arrow = &arrows[index];
-            x_hits_span(arrow.x1, left, right)
-                || (x_spans_overlap(
-                    (arrow.x1.min(arrow.x2), arrow.x1.max(arrow.x2)),
-                    (left, right),
-                ) && arrow.x_head > right + PARALLEL_VERT_MIN)
-        }) {
+        let painted_w = if pred.milestone || pred.marker {
+            MILESTONE_SIZE
+        } else {
+            pred.width.max(8.0)
+        };
+        // Adjacent FS (successor still on the source bar) stays on the 12px
+        // stub. A successor under the *label* but past the bar (Go-live
+        // under a zoomed-out Persist cart chip) still needs a dodge.
+        if arrow.x_head <= pred.x + painted_w + 12.0 {
             continue;
         }
-        let min_x1 = indexes
-            .iter()
-            .map(|&index| arrows[index].x1)
-            .fold(f32::MAX, f32::min);
-        let target = (right + PARALLEL_VERT_MIN).clamp(clip_left, clip_right);
-        let shift = (target - min_x1).max(0.0);
-        if shift < 0.5 {
+        let on_chip = x_hits_span(arrow.x1, left, right);
+        let under_chip = x_spans_overlap(
+            (arrow.x1.min(arrow.x2), arrow.x1.max(arrow.x2)),
+            (left, right),
+        );
+        if !on_chip && !under_chip {
             continue;
         }
-        for index in indexes {
-            let arrow = &mut arrows[index];
-            let next = (arrow.x1 + shift).clamp(clip_left, clip_right);
-            if (next - arrow.x1).abs() < 0.5 {
-                continue;
-            }
-            if arrow.wraps_around_successor() && next <= wrap_floor(arrow) {
-                continue;
-            }
-            let delta = next - arrow.x1;
-            arrow.x1 = next;
-            if arrow.wraps_around_successor() {
-                arrow.x2 = (arrow.x2 + delta).clamp(clip_left, clip_right);
-            }
+        // Don't flip a forward FS into wrap-around past the successor.
+        let desired = right + SOURCE_LABEL_CLEARANCE;
+        let wrap_limit = arrow.x_head - 1.0;
+        let target = desired.min(wrap_limit).clamp(clip_left, clip_right);
+        if target <= arrow.x1 + 0.5 {
+            continue;
+        }
+        if arrow.wraps_around_successor() && target <= wrap_floor(arrow) {
+            continue;
+        }
+        let delta = target - arrow.x1;
+        arrow.x1 = target;
+        if arrow.wraps_around_successor() {
+            arrow.x2 = (arrow.x2 + delta).clamp(clip_left, clip_right);
         }
     }
 }
@@ -3021,6 +3025,12 @@ fn bar_title_px(title: &str) -> f32 {
     title.chars().count() as f32 * 8.0 + 16.0
 }
 
+/// Painted outside-chip width. `text-xs` is ~10px/glyph; 8px/char sat the
+/// Persist cart → Go-live stub 0–3px from the letters.
+pub fn bar_title_paint_px(title: &str) -> f32 {
+    title.chars().count() as f32 * 10.0 + 16.0
+}
+
 /// Which timeline clip a fully off-screen dated bar sits past.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OffscreenEdge {
@@ -3091,7 +3101,7 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
     } else {
         bar.width.max(8.0)
     };
-    let title_w = bar_title_px(&bar.title);
+    let title_w = bar_title_paint_px(&bar.title);
     if bar_title_is_inside(bar) {
         bar.x + painted_w
     } else if bar.milestone || bar.marker {
@@ -5417,18 +5427,32 @@ mod tests {
             arrows[1].lane_y
         );
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let live = arrows.iter().find(|arrow| arrow.to_id == 1013).unwrap();
         if let Some((left, right)) = bar_outside_title_span(pred) {
             for arrow in &arrows {
+                if arrow.x_head <= right + SOURCE_LABEL_CLEARANCE {
+                    continue;
+                }
                 assert!(
                     !x_hits_span(arrow.x1, left, right),
                     "outgoing vertical must miss the Persist cart label, x1={} label={left}..{right} to={}",
                     arrow.x1,
                     arrow.to_id
                 );
+                assert!(
+                    arrow.x1 >= right + 6.0,
+                    "long Persist cart outgoing must sit ≥6px past the label, x1={} label_right={right} to={}",
+                    arrow.x1,
+                    arrow.to_id
+                );
             }
+            assert!(
+                live.x1 >= right + 6.0,
+                "Persist cart → Go-live must sit ≥6px past the Persist cart label, x1={} label={left}..{right}",
+                live.x1
+            );
         }
         let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
-        let live = arrows.iter().find(|arrow| arrow.to_id == 1013).unwrap();
         assert!(
             (live.x_head - go_live.x).abs() < 1.0,
             "Go-live arrowhead must sit on the diamond, x_head={} diamond={}",
@@ -5496,6 +5520,11 @@ mod tests {
             assert!(
                 !x_hits_span(persist_live.x1, left, right),
                 "Persist cart → Go-live must not cross the Persist cart label, x1={} label={left}..{right}",
+                persist_live.x1
+            );
+            assert!(
+                persist_live.x1 >= right + 6.0,
+                "Persist cart → Go-live must sit ≥6px past the Persist cart label, x1={} label={left}..{right}",
                 persist_live.x1
             );
         }
@@ -5865,7 +5894,7 @@ mod tests {
             cart.y
         );
         assert!(
-            cart_spike.lane_y >= cue_bottom && cart_spike.lane_y < cart.y + ROW_HEIGHT,
+            cart_spike.lane_y >= cue_bottom && cart_spike.lane_y <= cart.y + ROW_HEIGHT,
             "{scale:?}: Cart UI → spike must sit in the gap below the Cart UI cue, lane {} cue_bottom {} row {}",
             cart_spike.lane_y,
             cue_bottom,
@@ -5893,6 +5922,7 @@ mod tests {
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
             scale: GanttScale::Month,
+            zoom: 0.7,
             timeline_width: 512.0,
             ..Default::default()
         };
@@ -5933,16 +5963,30 @@ mod tests {
             persist_live.x1
         );
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
-        if let Some((left, right)) = bar_outside_title_span(pred) {
-            for arrow in [persist_spike, persist_live] {
-                assert!(
-                    !x_hits_span(arrow.x1, left, right),
-                    "outgoing vertical must miss the Persist cart label, x1={} label={left}..{right} to={}",
-                    arrow.x1,
-                    arrow.to_id
-                );
+        let (left, right) = bar_outside_title_span(pred)
+            .expect("zoomed-out Month Persist cart must paint an outside title");
+        for arrow in [persist_spike, persist_live] {
+            if arrow.x_head <= pred.x + pred.width.max(8.0) + 12.0 {
+                continue;
             }
+            assert!(
+                !x_hits_span(arrow.x1, left, right),
+                "outgoing vertical must miss the Persist cart label, x1={} label={left}..{right} to={}",
+                arrow.x1,
+                arrow.to_id
+            );
+            assert!(
+                arrow.x1 >= right + 6.0,
+                "long Persist cart outgoing must sit ≥6px past the label, x1={} label_right={right} to={}",
+                arrow.x1,
+                arrow.to_id
+            );
         }
+        assert!(
+            persist_live.x1 >= right + 6.0,
+            "runtime Persist cart → Go-live must sit ≥6px past the Persist cart label, x1={} label={left}..{right}",
+            persist_live.x1
+        );
     }
 
     #[test]

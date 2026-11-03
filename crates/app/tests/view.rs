@@ -1,12 +1,12 @@
 //! Rendered `PlannerView` coverage for popups, the Gantt header, and the form.
 
-use ado_core::{IdentityValue, SessionInfo, WorkItemNode};
+use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
-    LINK_HANDLE_HIT, MIN_TIMELINE_WIDTH, PARALLEL_VERT_MIN, ROW_HEIGHT, TODAY_ALIGN,
-    TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
-    insert_index_for_child,
+    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, PARALLEL_VERT_MIN, ROW_HEIGHT,
+    TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
+    bar_title_is_inside, insert_index_for_child,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -1288,7 +1288,7 @@ fn runtime_shared_source_outgoing_jogs_paint_sixteen_apart(cx: &mut gpui_kit::Te
     }
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
     state.gantt.scale = GanttScale::Month;
-    state.gantt.zoom = 1.0;
+    state.gantt.zoom = 0.7;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
@@ -1323,15 +1323,20 @@ fn runtime_shared_source_outgoing_jogs_paint_sixteen_apart(cx: &mut gpui_kit::Te
         dx >= PARALLEL_VERT_MIN,
         "painted shared-source jogs must sit ≥{PARALLEL_VERT_MIN}px apart, spike={spike_x} live={live_x} dx={dx}"
     );
-    if let Some(label) = cx.debug_bounds("gantt-bar-label-1003") {
-        let left = f32::from(label.origin.x);
-        let right = left + f32::from(label.size.width);
-        for (name, x) in [("spike", spike_x), ("go-live", live_x)] {
-            assert!(
-                x < left - 1.0 || x > right + 1.0,
-                "painted Persist cart → {name} outgoing at {x} must miss the Persist cart label {left}..{right}"
-            );
-        }
+    let label = cx
+        .debug_bounds("gantt-bar-label-1003")
+        .expect("zoomed-out Month Persist cart must paint an outside label");
+    let left = f32::from(label.origin.x);
+    let right = left + f32::from(label.size.width);
+    assert!(
+        live_x >= right + 6.0 || live_x <= left - 6.0,
+        "painted Persist cart → Go-live outgoing at {live_x} must sit ≥6px from the Persist cart label {left}..{right}"
+    );
+    for (name, x) in [("spike", spike_x), ("go-live", live_x)] {
+        assert!(
+            x < left - 1.0 || x > right + 1.0,
+            "painted Persist cart → {name} outgoing at {x} must miss the Persist cart label {left}..{right}"
+        );
     }
 }
 
@@ -4065,8 +4070,8 @@ fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
     draw(cx);
     for (id, title, required, min_w) in [
         (1_i64, "Cart", true, 36.0),
-        (2, "Persist cart", true, 100.0),
-        (3, "Unparented spike", false, 36.0),
+        (2, "Persist cart", true, 40.0),
+        (3, "Unparented spike", true, 36.0),
     ] {
         let selector = match id {
             1 => "gantt-bar-label-1",
@@ -4133,6 +4138,98 @@ fn year_checkout_rewrite_label_does_not_cross_today(cx: &mut gpui_kit::TestAppCo
 }
 
 #[gpui_kit::test]
+fn year_view_paints_a_label_on_every_visible_row(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today = cx.debug_bounds("gantt-today").expect("Today line");
+    let today_x = f32::from(today.origin.x);
+    let visible = view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars =
+            view.state
+                .gantt
+                .layout_bars(&view.state.nodes, &rows, &view.state.iterations, 720.0);
+        let timeline_w = view.state.gantt.timeline_width.max(1.0);
+        bars.into_iter()
+            .filter_map(|bar| {
+                if bar.marker
+                    || bar.kind == GanttBarKind::Unscheduled
+                    || bar.kind == GanttBarKind::NoFields
+                {
+                    return None;
+                }
+                let width = if bar.milestone {
+                    MILESTONE_SIZE
+                } else {
+                    bar.width.max(8.0)
+                };
+                if bar.x + width <= 0.0 || bar.x >= timeline_w {
+                    return None;
+                }
+                Some((bar.id, bar.title.clone(), bar_title_is_inside(&bar)))
+            })
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        !visible.is_empty(),
+        "Year view must have on-screen dated bars"
+    );
+    for (id, title, inside) in &visible {
+        let selector = match id {
+            1001 => "gantt-bar-label-1001",
+            1002 => "gantt-bar-label-1002",
+            1003 => "gantt-bar-label-1003",
+            1005 => "gantt-bar-label-1005",
+            1012 => "gantt-bar-label-1012",
+            1013 => "gantt-bar-label-1013",
+            1020 => "gantt-bar-label-1020",
+            _ => "gantt-bar-label",
+        };
+        let label = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("Year {title} (#{id}) must paint a drawn label"));
+        let min_w = if *inside { 24.0 } else { 36.0 };
+        assert!(
+            f32::from(label.size.width) >= min_w,
+            "Year {title} label must stay readable, width={}",
+            f32::from(label.size.width)
+        );
+        let left = f32::from(label.origin.x);
+        let right = left + f32::from(label.size.width);
+        assert!(
+            right <= today_x - 2.0 || left >= today_x + 4.0 || *inside,
+            "Year {title} must not run through Today, label={left}..{right} today={today_x}"
+        );
+    }
+    for (id, title, selector) in [
+        (1002_i64, "Cart", "gantt-bar-label-1002"),
+        (1003, "Persist cart", "gantt-bar-label-1003"),
+        (1012, "Unparented spike", "gantt-bar-label-1012"),
+        (1013, "Go-live milestone", "gantt-bar-label-1013"),
+    ] {
+        assert!(
+            visible.iter().any(|(row_id, _, _)| *row_id == id),
+            "Year fixture must show {title} on screen"
+        );
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "Year {title} must paint a drawn label"
+        );
+    }
+}
+
+#[gpui_kit::test]
 fn year_go_live_milestone_keeps_its_label(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -4149,19 +4246,20 @@ fn year_go_live_milestone_keeps_its_label(cx: &mut gpui_kit::TestAppContext) {
     draw(cx);
     let today = cx.debug_bounds("gantt-today").expect("Today line");
     let today_x = f32::from(today.origin.x);
-    if let Some(label) = cx.debug_bounds("gantt-bar-label-1013") {
-        let left = f32::from(label.origin.x);
-        let right = left + f32::from(label.size.width);
-        assert!(
-            f32::from(label.size.width) >= 100.0,
-            "Year Go-live must show the full title outside the diamond, not clip to Go-l…, width={}",
-            f32::from(label.size.width)
-        );
-        assert!(
-            right <= today_x - 2.0 || left >= today_x + 4.0,
-            "Year Go-live must not run through Today, label={left}..{right} today={today_x}"
-        );
-    }
+    let label = cx
+        .debug_bounds("gantt-bar-label-1013")
+        .expect("Year Go-live must paint an outside label");
+    let left = f32::from(label.origin.x);
+    let right = left + f32::from(label.size.width);
+    assert!(
+        f32::from(label.size.width) >= 40.0,
+        "Year Go-live must stay readable outside the diamond, width={}",
+        f32::from(label.size.width)
+    );
+    assert!(
+        right <= today_x - 2.0 || left >= today_x + 4.0,
+        "Year Go-live must not run through Today, label={left}..{right} today={today_x}"
+    );
 }
 
 #[gpui_kit::test]
@@ -4189,27 +4287,28 @@ fn year_persist_cart_label_and_go_live_link_clear_today(cx: &mut gpui_kit::TestA
     let persist_top = f32::from(persist.origin.y);
     let persist_bottom = persist_top + f32::from(persist.size.height);
     assert!(
-        f32::from(persist.size.width) >= 100.0,
-        "Year Persist cart must show the full title outside the bar, width={}",
+        f32::from(persist.size.width) >= 40.0,
+        "Year Persist cart must stay readable outside the bar, width={}",
         f32::from(persist.size.width)
     );
     assert!(
         persist_right <= today_x - 2.0 || persist_left >= today_x + 4.0,
         "Year Persist cart must not run through Today, label={persist_left}..{persist_right} today={today_x}"
     );
-    if let Some(go_live) = cx.debug_bounds("gantt-bar-label-1013") {
-        let left = f32::from(go_live.origin.x);
-        let right = left + f32::from(go_live.size.width);
-        assert!(
-            right <= today_x - 2.0 || left >= today_x + 4.0,
-            "Year Go-live must not run through Today, label={left}..{right} today={today_x}"
-        );
-        assert!(
-            f32::from(go_live.size.width) >= 100.0,
-            "Year Go-live must keep the full title, width={}",
-            f32::from(go_live.size.width)
-        );
-    }
+    let go_live = cx
+        .debug_bounds("gantt-bar-label-1013")
+        .expect("Year Go-live must paint an outside label");
+    let left = f32::from(go_live.origin.x);
+    let right = left + f32::from(go_live.size.width);
+    assert!(
+        right <= today_x - 2.0 || left >= today_x + 4.0,
+        "Year Go-live must not run through Today, label={left}..{right} today={today_x}"
+    );
+    assert!(
+        f32::from(go_live.size.width) >= 40.0,
+        "Year Go-live must stay readable, width={}",
+        f32::from(go_live.size.width)
+    );
     if let Some(arrow) = cx.debug_bounds("gantt-dep-arrow-1003-1013") {
         let arrow_left = f32::from(arrow.origin.x);
         let arrow_right = arrow_left + f32::from(arrow.size.width);
