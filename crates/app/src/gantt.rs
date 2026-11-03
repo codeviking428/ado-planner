@@ -3287,6 +3287,30 @@ mod tests {
     }
 
     #[test]
+    fn unscheduled_marker_no_move_does_not_commit() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        item.iteration_path.clear();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&[item.clone()]);
+        let bars = gantt.layout_bars(&[item.clone()], &rows, &[], 720.0);
+        let bar = bars[0].clone();
+        assert!(bar.marker);
+        gantt
+            .begin_gesture(&bar, GestureKind::Move, bar.x, &[item], &[])
+            .expect("move");
+        gantt.update_gesture(bar.x);
+        assert!(
+            gantt.finish_gesture().is_none(),
+            "a release with no movement must not commit dates"
+        );
+    }
+
+    #[test]
     fn header_major_labels_do_not_stack_at_the_origin() {
         let gantt = GanttView {
             origin: Date::new(2026, 1, 1).unwrap(),

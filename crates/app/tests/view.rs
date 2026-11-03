@@ -1978,6 +1978,66 @@ fn placeholder_drop_on_august_keeps_august_dates(cx: &mut gpui_kit::TestAppConte
 }
 
 #[gpui_kit::test]
+fn unscheduled_pill_click_without_drag_does_not_schedule(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = None;
+        node.target_date = None;
+        node.title = "Backlog grooming".into();
+        node.iteration_path = "Shop\\FY26\\Sprint 12".into();
+    }
+    state.iterations = vec![ado_core::IterationNode {
+        path: "Shop\\FY26\\Sprint 12".into(),
+        name: "Sprint 12".into(),
+        start_date: Some("2026-08-10T00:00:00Z".into()),
+        finish_date: Some("2026-08-21T00:00:00Z".into()),
+        children: Vec::new(),
+    }];
+    let today = jiff::Zoned::now().date();
+    state.gantt.go_today(today);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-2")
+        .expect("unscheduled gutter pill");
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "a no-move pill click must finish the gesture"
+        );
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .expect("pill item");
+        assert_eq!(
+            node.start_date, None,
+            "a click without drag must not PATCH Start, got {:?}",
+            node.start_date
+        );
+        assert_eq!(
+            node.target_date, None,
+            "a click without drag must not PATCH Target, got {:?}",
+            node.target_date
+        );
+        assert!(
+            view.state.history.undo.is_empty(),
+            "a no-move pill click must not record a date change"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn empty_team_keeps_the_gantt_toolbar(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -5629,6 +5689,64 @@ fn toast_undo_while_busy_is_not_dropped(cx: &mut gpui_kit::TestAppContext) {
             view.pending_toast_undo_id(),
             Some(toast_id),
             "busy Undo must keep the action until I/O frees"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn toast_stack_undo_while_busy_is_queued(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.predecessors = vec![1];
+    }
+    state.history.push(HistoryEntry::Link {
+        successor_id: 2,
+        predecessor_id: 1,
+        linked: true,
+    });
+    state
+        .toasts
+        .push_undo("Added link: A → B", UndoAction::StackUndo);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| {
+        view.set_busy_for_test(true);
+        let toast_id = view
+            .state
+            .toasts
+            .items
+            .last()
+            .map(|toast| toast.id)
+            .unwrap();
+        view.apply_toast_undo(toast_id, UndoAction::StackUndo, cx);
+        assert!(
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.id == 2)
+                .is_some_and(|node| node.predecessors.contains(&1)),
+            "busy StackUndo must queue instead of a silent spawn_state no-op"
+        );
+        assert_eq!(
+            view.state.history.undo.len(),
+            1,
+            "busy StackUndo must not consume history until I/O frees"
+        );
+        assert_eq!(
+            view.pending_toast_undo_id(),
+            Some(toast_id),
+            "busy StackUndo must wait on the toast undo queue"
+        );
+        view.set_busy_for_test(false);
+        view.replay_pending_toast_undo_for_test(cx);
+        assert!(
+            view.pending_toast_undo_id().is_none(),
+            "replay must consume the queued StackUndo"
+        );
+        assert!(
+            view.is_busy(),
+            "replayed StackUndo must take the I/O slot instead of dropping"
         );
     });
 }

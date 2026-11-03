@@ -1830,14 +1830,6 @@ impl PlannerView {
         }
         self.state.gantt.context_menu = None;
         self.state.gantt.hover_locked = false;
-        if matches!(action, UndoAction::StackUndo) {
-            self.undo_last(cx);
-            return;
-        }
-        if matches!(action, UndoAction::StackRedo) {
-            self.redo_last(cx);
-            return;
-        }
         let original = self.state.history_action_message_for_undo(&action);
         let undid = undone_toast_message(&original);
         if matches!(
@@ -1865,10 +1857,20 @@ impl PlannerView {
             return;
         }
         // Queue while spawn_state holds io_busy so Undo is not a silent dismiss.
-        // Replay even if the toast later expires or is dismissed.
+        // Replay even if the toast later expires or is dismissed. StackUndo/
+        // StackRedo also use spawn_state for non-date history, so they must
+        // wait here instead of calling undo_last/redo_last while busy.
         if self.io_busy {
             self.pending_toast_undo = Some((toast_id, action));
             cx.notify();
+            return;
+        }
+        if matches!(action, UndoAction::StackUndo) {
+            self.undo_last(cx);
+            return;
+        }
+        if matches!(action, UndoAction::StackRedo) {
+            self.redo_last(cx);
             return;
         }
         self.toast_undo_inflight = true;
@@ -4809,10 +4811,12 @@ impl PlannerView {
                             this.clear_toast_pointer_for_new_press();
                             this.dismiss_overlays();
                             let _ = this.classify_bar_hit(id, &layout, x);
-                            // Gutter pills are not on the date axis; start the
-                            // live bar at Today so a drag follows the pointer.
-                            let today_x = this.state.gantt.x_for_date(jiff::Zoned::now().date());
-                            let _ = this.state.begin_bar_gesture(id, GestureKind::Move, today_x);
+                            // Live dates start at Today (`dates_from_painted_bar`).
+                            // Origin is the click's layout x so a no-move release
+                            // keeps live == start and does not PATCH the gutter
+                            // as the viewport's left edge.
+                            let origin = this.pointer_layout_x(x, Some(id));
+                            let _ = this.state.begin_bar_gesture(id, GestureKind::Move, origin);
                             cx.notify();
                             return;
                         }
