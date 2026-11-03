@@ -6348,6 +6348,7 @@ fn pinned_tooltip_unpins_when_hovering_another_rows_overflow(cx: &mut gpui_kit::
     draw(cx);
     view.update(cx, |view, _| {
         view.state.gantt.pin_bar_tooltip = Some(1002);
+        view.state.gantt.bar_hovered_id = Some(1002);
     });
     draw(cx);
     let persist = cx.debug_bounds("gantt-bar-1003").expect("Persist cart bar");
@@ -6358,7 +6359,13 @@ fn pinned_tooltip_unpins_when_hovering_another_rows_overflow(cx: &mut gpui_kit::
             view.state.gantt.pin_bar_tooltip, None,
             "moving onto Persist cart must unpin the Cart dates chip so two tooltips do not stack"
         );
+        assert_ne!(
+            view.state.gantt.bar_hovered_id,
+            Some(1002),
+            "Cart handles must not stay painted after the pointer moves to Persist cart"
+        );
         view.state.gantt.pin_bar_tooltip = Some(1002);
+        view.state.gantt.bar_hovered_id = Some(1002);
     });
     draw(cx);
     let bang = point(
@@ -6372,7 +6379,20 @@ fn pinned_tooltip_unpins_when_hovering_another_rows_overflow(cx: &mut gpui_kit::
             view.state.gantt.pin_bar_tooltip, None,
             "moving onto Persist cart's ! must unpin the Cart dates chip"
         );
+        assert_ne!(
+            view.state.gantt.bar_hovered_id,
+            Some(1002),
+            "Cart handles must clear when the ! on Persist cart unpins the chip"
+        );
     });
+    assert!(
+        cx.debug_bounds("gantt-resize-grip-1002-end").is_none(),
+        "Cart's resize grip must unmount once the pin is on another row"
+    );
+    assert!(
+        cx.debug_bounds("gantt-link-dot-1002-link-end").is_none(),
+        "Cart's link connector must unmount once the pin is on another row"
+    );
 }
 
 #[gpui_kit::test]

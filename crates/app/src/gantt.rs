@@ -994,12 +994,19 @@ impl GanttView {
 
     /// Pointer landed on a tooltip-bearing control. Clears a pinned dates
     /// chip unless this hit is the same bar (so the chip can stay after a
-    /// drop). Returns whether the pin changed. `id` 0 is a non-bar hit
-    /// (link segment, arrowhead) and always unpins.
+    /// drop). Also drops hover on that bar so resize/link handles do not
+    /// stay painted. Returns whether the pin changed. `id` 0 is a non-bar
+    /// hit (link segment, arrowhead) and always unpins.
     pub fn note_hit_target(&mut self, id: i64) -> bool {
         match self.pin_bar_tooltip {
             Some(pin) if pin != id => {
                 self.pin_bar_tooltip = None;
+                if self.bar_hovered_id == Some(pin) {
+                    self.bar_hovered_id = None;
+                }
+                if self.hovered_id == Some(pin) {
+                    self.hovered_id = None;
+                }
                 true
             }
             _ => false,
@@ -7947,6 +7954,8 @@ mod tests {
     fn foreign_hit_target_clears_a_pinned_bar_tooltip() {
         let mut gantt = GanttView {
             pin_bar_tooltip: Some(1002),
+            hovered_id: Some(1002),
+            bar_hovered_id: Some(1002),
             ..Default::default()
         };
         assert!(
@@ -7954,17 +7963,25 @@ mod tests {
             "the pinned bar's own badge or handle must keep the dates chip"
         );
         assert_eq!(gantt.pin_bar_tooltip, Some(1002));
+        assert_eq!(gantt.bar_hovered_id, Some(1002));
         assert!(
             gantt.note_hit_target(1003),
             "Persist cart's ! must unpin Cart's dates chip"
         );
         assert_eq!(gantt.pin_bar_tooltip, None);
+        assert_eq!(
+            gantt.bar_hovered_id, None,
+            "Cart resize/link handles must clear when the pin moves to another row"
+        );
+        assert_eq!(gantt.hovered_id, None);
         gantt.pin_bar_tooltip = Some(1002);
+        gantt.bar_hovered_id = Some(1002);
         assert!(
             gantt.note_hit_target(0),
             "a link or arrowhead is not the pinned bar"
         );
         assert_eq!(gantt.pin_bar_tooltip, None);
+        assert_eq!(gantt.bar_hovered_id, None);
     }
 
     #[test]
