@@ -35,6 +35,7 @@ use gpui_kit::{
     MouseUpEvent, ParentElement, Render, Role, ScrollEvent, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px, rgb,
 };
+use jiff::ToSpan;
 
 use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
@@ -86,6 +87,9 @@ pub struct PlannerView {
     form_dates_typed_seed: String,
     /// Calendar picks write here, then Render copies into the Dates input and seed.
     pending_form_dates_text: Option<String>,
+    pending_form_picker: Option<PickerDate>,
+    /// After Clear dates I/O, rewrite the dialog from the adopted form.
+    sync_form_dates_after_io: bool,
     form_focus: FocusHandle,
     open_filter: Option<&'static str>,
     open_scope: Option<&'static str>,
@@ -313,6 +317,8 @@ impl PlannerView {
             form_calendar_open: false,
             form_dates_typed_seed: String::new(),
             pending_form_dates_text: None,
+            pending_form_picker: None,
+            sync_form_dates_after_io: false,
             form_focus: cx.focus_handle(),
             open_filter: None,
             open_scope: None,
@@ -593,6 +599,14 @@ impl PlannerView {
     }
 
     fn flush_pending_form_dates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(date) = self.pending_form_picker.take() {
+            let pickers: Vec<_> = self.form_dates.values().cloned().collect();
+            for picker in pickers {
+                picker.update(cx, |picker, cx| {
+                    picker.set_date(date, window, cx);
+                });
+            }
+        }
         let Some(text) = self.pending_form_dates_text.take() else {
             return;
         };
@@ -607,6 +621,30 @@ impl PlannerView {
             });
         }
         self.form_dates_typed_seed = text;
+    }
+
+    fn queue_form_dates_from_draft(&mut self) {
+        let Some(form) = self.state.form.as_ref() else {
+            return;
+        };
+        let start = form
+            .values
+            .get(ado_core::START_DATE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| parse_iso_date(Some(text)));
+        let target = form
+            .values
+            .get(ado_core::TARGET_DATE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| parse_iso_date(Some(text)));
+        let text = format_date_range(start, target);
+        self.pending_form_dates_text = Some(text.clone());
+        self.form_dates_typed_seed = text;
+        self.form_dates_preview = None;
+        self.pending_form_picker = Some(PickerDate::Range(
+            start.and_then(jiff_to_naive),
+            target.and_then(jiff_to_naive),
+        ));
     }
 
     fn form_date_picker_focused(&self, window: &Window, cx: &App) -> bool {
@@ -723,6 +761,10 @@ impl PlannerView {
                         this.state.adopt_spawned(working);
                         if discard_form {
                             this.state.form = None;
+                        }
+                        if this.sync_form_dates_after_io {
+                            this.sync_form_dates_after_io = false;
+                            this.queue_form_dates_from_draft();
                         }
                         if let Some(at) = shown_at
                             && !this.state.hierarchy_loading
@@ -1447,25 +1489,41 @@ impl PlannerView {
                         )
                     })
                     .child(
-                        Button::new(("dismiss-toast", id))
-                            .label("×")
+                        div()
+                            .id(("toast-dismiss-wrap", id))
+                            .debug_selector(|| "toast-dismiss".into())
                             .flex_shrink_0()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.toasts.dismiss(id);
-                                cx.notify();
-                            })),
+                            .child(Button::new(("dismiss-toast", id)).label("×").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.state.toasts.dismiss(id);
+                                    this.clamp_toast_hover();
+                                    cx.notify();
+                                }),
+                            )),
                     )
             }))
     }
 
     fn set_toast_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
-            self.toast_hover_depth = self.toast_hover_depth.saturating_add(1);
+            self.toast_hover_depth = self.toast_hover_depth.saturating_add(1).min(8);
         } else {
             self.toast_hover_depth = self.toast_hover_depth.saturating_sub(1);
         }
+        if self.state.toasts.items.is_empty() {
+            self.toast_hover_depth = 0;
+        }
         self.state.toasts.paused = self.toast_hover_depth > 0;
         cx.notify();
+    }
+
+    fn clamp_toast_hover(&mut self) {
+        if self.state.toasts.items.is_empty() {
+            self.toast_hover_depth = 0;
+        } else {
+            self.toast_hover_depth = self.toast_hover_depth.min(1);
+        }
+        self.state.toasts.paused = self.toast_hover_depth > 0;
     }
 
     fn arm_toast_pointer(&mut self) {
@@ -1510,6 +1568,7 @@ impl PlannerView {
             if let Some(pending) = self.state.toast_restore_or_undo_dates(action) {
                 self.state.toasts.dismiss_undo();
                 self.state.toasts.dismiss(toast_id);
+                self.clamp_toast_hover();
                 let already_toasted = pending.role == DateSaveRole::Undo;
                 self.enqueue_date_save(cx, pending);
                 if !already_toasted {
@@ -1530,6 +1589,7 @@ impl PlannerView {
         self.spawn_toast_undo(cx, action, undid);
         self.state.toasts.dismiss_undo();
         self.state.toasts.dismiss(toast_id);
+        self.clamp_toast_hover();
         cx.notify();
     }
 
@@ -3735,10 +3795,11 @@ impl PlannerView {
                             (Some(id), Some(origin), Some(live))
                                 if (live - origin).abs() >= 6.0 =>
                             {
-                                let origin_t = origin - self.state.gantt.timeline_origin_x;
-                                let live_t = live - self.state.gantt.timeline_origin_x;
-                                let x = origin_t.min(live_t);
-                                let w = (origin_t - live_t).abs().max(8.0);
+                                let (start, target) =
+                                    self.state.gantt.schedule_span_from_window_xs(origin, live);
+                                let x = self.state.gantt.x_for_date(start);
+                                let end = self.state.gantt.x_for_date(target.saturating_add(1.days()));
+                                let w = (end - x).abs().max(8.0);
                                 let y = window
                                     .iter()
                                     .position(|row| row.id == id)
@@ -5334,32 +5395,18 @@ impl PlannerView {
                                             .ghost()
                                             .compact()
                                             .label("Clear dates")
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                if let Some(form) = this.state.form.as_mut() {
-                                                    form.set_exact_range_dates(None, None);
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.sync_form_dates_after_io = true;
+                                                if !this.spawn_state(
+                                                    cx,
+                                                    move |mut state| async move {
+                                                        let result =
+                                                            state.clear_dates(form_id).await;
+                                                        (state, result)
+                                                    },
+                                                ) {
+                                                    this.sync_form_dates_after_io = false;
                                                 }
-                                                this.pending_form_dates_text = Some(String::new());
-                                                this.form_dates_typed_seed.clear();
-                                                this.form_dates_preview = None;
-                                                let pickers: Vec<_> =
-                                                    this.form_dates.values().cloned().collect();
-                                                for picker in pickers {
-                                                    picker.update(cx, |picker, cx| {
-                                                        let cleared = match picker.date() {
-                                                            PickerDate::Single(_) => {
-                                                                PickerDate::Single(None)
-                                                            }
-                                                            PickerDate::Range(_, _) => {
-                                                                PickerDate::Range(None, None)
-                                                            }
-                                                        };
-                                                        picker.set_date(cleared, window, cx);
-                                                    });
-                                                }
-                                                this.spawn_state(cx, move |mut state| async move {
-                                                    let result = state.clear_dates(form_id).await;
-                                                    (state, result)
-                                                });
                                                 cx.notify();
                                             })),
                                     )
@@ -6158,6 +6205,14 @@ impl PlannerView {
         self.io_busy = busy;
     }
 
+    pub fn simulate_toast_hover_for_test(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.set_toast_hover(hovered, cx);
+    }
+
+    pub fn toast_pause_for_test(&self) -> bool {
+        self.state.toasts.paused
+    }
+
     pub fn replay_pending_toast_undo_for_test(&mut self, cx: &mut Context<Self>) {
         self.replay_pending_toast_undo(cx);
     }
@@ -6367,6 +6422,7 @@ impl PlannerView {
     }
 
     fn note_toasts_changed(&mut self, cx: &mut Context<Self>) {
+        self.clamp_toast_hover();
         self.toast_expiry_gen += 1;
         self.toast_expiry_armed = false;
         self.schedule_toast_expiry(cx);
@@ -6832,6 +6888,10 @@ impl Render for PlannerView {
         self.state.gantt.clamp_tree_width();
         self.state.gantt.timeline_origin_x = self.state.gantt.tree_width + SPLITTER_WIDTH;
         self.state.gantt.timeline_origin_y = (viewport_h - self.state.gantt.viewport_h).max(0.0);
+        if self.state.toasts.items.is_empty() {
+            self.toast_hover_depth = 0;
+            self.state.toasts.paused = false;
+        }
         if !self.state.toasts.paused {
             self.state.toasts.expire();
         }
@@ -6889,9 +6949,11 @@ impl Render for PlannerView {
                         || origin.is_some_and(|origin| (x - origin).abs() >= 6.0);
                     this.saw_pressed_drag = false;
                     if dragged && x > this.state.gantt.timeline_origin_x {
-                        let date = this.state.gantt.drop_date(x);
+                        let origin_x = origin.unwrap_or(x);
+                        let (start, target) =
+                            this.state.gantt.schedule_span_from_window_xs(origin_x, x);
                         this.spawn_state(cx, move |mut state| async move {
-                            let result = state.schedule_at(id, date).await;
+                            let result = state.schedule_span(id, start, target).await;
                             (state, result)
                         });
                     }

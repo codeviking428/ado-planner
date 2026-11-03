@@ -928,6 +928,18 @@ impl GanttView {
         self.date_for_x(window_x - self.timeline_origin_x)
     }
 
+    /// Inclusive Start/Target for an unscheduled-row drag. A same-day drop
+    /// keeps the default two-week bar so a tiny drag still schedules work.
+    pub fn schedule_span_from_window_xs(&self, a: f32, b: f32) -> (Date, Date) {
+        let start = self.drop_date(a.min(b));
+        let end = self.drop_date(a.max(b));
+        if end <= start {
+            (start, start.saturating_add(13.days()))
+        } else {
+            (start, end)
+        }
+    }
+
     pub fn layout_bars(
         &self,
         nodes: &[WorkItemNode],
@@ -2767,6 +2779,34 @@ mod tests {
         assert_eq!(GanttView::gesture_patch_dates(gesture), (None, None));
         gantt.cancel_gesture();
         assert!(gantt.gesture.is_none());
+    }
+
+    #[test]
+    fn schedule_span_from_window_xs_uses_the_dragged_days() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 8, 1).unwrap(),
+            scale: GanttScale::Day,
+            zoom: 1.0,
+            timeline_origin_x: 0.0,
+            scroll_x: 0.0,
+            ..Default::default()
+        };
+        let day = gantt.scale.pixels_per_day(gantt.zoom);
+        let (start, target) = gantt.schedule_span_from_window_xs(day * 2.0, day * 6.0);
+        assert_eq!(start, Date::new(2026, 8, 3).unwrap());
+        assert_eq!(
+            target,
+            Date::new(2026, 8, 7).unwrap(),
+            "a 4-day drag must save 4 days, not a default-length bar"
+        );
+        let (point_start, point_target) =
+            gantt.schedule_span_from_window_xs(day * 2.0, day * 2.0 + 3.0);
+        assert_eq!(point_start, Date::new(2026, 8, 3).unwrap());
+        assert_eq!(
+            point_target,
+            Date::new(2026, 8, 16).unwrap(),
+            "a same-day drop keeps the default two-week bar"
+        );
     }
 
     #[test]

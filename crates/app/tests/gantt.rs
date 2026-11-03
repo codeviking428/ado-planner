@@ -249,6 +249,43 @@ async fn clear_dates_clears_the_open_form_fields() {
 }
 
 #[tokio::test]
+async fn failed_clear_dates_keeps_the_open_form_fields() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields && n.start_date.is_some() && n.target_date.is_some())
+        .cloned()
+        .unwrap();
+    let start = node.start_date.clone();
+    let target = node.target_date.clone();
+    state.open_form(node.id).await.expect("open form");
+    let form_start = state
+        .form
+        .as_ref()
+        .and_then(|form| form.values.get(START_DATE_FIELD).cloned());
+    let form_target = state
+        .form
+        .as_ref()
+        .and_then(|form| form.values.get(TARGET_DATE_FIELD).cloned());
+    mock.fail_next(&format!("/workitems/{}", node.id), 503, "clear failed");
+    assert!(state.clear_dates(node.id).await.is_err());
+    let live = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(
+        live.start_date, start,
+        "failed clear must restore the Gantt row"
+    );
+    assert_eq!(live.target_date, target);
+    let form = state.form.as_ref().expect("form stays open");
+    assert_eq!(
+        form.values.get(START_DATE_FIELD),
+        form_start.as_ref(),
+        "failed clear must not leave the dialog empty and dirty"
+    );
+    assert_eq!(form.values.get(TARGET_DATE_FIELD), form_target.as_ref());
+}
+
+#[tokio::test]
 async fn nudge_coalesces_five_presses_into_one_patch() {
     let (mock, mut state, _dir) = signed_in().await;
     let node = state
@@ -844,6 +881,35 @@ async fn schedule_at_writes_start_and_target_for_an_unscheduled_item() {
         start
     );
     assert!(parse_iso_date(updated.target_date.as_deref()).unwrap() > start);
+}
+
+#[tokio::test]
+async fn schedule_span_uses_the_dragged_range() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let node = state
+        .nodes
+        .iter()
+        .find(|n| n.has_date_fields)
+        .cloned()
+        .unwrap();
+    state.clear_dates(node.id).await.expect("clear");
+    let start = Date::new(2026, 8, 3).unwrap();
+    let target = Date::new(2026, 8, 12).unwrap();
+    state
+        .schedule_span(node.id, start, target)
+        .await
+        .expect("schedule span");
+    let updated = state.nodes.iter().find(|n| n.id == node.id).unwrap();
+    assert_eq!(
+        parse_iso_date(updated.start_date.as_deref()),
+        Some(start),
+        "drag start must become Start Date"
+    );
+    assert_eq!(
+        parse_iso_date(updated.target_date.as_deref()),
+        Some(target),
+        "drag end must become Target Date, not a default-length bar"
+    );
 }
 
 #[tokio::test]

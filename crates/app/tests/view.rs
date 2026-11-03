@@ -8,7 +8,7 @@ use ado_planner::gantt::{
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
-use ado_planner::toasts::{HistoryEntry, UndoAction};
+use ado_planner::toasts::{HistoryEntry, ToastKind, UndoAction};
 use ado_planner::ui::PlannerView;
 use ado_planner::ui::{
     date_field_text, dates_from_range_picker, dates_from_range_picker_in_years,
@@ -2534,6 +2534,43 @@ fn dragging_an_unscheduled_row_shows_a_schedule_ghost(cx: &mut gpui_kit::TestApp
     );
     view.update(cx, |view, _| {
         assert_eq!(view.state.gantt.schedule_drag, Some(3));
+    });
+}
+
+#[gpui_kit::test]
+fn dismissing_a_hovered_toast_unpauses_expiry(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.toasts.push(ToastKind::Success, "Saved");
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.simulate_toast_hover_for_test(true, cx);
+        view.simulate_toast_hover_for_test(true, cx);
+        assert!(
+            view.toast_pause_for_test(),
+            "nested hover must pause expiry"
+        );
+    });
+    let dismiss = cx
+        .debug_bounds("toast-dismiss")
+        .expect("toast dismiss control");
+    cx.simulate_click(dismiss.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.toasts.items.is_empty(),
+            "× must dismiss the hovered toast"
+        );
+        assert!(
+            !view.toast_pause_for_test(),
+            "dismissing a hovered toast must unpause so later toasts can expire"
+        );
     });
 }
 

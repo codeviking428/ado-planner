@@ -182,6 +182,10 @@ impl Toasts {
     }
 
     pub fn expire(&mut self) {
+        if self.items.is_empty() {
+            self.paused = false;
+            return;
+        }
         if self.paused {
             return;
         }
@@ -332,5 +336,18 @@ mod tests {
         toasts.paused = false;
         toasts.expire();
         assert!(toasts.items.is_empty());
+    }
+
+    #[test]
+    fn empty_list_clears_pause() {
+        let mut toasts = Toasts {
+            paused: true,
+            ..Default::default()
+        };
+        toasts.expire();
+        assert!(
+            !toasts.paused,
+            "an empty toast stack must not stay paused after the hovered toast is gone"
+        );
     }
 }

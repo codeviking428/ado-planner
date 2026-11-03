@@ -1602,7 +1602,26 @@ impl PlannerState {
     }
 
     pub async fn schedule_at(&mut self, id: i64, start: Date) -> Result<(), AppError> {
-        let target = start.saturating_add(13.days());
+        self.schedule_span(id, start, start.saturating_add(13.days()))
+            .await
+    }
+
+    pub async fn schedule_span(
+        &mut self,
+        id: i64,
+        start: Date,
+        target: Date,
+    ) -> Result<(), AppError> {
+        let (start, target) = if start <= target {
+            (start, target)
+        } else {
+            (target, start)
+        };
+        let target = if target == start {
+            start.saturating_add(13.days())
+        } else {
+            target
+        };
         self.save_dates(id, start, target).await
     }
 
