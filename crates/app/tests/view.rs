@@ -3791,6 +3791,66 @@ fn year_today_label_does_not_overlap_month_ticks(cx: &mut gpui_kit::TestAppConte
 }
 
 #[gpui_kit::test]
+fn day_today_label_does_not_hide_the_next_tick(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let today = jiff::Zoned::now().date();
+    state.gantt.origin = today.saturating_sub(3.days());
+    state.gantt.scale = GanttScale::Day;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today_label = cx
+        .debug_bounds("gantt-today-label")
+        .expect("Day Today label");
+    let today_top = f32::from(today_label.origin.y);
+    let today_bottom = today_top + f32::from(today_label.size.height);
+    let today_left = f32::from(today_label.origin.x);
+    let today_right = today_left + f32::from(today_label.size.width);
+    let mut tick_count = 0;
+    let mut min_tick_top = f32::MAX;
+    for selector in [
+        "gantt-tick-0",
+        "gantt-tick-1",
+        "gantt-tick-2",
+        "gantt-tick-3",
+        "gantt-tick-4",
+        "gantt-tick-5",
+        "gantt-tick-6",
+        "gantt-tick-7",
+        "gantt-tick-8",
+        "gantt-tick-9",
+    ] {
+        let Some(tick) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        tick_count += 1;
+        let tick_top = f32::from(tick.origin.y);
+        min_tick_top = min_tick_top.min(tick_top);
+        let tick_left = f32::from(tick.origin.x);
+        let tick_w = f32::from(tick.size.width);
+        let tick_right = tick_left + tick_w;
+        let overlaps_x = tick_left < today_right && tick_right > today_left;
+        if overlaps_x {
+            assert!(
+                tick_w >= 7.0,
+                "{selector} under Today must keep a readable width, not a 4px cap, got {tick_w}"
+            );
+        }
+    }
+    assert!(tick_count >= 4, "Day view must paint day-number ticks");
+    assert!(
+        today_bottom <= min_tick_top + 1.0,
+        "Day Today at {today_top}..{today_bottom} must stay on the major row, not cover ticks at {min_tick_top}"
+    );
+}
+
+#[gpui_kit::test]
 fn week_header_nov_does_not_overlap_today(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -3953,8 +4013,8 @@ fn year_go_live_milestone_keeps_its_label(cx: &mut gpui_kit::TestAppContext) {
         .debug_bounds("gantt-bar-label-1013")
         .expect("Year Go-live milestone must keep an outside label");
     assert!(
-        f32::from(label.size.width) >= 24.0,
-        "Year Go-live label width {} must not be hidden as cramped",
+        f32::from(label.size.width) >= 100.0,
+        "Year Go-live must show the full title outside the diamond, not clip to Go-l…, width={}",
         f32::from(label.size.width)
     );
 }
@@ -4370,6 +4430,87 @@ fn bottom_band_does_not_pause_undone_toast_expiry(cx: &mut gpui_kit::TestAppCont
             "an Undone toast must auto-dismiss after its TTL"
         );
     });
+}
+
+#[gpui_kit::test]
+fn toast_ttl_still_expires_across_a_scale_switch(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.toasts.push(ToastKind::Success, "Saved");
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("planner-toast").is_some(),
+        "precondition: success toast is visible"
+    );
+    view.update(cx, |view, _| {
+        view.state.toasts.items[0].created_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        view.state.toasts.paused = true;
+    });
+    let day = cx.debug_bounds("gantt-scale-Day").expect("Day scale");
+    cx.simulate_click(day.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("planner-toast").is_none(),
+        "a past-TTL toast must dismiss on a view switch even if hover-pause stuck"
+    );
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.toasts.items.is_empty(),
+            "scale switch must unpause and honour toast TTL"
+        );
+        assert!(
+            !view.toast_pause_for_test(),
+            "scale switch must clear a stuck toast pause"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn offscreen_bar_paints_an_edge_indicator(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.scroll_x = 4000.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 2).expect("leaf bar");
+        assert!(
+            bar.x + bar.width.max(8.0) <= 0.0,
+            "precondition: work item 2 must sit fully left of the clip, x={} w={}",
+            bar.x,
+            bar.width
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-bar-edge-left-2").is_some(),
+        "a bar scrolled fully left of the viewport must show a left-edge indicator"
+    );
+    view.update(cx, |view, cx| {
+        view.state.gantt.scroll_x = -4000.0;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-edge-right-2").is_some(),
+        "a bar scrolled fully right of the viewport must show a right-edge indicator"
+    );
 }
 
 #[gpui_kit::test]
@@ -5835,19 +5976,38 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
         .expect("pinned tooltip");
     let bar_after = cx.debug_bounds("gantt-bar-2").expect("leaf bar after drop");
     let tip_top = f32::from(tip.origin.y);
-    let bar_bottom = f32::from(bar_after.origin.y) + f32::from(bar_after.size.height);
+    let tip_bottom = tip_top + f32::from(tip.size.height);
+    let bar_top = f32::from(bar_after.origin.y);
+    let bar_bottom = bar_top + f32::from(bar_after.size.height);
+    let bar_left = f32::from(bar_after.origin.x);
+    let bar_right = bar_left + f32::from(bar_after.size.width);
+    let tip_left = f32::from(tip.origin.x);
+    let tip_right = tip_left + f32::from(tip.size.width);
     assert!(
-        tip_top + 1.0 >= bar_bottom,
-        "pinned move/resize tooltip must sit below the bar, tip_top={tip_top} bar_bottom={bar_bottom}"
+        tip_top < bar_bottom + 2.0 && tip_bottom > bar_top - 2.0,
+        "pinned move/resize tooltip must stay in the bar's row, tip={tip_top}..{tip_bottom} bar={bar_top}..{bar_bottom}"
+    );
+    let beside = tip_left + 1.0 >= bar_right - 4.0 || tip_right <= bar_left + 4.0;
+    assert!(
+        beside,
+        "pinned tooltip must sit in empty row space beside the bar, tip={tip_left}..{tip_right} bar={bar_left}..{bar_right}"
     );
     if let Some(parent) = cx.debug_bounds("gantt-bar-1") {
         let parent_top = f32::from(parent.origin.y);
         let parent_bottom = parent_top + f32::from(parent.size.height);
-        let tip_bottom = tip_top + f32::from(tip.size.height);
         let overlaps_parent = tip_top < parent_bottom && tip_bottom > parent_top;
         assert!(
             !overlaps_parent,
             "pinned tooltip must not cover the neighbouring parent title, tip={tip_top}..{tip_bottom} parent={parent_top}..{parent_bottom}"
+        );
+    }
+    if let Some(next) = cx.debug_bounds("gantt-bar-3") {
+        let next_top = f32::from(next.origin.y);
+        let next_bottom = next_top + f32::from(next.size.height);
+        let overlaps_next = tip_top < next_bottom && tip_bottom > next_top;
+        assert!(
+            !overlaps_next,
+            "pinned tooltip must not cover the next row, tip={tip_top}..{tip_bottom} next={next_top}..{next_bottom}"
         );
     }
     cx.simulate_mouse_move(bar_after.center(), None, Modifiers::default());

@@ -2848,6 +2848,32 @@ fn bar_title_px(title: &str) -> f32 {
     title.chars().count() as f32 * 8.0 + 16.0
 }
 
+/// Which timeline clip a fully off-screen dated bar sits past.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OffscreenEdge {
+    Left,
+    Right,
+}
+
+/// `None` for peeking fragments, gutter markers, and in-view bars.
+pub(crate) fn bar_offscreen_edge(bar: &BarLayout, timeline_w: f32) -> Option<OffscreenEdge> {
+    if bar.marker || bar.kind == GanttBarKind::Unscheduled || bar.kind == GanttBarKind::NoFields {
+        return None;
+    }
+    let width = if bar.milestone {
+        MILESTONE_SIZE
+    } else {
+        bar.width.max(8.0)
+    };
+    if bar.x + width <= 0.0 {
+        Some(OffscreenEdge::Left)
+    } else if bar.x >= timeline_w {
+        Some(OffscreenEdge::Right)
+    } else {
+        None
+    }
+}
+
 /// Inside when the visible text area can hold the title; otherwise the label
 /// floats to the right of the bar instead of truncating (monday.com). Measure
 /// the inner width after grips/padding so Year slivers do not clip to "C".
@@ -3990,6 +4016,64 @@ mod tests {
             "unscheduled items are a gutter pill, not an iteration ghost bar"
         );
         assert!((bars[0].width - MILESTONE_SIZE).abs() < 0.1);
+    }
+
+    #[test]
+    fn bar_offscreen_edge_flags_fully_outside_bars() {
+        let on_screen = BarLayout {
+            id: 2,
+            kind: GanttBarKind::Scheduled,
+            x: 80.0,
+            width: 120.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        assert_eq!(bar_offscreen_edge(&on_screen, 512.0), None);
+        let peeking = BarLayout {
+            x: -40.0,
+            width: 80.0,
+            ..on_screen.clone()
+        };
+        assert_eq!(
+            bar_offscreen_edge(&peeking, 512.0),
+            None,
+            "a fragment still in view must not get an edge chevron"
+        );
+        let left = BarLayout {
+            x: -200.0,
+            width: 80.0,
+            ..on_screen.clone()
+        };
+        assert_eq!(bar_offscreen_edge(&left, 512.0), Some(OffscreenEdge::Left));
+        let right = BarLayout {
+            x: 600.0,
+            width: 80.0,
+            ..on_screen
+        };
+        assert_eq!(
+            bar_offscreen_edge(&right, 512.0),
+            Some(OffscreenEdge::Right)
+        );
+        let marker = BarLayout {
+            x: -80.0,
+            width: MILESTONE_SIZE,
+            marker: true,
+            kind: GanttBarKind::Unscheduled,
+            ..left
+        };
+        assert_eq!(
+            bar_offscreen_edge(&marker, 512.0),
+            None,
+            "gutter markers must not paint a timeline-edge chevron"
+        );
     }
 
     #[test]

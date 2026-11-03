@@ -46,11 +46,12 @@ use crate::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH,
     DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
     LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH,
-    NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
+    NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP, OffscreenEdge,
     PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT,
     SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH,
-    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, header_label_px,
-    parent_date_overflow, parent_overflow_tip, timeline_is_empty_of_scheduled, today_pill_left,
+    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_offscreen_edge, bar_title_is_inside,
+    header_label_px, parent_date_overflow, parent_overflow_tip, timeline_is_empty_of_scheduled,
+    today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -1103,6 +1104,11 @@ impl PlannerView {
 
     fn animate_gantt(&mut self, cx: &mut Context<Self>, apply: impl FnOnce(&mut GanttView)) {
         self.state.gantt.clear_hover();
+        // Scale/zoom remounts the toast stack and can drop the hover-leave, which
+        // used to leave `paused` stuck and freeze TTL across view switches.
+        self.toast_hover_depth = 0;
+        self.state.toasts.paused = false;
+        self.state.toasts.expire();
         let from = self.visible_camera();
         self.state.gantt.restore(from);
         apply(&mut self.state.gantt);
@@ -4422,6 +4428,9 @@ impl PlannerView {
                         self.render_open_ended_cue(bar, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
+                        self.render_offscreen_edge(bar, cx)
+                    }))
+                    .children(bars.iter().filter_map(|bar| {
                         self.render_gantt_link_handles(bar, dragging, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
@@ -4569,17 +4578,9 @@ impl PlannerView {
                                 let next = ticks.get(index + 1).map(|(nx, _)| *nx).unwrap_or(width);
                                 // Month/Year/Quarter ticks sit on the row below Today.
                                 // Capping their width to the pill hid "Nov".
-                                let cap = if matches!(
-                                    self.state.gantt.scale,
-                                    GanttScale::Year | GanttScale::Quarter | GanttScale::Month
-                                ) {
-                                    next
-                                } else if *x < today_label_x && today_label_x < next {
-                                    (today_label_x - 4.0).max(*x)
-                                } else {
-                                    next
-                                };
-                                let max_w = (cap - *x).max(4.0);
+                                // Ticks sit on the row below Today. Capping their
+                                // width to the pill hid Day "4" and Month "Nov".
+                                let max_w = (next - *x).max(4.0);
                                 div()
                                     .id(("gantt-tick", index as u64))
                                     .debug_selector(move || selector)
@@ -4604,6 +4605,10 @@ impl PlannerView {
                         .absolute()
                         .left(px(today_label_x))
                         .top(px(today_label_top))
+                        .h(px(16.))
+                        .max_h(px(16.))
+                        .line_height(px(16.))
+                        .overflow_hidden()
                         .whitespace_nowrap()
                         .text_xs()
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
@@ -4620,14 +4625,24 @@ impl PlannerView {
                     let bar = bars.iter().find(|bar| bar.id == gesture.id);
                     let (x, y) = match bar {
                         Some(bar) => {
-                            let x = match gesture.kind {
-                                GestureKind::ResizeEnd => bar.x + bar.width + 6.0,
-                                // Sit over the bar body, not the start grip, so
-                                // mouse-up on a left-end resize is not eaten.
-                                GestureKind::ResizeStart => (bar.x + 12.0).max(4.0),
-                                _ => bar.x.max(4.0),
+                            let painted_w = if bar.milestone || bar.marker {
+                                MILESTONE_SIZE
+                            } else {
+                                bar.width.max(8.0)
                             };
-                            let y = TIMELINE_HEADER_H + bar.y + ROW_HEIGHT + 2.0;
+                            let tip_w = (text.chars().count() as f32 * 7.0 + 24.0).max(48.0);
+                            // Same row, to the right of the bar (flip at the clip)
+                            // so the preview does not cover Persist/Cart below.
+                            let x = row_side_tooltip_left(
+                                bar.x,
+                                painted_w,
+                                6.0,
+                                tip_w,
+                                width,
+                            );
+                            let y = TIMELINE_HEADER_H
+                                + bar.y
+                                + ((ROW_HEIGHT - 22.0) / 2.0).max(2.0);
                             (x, y)
                         }
                         None => (gesture.live_x.max(4.0), 4.0),
@@ -5030,19 +5045,34 @@ impl PlannerView {
         ];
         if self.state.gantt.pin_bar_tooltip == Some(id) && !dragging && !self.details_overlay() {
             let tip = bar_hover_tooltip(bar, &self.state.nodes);
+            let painted_w = if milestone || marker {
+                MILESTONE_SIZE
+            } else {
+                bar.width.max(8.0)
+            };
+            let tip_w = (tip.chars().count() as f32 * 7.0 + 24.0).max(48.0);
+            let overflow = parent_date_overflow(&self.state.nodes, id);
+            let extra = if overflow {
+                LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 8.0
+            } else {
+                LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
+            };
+            let timeline_w = self.state.gantt.timeline_width.max(1.0);
+            let tip_x = row_side_tooltip_left(bar.x, painted_w, extra, tip_w, timeline_w);
             items.push(
                 div()
                     .id(("gantt-bar-tooltip", id as u64))
                     .debug_selector(|| "gantt-bar-tooltip".into())
                     .absolute()
-                    .left(px(bar.x))
-                    .top(px(bar_top + bar_h + 4.0))
+                    .left(px(tip_x))
+                    .top(px(bar_top))
                     .px_2()
                     .py_1()
                     .rounded_md()
                     .bg(cx.theme().popover)
                     .text_color(cx.theme().popover_foreground)
                     .text_xs()
+                    .whitespace_nowrap()
                     .border_1()
                     .border_color(cx.theme().border)
                     .child(tip)
@@ -5507,54 +5537,73 @@ impl PlannerView {
         Some((label_x, max_w))
     }
 
-    /// Sit the chip on the diamond. A Today dodge used to jump "Go-live
-    /// milestone" ~120px past the pill in Quarter view.
+    /// Sit the chip on the diamond. Prefer the right; flip left when the
+    /// remainder cannot hold the full title so Year does not clip to "Go-l…".
+    /// Do not dodge Today — that shrink used to truncate the chip.
     fn milestone_external_label_frame(
         bar: &crate::gantt::BarLayout,
         timeline_w: f32,
         title_width: f32,
-        today_x: Option<f32>,
+        _today_x: Option<f32>,
         min_outside: f32,
     ) -> Option<(f32, f32)> {
         const GAP: f32 = 6.0;
         let estimated = title_width.max(24.0);
         let diamond_right = bar.x + MILESTONE_SIZE;
-        let left_of_diamond = bar.x - estimated - GAP;
-        let mut label_x = diamond_right + GAP;
-        if label_x >= timeline_w - 8.0 {
-            if left_of_diamond >= 0.0 {
-                label_x = left_of_diamond;
-            } else {
-                return None;
-            }
+        let right_x = diamond_right + GAP;
+        let left_x = bar.x - estimated - GAP;
+        let right_room = (timeline_w - right_x - 4.0).max(0.0);
+        if right_room >= estimated && right_x < timeline_w - 8.0 && right_x + 8.0 >= 0.0 {
+            return Some((right_x, estimated));
         }
-        if label_x >= timeline_w || label_x + 8.0 < 0.0 {
-            return None;
+        if left_x >= 0.0 {
+            return Some((left_x, estimated));
         }
-        let mut max_w = (timeline_w - label_x - 4.0).max(0.0);
-        if max_w < min_outside {
-            return None;
+        if right_room >= min_outside && right_x < timeline_w {
+            Some((right_x, right_room.max(min_outside)))
+        } else {
+            None
         }
-        if let Some(today) = today_x {
-            let label_right = label_x + estimated.min(max_w);
-            if label_x < today && label_right > today - 4.0 {
-                let before = (today - 8.0 - label_x).max(0.0);
-                if before >= min_outside {
-                    max_w = before.min(max_w);
-                } else if left_of_diamond >= 0.0 && left_of_diamond + estimated <= today - 4.0 {
-                    label_x = left_of_diamond;
-                    max_w = (today - 8.0 - label_x)
-                        .min(timeline_w - label_x - 4.0)
-                        .max(24.0);
-                } else if before > 0.0 {
-                    max_w = before;
-                    if max_w < min_outside {
-                        return None;
-                    }
-                }
-            }
-        }
-        Some((label_x, max_w))
+    }
+
+    /// ‹ / › on the row when a dated bar sits fully past the timeline clip.
+    fn render_offscreen_edge(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let timeline_w = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
+        let edge = bar_offscreen_edge(bar, timeline_w)?;
+        let id = bar.id;
+        const EDGE_W: f32 = 16.0;
+        let (x, glyph, side) = match edge {
+            OffscreenEdge::Left => (2.0, "‹", "left"),
+            OffscreenEdge::Right => ((timeline_w - EDGE_W - 2.0).max(2.0), "›", "right"),
+        };
+        let bar_h = bar.paint_h();
+        let bar_top = bar.paint_top();
+        let selector = format!("gantt-bar-edge-{side}-{id}");
+        Some(
+            div()
+                .id(("gantt-bar-edge", id as u64))
+                .debug_selector(move || selector)
+                .absolute()
+                .left(px(x))
+                .top(px(bar.y + bar_top))
+                .w(px(EDGE_W))
+                .h(px(bar_h.max(16.0)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .bg(cx.theme().background.opacity(0.92))
+                .border_1()
+                .border_color(rgb(bar.color).opacity(0.7))
+                .text_color(rgb(bar.color))
+                .text_sm()
+                .child(glyph)
+                .into_any_element(),
+        )
     }
 
     fn render_parent_overflow_badge(
@@ -5607,7 +5656,7 @@ impl PlannerView {
                         .h_full()
                         .occlude()
                         .tooltip(overflow_tip)
-                        .tooltip_placement(Placement::Top)
+                        .tooltip_placement(Placement::Right)
                         .tooltip_show_delay(Duration::ZERO),
                 )
                 .into_any_element(),
@@ -5649,11 +5698,12 @@ impl PlannerView {
                 .left(px(label_x))
                 .top(px(bar.y + ((ROW_HEIGHT - 16.0) / 2.0).max(2.0)))
                 .h(px(16.))
-                .max_w(px(max_w))
                 .flex()
                 .items_center()
-                .overflow_hidden()
-                .truncate()
+                .when(bar.milestone, |el| el.w(px(max_w)).whitespace_nowrap())
+                .when(!bar.milestone, |el| {
+                    el.max_w(px(max_w)).overflow_hidden().truncate()
+                })
                 .text_xs()
                 .text_color(muted_fg)
                 .when(!dragging, |el| el.occlude())
@@ -8674,6 +8724,26 @@ enum TypedDateRange {
     Invalid,
 }
 
+/// Place a same-row tooltip to the right of a bar, flipping left at the clip
+/// only when the left side actually fits. Clamping to x=0 would cover the bar.
+fn row_side_tooltip_left(
+    bar_x: f32,
+    painted_w: f32,
+    extra: f32,
+    tip_w: f32,
+    timeline_w: f32,
+) -> f32 {
+    let right = bar_x + painted_w + extra;
+    let left = bar_x - extra - tip_w;
+    if right + tip_w <= timeline_w - 4.0 {
+        right
+    } else if left >= 0.0 {
+        left
+    } else {
+        right
+    }
+}
+
 fn bar_title_chip(title: String, ink: gpui_kit::Hsla) -> gpui_kit::Div {
     let chip = if ink.l > 0.5 {
         gpui_kit::hsla(0., 0., 0., 0.5)
@@ -9380,7 +9450,8 @@ mod bar_label_tests {
         };
         let diamond_right = bar.x + MILESTONE_SIZE;
         let today_x = diamond_right + 104.0;
-        let (label_x, _) =
+        let estimated = bar.title.chars().count() as f32 * 8.0 + 16.0;
+        let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
                 .expect("Go-live must keep an outside chip");
         assert!(
@@ -9391,6 +9462,62 @@ mod bar_label_tests {
         assert!(
             label_x < today_x,
             "must not jump the milestone chip past Today, label_x={label_x} today={today_x}"
+        );
+        assert!(
+            max_w + 0.1 >= estimated,
+            "Today must not shrink the milestone chip below the full title, max_w={max_w} estimated={estimated}"
+        );
+    }
+
+    #[test]
+    fn year_go_live_chip_flips_left_of_a_tight_clip() {
+        let bar = BarLayout {
+            id: 1013,
+            kind: GanttBarKind::Scheduled,
+            x: 480.0,
+            width: MILESTONE_SIZE,
+            y: 160.0,
+            summary: false,
+            milestone: true,
+            label: String::new(),
+            title: "Go-live milestone".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let estimated = bar.title.chars().count() as f32 * 8.0 + 16.0;
+        let (label_x, max_w) =
+            PlannerView::bar_external_label_frame(&bar, 512.0, true, None, false)
+                .expect("Year Go-live must keep an outside chip");
+        assert!(
+            label_x + estimated <= bar.x + 0.1,
+            "a tight right clip must flip the full title left of the diamond, label_x={label_x} bar.x={} estimated={estimated}",
+            bar.x
+        );
+        assert!(
+            max_w + 0.1 >= estimated,
+            "flipped Year Go-live must keep the full title width, max_w={max_w} estimated={estimated}"
+        );
+    }
+
+    #[test]
+    fn row_side_tooltip_flips_left_at_the_clip() {
+        let left = super::row_side_tooltip_left(40.0, 80.0, 8.0, 120.0, 800.0);
+        assert!(
+            (left - 128.0).abs() < 0.1,
+            "room on the right must sit the tooltip past the bar, got {left}"
+        );
+        let flipped = super::row_side_tooltip_left(700.0, 80.0, 8.0, 120.0, 800.0);
+        assert!(
+            flipped + 120.0 <= 700.0 + 0.1,
+            "a tight clip must flip the tooltip left of the bar, got {flipped}"
+        );
+        let no_left_room = super::row_side_tooltip_left(40.0, 80.0, 8.0, 300.0, 200.0);
+        assert!(
+            (no_left_room - 128.0).abs() < 0.1,
+            "when the left side cannot hold the chip, stay to the right rather than covering the bar, got {no_left_room}"
         );
     }
 
