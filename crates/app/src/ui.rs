@@ -4655,13 +4655,13 @@ impl PlannerView {
                                 bar.width.max(8.0)
                             };
                             let tip_w = (text.chars().count() as f32 * 7.0 + 24.0).max(48.0);
-                            // Same row, past an outside title so the live dates
-                            // are not covered by "Persist cart".
-                            let extra = if bar_title_is_inside(bar) {
-                                6.0
-                            } else {
-                                6.0 + bar.title.chars().count() as f32 * 8.0 + 24.0
-                            };
+                            // Same row, past handles/`!` and the painted
+                            // outside title so the live dates are not
+                            // covered by "Persist cart".
+                            let extra = drag_preview_row_extra(
+                                bar,
+                                parent_date_overflow(&self.state.nodes, bar.id),
+                            );
                             let x = row_side_tooltip_left(
                                 bar.x,
                                 painted_w,
@@ -5503,13 +5503,7 @@ impl PlannerView {
         if bar.milestone {
             return Self::milestone_external_label_frame(bar, timeline_w, title_width, today_x);
         }
-        let label_gap = if overflow_badge {
-            LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0
-        } else if show_link_handles {
-            LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
-        } else {
-            10.0
-        };
+        let label_gap = outside_title_right_gap(false, show_link_handles, overflow_badge);
         let estimated = title_width.max(24.0);
         let label_x = bar_right + label_gap;
         if let Some(frame) = Self::clip_outside_frame(label_x, estimated, timeline_w, today_x) {
@@ -5517,9 +5511,9 @@ impl PlannerView {
         }
         // Today left less than MIN_OUTSIDE on the right: try the left side
         // rather than jumping through the line. Do not flip for a right-edge
-        // clip (#1014).
+        // clip (#1014). Sit past the inbound 16px handle.
         if today_x.is_some() {
-            let left_x = bar.x - estimated - 10.0;
+            let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
             if let Some(frame) = Self::clip_outside_frame(left_x, estimated, timeline_w, today_x) {
                 return Some(frame);
             }
@@ -5578,7 +5572,7 @@ impl PlannerView {
         if let Some(frame) = Self::clip_outside_frame(right_x, estimated, timeline_w, today_x) {
             return Some(frame);
         }
-        let left_x = bar.x - estimated - GAP;
+        let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
         Self::clip_outside_frame(left_x, estimated, timeline_w, today_x)
     }
 
@@ -8923,6 +8917,33 @@ enum TypedDateRange {
     Invalid,
 }
 
+/// Gap from the bar's left edge to a flipped outside title. The inbound
+/// link handle sits at `local_left - LINK_HANDLE_HIT - 2` (16px hit box).
+const OUTSIDE_TITLE_LEFT_GAP: f32 = LINK_HANDLE_HIT + LINK_HANDLE_GAP;
+
+fn outside_title_right_gap(milestone: bool, show_link_handles: bool, overflow_badge: bool) -> f32 {
+    if milestone {
+        6.0
+    } else if overflow_badge {
+        LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0
+    } else if show_link_handles {
+        LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
+    } else {
+        10.0
+    }
+}
+
+/// Extra past the painted bar so a same-row drag preview sits after an
+/// outside title (handles/`!` gap plus the painted chip) instead of on it.
+fn drag_preview_row_extra(bar: &crate::gantt::BarLayout, overflow: bool) -> f32 {
+    if bar_title_is_inside(bar) {
+        return 6.0;
+    }
+    outside_title_right_gap(bar.milestone || bar.marker, true, overflow)
+        + bar_title_paint_px(&bar.title)
+        + 6.0
+}
+
 /// Place a same-row tooltip to the right of a bar, flipping left at the clip
 /// only when the left side actually fits. Clamping to x=0 would cover the bar.
 fn row_side_tooltip_left(
@@ -9961,6 +9982,78 @@ mod bar_label_tests {
                 "an outside title at the clip must not cover the link handle, label_x={label_x} handle_left={handle_left}"
             );
         }
+    }
+
+    #[test]
+    fn flipped_outside_title_does_not_cover_the_start_handle() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 300.0,
+            width: 24.0,
+            y: 80.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let estimated = bar_title_paint_px(&bar.title);
+        let bar_right = bar.x + bar.width.max(8.0);
+        let right_x = bar_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let today_x = right_x + 20.0;
+        let (label_x, max_w) =
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
+                .expect("Today on the right must flip Persist cart left of the bar");
+        let handle_left = bar.x - LINK_HANDLE_HIT - 2.0;
+        assert!(
+            label_x + max_w <= handle_left + 0.5,
+            "a flipped outside title must sit left of the inbound handle, label={label_x}+{max_w} handle_left={handle_left} estimated={estimated}"
+        );
+        assert!(
+            label_x + estimated <= bar.x + 0.1,
+            "flipped Persist cart must stay left of the bar, label_x={label_x} bar.x={}",
+            bar.x
+        );
+    }
+
+    #[test]
+    fn drag_preview_extra_clears_the_outside_title() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 40.0,
+            width: 24.0,
+            y: 80.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let (label_x, max_w) =
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
+                .expect("Year Persist cart paints outside");
+        let extra = super::drag_preview_row_extra(&bar, false);
+        let preview_x = bar.x + bar.width.max(8.0) + extra;
+        assert!(
+            preview_x + 0.5 >= label_x + max_w,
+            "live dates must start past the outside title, preview_x={preview_x} label={label_x}..{}",
+            label_x + max_w
+        );
+        let with_badge = super::drag_preview_row_extra(&bar, true);
+        assert!(
+            with_badge >= extra + OVERFLOW_BADGE - 0.5,
+            "an overflow ! must push the preview further, extra={extra} with_badge={with_badge}"
+        );
     }
 
     #[test]
