@@ -2150,8 +2150,9 @@ async fn failed_shift_drag_parent_persist_restores_children() {
     let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
     let _ = state.begin_bar_gesture(parent.id, GestureKind::Move, 0.0);
     state.update_bar_gesture(step * 3.0);
-    let pending = state.commit_date_gesture_now().expect("parent move");
+    let mut pending = state.commit_date_gesture_now().expect("parent move");
     let kids = state.shift_children_with_committed_move(&pending);
+    pending.cascade = kids.clone();
     assert!(
         kids.iter().any(|save| save.id == child.id),
         "Shift-drag must queue the child persist, got {:?}",
@@ -2177,6 +2178,115 @@ async fn failed_shift_drag_parent_persist_restores_children() {
         ),
         "a failed parent persist must drop the DatesGroup, got {:?}",
         state.history.undo.last()
+    );
+}
+
+#[tokio::test]
+async fn failed_parent_persist_restores_children_after_a_later_parent_move() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let parent = state
+        .nodes
+        .iter()
+        .find(|node| {
+            node.has_date_fields
+                && node.start_date.is_some()
+                && node.target_date.is_some()
+                && state.nodes.iter().any(|child| {
+                    child.parent_id == Some(node.id)
+                        && child.has_date_fields
+                        && child.start_date.is_some()
+                })
+        })
+        .cloned()
+        .expect("parent with dated children");
+    let child = state
+        .nodes
+        .iter()
+        .find(|node| node.parent_id == Some(parent.id) && node.start_date.is_some())
+        .cloned()
+        .unwrap();
+    let child_start = child.start_date.clone();
+    mock.fail_next(&format!("/workitems/{}", parent.id), 503, "save failed");
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+    let _ = state.begin_bar_gesture(parent.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 3.0);
+    let mut pending = state.commit_date_gesture_now().expect("parent move");
+    pending.cascade = state.shift_children_with_committed_move(&pending);
+    let later_start = parse_iso_date(pending.after_start.as_deref())
+        .unwrap()
+        .saturating_add(3.days());
+    let later_target = parse_iso_date(pending.after_target.as_deref())
+        .unwrap()
+        .saturating_add(3.days());
+    let _ = state.apply_optimistic_partial(parent.id, Some(later_start), Some(later_target));
+    let _ = state.persist_pending_dates(pending).await;
+    let live_child = state.nodes.iter().find(|node| node.id == child.id).unwrap();
+    assert_eq!(
+        live_child.start_date, child_start,
+        "a failed persist must restore Shift-drag children even if the parent moved again"
+    );
+    let live_parent = state
+        .nodes
+        .iter()
+        .find(|node| node.id == parent.id)
+        .unwrap();
+    assert_eq!(
+        live_parent.start_date,
+        Some(ado_core::iso_date_only(later_start)),
+        "the later local parent dates must stay when the first persist fails"
+    );
+}
+
+#[tokio::test]
+async fn failed_earlier_persist_does_not_restore_a_later_shift() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let parent = state
+        .nodes
+        .iter()
+        .find(|node| {
+            node.has_date_fields
+                && node.start_date.is_some()
+                && node.target_date.is_some()
+                && state.nodes.iter().any(|child| {
+                    child.parent_id == Some(node.id)
+                        && child.has_date_fields
+                        && child.start_date.is_some()
+                })
+        })
+        .cloned()
+        .expect("parent with dated children");
+    let child = state
+        .nodes
+        .iter()
+        .find(|node| node.parent_id == Some(parent.id) && node.start_date.is_some())
+        .cloned()
+        .unwrap();
+    mock.fail_next(&format!("/workitems/{}", parent.id), 503, "save failed");
+    let step = state.gantt.scale.pixels_per_day(state.gantt.zoom);
+    let _ = state.begin_bar_gesture(parent.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 3.0);
+    let mut first = state.commit_date_gesture_now().expect("first move");
+    first.cascade = state.shift_children_with_committed_move(&first);
+    let _ = state.begin_bar_gesture(parent.id, GestureKind::Move, 0.0);
+    state.update_bar_gesture(step * 3.0);
+    let mut second = state.commit_date_gesture_now().expect("second move");
+    second.cascade = state.shift_children_with_committed_move(&second);
+    let later_child = state
+        .nodes
+        .iter()
+        .find(|node| node.id == child.id)
+        .unwrap()
+        .start_date
+        .clone();
+    assert_ne!(
+        later_child, child.start_date,
+        "second Shift-drag must move the child"
+    );
+    let _ = state.persist_pending_dates(first).await;
+    let live_child = state.nodes.iter().find(|node| node.id == child.id).unwrap();
+    assert_eq!(
+        live_child.start_date, later_child,
+        "a failed earlier persist must not discard a later Shift-drag's children"
     );
 }
 

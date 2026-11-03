@@ -96,6 +96,25 @@ pub struct PendingDateSave {
     pub previous: WorkItemNode,
     pub role: DateSaveRole,
     pub rev: i64,
+    /// Shift-drag descendants owned by this persist. Bound to the save so a
+    /// later parent move cannot overwrite or discard them.
+    pub cascade: Vec<PendingDateSave>,
+}
+
+impl PendingDateSave {
+    pub fn live_dates_match(&self, nodes: &[WorkItemNode]) -> bool {
+        nodes.iter().any(|node| {
+            node.id == self.id
+                && node.start_date == self.after_start
+                && node.target_date == self.after_target
+        })
+    }
+
+    pub fn adopt_cascade_from_superseded(&mut self, dropped: PendingDateSave) {
+        if self.cascade.is_empty() && !dropped.cascade.is_empty() {
+            self.cascade = dropped.cascade;
+        }
+    }
 }
 
 impl PlannerState {
@@ -1392,6 +1411,7 @@ impl PlannerState {
             rev: persisted.rev,
             previous: persisted.clone(),
             role: DateSaveRole::Commit,
+            cascade: Vec::new(),
         }
     }
 
@@ -1422,6 +1442,7 @@ impl PlannerState {
             rev: previous.rev,
             previous,
             role: DateSaveRole::Commit,
+            cascade: Vec::new(),
         };
         self.offer_local_date_commit_toast(&pending);
         Some(pending)
@@ -1468,6 +1489,7 @@ impl PlannerState {
             rev: previous.rev,
             previous,
             role: DateSaveRole::Commit,
+            cascade: Vec::new(),
         };
         self.offer_local_date_commit_toast(&pending);
         Some(pending)
@@ -1540,6 +1562,7 @@ impl PlannerState {
                     rev: previous.rev,
                     previous,
                     role: DateSaveRole::Undo,
+                    cascade: Vec::new(),
                 }]
             }
             Some(HistoryEntry::DatesGroup { items }) => {
@@ -1607,6 +1630,7 @@ impl PlannerState {
                     rev: previous.rev,
                     previous,
                     role: DateSaveRole::Redo,
+                    cascade: Vec::new(),
                 }]
             }
             Some(HistoryEntry::DatesGroup { items }) => {
@@ -1672,6 +1696,7 @@ impl PlannerState {
                 rev: previous.rev,
                 previous,
                 role,
+                cascade: Vec::new(),
             });
         }
         out
@@ -1693,6 +1718,7 @@ impl PlannerState {
             return Ok(());
         };
         if node.start_date != pending.after_start || node.target_date != pending.after_target {
+            self.restore_matching_commit_cascade(&pending);
             return Ok(());
         }
         if !node.has_date_fields {
@@ -1729,15 +1755,8 @@ impl PlannerState {
                 Ok(())
             }
             Err(err) => {
-                if self.nodes.iter().any(|node| {
-                    node.id == pending.id
-                        && node.start_date == pending.after_start
-                        && node.target_date == pending.after_target
-                }) {
-                    if pending.role == DateSaveRole::Commit {
-                        let kids = self.take_shifted_children(pending.id);
-                        self.restore_cascade_saves(&kids);
-                    }
+                self.restore_matching_commit_cascade(&pending);
+                if pending.live_dates_match(&self.nodes) {
                     self.restore_node(pending.previous.clone());
                     self.revert_date_save_history(&pending);
                     self.restore_date_save_failed(&pending);
@@ -2705,6 +2724,7 @@ impl PlannerState {
                 rev: previous.rev,
                 previous,
                 role,
+                cascade: Vec::new(),
             });
         }
         out
@@ -3045,6 +3065,19 @@ impl PlannerState {
         }
     }
 
+    fn restore_matching_commit_cascade(&mut self, pending: &PendingDateSave) {
+        if pending.role != DateSaveRole::Commit {
+            return;
+        }
+        let matching: Vec<_> = pending
+            .cascade
+            .iter()
+            .filter(|save| save.live_dates_match(&self.nodes))
+            .cloned()
+            .collect();
+        self.restore_cascade_saves(&matching);
+    }
+
     fn push_dates_moved_toast(
         &mut self,
         id: i64,
@@ -3150,6 +3183,7 @@ impl PlannerState {
                 rev: previous.rev,
                 previous,
                 role: DateSaveRole::Cascade,
+                cascade: Vec::new(),
             });
             child_changes.push(change);
         }
@@ -4540,6 +4574,7 @@ mod toast_copy_tests {
             previous: parent_before,
             role: super::DateSaveRole::Commit,
             rev: 1,
+            cascade: Vec::new(),
         };
         let kids = state.shift_children_with_committed_move(&pending);
         assert!(
@@ -4593,6 +4628,7 @@ mod toast_copy_tests {
             previous: parent_before,
             role: super::DateSaveRole::Commit,
             rev: 1,
+            cascade: Vec::new(),
         };
         let kids = state.shift_children_with_committed_move(&pending);
         assert!(!kids.is_empty());
@@ -4644,6 +4680,7 @@ mod toast_copy_tests {
             previous: parent_before.clone(),
             role: super::DateSaveRole::Commit,
             rev: 1,
+            cascade: Vec::new(),
         };
         let kids = state.shift_children_with_committed_move(&pending);
         let child_before = kids
@@ -4679,5 +4716,65 @@ mod toast_copy_tests {
         );
         let parent = state.nodes.iter().find(|node| node.id == 1).unwrap();
         assert_eq!(parent.start_date.as_deref(), Some("2026-07-06T00:00:00Z"));
+    }
+
+    #[test]
+    fn later_shift_keeps_its_cascade_when_an_earlier_save_is_superseded() {
+        let mut first = super::PendingDateSave {
+            id: 1,
+            start: None,
+            target: None,
+            after_start: Some("2026-07-09T00:00:00Z".into()),
+            after_target: Some("2026-07-23T00:00:00Z".into()),
+            previous: super::fake_hierarchy(1).remove(0),
+            role: super::DateSaveRole::Commit,
+            rev: 1,
+            cascade: vec![super::PendingDateSave {
+                id: 2,
+                start: None,
+                target: None,
+                after_start: Some("2026-07-09T00:00:00Z".into()),
+                after_target: Some("2026-07-23T00:00:00Z".into()),
+                previous: super::fake_hierarchy(1).remove(0),
+                role: super::DateSaveRole::Cascade,
+                rev: 1,
+                cascade: Vec::new(),
+            }],
+        };
+        let mut second = super::PendingDateSave {
+            id: 1,
+            start: None,
+            target: None,
+            after_start: Some("2026-07-12T00:00:00Z".into()),
+            after_target: Some("2026-07-26T00:00:00Z".into()),
+            previous: super::fake_hierarchy(1).remove(0),
+            role: super::DateSaveRole::Commit,
+            rev: 1,
+            cascade: vec![super::PendingDateSave {
+                id: 2,
+                start: None,
+                target: None,
+                after_start: Some("2026-07-12T00:00:00Z".into()),
+                after_target: Some("2026-07-26T00:00:00Z".into()),
+                previous: super::fake_hierarchy(1).remove(0),
+                role: super::DateSaveRole::Cascade,
+                rev: 1,
+                cascade: Vec::new(),
+            }],
+        };
+        second.adopt_cascade_from_superseded(first.clone());
+        assert_eq!(
+            second.cascade[0].after_start.as_deref(),
+            Some("2026-07-12T00:00:00Z"),
+            "a later Shift-drag must keep its own children"
+        );
+        first.cascade.clear();
+        let mut non_shift = first.clone();
+        non_shift.adopt_cascade_from_superseded(second);
+        assert_eq!(
+            non_shift.cascade[0].after_start.as_deref(),
+            Some("2026-07-12T00:00:00Z"),
+            "a later non-Shift parent persist must still persist the Shift-drag children"
+        );
     }
 }
