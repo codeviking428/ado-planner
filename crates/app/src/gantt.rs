@@ -858,6 +858,7 @@ impl GanttView {
                 }
             }
             GanttScale::Year => {
+                let (start, end) = self.painted_year_range();
                 if start.year() == end.year() {
                     start.year().to_string()
                 } else {
@@ -865,6 +866,46 @@ impl GanttView {
                 }
             }
         }
+    }
+
+    /// First leftover year through the last painted Year major or month tick.
+    /// A 2029 banner can sit on the clip (`fit_labels_to_width` shifts it in)
+    /// while `date_for_x(width-1)` is still late 2028.
+    fn painted_year_range(&self) -> (Date, Date) {
+        let width = self.timeline_width.max(1.0);
+        let start = self.viewport_axis_start_date();
+        let mut end = self.date_for_x((width - 1.0).max(0.0));
+        let ticks = self.timeline_ticks(width);
+        let resolve = |x: f32, label: &str, major: bool| -> Option<Date> {
+            ticks
+                .iter()
+                .filter(|tick| {
+                    if major {
+                        tick.major && tick.major_label == label
+                    } else {
+                        tick.label == label
+                    }
+                })
+                .min_by(|a, b| {
+                    let da = (a.x.max(0.0) - x).abs();
+                    let db = (b.x.max(0.0) - x).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|tick| tick.date)
+        };
+        if let Some((x, label)) = self.header_major_labels(width).last()
+            && let Some(date) = resolve(*x, label, true)
+            && date > end
+        {
+            end = date;
+        }
+        if let Some((x, label)) = self.header_tick_labels(width).last()
+            && let Some(date) = resolve(*x, label, false)
+            && date > end
+        {
+            end = date;
+        }
+        (start, end)
     }
 
     /// First and last painted Quarter columns, matching `header_tick_labels`
@@ -1739,13 +1780,20 @@ impl GanttView {
         }
         let left = self.date_for_x(-ppd);
         let right = self.date_for_x(width + ppd.max(1.0));
+        // Year majors just past the clip are still painted: fit_labels_to_width
+        // slides "2029" onto the right edge while date_for_x(width-1) is 2028.
+        let overflow = if matches!(self.scale, GanttScale::Year) {
+            MAJOR_LABEL_ESTIMATE.max(ppd * 32.0)
+        } else {
+            1.0
+        };
         let mut date = self.scale.tick_floor(left);
         let mut ticks = Vec::new();
         let mut last_major = String::new();
         let mut guard = 0;
         while guard < 512 {
             let x = self.x_for_date(date);
-            if x > width + 1.0 && date > right {
+            if x > width + overflow && date > right {
                 break;
             }
             let major_label = self.scale.major_label(date);
@@ -2218,14 +2266,10 @@ impl GanttView {
                     }
                 }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
-                // Stay in the predecessor row's gutter so the outgoing
-                // vertical does not run through bars on rows in between.
                 let lane_y = if same_row {
                     y1
-                } else if bar.y > pred.y {
-                    pred.y + ROW_HEIGHT - 1.0
                 } else {
-                    pred.y + 1.0
+                    arrow_lane_y(pred, bar)
                 };
                 if !succ_gutter && !inbound_right && !wrap_around {
                     let clear = gutter_clear_x(bars);
@@ -2310,6 +2354,22 @@ impl GanttView {
         // `clip_right` (1–3px stack at the chart edge). Separate after.
         separate_parallel_verticals(&mut out, clip_left, clip_right);
         out
+    }
+}
+
+/// Horizontal run in the padding below (or above) the predecessor bar so
+/// a 2px stroke stays in that row gap instead of riding the next row
+/// (Persist cart → Go-live along Cart UI) or through an open-ended cue
+/// (Cart UI → spike).
+fn arrow_lane_y(pred: &BarLayout, succ: &BarLayout) -> f32 {
+    const STROKE: f32 = 2.0;
+    if succ.y > pred.y {
+        let below_bar = pred.y + pred.paint_top() + pred.paint_h() + STROKE;
+        let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
+        below_bar.min(in_row)
+    } else {
+        let above_bar = pred.y + pred.paint_top() - STROKE;
+        above_bar.max(pred.y + STROKE)
     }
 }
 
@@ -2754,6 +2814,8 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
     let title_w = bar_title_px(&bar.title);
     if bar_title_is_inside(bar) {
         bar.x + painted_w
+    } else if bar.milestone || bar.marker {
+        bar.x + painted_w + 6.0 + title_w
     } else {
         bar.x + painted_w + HANDLE_WIDTH + LINK_HANDLE_HIT + 16.0 + title_w
     }
@@ -4855,10 +4917,13 @@ mod tests {
             "adjacent routing must stay local instead of wrapping to the label edge {}",
             bar_label_right(pred)
         );
+        let gap = pred.y.min(succ.y) + pred.paint_top() + pred.paint_h();
         assert!(
-            arrows[0].lane_y >= pred.y.min(succ.y) + ROW_HEIGHT - 1.0,
-            "horizontal run must sit in the gap between rows, got lane {}",
-            arrows[0].lane_y
+            arrows[0].lane_y >= gap && arrows[0].lane_y < pred.y.min(succ.y) + ROW_HEIGHT,
+            "horizontal run must sit in the row gap below the predecessor bar, got lane {} gap {} row {}",
+            arrows[0].lane_y,
+            gap,
+            pred.y.min(succ.y)
         );
     }
 
@@ -5290,6 +5355,21 @@ mod tests {
             cart_spike.x2,
             persist_live.lane_y,
             cart_spike.lane_y
+        );
+        let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let cue_bottom = cart.y + cart.paint_top() + cart.paint_h();
+        assert!(
+            persist_live.lane_y < cart.y || persist_live.lane_y >= cart.y + ROW_HEIGHT,
+            "{scale:?}: Persist cart → Go-live must not ride the Cart UI row, lane {} cart {}",
+            persist_live.lane_y,
+            cart.y
+        );
+        assert!(
+            cart_spike.lane_y >= cue_bottom && cart_spike.lane_y < cart.y + ROW_HEIGHT,
+            "{scale:?}: Cart UI → spike must sit in the gap below the Cart UI cue, lane {} cue_bottom {} row {}",
+            cart_spike.lane_y,
+            cue_bottom,
+            cart.y
         );
     }
 
@@ -7396,17 +7476,55 @@ mod tests {
         year.scroll_x = 0.0;
         let year_title = year.viewport_range_title();
         let year_start = year.viewport_axis_start_date();
-        let year_end = year.date_for_x(799.0);
-        if year_end.year() != year_start.year() {
+        let year_majors = year.header_major_labels(800.0);
+        let first = year_start.year().to_string();
+        let last = year_majors
+            .last()
+            .map(|(_, label)| label.as_str())
+            .unwrap_or(first.as_str());
+        assert!(
+            year_title.contains(&first),
+            "Year title {year_title:?} must name the start year {first}, majors={year_majors:?}"
+        );
+        assert!(
+            year_title.contains(last),
+            "Year title {year_title:?} must cover the last painted year {last}, majors={year_majors:?}"
+        );
+        if first != last {
             assert!(
-                year_title.contains('–')
-                    && year_title.contains(&year_start.year().to_string())
-                    && year_title.contains(&year_end.year().to_string()),
-                "Year spanning {year_start}–{year_end} must name both years, got {year_title:?}"
+                year_title.contains('–'),
+                "Year spanning {first}–{last} must use an en dash, got {year_title:?}"
             );
-        } else {
-            assert_eq!(year_title, year_start.year().to_string());
         }
+    }
+
+    #[test]
+    fn year_title_covers_a_painted_next_year_major() {
+        // Zoomed-out Year: last pixel is still 2028 while fit_labels_to_width
+        // slides a 2029 banner (and a Nov column) onto the clip.
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 0.6,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let majors = gantt.header_major_labels(800.0);
+        let ticks = gantt.header_tick_labels(800.0);
+        let title = gantt.viewport_range_title();
+        let pixel_end = gantt.date_for_x(799.0);
+        assert!(
+            majors.iter().any(|(_, label)| label == "2029"),
+            "precondition: 2029 must paint (shifted onto the clip) while the last pixel is {pixel_end}, majors={majors:?} ticks={ticks:?}"
+        );
+        assert!(
+            pixel_end.year() <= 2028,
+            "precondition: last pixel must still be 2028 so the title cannot use date_for_x, got {pixel_end}"
+        );
+        assert!(
+            title.contains("2029"),
+            "Year title {title:?} must cover painted 2029 even when the last pixel is {pixel_end}, majors={majors:?} ticks={ticks:?}"
+        );
     }
 
     #[test]

@@ -5420,13 +5420,6 @@ impl PlannerView {
             return None;
         }
         let title_width = bar.title.chars().count() as f32 * 8.0 + 16.0;
-        let label_gap = if overflow_badge {
-            LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0
-        } else if show_link_handles {
-            LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
-        } else {
-            10.0
-        };
         let painted_w = if bar.milestone || bar.marker {
             MILESTONE_SIZE
         } else {
@@ -5436,13 +5429,29 @@ impl PlannerView {
         if bar_right < 0.0 || bar.x > timeline_w {
             return None;
         }
-        let estimated = title_width.max(24.0);
-        let right_x = bar_right + label_gap;
-        let left_x = bar.x - estimated - 6.0;
         // Keep outside titles on the right of the bar. Flipping to the left
         // after a right-edge resize (#1014) is the jump the review caught;
         // hide a fragment at the clip instead of clipping to a letter.
         const MIN_OUTSIDE: f32 = 40.0;
+        if bar.milestone {
+            return Self::milestone_external_label_frame(
+                bar,
+                timeline_w,
+                title_width,
+                today_x,
+                MIN_OUTSIDE,
+            );
+        }
+        let label_gap = if overflow_badge {
+            LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0
+        } else if show_link_handles {
+            LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
+        } else {
+            10.0
+        };
+        let estimated = title_width.max(24.0);
+        let right_x = bar_right + label_gap;
+        let left_x = bar.x - estimated - 6.0;
         let mut label_x = right_x;
         if label_x >= timeline_w - 8.0 {
             // Don't pull the title onto the handle/`!`. Hide the fragment.
@@ -5471,6 +5480,56 @@ impl PlannerView {
                     max_w = (today - 8.0 - label_x).max(24.0);
                 } else {
                     max_w = before.max(estimated);
+                }
+            }
+        }
+        Some((label_x, max_w))
+    }
+
+    /// Sit the chip on the diamond. A Today dodge used to jump "Go-live
+    /// milestone" ~120px past the pill in Quarter view.
+    fn milestone_external_label_frame(
+        bar: &crate::gantt::BarLayout,
+        timeline_w: f32,
+        title_width: f32,
+        today_x: Option<f32>,
+        min_outside: f32,
+    ) -> Option<(f32, f32)> {
+        const GAP: f32 = 6.0;
+        let estimated = title_width.max(24.0);
+        let diamond_right = bar.x + MILESTONE_SIZE;
+        let left_of_diamond = bar.x - estimated - GAP;
+        let mut label_x = diamond_right + GAP;
+        if label_x >= timeline_w - 8.0 {
+            if left_of_diamond >= 0.0 {
+                label_x = left_of_diamond;
+            } else {
+                return None;
+            }
+        }
+        if label_x >= timeline_w || label_x + 8.0 < 0.0 {
+            return None;
+        }
+        let mut max_w = (timeline_w - label_x - 4.0).max(0.0);
+        if max_w < min_outside {
+            return None;
+        }
+        if let Some(today) = today_x {
+            let label_right = label_x + estimated.min(max_w);
+            if label_x < today && label_right > today - 4.0 {
+                let before = (today - 8.0 - label_x).max(0.0);
+                if before >= min_outside {
+                    max_w = before.min(max_w);
+                } else if left_of_diamond >= 0.0 && left_of_diamond + estimated <= today - 4.0 {
+                    label_x = left_of_diamond;
+                    max_w = (today - 8.0 - label_x)
+                        .min(timeline_w - label_x - 4.0)
+                        .max(24.0);
+                } else if before > 0.0 {
+                    max_w = before;
+                    if max_w < min_outside {
+                        return None;
+                    }
                 }
             }
         }
@@ -5516,8 +5575,19 @@ impl PlannerView {
                 .line_height(px(20.))
                 .font_weight(gpui_kit::FontWeight::BOLD)
                 .occlude()
-                .tooltip(move |window, cx| Tooltip::new(overflow_tip.clone()).build(window, cx))
                 .child("!")
+                .child(
+                    Button::new(("overflow-tip", id as u64))
+                        .ghost()
+                        .compact()
+                        .tab_stop(false)
+                        .absolute()
+                        .inset_0()
+                        .w_full()
+                        .h_full()
+                        .tooltip(overflow_tip)
+                        .tooltip_placement(Placement::Top),
+                )
                 .into_any_element(),
         )
     }
@@ -9233,6 +9303,42 @@ mod bar_label_tests {
         assert!(
             badge_x >= plain_x + OVERFLOW_BADGE - 0.5,
             "showing the ! must shift the title right, plain={plain_x} with_badge={badge_x}"
+        );
+    }
+
+    #[test]
+    fn quarter_go_live_chip_stays_next_to_the_diamond() {
+        // Quarter PPD at zoom 0.6 puts Today ~104px after the Aug 15 diamond,
+        // so a handle-gap + Today jump used to land the chip ~120px away.
+        let bar = BarLayout {
+            id: 1013,
+            kind: GanttBarKind::Scheduled,
+            x: 100.0,
+            width: MILESTONE_SIZE,
+            y: 160.0,
+            summary: false,
+            milestone: true,
+            label: String::new(),
+            title: "Go-live milestone".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let diamond_right = bar.x + MILESTONE_SIZE;
+        let today_x = diamond_right + 104.0;
+        let (label_x, _) =
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
+                .expect("Go-live must keep an outside chip");
+        assert!(
+            (label_x - (diamond_right + 6.0)).abs() < 1.0
+                || (label_x + 8.0 <= diamond_right && diamond_right - label_x <= 160.0),
+            "Quarter Go-live chip must sit next to the diamond, not jump past Today, label_x={label_x} diamond={diamond_right} today={today_x}"
+        );
+        assert!(
+            label_x < today_x,
+            "must not jump the milestone chip past Today, label_x={label_x} today={today_x}"
         );
     }
 
