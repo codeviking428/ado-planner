@@ -4501,6 +4501,84 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
     );
 }
 
+#[gpui_kit::test]
+fn left_end_resize_clears_preview_chip_on_mouse_up(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let start_before = Date::new(2026, 7, 6).unwrap();
+    let target_before = Date::new(2026, 7, 20).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let grip = point(bar.origin.x + px(3.), bar.origin.y + bar.size.height / 2.0);
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("mouse-down 3px inside the left end must start a resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeStart,
+            "inner-start grip mouse-down must be ResizeStart, got {:?}",
+            gesture.kind
+        );
+    });
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(grip.x - px(ppd * 4.0), grip.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.clone().expect("live resize");
+        let (start, target) = GanttView::gesture_patch_dates(&gesture);
+        assert_eq!(
+            target, None,
+            "resizing the start must not patch Target Date, got {target:?}"
+        );
+        assert_eq!(
+            start,
+            Some(start_before.saturating_sub(4.days())),
+            "dragging 4 days from the inner left grip must move Start Date, got {start:?}"
+        );
+        assert_eq!(
+            gesture.live_target, target_before,
+            "Target Date must stay {target_before}, got {}",
+            gesture.live_target
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_some(),
+        "a live left-end resize must show the date preview chip"
+    );
+    // Release on the start grip (where the mouse still is) with no extra move.
+    cx.simulate_mouse_up(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "mouse-up on the start grip must end the resize, got {:?}",
+            view.state.gantt.gesture.as_ref().map(|g| g.kind)
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_none(),
+        "the preview chip must clear after a left-end commit without another mouse-move"
+    );
+}
+
 fn click_painted_bar_inset(
     cx: &mut VisualTestContext,
     view: &Entity<PlannerView>,
@@ -6297,8 +6375,8 @@ fn add_item_under_epic_paints_at_child_indent(cx: &mut gpui_kit::TestAppContext)
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
     // Match the mock backlog the reviewer uses: Epic #1001, Feature #1013
-    // under it, then root Task #1012 so a last-child Feature sits next to a
-    // true root and indent is unambiguous.
+    // under it, then root Task #1012 so a first-child Feature sits next to
+    // the Epic and indent is unambiguous.
     let mut nodes = vec![
         mock_tree_node(1001, None, "Epic", "Checkout rewrite"),
         mock_tree_node(1013, Some(1001), "Feature", "Go-live milestone"),
@@ -6324,9 +6402,14 @@ fn add_item_under_epic_paints_at_child_indent(cx: &mut gpui_kit::TestAppContext)
         let sibling_at = ids.iter().position(|id| *id == 1013).expect("sibling");
         let created_at = ids.iter().position(|id| *id == 1999).expect("created");
         let root_at = ids.iter().position(|id| *id == 1012).expect("root task");
+        assert_eq!(
+            created_at,
+            epic_at + 1,
+            "new Feature must sit directly under the Epic, got {ids:?}"
+        );
         assert!(
-            epic_at < sibling_at && sibling_at < created_at && created_at < root_at,
-            "new Feature must sit after the Epic's last child and before the next root, got {ids:?}"
+            epic_at < created_at && created_at < sibling_at && sibling_at < root_at,
+            "new Feature must sit before existing siblings and before the next root, got {ids:?}"
         );
         let created_row = rows.iter().find(|row| row.id == 1999).unwrap();
         let sibling_row = rows.iter().find(|row| row.id == 1013).unwrap();
@@ -6348,8 +6431,8 @@ fn add_item_under_epic_paints_at_child_indent(cx: &mut gpui_kit::TestAppContext)
     let created_y = f32::from(created_row.origin.y);
     let root_y = f32::from(root_row.origin.y);
     assert!(
-        epic_y < sibling_y && sibling_y < created_y && created_y < root_y,
-        "painted order must be Epic, Go-live, new Feature, Unparented spike; y={epic_y},{sibling_y},{created_y},{root_y}"
+        epic_y < created_y && created_y < sibling_y && sibling_y < root_y,
+        "painted order must be Epic, new Feature, Go-live, Unparented spike; y={epic_y},{created_y},{sibling_y},{root_y}"
     );
     let sibling_slot = cx
         .debug_bounds("gantt-expand-slot-1013")

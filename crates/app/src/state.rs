@@ -1279,19 +1279,52 @@ impl PlannerState {
                 self.discard_dates_after(pending.id, &pending.after_start, &pending.after_target);
             }
             DateSaveRole::Undo => {
-                if let Some(entry) = self.history.redo.pop() {
-                    self.history.undo.push(entry);
-                }
+                self.restore_failed_date_undo(pending.id);
             }
             DateSaveRole::Redo => {
-                if let Some(entry) = self.history.undo.pop() {
-                    self.history.redo.push(entry);
-                }
+                self.restore_failed_date_redo(pending.id);
             }
             DateSaveRole::Restore => {}
             DateSaveRole::Cascade => {
                 self.discard_dates_after(pending.id, &pending.after_start, &pending.after_target);
+                // Grouped undo puts DatesGroup on redo; a failed child persist
+                // must move that group back so Ctrl+Z can finish the restore.
+                self.restore_failed_date_undo(pending.id);
             }
+        }
+    }
+
+    fn history_entry_involves(entry: &HistoryEntry, id: i64) -> bool {
+        match entry {
+            HistoryEntry::Dates { id: entry_id, .. } => *entry_id == id,
+            HistoryEntry::DatesGroup { items } => items.iter().any(|item| item.id == id),
+            _ => false,
+        }
+    }
+
+    /// Move a matching Dates/DatesGroup from redo back to undo. No-op if the
+    /// top redo entry is a different action (another member already restored it).
+    fn restore_failed_date_undo(&mut self, id: i64) {
+        if self
+            .history
+            .redo
+            .last()
+            .is_some_and(|entry| Self::history_entry_involves(entry, id))
+            && let Some(entry) = self.history.redo.pop()
+        {
+            self.history.undo.push(entry);
+        }
+    }
+
+    fn restore_failed_date_redo(&mut self, id: i64) {
+        if self
+            .history
+            .undo
+            .last()
+            .is_some_and(|entry| Self::history_entry_involves(entry, id))
+            && let Some(entry) = self.history.undo.pop()
+        {
+            self.history.redo.push(entry);
         }
     }
 
@@ -2091,6 +2124,8 @@ impl PlannerState {
                     self.gantt.collapsed.remove(&pid);
                 }
                 self.gantt.selected_id = Some(id);
+                self.gantt.clear_hover();
+                self.gantt.hover_locked = true;
                 let rows = self.gantt.flatten(&self.nodes);
                 self.gantt.select_relative(&rows, 0);
                 self.persist_hierarchy_cache();
@@ -4167,5 +4202,32 @@ mod toast_copy_tests {
         let child = state.nodes.iter().find(|node| node.id == 2).unwrap();
         assert_eq!(parent.start_date.as_deref(), Some("2026-07-06T00:00:00Z"));
         assert_eq!(child.start_date.as_deref(), Some("2026-07-06T00:00:00Z"));
+        let child_save = pending.iter().find(|save| save.id == 2).unwrap();
+        assert_eq!(child_save.role, super::DateSaveRole::Cascade);
+        assert!(
+            matches!(
+                state.history.redo.last(),
+                Some(HistoryEntry::DatesGroup { .. })
+            ),
+            "grouped undo must sit on redo before persist, got {:?}",
+            state.history.redo.last()
+        );
+        state.revert_date_save_history(child_save);
+        assert!(
+            matches!(
+                state.history.undo.last(),
+                Some(HistoryEntry::DatesGroup { .. })
+            ),
+            "a failed child persist must put the group back on undo, got undo={:?} redo={:?}",
+            state.history.undo.last(),
+            state.history.redo.last()
+        );
+        assert!(
+            !matches!(
+                state.history.redo.last(),
+                Some(HistoryEntry::DatesGroup { .. })
+            ),
+            "the group must leave redo after a failed child persist"
+        );
     }
 }

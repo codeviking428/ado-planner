@@ -846,6 +846,7 @@ impl PlannerView {
                     Ok((working, result)) => {
                         let shown_at = this.loading_shown_at;
                         let discard_form = this.form_loading.is_none() && this.state.form.is_none();
+                        let prev_selected = this.state.gantt.selected_id;
                         this.state.adopt_spawned(working);
                         this.state.gantt.context_menu = None;
                         if discard_form {
@@ -891,6 +892,12 @@ impl PlannerView {
                         }
                         if let Err(err) = result {
                             tracing::warn!("planner action failed: {err}");
+                        }
+                        if this.state.gantt.selected_id != prev_selected {
+                            this.state.gantt.clear_hover();
+                            this.state.gantt.hover_locked = true;
+                            let rows = this.state.gantt.flatten(&this.state.nodes);
+                            this.state.gantt.select_relative(&rows, 0);
                         }
                     }
                     Err(_) => tracing::warn!("planner action cancelled"),
@@ -4285,7 +4292,9 @@ impl PlannerView {
                         Some(bar) => {
                             let x = match gesture.kind {
                                 GestureKind::ResizeEnd => bar.x + bar.width + 6.0,
-                                GestureKind::ResizeStart => (bar.x - 8.0).max(4.0),
+                                // Sit over the bar body, not the start grip, so
+                                // mouse-up on a left-end resize is not eaten.
+                                GestureKind::ResizeStart => (bar.x + 12.0).max(4.0),
                                 _ => bar.x.max(4.0),
                             };
                             let y = (TIMELINE_HEADER_H + bar.y - 24.0).max(2.0);
@@ -4297,7 +4306,6 @@ impl PlannerView {
                         div()
                             .id("gantt-drag-preview")
                             .debug_selector(|| "gantt-drag-preview".into())
-                            .occlude()
                             .absolute()
                             .left(px(x))
                             .top(px(y))
@@ -4311,6 +4319,12 @@ impl PlannerView {
                             .text_xs()
                             .whitespace_nowrap()
                             .shadow_md()
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.commit_gesture(window, cx);
+                                }),
+                            )
                             .child(text),
                     )
                 })
@@ -4738,6 +4752,12 @@ impl PlannerView {
                         this.continue_or_begin_bar_gesture(id, kind, origin, window, cx);
                     }),
                 )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.commit_gesture(window, cx);
+                    }),
+                )
                 .into_any_element()
         })
         .collect()
@@ -4782,6 +4802,7 @@ impl PlannerView {
                 .when(!linking, |el| el.occlude())
                 .bg(gpui_kit::hsla(0., 0., 0., 0.01))
                 .cursor(CursorStyle::OperationNotAllowed)
+                .tooltip(move |window, cx| Tooltip::new(DATES_ROLLUP_TIP).build(window, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_hovered(Some(id), cx);
@@ -4807,26 +4828,6 @@ impl PlannerView {
                         // overlay pixels into Move (leaf grips force Resize*).
                         this.begin_rollup_edge_press(id, &layout, x, window, cx);
                     }),
-                )
-                .child(
-                    Button::new((
-                        if at_start {
-                            "summary-edge-tip-start"
-                        } else {
-                            "summary-edge-tip-end"
-                        },
-                        id as u64,
-                    ))
-                    .ghost()
-                    .compact()
-                    .tab_stop(false)
-                    .absolute()
-                    .inset_0()
-                    .w_full()
-                    .h_full()
-                    .tooltip(DATES_ROLLUP_TIP)
-                    .tooltip_placement(Placement::Top)
-                    .tooltip_show_delay(Duration::from_millis(450)),
                 )
                 .into_any_element()
         })
@@ -6730,7 +6731,8 @@ impl PlannerView {
 
     /// `Window.refresh` is a no-op while GPUI is drawing, so mouse-up during
     /// a frame can leave the preview chip and toast stale until the pointer
-    /// moves. Notify now and again on the next turn.
+    /// moves. Notify now, and again after a frame so a still mouse (left-end
+    /// resize under the start grip) still gets a paint.
     fn request_repaint(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         cx.notify();
         if let Some(window) = window {
@@ -6738,6 +6740,9 @@ impl PlannerView {
         }
         cx.refresh_windows();
         cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
             let _ = this.update(cx, |_, cx| {
                 cx.notify();
                 cx.refresh_windows();

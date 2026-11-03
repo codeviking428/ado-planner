@@ -1604,12 +1604,17 @@ async fn add_item_creates_a_work_item_on_the_team() {
 async fn add_item_keeps_the_selected_parent_after_reload() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.selected_id = Some(1005);
+    state.gantt.hovered_id = Some(1005);
     state.add_item().await.expect("create");
     let created = created_item(&state);
     assert_eq!(
         created.parent_id,
         Some(1005),
         "new items must nest under the selected work item"
+    );
+    assert_eq!(
+        state.gantt.hovered_id, None,
+        "Add child must clear lingering link-handle hover on the parent"
     );
     state.load_hierarchy().await.expect("reload");
     let reloaded = state
@@ -1838,15 +1843,21 @@ async fn add_item_on_an_epic_creates_a_child_feature() {
         "new Feature must share tree depth with Feature #1013, got {created_row:?} vs {sibling:?}"
     );
     let visible_ids: Vec<i64> = visible_rows.iter().map(|row| row.id).collect();
+    let epic_at_vis = visible_ids.iter().position(|id| *id == 1001).expect("epic");
     let sibling_at = visible_ids.iter().position(|id| *id == 1013).expect("1013");
     let created_at_vis = visible_ids
         .iter()
         .position(|id| *id == created.id)
         .expect("created");
     let root_at = visible_ids.iter().position(|id| *id == 1012);
+    assert_eq!(
+        created_at_vis,
+        epic_at_vis + 1,
+        "new Feature must sit directly under the Epic, got {visible_ids:?}"
+    );
     assert!(
-        created_at_vis > sibling_at,
-        "new Feature must paint after the Epic's last existing child, got {visible_ids:?}"
+        created_at_vis < sibling_at,
+        "new Feature must paint before existing siblings, got {visible_ids:?}"
     );
     if let Some(root_at) = root_at {
         assert!(
@@ -1889,8 +1900,13 @@ async fn add_item_under_nests_even_when_another_row_is_selected() {
         .position(|id| *id == created.id)
         .expect("created");
     let root_at = rows.iter().position(|id| *id == 1012).expect("root");
+    assert_eq!(
+        created_at,
+        epic_at + 1,
+        "new child must sit directly under the Epic, got {rows:?}"
+    );
     assert!(
-        epic_at < created_at && created_at < root_at,
+        created_at < root_at,
         "new child must sit under the Epic, not at the bottom with #1012, got {rows:?}"
     );
     let created_row = state

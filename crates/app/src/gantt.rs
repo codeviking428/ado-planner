@@ -1772,8 +1772,9 @@ impl GanttView {
 
     pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
         const STUB: f32 = 12.0;
-        // Backward inbound stays off the successor's right-side link handle.
-        const BACKWARD_HEAD_GAP: f32 = HANDLE_WIDTH + LINK_HANDLE_HIT + LINK_HANDLE + 8.0;
+        // Just past the successor's right, before the external title (~42px).
+        // A 48px gap sat in the label and ran the head off the chart.
+        const BACKWARD_HEAD_GAP: f32 = 8.0;
         const INCOMING_FAN: f32 = 10.0;
         const LANE_SEP: f32 = 6.0;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
@@ -1893,14 +1894,26 @@ impl GanttView {
 }
 
 fn clip_arrow_to_timeline(arrow: &mut DependencyArrow, left: f32, right: f32) {
-    if arrow.x_head > right {
-        let delta = arrow.x_head - right;
-        arrow.x_head = right;
-        arrow.x2 -= delta;
-    } else if arrow.x_head < left {
-        let delta = left - arrow.x_head;
-        arrow.x_head = left;
-        arrow.x2 += delta;
+    let clamp = |x: f32| x.clamp(left, right);
+    arrow.x_head = clamp(arrow.x_head);
+    arrow.x1 = clamp(arrow.x1);
+    arrow.x2 = clamp(arrow.x2);
+    const MIN_STUB: f32 = 10.0;
+    // Only expand a collapsed inbound stub. Do not shrink wrap-around elbows.
+    if arrow.inbound_right {
+        if arrow.x2 < arrow.x_head + MIN_STUB {
+            arrow.x2 = (arrow.x_head + MIN_STUB).min(right);
+        }
+        if arrow.x_head > right - MIN_STUB {
+            arrow.x_head = (right - MIN_STUB).max(left);
+            arrow.x2 = right;
+        }
+    } else if (arrow.x_head - arrow.x2).abs() < MIN_STUB {
+        arrow.x2 = (arrow.x_head - MIN_STUB).max(left);
+        if arrow.x_head < left + MIN_STUB {
+            arrow.x_head = (left + MIN_STUB).min(right);
+            arrow.x2 = left;
+        }
     }
 }
 
@@ -2154,17 +2167,32 @@ pub fn flatten_visible(nodes: &[WorkItemNode], collapsed: &HashSet<i64>) -> Vec<
     out
 }
 
+/// Index after `id` and its descendants (last among that subtree).
+pub fn insert_index_after_subtree(nodes: &[WorkItemNode], id: i64) -> usize {
+    let Some(index) = nodes.iter().position(|node| node.id == id) else {
+        return 0;
+    };
+    match descendants(nodes, id).last() {
+        Some(last_id) => nodes
+            .iter()
+            .position(|node| node.id == *last_id)
+            .map(|index| index + 1)
+            .unwrap_or(index + 1),
+        None => index + 1,
+    }
+}
+
 /// Index after `selected_id` and its descendants so a new sibling lands next
 /// to the selection instead of nesting under it.
 pub fn insert_index_for_sibling(nodes: &[WorkItemNode], selected_id: Option<i64>) -> usize {
     let Some(id) = selected_id else {
         return nodes.len();
     };
-    insert_index_for_child(nodes, Some(id))
+    insert_index_after_subtree(nodes, id)
 }
 
-/// Index at which a newly created child should land so flatten order appends
-/// it after the parent's existing descendants (last among siblings).
+/// Index at which a newly created child should land: directly under the parent
+/// (first among siblings) so it is visible next to the row that spawned it.
 pub fn insert_index_for_child(nodes: &[WorkItemNode], parent_id: Option<i64>) -> usize {
     let Some(pid) = parent_id else {
         return nodes.len();
@@ -2172,14 +2200,7 @@ pub fn insert_index_for_child(nodes: &[WorkItemNode], parent_id: Option<i64>) ->
     let Some(parent_index) = nodes.iter().position(|node| node.id == pid) else {
         return 0;
     };
-    match descendants(nodes, pid).last() {
-        Some(last_id) => nodes
-            .iter()
-            .position(|node| node.id == *last_id)
-            .map(|index| index + 1)
-            .unwrap_or(parent_index + 1),
-        None => parent_index + 1,
-    }
+    parent_index + 1
 }
 
 pub fn descendants(nodes: &[WorkItemNode], id: i64) -> Vec<i64> {
@@ -4394,15 +4415,15 @@ mod tests {
     }
 
     #[test]
-    fn new_child_appends_after_existing_siblings() {
+    fn new_child_inserts_directly_under_parent() {
         let nodes = vec![
             node(1, None),
             node(2, Some(1)),
             node(3, Some(2)),
             node(4, Some(1)),
         ];
-        assert_eq!(insert_index_for_child(&nodes, Some(1)), 4);
-        assert_eq!(insert_index_for_child(&nodes, Some(2)), 3);
+        assert_eq!(insert_index_for_child(&nodes, Some(1)), 1);
+        assert_eq!(insert_index_for_child(&nodes, Some(2)), 2);
         assert_eq!(insert_index_for_child(&nodes, None), 4);
         assert_eq!(insert_index_for_child(&nodes, Some(4)), 4);
         assert_eq!(insert_index_for_sibling(&nodes, Some(2)), 3);
@@ -4778,6 +4799,66 @@ mod tests {
             arrows[0].x1,
             arrows[0].x2,
             gantt.timeline_width
+        );
+    }
+
+    #[test]
+    fn backward_link_when_source_starts_after_target_keeps_head_on_screen() {
+        let mut pred = node(1005, Some(1));
+        pred.title = "Cart UI".into();
+        pred.start_date = Some("2026-07-28T00:00:00Z".into());
+        pred.target_date = None;
+        let mut succ = node(1012, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1005];
+        let nodes = vec![node(1, None), pred, succ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 1, "the #1005→#1012 link must still layout");
+        let pred_bar = bars.iter().find(|bar| bar.id == 1005).expect("pred");
+        let succ_bar = bars.iter().find(|bar| bar.id == 1012).expect("succ");
+        assert!(
+            pred_bar.x > succ_bar.x + 1.0,
+            "fixture must place #1005 after #1012's start, pred.x={} succ.x={}",
+            pred_bar.x,
+            succ_bar.x
+        );
+        let arrow = &arrows[0];
+        assert!(
+            arrow.inbound_right,
+            "source after the target start is a backward FS link"
+        );
+        let succ_right = succ_bar.x + succ_bar.width.max(8.0);
+        let label_left = succ_right + HANDLE_WIDTH + LINK_HANDLE_HIT + 16.0;
+        assert!(
+            arrow.x_head >= succ_right - 1.0 && arrow.x_head < label_left - 4.0,
+            "the head must sit just past the successor, not in the title, x_head={} succ_right={succ_right} label_left={label_left}",
+            arrow.x_head
+        );
+        for (name, x) in [("x_head", arrow.x_head), ("x1", arrow.x1), ("x2", arrow.x2)] {
+            assert!(
+                x >= 10.0 && x <= gantt.timeline_width - 8.0,
+                "{name}={x} must stay on-screen (width={})",
+                gantt.timeline_width
+            );
+        }
+        assert!(
+            !arrow.wraps_around_successor(),
+            "backward routing must stay a local elbow"
+        );
+        assert!(
+            (arrow.x2 - arrow.x_head).abs() >= 8.0,
+            "the inbound stub must remain long enough for an arrowhead, x2={} x_head={}",
+            arrow.x2,
+            arrow.x_head
         );
     }
 
