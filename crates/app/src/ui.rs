@@ -4429,6 +4429,18 @@ impl PlannerView {
                             }),
                     )
                     .children({
+                        let arrows = self.state.gantt.layout_dependency_arrows(bars);
+                        arrows
+                            .into_iter()
+                            .map(|arrow| self.render_dependency_arrow(&arrow, cx))
+                    })
+                    .children(bars.iter().filter_map(|bar| {
+                        self.render_open_ended_cue(bar, cx)
+                    }))
+                    .children({
+                        // After arrows/cues so the line stays continuous
+                        // through links; before labels so chips still cover
+                        // it. `today_line_chip_skips` already gaps those bands.
                         let skips = today_line_chip_skips(bars, today_x, width);
                         today_line_segments(0.0, content_h, &skips)
                             .into_iter()
@@ -4445,15 +4457,6 @@ impl PlannerView {
                                     .bg(today_color)
                             })
                     })
-                    .children({
-                        let arrows = self.state.gantt.layout_dependency_arrows(bars);
-                        arrows
-                            .into_iter()
-                            .map(|arrow| self.render_dependency_arrow(&arrow, cx))
-                    })
-                    .children(bars.iter().filter_map(|bar| {
-                        self.render_open_ended_cue(bar, cx)
-                    }))
                     .children(bars.iter().filter_map(|bar| {
                         self.render_offscreen_edge(bar, cx)
                     }))

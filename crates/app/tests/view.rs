@@ -4440,6 +4440,10 @@ fn year_persist_cart_label_and_go_live_link_clear_today(cx: &mut gpui_kit::TestA
         height: px(800.),
     });
     draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-today-body").is_some(),
+        "Year body Today line must paint above arrows, gapped through chips"
+    );
     let persist = cx
         .debug_bounds("gantt-bar-label-1003")
         .expect("Year Persist cart must paint an outside label, not Pers…");

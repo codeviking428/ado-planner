@@ -2818,29 +2818,40 @@ fn nudge_forward_inbounds_off_solid_bodies(
             })
             .collect();
         let mut x = arrow.x2;
-        for mid in &intervening {
-            // Body + open-ended cue (the painted Cart UI bar), not Year
-            // outside titles — those would shove the drop tens of days.
-            let (left, right) = bar_occupied_x(mid, false, Some(clip_right), None);
-            if !x_hits_span(x, left, right) {
-                continue;
+        // Re-scan so dropping before bar A cannot land inside bar B.
+        for _ in 0..=intervening.len() {
+            let mut moved = false;
+            for mid in &intervening {
+                // Body + open-ended cue (the painted Cart UI bar), not Year
+                // outside titles — those would shove the drop tens of days.
+                let (left, right) = bar_occupied_x(mid, false, Some(clip_right), None);
+                if !x_hits_span(x, left, right) {
+                    continue;
+                }
+                let (body_left, body_right) = bar_occupied_x(mid, false, None, None);
+                let before = (left - 8.0).max(clip_left);
+                // Occupancy already pads the body by 4px; +2 sits in the Year
+                // sliver gap without walking onto Persist cart's outside chip.
+                let past_body = (body_right + 2.0).min(clip_right);
+                let next = if !x_hits_span(before, left, right) {
+                    // Room left of the painted bar (Month Cart UI at x≈611).
+                    before
+                } else if past_body < arrow.x_head - 2.0
+                    && !x_hits_span(past_body, body_left, body_right)
+                {
+                    // Year sliver: the unscheduled gutter clip sits on the body,
+                    // but Go-live is just past it — use that gap.
+                    past_body
+                } else {
+                    before
+                };
+                if (next - x).abs() > 0.5 {
+                    x = next;
+                    moved = true;
+                }
             }
-            let (body_left, body_right) = bar_occupied_x(mid, false, None, None);
-            let before = (left - 8.0).max(clip_left);
-            // Occupancy already pads the body by 4px; +2 sits in the Year
-            // sliver gap without walking onto Persist cart's outside chip.
-            let past_body = (body_right + 2.0).min(clip_right);
-            if !x_hits_span(before, left, right) {
-                // Room left of the painted bar (Month Cart UI at x≈611).
-                x = before;
-            } else if past_body < arrow.x_head - 2.0
-                && !x_hits_span(past_body, body_left, body_right)
-            {
-                // Year sliver: the unscheduled gutter clip sits on the body,
-                // but Go-live is just past it — use that gap.
-                x = past_body;
-            } else {
-                x = before;
+            if !moved {
+                break;
             }
         }
         arrow.x2 = x;
