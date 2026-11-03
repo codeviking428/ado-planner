@@ -5661,12 +5661,7 @@ impl PlannerView {
             )))
             .debug_selector(|| "gantt-dep-arrowhead".into())
             .absolute()
-            .left(px(if arrow.inbound_right {
-                arrow.x_head - min_x - 4.0
-            } else {
-                // Sit on the inbound stub, left of the inset start handle.
-                arrow.stub_start() - min_x - 16.0
-            }))
+            .left(px(arrow.arrowhead_left() - min_x))
             .top(px(arrow.y2 - min_y - 10.0))
             .w(px(18.))
             .h(px(20.))

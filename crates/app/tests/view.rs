@@ -1048,6 +1048,51 @@ fn painted_dependency_arrow_joins_predecessor_to_successor(cx: &mut gpui_kit::Te
 }
 
 #[gpui_kit::test]
+fn inbound_arrowhead_paints_at_the_target_not_the_elbow(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = Some("2026-07-10T00:00:00Z".into());
+        node.target_date = Some("2026-08-04T00:00:00Z".into());
+    }
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 3) {
+        node.predecessors = vec![1];
+        node.start_date = Some("2026-07-21T00:00:00Z".into());
+        node.target_date = Some("2026-08-04T00:00:00Z".into());
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let head = cx.debug_bounds("gantt-dep-arrowhead").expect("inbound ▶");
+    let target = cx.debug_bounds("gantt-bar-3").expect("successor");
+    let elbow_gap = view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars =
+            view.state
+                .gantt
+                .layout_bars(&view.state.nodes, &rows, &view.state.iterations, 720.0);
+        let arrow = view
+            .state
+            .gantt
+            .layout_dependency_arrows(&bars)
+            .into_iter()
+            .find(|arrow| arrow.from_id == 1 && arrow.to_id == 3)
+            .expect("1→3");
+        (arrow.x2 - arrow.x_head).abs()
+    });
+    let head_right = f32::from(head.origin.x + head.size.width);
+    let target_left = f32::from(target.origin.x);
+    assert!(
+        (head_right - target_left).abs() < 24.0,
+        "▶ must sit on the successor edge, not the dodged elbow; head_right={head_right} target_left={target_left} elbow_gap={elbow_gap}"
+    );
+}
+
+#[gpui_kit::test]
 fn inline_dates_use_a_range_picker(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();

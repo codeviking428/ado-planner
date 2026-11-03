@@ -496,6 +496,16 @@ impl DependencyArrow {
         }
     }
 
+    /// Timeline x of the incoming ▶/◀. Always the successor edge (`x_head`),
+    /// never the inbound elbow (`x2`) — bar-dodging can push `x2` far left.
+    pub fn arrowhead_left(&self) -> f32 {
+        if self.inbound_right {
+            self.x_head - 4.0
+        } else {
+            self.x_head - 16.0
+        }
+    }
+
     /// Sit above the outgoing stub, off the predecessor bar and the line.
     const REMOVE_ABOVE: f32 = 18.0;
 
@@ -5091,6 +5101,19 @@ mod tests {
             "the head must still sit on the successor start, x_head={} succ.x={}",
             arrows[0].x_head,
             succ.x
+        );
+        assert!(
+            (arrows[0].x2 - arrows[0].x_head).abs() > 8.0,
+            "precondition: dodging must leave the elbow away from the target, x2={} x_head={}",
+            arrows[0].x2,
+            arrows[0].x_head
+        );
+        assert!(
+            (arrows[0].arrowhead_left() - (arrows[0].x_head - 16.0)).abs() < 0.5,
+            "▶ must sit on the target edge, not the elbow, arrowhead={} x2={} x_head={}",
+            arrows[0].arrowhead_left(),
+            arrows[0].x2,
+            arrows[0].x_head
         );
     }
 
