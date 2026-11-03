@@ -5445,10 +5445,8 @@ impl PlannerView {
         const MIN_OUTSIDE: f32 = 40.0;
         let mut label_x = right_x;
         if label_x >= timeline_w - 8.0 {
-            label_x = (bar_right + 4.0).min(timeline_w - 24.0);
-            if label_x < bar_right {
-                label_x = bar_right.min(timeline_w - 8.0);
-            }
+            // Don't pull the title onto the handle/`!`. Hide the fragment.
+            return None;
         }
         if label_x >= timeline_w || label_x + 8.0 < 0.0 {
             return None;
@@ -9236,6 +9234,34 @@ mod bar_label_tests {
             badge_x >= plain_x + OVERFLOW_BADGE - 0.5,
             "showing the ! must shift the title right, plain={plain_x} with_badge={badge_x}"
         );
+    }
+
+    #[test]
+    fn clip_edge_outside_title_does_not_cover_the_handle() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 740.0,
+            width: 40.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0xa6e3a1,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, None, true);
+        if let Some((label_x, _)) = frame {
+            let handle_left = bar.x + bar.width + LINK_HANDLE_GAP;
+            assert!(
+                label_x >= handle_left + LINK_HANDLE_HIT - 0.5,
+                "an outside title at the clip must not cover the link handle, label_x={label_x} handle_left={handle_left}"
+            );
+        }
     }
 
     #[test]

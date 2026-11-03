@@ -1815,8 +1815,8 @@ impl GanttView {
     /// other month from the first painted tick so leftover Jul yields
     /// Jul, Sep, Nov, Jan, Mar — not calendar-odd names that skip Jan.
     /// Day/Week still shift the in-month number off the Today line so "2"
-    /// stays readable. Quarter dodges labels around the pill; Year ticks
-    /// keep their month x (different row) so the interval stays even.
+    /// stays readable. Year/Quarter ticks keep their column x (different
+    /// row from the pill) so a Today dodge cannot stack them and drop Nov.
     pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 22.0;
         const SHIFT: f32 = 16.0;
@@ -1831,31 +1831,21 @@ impl GanttView {
                 }
             })
             .collect();
-        if let Some(today) = hide_x {
-            if matches!(self.scale, GanttScale::Quarter) {
-                let pill_left = today_pill_left(today, width);
-                let pill_right = pill_left + TODAY_PILL_W;
-                for (x, label) in ticks.iter_mut() {
-                    let right = *x + header_label_px(label);
-                    if right >= pill_left - 2.0 && *x <= pill_right + 2.0 {
-                        *x = pill_right + TODAY_PILL_GAP;
-                    }
-                }
-            } else if !matches!(self.scale, GanttScale::Year)
-                && let Some(index) = ticks
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (x, _))| (x - today).abs() < HIDE_PAD)
-                    .min_by(|(_, (a, _)), (_, (b, _))| {
-                        (a - today)
-                            .abs()
-                            .partial_cmp(&(b - today).abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(index, _)| index)
-            {
-                ticks[index].0 = today + SHIFT;
-            }
+        if let Some(today) = hide_x
+            && !matches!(self.scale, GanttScale::Year | GanttScale::Quarter)
+            && let Some(index) = ticks
+                .iter()
+                .enumerate()
+                .filter(|(_, (x, _))| (x - today).abs() < HIDE_PAD)
+                .min_by(|(_, (a, _)), (_, (b, _))| {
+                    (a - today)
+                        .abs()
+                        .partial_cmp(&(b - today).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(index, _)| index)
+        {
+            ticks[index].0 = today + SHIFT;
         }
         let min_gap = if matches!(self.scale, GanttScale::Quarter) {
             48.0
@@ -2409,7 +2399,9 @@ fn wrap_floor(arrow: &DependencyArrow) -> f32 {
 
 /// Shift one vertical. Wrap x1/x2 stay coupled so the drop does not split
 /// from the source stub. Do not clamp inbound to `x_head - 4` — that undoes
-/// a right-edge push and restacks two clipped verticals.
+/// a right-edge push and restacks two clipped verticals. Do not let a
+/// forward FS inbound cross `x_head + WRAP_STUB`, or the polyline flips
+/// to wrap-around.
 fn shift_vertical(
     arrow: &mut DependencyArrow,
     kind: VertKind,
@@ -2427,6 +2419,9 @@ fn shift_vertical(
         return false;
     }
     if wrap && next <= wrap_floor(arrow) {
+        return false;
+    }
+    if !wrap && kind == VertKind::Inbound && next > arrow.x_head + DependencyArrow::WRAP_STUB {
         return false;
     }
     let applied = next - cur;
@@ -5109,6 +5104,51 @@ mod tests {
     }
 
     #[test]
+    fn separating_verticals_does_not_flip_a_forward_link_to_wrap() {
+        let a = DependencyArrow {
+            from_id: 1003,
+            to_id: 1013,
+            x1: 200.0,
+            y1: 20.0,
+            x2: 628.0,
+            y2: 180.0,
+            x_head: 640.0,
+            lane_y: 39.0,
+            inbound_right: false,
+        };
+        let b = DependencyArrow {
+            from_id: 1005,
+            to_id: 1012,
+            x1: 210.0,
+            y1: 60.0,
+            x2: 630.0,
+            y2: 220.0,
+            x_head: 360.0,
+            lane_y: 79.0,
+            inbound_right: false,
+        };
+        assert!(
+            !a.wraps_around_successor(),
+            "precondition: Persist cart → Go-live is a forward inbound"
+        );
+        let mut arrows = vec![a, b];
+        separate_parallel_verticals(&mut arrows, 0.0, 800.0);
+        assert!(
+            !arrows[0].wraps_around_successor(),
+            "pushing the inbound must not flip it to wrap-around, x2={} x_head={}",
+            arrows[0].x2,
+            arrows[0].x_head
+        );
+        let dx = closest_vertical_gap(&arrows[0], &arrows[1]);
+        assert!(
+            dx >= PARALLEL_VERT_MIN || !arrows[1].wraps_around_successor(),
+            "the other arrow may move, but the forward link must stay forward, dx={dx} x2={},{}",
+            arrows[0].x2,
+            arrows[1].x2
+        );
+    }
+
+    #[test]
     fn persist_cart_go_live_clears_the_cart_ui_spike_lane() {
         let mut persist = node(1003, Some(1002));
         persist.title = "Persist cart".into();
@@ -7583,6 +7623,16 @@ mod tests {
         assert!(
             ticks.iter().any(|(_, label)| label.starts_with('Q')),
             "Quarter ticks live on the row below Today and must stay, got {ticks:?}"
+        );
+        let pill_left = today_pill_left(today_x, 800.0);
+        let pill_right = pill_left + TODAY_PILL_W;
+        let stacked = ticks
+            .iter()
+            .filter(|(x, _)| (*x - (pill_right + TODAY_PILL_GAP)).abs() < 1.0)
+            .count();
+        assert!(
+            stacked <= 1,
+            "Quarter Today dodge must not stack Q labels on one x, got {ticks:?}"
         );
     }
 
