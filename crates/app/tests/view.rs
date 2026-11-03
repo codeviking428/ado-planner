@@ -5627,21 +5627,19 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
             view.state.gantt.gesture.is_none(),
             "mouse-up must end the resize gesture"
         );
-        assert_eq!(
-            view.state.gantt.pin_bar_tooltip, None,
-            "mouse-up must clear the bar tooltip instead of pinning it"
-        );
     });
     assert!(
         cx.debug_bounds("gantt-drag-preview").is_none(),
         "the preview chip must clear when the resize ends, without waiting for another mouse-move"
     );
-    assert!(
-        cx.debug_bounds("gantt-bar-tooltip").is_none(),
-        "mouse-up must not leave a pinned tooltip on the bar"
-    );
     cx.simulate_mouse_move(point(px(8.), px(8.)), None, Modifiers::default());
     draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "leaving the bar must unpin the live tooltip"
+        );
+    });
     assert!(
         cx.debug_bounds("gantt-bar-tooltip").is_none(),
         "leaving the bar must keep the tooltip cleared"
@@ -5678,10 +5676,6 @@ fn drop_undo_and_pointer_leave_clear_the_bar_tooltip(cx: &mut gpui_kit::TestAppC
     cx.simulate_mouse_up(grip, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
-        assert_eq!(
-            view.state.gantt.pin_bar_tooltip, None,
-            "mouse-up after a drop must clear the tooltip"
-        );
         view.state.gantt.pin_bar_tooltip = Some(2);
         view.state.gantt.pin_ignore_leave = true;
     });
@@ -5796,6 +5790,67 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
     assert!(
         cx.debug_bounds("gantt-bar-tooltip").is_some(),
         "the live bar tooltip must paint after a resize while the cursor stays on the bar"
+    );
+    let bar_after = cx.debug_bounds("gantt-bar-2").expect("leaf bar after drop");
+    cx.simulate_mouse_move(bar_after.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip,
+            Some(2),
+            "an on-bar mouse-move after drop must not consume the pin, or a remount leave would hide the new dates"
+        );
+    });
+    cx.simulate_mouse_move(point(px(8.), px(8.)), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "leaving the bar must unpin the live tooltip"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn drop_off_the_bar_does_not_pin_a_tooltip(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let grip = point(
+        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    let dest = point(grip.x + px(ppd * 5.0), grip.y);
+    cx.simulate_mouse_move(dest, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    let nav = cx.debug_bounds("gantt-nav").expect("toolbar");
+    cx.simulate_mouse_up(nav.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "dropping on the toolbar must not leave a stuck bar tooltip"
+        );
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "mouse-up off the bar must still commit the resize"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-bar-tooltip").is_none(),
+        "a drop on the toolbar must not paint a pinned tooltip"
     );
 }
 

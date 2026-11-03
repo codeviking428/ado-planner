@@ -1228,13 +1228,12 @@ impl PlannerView {
 
     fn set_bar_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
         if id.is_none() {
-            if self.state.gantt.pin_ignore_leave {
+            if self.state.gantt.pin_bar_tooltip.is_some() {
                 // Remount after a date commit fires hover-leave while the
-                // pointer is still on the bar. Keep the live pinned tooltip.
-                self.state.gantt.pin_ignore_leave = false;
+                // pointer is still on the bar. Keep the live pinned tooltip
+                // until a pointer hit-test says it left.
                 return;
             }
-            self.state.gantt.pin_bar_tooltip = None;
             if self.state.gantt.hover_locked {
                 self.state.gantt.hover_locked = false;
                 cx.notify();
@@ -1266,6 +1265,11 @@ impl PlannerView {
         }
         if id.is_none() {
             if self.state.gantt.hover_locked {
+                return;
+            }
+            if self.state.gantt.pin_bar_tooltip.is_some() {
+                self.state.gantt.clear_row_hover();
+                cx.notify();
                 return;
             }
             if self.state.gantt.hovered_id.is_some()
@@ -2107,10 +2111,21 @@ impl PlannerView {
             cx.notify();
             return;
         }
+        if self.state.gantt.pin_bar_tooltip.is_some() {
+            // Spurious canvas leave on remount must not drop the live
+            // post-drop tooltip. Pointer hit-test unpins.
+            if self.state.gantt.hovered_id.is_some()
+                || self.state.gantt.bar_hovered_id.is_some()
+                || self.state.gantt.hovered_link.is_some()
+            {
+                self.state.gantt.clear_row_hover();
+                cx.notify();
+            }
+            return;
+        }
         if self.state.gantt.hovered_id.is_some()
             || self.state.gantt.bar_hovered_id.is_some()
             || self.state.gantt.hovered_link.is_some()
-            || self.state.gantt.pin_bar_tooltip.is_some()
         {
             self.state.gantt.clear_hover();
             cx.notify();
@@ -7171,7 +7186,7 @@ impl PlannerView {
         self.bar_press_window_x = None;
         self.bar_last_window_x = None;
         self.saw_pressed_drag = true;
-        self.commit_gesture(window, cx);
+        self.commit_gesture(window_x, window_y, window, cx);
     }
 
     fn unmoved_date_gesture(&self) -> bool {
@@ -7293,6 +7308,16 @@ impl PlannerView {
         self.timeline_local_x(window_x)
     }
 
+    fn pointer_on_bar(&self, id: i64, window_x: f32, window_y: f32) -> Option<bool> {
+        let painted = self.painted_bar_bounds.borrow().get(&id).copied()?;
+        const SLOP: f32 = 8.0;
+        Some(
+            window_x >= painted.left - SLOP
+                && window_x <= painted.right + SLOP
+                && self.state.gantt.pointer_in_rows(window_x, window_y),
+        )
+    }
+
     fn clear_pinned_tooltip_if_pointer_left(
         &mut self,
         window_x: f32,
@@ -7302,17 +7327,8 @@ impl PlannerView {
         let Some(id) = self.state.gantt.pin_bar_tooltip else {
             return;
         };
-        let Some(painted) = self.painted_bar_bounds.borrow().get(&id).copied() else {
-            self.state.gantt.pin_bar_tooltip = None;
-            self.state.gantt.pin_ignore_leave = false;
-            cx.notify();
-            return;
-        };
-        let on_bar = window_x >= painted.left
-            && window_x <= painted.right
-            && self.state.gantt.pointer_in_rows(window_x, window_y);
-        if on_bar {
-            self.state.gantt.pin_ignore_leave = false;
+        // Missing bounds are a remount, not a leave. Keep the pin.
+        if self.pointer_on_bar(id, window_x, window_y) != Some(false) {
             return;
         }
         self.state.gantt.pin_bar_tooltip = None;
@@ -7455,7 +7471,13 @@ impl PlannerView {
         cx.notify();
     }
 
-    fn commit_gesture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn commit_gesture(
+        &mut self,
+        window_x: f32,
+        window_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.saw_pressed_drag = false;
         self.bar_press_window_x = None;
         self.bar_last_window_x = None;
@@ -7487,7 +7509,7 @@ impl PlannerView {
             }
             return;
         }
-        self.state.gantt.clear_hover();
+        self.state.gantt.clear_row_hover();
         if let Some(mut pending) = self.state.commit_date_gesture_now() {
             self.last_committed_start_for_test = pending.start;
             self.last_committed_target_for_test = pending.target;
@@ -7496,11 +7518,16 @@ impl PlannerView {
             }
             let id = pending.id;
             self.enqueue_date_save(cx, pending);
-            // Cursor is still on the bar. Pin a live tooltip so GPUI cannot
-            // keep the pre-resize end date. Leave row hover cleared so a
-            // finished drag does not keep the highlight or link handles.
-            self.state.gantt.pin_bar_tooltip = Some(id);
-            self.state.gantt.pin_ignore_leave = true;
+            // Pin a live tooltip only while the pointer is still on the bar
+            // so a drop on the tree/header/outside cannot stick. Row hover
+            // stays cleared so a finished drag does not keep handles.
+            if self.pointer_on_bar(id, window_x, window_y) == Some(true) {
+                self.state.gantt.pin_bar_tooltip = Some(id);
+                self.state.gantt.pin_ignore_leave = true;
+            } else {
+                self.state.gantt.pin_bar_tooltip = None;
+                self.state.gantt.pin_ignore_leave = false;
+            }
         }
         self.request_repaint(Some(window), cx);
     }

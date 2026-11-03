@@ -979,10 +979,15 @@ impl GanttView {
         }
     }
 
-    pub fn clear_hover(&mut self) {
+    /// Row / bar / link hover, not a live post-drop tooltip.
+    pub fn clear_row_hover(&mut self) {
         self.hovered_id = None;
         self.bar_hovered_id = None;
         self.hovered_link = None;
+    }
+
+    pub fn clear_hover(&mut self) {
+        self.clear_row_hover();
         self.pin_bar_tooltip = None;
         self.pin_ignore_leave = false;
     }
@@ -7394,6 +7399,22 @@ mod tests {
         gantt.clear_hover();
         assert_eq!(gantt.pin_bar_tooltip, None);
         assert!(!gantt.pin_ignore_leave);
+        assert_eq!(gantt.hovered_id, None);
+        assert_eq!(gantt.bar_hovered_id, None);
+    }
+
+    #[test]
+    fn clear_row_hover_keeps_a_pinned_bar_tooltip() {
+        let mut gantt = GanttView {
+            pin_bar_tooltip: Some(2),
+            pin_ignore_leave: true,
+            hovered_id: Some(2),
+            bar_hovered_id: Some(2),
+            ..Default::default()
+        };
+        gantt.clear_row_hover();
+        assert_eq!(gantt.pin_bar_tooltip, Some(2));
+        assert!(gantt.pin_ignore_leave);
         assert_eq!(gantt.hovered_id, None);
         assert_eq!(gantt.bar_hovered_id, None);
     }
