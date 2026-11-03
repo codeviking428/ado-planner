@@ -16,6 +16,10 @@ pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
 pub const SPLITTER_WIDTH: f32 = 8.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
+/// Extra-wide end-cap so grabbing a bar's right edge is not an 8px hunt.
+pub const RESIZE_END_HIT: f32 = 16.0;
+/// Pixels per tree depth. A spacer child, not padding, so painted x matches depth.
+pub const TREE_INDENT: f32 = 20.0;
 pub const LINK_HANDLE: f32 = 14.0;
 pub const LINK_HANDLE_HIT: f32 = 18.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
@@ -45,7 +49,7 @@ pub const EXPANDER_SLOT: f32 = 18.0;
 pub const TODAY_PILL_W: f32 = 44.0;
 pub const TODAY_PILL_GAP: f32 = 6.0;
 /// Keep year/month majors off the Today pill; "nearly touching" is still a miss.
-const HEADER_TODAY_LABEL_GAP: f32 = 32.0;
+const HEADER_TODAY_LABEL_GAP: f32 = 40.0;
 const MAJOR_LABEL_ESTIMATE: f32 = 84.0;
 const TICK_MIN_GAP: f32 = 18.0;
 /// Keep edge tick/year labels off the clip.
@@ -1324,26 +1328,25 @@ impl GanttView {
         width: f32,
         hide_x: Option<f32>,
     ) -> Vec<(f32, String)> {
-        let hide_year = matches!(self.scale, GanttScale::Year);
         let ticks: Vec<(f32, String)> = self
             .timeline_ticks(width)
             .into_iter()
             .filter(|tick| tick.major)
-            .filter_map(|tick| {
+            .map(|tick| {
                 let mut x = tick.x.max(0.0);
                 if let Some(today) = hide_x {
                     let pill_left = (today + TODAY_PILL_GAP).max(4.0);
                     let pill_right = pill_left + TODAY_PILL_W;
                     if x < pill_right + HEADER_TODAY_LABEL_GAP
-                        && x + MAJOR_LABEL_ESTIMATE > pill_left
+                        && x + MAJOR_LABEL_ESTIMATE.max(header_label_px(&tick.major_label))
+                            > pill_left
                     {
-                        if hide_year {
-                            return None;
-                        }
+                        // Shift, never drop — Year still needs "2027" to the
+                        // right of Today instead of hiding the next year.
                         x = pill_right + HEADER_TODAY_LABEL_GAP;
                     }
                 }
-                Some((x, tick.major_label))
+                (x, tick.major_label)
             })
             .collect();
         let labels = Self::sticky_header_labels(ticks, false, 72.0);
@@ -1584,7 +1587,7 @@ impl GanttView {
                 y >= bar.y
                     && y < bar.y + ROW_HEIGHT
                     && x >= bar.x - HANDLE_WIDTH
-                    && x <= bar.x + bar.width + HANDLE_WIDTH
+                    && x <= bar.x + bar.width + RESIZE_END_HIT
             })?
             .clone();
         let kind = if bar.milestone || bar.summary || bar.marker {
@@ -1597,7 +1600,7 @@ impl GanttView {
             }
         } else if x <= bar.x + HANDLE_WIDTH {
             GestureKind::ResizeStart
-        } else if x >= bar.x + bar.width - HANDLE_WIDTH {
+        } else if x >= bar.x + bar.width - RESIZE_END_HIT {
             GestureKind::ResizeEnd
         } else {
             GestureKind::Move
@@ -1645,11 +1648,28 @@ impl GanttView {
                 } else {
                     pred.x + pred.width
                 };
-                // monday.com-style short elbows off the painted bars, never a
-                // loop out past every title to the far right edge of the chart.
-                let x_head = bar.x - HEAD_GAP;
-                let x_out = pred_end + STUB;
-                let x_in = x_head - STUB;
+                let succ_right = if bar.milestone || bar.marker {
+                    bar.x + MILESTONE_SIZE
+                } else {
+                    bar.x + bar.width.max(8.0)
+                };
+                // Forward FS: inbound from the left of the successor.
+                // Backward (pred ends to the right of succ start): inbound from
+                // the successor's right so the elbow stays between the bars
+                // instead of running out to the far-left chart edge.
+                let backward = pred_end > bar.x + 1.0;
+                let (x_head, x_out, x_in) = if backward {
+                    let x_head = succ_right + HEAD_GAP;
+                    let x_out = if pred.x >= succ_right - 1.0 {
+                        pred.x - STUB
+                    } else {
+                        pred_end + STUB
+                    };
+                    (x_head, x_out, x_head + STUB)
+                } else {
+                    let x_head = bar.x - HEAD_GAP;
+                    (x_head, pred_end + STUB, x_head - STUB)
+                };
                 let same_row = (pred.y - bar.y).abs() < 1.0;
                 // Stay in the predecessor row's gutter so the outgoing
                 // vertical does not run through bars on rows in between.
@@ -1684,8 +1704,14 @@ impl GanttView {
             for (rank, &index) in indexes.iter().enumerate() {
                 let shift = rank as f32 * INCOMING_FAN;
                 let lane_shift = rank as f32 * LANE_SEP;
-                out[index].x_head -= shift;
-                out[index].x2 -= shift;
+                let inbound_left = out[index].x2 <= out[index].x_head;
+                if inbound_left {
+                    out[index].x_head -= shift;
+                    out[index].x2 -= shift;
+                } else {
+                    out[index].x_head += shift;
+                    out[index].x2 += shift;
+                }
                 let dir = if out[index].y2 >= out[index].y1 {
                     -1.0
                 } else {
@@ -1734,8 +1760,9 @@ fn bar_title_px(title: &str) -> f32 {
     title.chars().count() as f32 * 6.5 + 16.0
 }
 
-/// Same-width bars keep the same placement regardless of title length or
-/// whether the row is a summary, so Growth and Platform match.
+/// Inside when the visible fragment can hold the title; otherwise the label
+/// floats outside instead of truncating. Clipped-left bars keep the title in
+/// the on-screen fragment so it does not jump to the grid.
 pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
     if bar.kind == GanttBarKind::Unscheduled || bar.milestone || bar.marker || bar.open_ended {
         return false;
@@ -1745,7 +1772,8 @@ pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
     if bar.x < 0.0 && visible_w >= 32.0 {
         return true;
     }
-    visible_w >= BAR_LABEL_INSIDE_MIN
+    let title_w = bar_title_px(&bar.title);
+    visible_w >= (title_w + 12.0).max(32.0)
 }
 
 /// Right edge of a bar including an external title, so arrows skip labels.
@@ -2092,7 +2120,13 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(&bars, 184.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::ResizeEnd),
-            "an 8px hit area must extend outside the end edge"
+            "the end grip must extend outside the bar"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&bars, 100.0 + 80.0 + RESIZE_END_HIT - 1.0, 4.0)
+                .map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "end grip hit area must stay wide of the bar's right edge"
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 91.0, 4.0).map(|(_, kind)| kind),
@@ -2670,6 +2704,10 @@ mod tests {
         assert_eq!(bars.len(), 1);
         assert!(bars[0].width < BAR_LABEL_INSIDE_MIN);
         assert_eq!(bars[0].title, "WI 1");
+        assert!(
+            !bar_title_is_inside(&bars[0]),
+            "a title that does not fit the visible bar must go outside"
+        );
     }
 
     #[test]
@@ -3251,17 +3289,29 @@ mod tests {
             "two links into the same bar must not share one polyline, dx={dx} dy={dy}"
         );
         for arrow in &arrows {
-            assert!(
-                arrow.x_head <= succ.x - HANDLE_WIDTH - LINK_HANDLE_HIT,
-                "inbound stub must stay left of the successor handle, x_head={} bar.x={}",
-                arrow.x_head,
-                succ.x
-            );
-            let (rx, ry) = arrow.remove_control_pos();
             let pred = bars.iter().find(|bar| bar.id == arrow.from_id).unwrap();
+            let backward = pred.x + pred.width > succ.x + 1.0;
+            if backward {
+                assert!(
+                    arrow.x_head >= succ.x + succ.width - 1.0,
+                    "backward inbound must sit on the successor's right, x_head={} succ={}..{}",
+                    arrow.x_head,
+                    succ.x,
+                    succ.x + succ.width
+                );
+            } else {
+                assert!(
+                    arrow.x_head <= succ.x - HANDLE_WIDTH - LINK_HANDLE_HIT,
+                    "inbound stub must stay left of the successor handle, x_head={} bar.x={}",
+                    arrow.x_head,
+                    succ.x
+                );
+            }
+            let (rx, ry) = arrow.remove_control_pos();
             assert!(
-                rx >= pred.x + pred.width - 1.0,
-                "× must not overlap the predecessor bar end, ×x={rx} pred_end={}",
+                rx < pred.x - 1.0 || rx > pred.x + pred.width - 1.0,
+                "× must not overlap the predecessor bar, ×x={rx} pred={}..{}",
+                pred.x,
                 pred.x + pred.width
             );
             assert!(
@@ -3950,6 +4000,54 @@ mod tests {
     }
 
     #[test]
+    fn backward_dependency_routes_locally_not_to_the_left_edge() {
+        let mut pred = node(1013, Some(1));
+        pred.title = "Go-live milestone".into();
+        pred.start_date = Some("2026-08-15T00:00:00Z".into());
+        pred.target_date = Some("2026-08-15T00:00:00Z".into());
+        let mut succ = node(1012, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1013];
+        let nodes = vec![node(1, None), pred, succ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 1);
+        let pred = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1012).unwrap();
+        assert!(
+            pred.x + pred.width > succ.x + 1.0,
+            "fixture must place the predecessor to the right of the successor"
+        );
+        assert!(
+            arrows[0].x_head >= succ.x + succ.width - 1.0,
+            "a backward link must attach near the successor's right, not the far-left edge, x_head={} succ={}..{}",
+            arrows[0].x_head,
+            succ.x,
+            succ.x + succ.width
+        );
+        assert!(
+            arrows[0].x_head.min(arrows[0].x1).min(arrows[0].x2) > succ.x + 8.0,
+            "the polyline must stay between the bars, got x1={} x2={} x_head={} succ.x={}",
+            arrows[0].x1,
+            arrows[0].x2,
+            arrows[0].x_head,
+            succ.x
+        );
+        assert!(
+            !arrows[0].wraps_around_successor(),
+            "backward links must stay a local elbow, not a wrap-around rectangle"
+        );
+    }
+
+    #[test]
     fn year_view_link_is_not_a_chart_width_loop() {
         let mut a = node(1, None);
         let mut c = node(3, None);
@@ -4180,26 +4278,40 @@ mod tests {
     #[test]
     fn year_today_label_does_not_touch_year_majors() {
         let today = Date::new(2026, 11, 2).unwrap();
-        let gantt = GanttView {
-            origin: today.saturating_sub(20.days()),
-            scale: GanttScale::Year,
-            zoom: 0.4,
-            timeline_width: 800.0,
-            ..Default::default()
-        };
-        let today_x = gantt.today_x(today);
-        let pill_right = (today_x + TODAY_PILL_GAP).max(4.0) + TODAY_PILL_W;
-        let majors = gantt.header_major_labels_except(800.0, Some(today_x));
-        for (x, label) in &majors {
+        let centered_days =
+            ((800.0 * TODAY_ALIGN) / GanttScale::Year.pixels_per_day(0.4)).round() as i32;
+        for (origin, timeline_width) in [
+            (today.saturating_sub(20.days()), 800.0),
+            // Centered Today, matching go_today / TODAY_ALIGN.
+            (today.saturating_sub(centered_days.days()), 800.0),
+        ] {
+            let gantt = GanttView {
+                origin,
+                scale: GanttScale::Year,
+                zoom: 0.4,
+                timeline_width,
+                ..Default::default()
+            };
+            let today_x = gantt.today_x(today);
+            let pill_left = (today_x + TODAY_PILL_GAP).max(4.0);
+            let pill_right = pill_left + TODAY_PILL_W;
+            let majors = gantt.header_major_labels_except(timeline_width, Some(today_x));
+            let twenty_seven = majors.iter().find(|(_, label)| label == "2027");
             assert!(
-                *x + 1.0 <= pill_right || *x >= pill_right + HEADER_TODAY_LABEL_GAP - 0.1,
-                "Year label {label:?} at {x} must clear the Today pill ending at {pill_right}"
+                twenty_seven.is_some(),
+                "Year view must still show 2027 instead of letting Today hide it, origin={origin} majors={majors:?}"
             );
-            if label == "2027" {
+            for (x, label) in &majors {
                 assert!(
-                    *x >= pill_right + HEADER_TODAY_LABEL_GAP - 0.1,
-                    "2027 must not crowd Today, got {x} pill_right={pill_right}"
+                    *x + 1.0 <= pill_right || *x >= pill_right + HEADER_TODAY_LABEL_GAP - 0.1,
+                    "Year label {label:?} at {x} must clear the Today pill ending at {pill_right}"
                 );
+                if label == "2027" {
+                    assert!(
+                        *x >= pill_right + HEADER_TODAY_LABEL_GAP - 0.1,
+                        "2027 must sit to the right of Today, got {x} pill_right={pill_right}"
+                    );
+                }
             }
         }
     }

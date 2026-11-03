@@ -16,6 +16,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::{ElementExt as _, Popup, Selectable};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Disableable;
+use gpui_kit::component::Icon;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::Size;
 use gpui_kit::component::avatar::Avatar;
@@ -46,9 +47,9 @@ use crate::gantt::{
     ASSIGNEE_COL_WIDTH, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH, DependencyArrow,
     EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H,
     LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis,
-    PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SPLITTER_WIDTH, SUMMARY_BAR_H,
-    SavedGanttView, TIMELINE_HEADER_H, TODAY_PILL_GAP, TODAY_PILL_W, TYPE_COL_WIDTH,
-    bar_title_is_inside, parent_date_overflow,
+    PLACEHOLDER_BAR_H, RESIZE_END_HIT, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SPLITTER_WIDTH,
+    SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TODAY_PILL_GAP, TODAY_PILL_W, TREE_INDENT,
+    TYPE_COL_WIDTH, bar_title_is_inside, parent_date_overflow,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -563,7 +564,7 @@ impl PlannerView {
         self.inline_input.update(cx, |input, cx| {
             input.replace_all(text, window, cx);
         });
-        self.inline_dates_error = typed_dates_error(text).map(str::to_string);
+        self.inline_dates_error = typed_dates_error(text);
         cx.notify();
     }
 
@@ -745,7 +746,7 @@ impl PlannerView {
                 && matches!(event, InputEvent::Change)
             {
                 let value = input.read(cx).value().to_string();
-                this.inline_dates_error = typed_dates_error(&value).map(str::to_string);
+                this.inline_dates_error = typed_dates_error(&value);
                 cx.notify();
             }
             if matches!(event, InputEvent::PressEnter { .. }) && this.inline_edit.is_some() {
@@ -1215,7 +1216,7 @@ impl PlannerView {
         let value = self.inline_input.read(cx).value().to_string();
         if let InlineEdit::Dates(id) = edit {
             if let Some(err) = typed_dates_error(&value) {
-                self.inline_dates_error = Some(err.to_string());
+                self.inline_dates_error = Some(err);
                 cx.notify();
                 return;
             }
@@ -2786,7 +2787,13 @@ impl PlannerView {
                     .font_weight(gpui_kit::FontWeight::MEDIUM)
                     .text_color(sync_color)
                     .bg(sync_color.opacity(0.12))
-                    .child(sync_label),
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(Icon::new(self.sync_status_icon()).with_size(Size::XSmall))
+                            .child(sync_label),
+                    ),
             )
     }
 
@@ -2808,6 +2815,14 @@ impl PlannerView {
             "Error".into()
         } else {
             "Synced".into()
+        }
+    }
+
+    fn sync_status_icon(&self) -> IconName {
+        match self.sync_status_text().as_str() {
+            "Error" => IconName::CircleAlert,
+            "Saving…" | "Loading…" => IconName::Loader,
+            _ => IconName::CloudCheck,
         }
     }
 
@@ -3014,7 +3029,16 @@ impl PlannerView {
                                             .overflow_hidden()
                                             .px_2()
                                             .gap_2()
-                                            .pl(px(8.0 + depth as f32 * 16.))
+                                            .child(
+                                                div()
+                                                    .id(("tree-indent", id as u64))
+                                                    .debug_selector(move || {
+                                                        format!("gantt-tree-indent-{id}")
+                                                    })
+                                                    .w(px(depth as f32 * TREE_INDENT))
+                                                    .min_w(px(depth as f32 * TREE_INDENT))
+                                                    .flex_shrink_0(),
+                                            )
                                             .child(
                                                 div()
                                                     .id(("expand-slot", id as u64))
@@ -4343,17 +4367,19 @@ impl PlannerView {
                 .into_any_element(),
         ];
         if can_resize {
-            for (name, handle_id, handle_x, kind) in [
+            for (name, handle_id, handle_x, handle_w, kind) in [
                 (
                     "start",
                     "resize-start",
                     bar.x - HANDLE_WIDTH,
+                    HANDLE_WIDTH,
                     GestureKind::ResizeStart,
                 ),
                 (
                     "end",
                     "resize-end",
                     bar.x + bar.width,
+                    RESIZE_END_HIT,
                     GestureKind::ResizeEnd,
                 ),
             ] {
@@ -4373,7 +4399,7 @@ impl PlannerView {
                         .left(px(handle_x))
                         .top(px(bar_top))
                         .h(px(bar_h))
-                        .w(px(HANDLE_WIDTH))
+                        .w(px(handle_w))
                         .when(show_handles, |el| el.bg(cx.theme().primary))
                         .when(!show_handles, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.01)))
                         .cursor_col_resize()
@@ -5843,7 +5869,7 @@ impl PlannerView {
             .get(ado_core::START_DATE_FIELD)
             .or_else(|| self.form_inputs.get(ado_core::TARGET_DATE_FIELD))
             .map(|input| input.read(cx).value().to_string())?;
-        typed_dates_error(&typed).map(str::to_string)
+        typed_dates_error(&typed)
     }
 
     fn form_has_unsaved_edits(&self, cx: &App) -> bool {
@@ -7146,12 +7172,18 @@ fn parse_typed_date_range(
     }
 }
 
+fn dates_parse_hint() -> String {
+    let start = jiff::Zoned::now().date();
+    let target = start.saturating_add(6.days());
+    let a = compact_date(start);
+    let b = compact_date(target);
+    format!("Could not parse dates. Use {a} → {b}, {a} -> {b}, {a} to {b}, or a start date only.")
+}
+
 /// `None` when the Dates field is empty or a recognised range.
-pub fn typed_dates_error(typed: &str) -> Option<&'static str> {
+pub fn typed_dates_error(typed: &str) -> Option<String> {
     match parse_typed_date_range(typed, None, None) {
-        TypedDateRange::Invalid => Some(
-            "Could not parse dates. Use Jul 22 → Jul 28, Jul 22 -> Jul 28, Jul 22 to Jul 28, or a start date only.",
-        ),
+        TypedDateRange::Invalid => Some(dates_parse_hint()),
         TypedDateRange::Empty | TypedDateRange::Parsed(_, _) => None,
     }
 }
@@ -7511,6 +7543,34 @@ mod bar_label_tests {
         assert!(
             PlannerView::bar_title_fits_inside(&leaf),
             "a wide bar must keep the title inside"
+        );
+    }
+
+    #[test]
+    fn long_title_on_a_narrow_bar_paints_outside() {
+        let bar = BarLayout {
+            id: 1,
+            kind: GanttBarKind::Scheduled,
+            x: 20.0,
+            width: 80.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Unparented spike".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        assert!(
+            !PlannerView::bar_title_fits_inside(&bar),
+            "a title wider than the bar must paint outside instead of truncating"
+        );
+        assert!(
+            PlannerView::bar_external_label_frame(&bar, 800.0, false).is_some(),
+            "the outside label must have a frame on the timeline"
         );
     }
 }

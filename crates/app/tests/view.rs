@@ -1,10 +1,10 @@
 //! Rendered `PlannerView` coverage for popups, the Gantt header, and the form.
 
-use ado_core::{IdentityValue, SessionInfo};
+use ado_core::{IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, MIN_TIMELINE_WIDTH,
-    ROW_HEIGHT, TODAY_ALIGN,
+    RESIZE_END_HIT, ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, insert_index_for_child,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -21,6 +21,7 @@ use gpui_kit::{
     KeyDownEvent, Keystroke, Modifiers, MouseButton, ScrollDelta, ScrollEvent, VisualTestContext,
     point, px,
 };
+use jiff::ToSpan;
 use jiff::civil::Date;
 
 fn idle_state(dir: &tempfile::TempDir) -> PlannerState {
@@ -461,6 +462,19 @@ fn typed_unparseable_dates_do_not_clear_the_range() {
     );
     assert!(typed_dates_error("Jul 22 -> zz").is_some());
     assert!(typed_dates_error("").is_none());
+    let hint = typed_dates_error("not a date").expect("parse hint");
+    let today = jiff::Zoned::now().date();
+    let near = today.saturating_add(6.days());
+    let today_s = ado_core::compact_date(today);
+    let near_s = ado_core::compact_date(near);
+    assert!(
+        hint.contains(&today_s) && hint.contains(&near_s),
+        "parse-hint examples must use dates near today ({today_s} → {near_s}), got {hint}"
+    );
+    assert!(
+        !hint.contains("Jul 22"),
+        "parse-hint must not keep the stale July examples, got {hint}"
+    );
     let cleared = dates_from_range_picker(calendar, "", seed).expect("empty typed is a clear");
     assert_eq!(
         cleared,
@@ -3388,14 +3402,13 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         f32::from(link.size.height)
     );
     assert!(
-        (f32::from(resize.size.width) - HANDLE_WIDTH).abs() < 0.5,
-        "resize handle must stay a {}px end cap, got {}",
-        HANDLE_WIDTH,
+        (f32::from(resize.size.width) - RESIZE_END_HIT).abs() < 0.5,
+        "end resize grip hit area must be {RESIZE_END_HIT}px, got {}",
         f32::from(resize.size.width)
     );
     assert!(
-        (f32::from(link.size.width) - f32::from(resize.size.width)).abs() > 4.0,
-        "link handles must not share the resize-handle size"
+        (f32::from(link.size.width) - HANDLE_WIDTH).abs() > 4.0,
+        "link handles must not share the start-resize size"
     );
     let bar = cx.debug_bounds("gantt-bar-2").expect("hovered bar");
     let start = cx
@@ -5345,6 +5358,131 @@ fn realistic_backlog_keeps_markers_badges_and_indent(cx: &mut gpui_kit::TestAppC
     assert!(
         cx.debug_bounds("gantt-open-details").is_some(),
         "details affordance must be visible on unselected rows"
+    );
+}
+
+fn mock_tree_node(id: i64, parent: Option<i64>, ty: &str, title: &str) -> WorkItemNode {
+    WorkItemNode {
+        id,
+        rev: 1,
+        title: title.into(),
+        work_item_type: ty.into(),
+        state: "New".into(),
+        assigned_to: None,
+        parent_id: parent,
+        area_path: "Shop\\Platform".into(),
+        iteration_path: "Shop\\FY26".into(),
+        start_date: Some("2026-07-06T00:00:00Z".into()),
+        target_date: Some("2026-07-20T00:00:00Z".into()),
+        has_date_fields: true,
+        predecessors: Vec::new(),
+        fields: serde_json::Map::new(),
+    }
+}
+
+#[gpui_kit::test]
+fn add_item_under_epic_paints_at_child_indent(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    // Match the mock backlog the reviewer uses: Epic #1001, Feature #1013
+    // under it, then root Task #1012 so a last-child Feature sits next to a
+    // true root and indent is unambiguous.
+    let mut nodes = vec![
+        mock_tree_node(1001, None, "Epic", "Checkout rewrite"),
+        mock_tree_node(1013, Some(1001), "Feature", "Go-live milestone"),
+        mock_tree_node(1012, None, "Task", "Unparented spike"),
+    ];
+    let created = mock_tree_node(1999, Some(1001), "Feature", "New work item");
+    let insert_at = insert_index_for_child(&nodes, Some(1001));
+    nodes.insert(insert_at, created);
+    state.nodes = nodes;
+    state.gantt.selected_id = Some(1999);
+    state.gantt.set_tree_width(640.0);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let visible = view.state.visible_nodes();
+        let rows = view.state.gantt.flatten(&visible);
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        let epic_at = ids.iter().position(|id| *id == 1001).expect("epic");
+        let sibling_at = ids.iter().position(|id| *id == 1013).expect("sibling");
+        let created_at = ids.iter().position(|id| *id == 1999).expect("created");
+        let root_at = ids.iter().position(|id| *id == 1012).expect("root task");
+        assert!(
+            epic_at < sibling_at && sibling_at < created_at && created_at < root_at,
+            "new Feature must sit after the Epic's last child and before the next root, got {ids:?}"
+        );
+        let created_row = rows.iter().find(|row| row.id == 1999).unwrap();
+        let sibling_row = rows.iter().find(|row| row.id == 1013).unwrap();
+        assert_eq!(
+            created_row.depth, sibling_row.depth,
+            "created Feature must share depth with Feature #1013, got {created_row:?}"
+        );
+        assert!(
+            created_row.depth > 0,
+            "created Feature must not flatten as a root, got {created_row:?}"
+        );
+    });
+    let epic_row = cx.debug_bounds("gantt-tree-row-1001").expect("epic row");
+    let sibling_row = cx.debug_bounds("gantt-tree-row-1013").expect("sibling row");
+    let created_row = cx.debug_bounds("gantt-tree-row-1999").expect("created row");
+    let root_row = cx.debug_bounds("gantt-tree-row-1012").expect("root row");
+    let epic_y = f32::from(epic_row.origin.y);
+    let sibling_y = f32::from(sibling_row.origin.y);
+    let created_y = f32::from(created_row.origin.y);
+    let root_y = f32::from(root_row.origin.y);
+    assert!(
+        epic_y < sibling_y && sibling_y < created_y && created_y < root_y,
+        "painted order must be Epic, Go-live, new Feature, Unparented spike; y={epic_y},{sibling_y},{created_y},{root_y}"
+    );
+    let sibling_slot = cx
+        .debug_bounds("gantt-expand-slot-1013")
+        .expect("sibling expander");
+    let created_slot = cx
+        .debug_bounds("gantt-expand-slot-1999")
+        .expect("created expander");
+    let epic_slot = cx
+        .debug_bounds("gantt-expand-slot-1001")
+        .expect("epic expander");
+    let root_slot = cx
+        .debug_bounds("gantt-expand-slot-1012")
+        .expect("root expander");
+    let sibling_x = f32::from(sibling_slot.origin.x);
+    let created_x = f32::from(created_slot.origin.x);
+    let epic_x = f32::from(epic_slot.origin.x);
+    let root_x = f32::from(root_slot.origin.x);
+    assert!(
+        (created_x - sibling_x).abs() < 2.0,
+        "new Feature expander x {created_x} must match sibling Feature {sibling_x}, not a root"
+    );
+    assert!(
+        created_x >= epic_x + TREE_INDENT - 2.0,
+        "new Feature expander x {created_x} must sit one indent right of Epic {epic_x}"
+    );
+    assert!(
+        created_x >= root_x + TREE_INDENT - 2.0,
+        "new Feature expander x {created_x} must sit one indent right of root Task {root_x}"
+    );
+    let created_indent = cx
+        .debug_bounds("gantt-tree-indent-1999")
+        .expect("created indent spacer");
+    let sibling_indent = cx
+        .debug_bounds("gantt-tree-indent-1013")
+        .expect("sibling indent spacer");
+    assert!(
+        (f32::from(created_indent.size.width) - TREE_INDENT).abs() < 1.0,
+        "created indent spacer must be TREE_INDENT {TREE_INDENT}, got {}",
+        f32::from(created_indent.size.width)
+    );
+    assert!(
+        (f32::from(sibling_indent.size.width) - TREE_INDENT).abs() < 1.0,
+        "sibling indent spacer must be TREE_INDENT {TREE_INDENT}, got {}",
+        f32::from(sibling_indent.size.width)
     );
 }
 

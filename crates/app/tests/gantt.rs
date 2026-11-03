@@ -1815,16 +1815,40 @@ async fn add_item_on_an_epic_creates_a_child_feature() {
         created_at > epic_at,
         "a child of Epic 1001 must land under it, got {rows:?}"
     );
-    let created_row = state
-        .gantt
-        .flatten(&state.visible_nodes())
-        .into_iter()
+    let visible_rows = state.gantt.flatten(&state.visible_nodes());
+    let created_row = visible_rows
+        .iter()
         .find(|row| row.id == created.id)
         .expect("created child is visible");
+    let sibling = visible_rows
+        .iter()
+        .find(|row| row.id == 1013)
+        .expect("existing Feature under the Epic");
     assert!(
         created_row.depth > 0,
         "a child of an Epic must not appear at root, got {created_row:?}"
     );
+    assert_eq!(
+        created_row.depth, sibling.depth,
+        "new Feature must share tree depth with Feature #1013, got {created_row:?} vs {sibling:?}"
+    );
+    let visible_ids: Vec<i64> = visible_rows.iter().map(|row| row.id).collect();
+    let sibling_at = visible_ids.iter().position(|id| *id == 1013).expect("1013");
+    let created_at_vis = visible_ids
+        .iter()
+        .position(|id| *id == created.id)
+        .expect("created");
+    let root_at = visible_ids.iter().position(|id| *id == 1012);
+    assert!(
+        created_at_vis > sibling_at,
+        "new Feature must paint after the Epic's last existing child, got {visible_ids:?}"
+    );
+    if let Some(root_at) = root_at {
+        assert!(
+            created_at_vis < root_at,
+            "new Feature must stay under the Epic, before the next root, got {visible_ids:?}"
+        );
+    }
     assert_eq!(
         state
             .visible_nodes()
