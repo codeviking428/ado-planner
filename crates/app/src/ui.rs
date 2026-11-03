@@ -47,9 +47,9 @@ use crate::gantt::{
     ASSIGNEE_COL_WIDTH, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH, DependencyArrow,
     EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H,
     LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis,
-    PLACEHOLDER_BAR_H, RESIZE_END_HIT, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SPLITTER_WIDTH,
-    SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TODAY_PILL_GAP, TODAY_PILL_W, TREE_INDENT,
-    TYPE_COL_WIDTH, bar_title_is_inside, parent_date_overflow,
+    PLACEHOLDER_BAR_H, RESIZE_END_HIT, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ROW_TINT,
+    SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TODAY_PILL_GAP, TODAY_PILL_W,
+    TREE_INDENT, TYPE_COL_WIDTH, bar_title_is_inside, parent_date_overflow,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -64,6 +64,10 @@ actions!(
 
 const DATES_RANGE_HINT: &str = "Start → Target, or start only";
 const DATE_HINT: &str = "Date";
+const DATES_ERROR_SLOT_H: f32 = 32.0;
+const SAVING_HOLD_MS: u64 = 400;
+const PROGRESS_ROLLUP_TIP: &str =
+    "Progress is rolled up from child work-item states. Active counts as half done.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InlineEdit {
@@ -112,6 +116,8 @@ pub struct PlannerView {
     banner_dismissed: bool,
     form_loading: Option<(i64, String)>,
     io_busy: bool,
+    saving_shown_at: Option<Instant>,
+    saving_hold_gen: u64,
     date_save_busy: HashSet<i64>,
     date_save_queue: VecDeque<PendingDateSave>,
     pending_team: Option<String>,
@@ -343,6 +349,8 @@ impl PlannerView {
             banner_dismissed: false,
             form_loading: None,
             io_busy: false,
+            saving_shown_at: None,
+            saving_hold_gen: 0,
             date_save_busy: HashSet::new(),
             date_save_queue: VecDeque::new(),
             pending_team: None,
@@ -784,6 +792,7 @@ impl PlannerView {
             return false;
         }
         self.io_busy = true;
+        self.arm_saving_status(cx);
         let runtime = self.state.runtime.clone();
         let working = self.state.clone();
         let rx = runtime.spawn_result(async move { work(working).await });
@@ -791,6 +800,7 @@ impl PlannerView {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
                 this.io_busy = false;
+                this.arm_saving_status(cx);
                 match outcome {
                     Ok((working, result)) => {
                         let shown_at = this.loading_shown_at;
@@ -1641,6 +1651,7 @@ impl PlannerView {
 
     fn spawn_toast_undo(&mut self, cx: &mut Context<Self>, action: UndoAction, undid: String) {
         self.io_busy = true;
+        self.arm_saving_status(cx);
         let runtime = self.state.runtime.clone();
         let mut working = self.state.clone();
         let merge_action = action.clone();
@@ -1652,6 +1663,7 @@ impl PlannerView {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
                 this.io_busy = false;
+                this.arm_saving_status(cx);
                 this.toast_undo_inflight = false;
                 match outcome {
                     Ok((working, Ok(()))) => {
@@ -2815,13 +2827,51 @@ impl PlannerView {
             )
     }
 
+    fn io_saving(&self) -> bool {
+        self.io_busy
+            || !self.date_save_busy.is_empty()
+            || self.state.form.as_ref().is_some_and(|form| form.saving)
+    }
+
+    fn arm_saving_status(&mut self, cx: &mut Context<Self>) {
+        if self.io_saving() {
+            if self.saving_shown_at.is_none() {
+                self.saving_shown_at = Some(Instant::now());
+            }
+            self.saving_hold_gen += 1;
+            return;
+        }
+        let Some(at) = self.saving_shown_at else {
+            return;
+        };
+        let remain = Duration::from_millis(SAVING_HOLD_MS).saturating_sub(at.elapsed());
+        if remain == Duration::ZERO {
+            self.saving_shown_at = None;
+            return;
+        }
+        self.saving_hold_gen += 1;
+        let hold_gen = self.saving_hold_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(remain).await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| {
+                    if this.saving_hold_gen != hold_gen {
+                        return;
+                    }
+                    if !this.io_saving() {
+                        this.saving_shown_at = None;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     fn sync_status_text(&self) -> String {
         if self.state.hierarchy_loading {
             "Loading…".into()
-        } else if self.io_busy
-            || !self.date_save_busy.is_empty()
-            || self.state.form.as_ref().is_some_and(|form| form.saving)
-        {
+        } else if self.io_saving() || self.saving_shown_at.is_some() {
             "Saving…".into()
         } else if self
             .state
@@ -2963,7 +3013,7 @@ impl PlannerView {
                                     .bg(if hovered {
                                         hover_bg
                                     } else if selected && !dim_selection {
-                                        selected_bg.opacity(0.22)
+                                        selected_bg.opacity(SELECTED_ROW_TINT)
                                     } else if striped {
                                         stripe
                                     } else {
@@ -3398,7 +3448,7 @@ impl PlannerView {
         let (x, mut y) = self.dates_anchor.unwrap_or((320.0, 160.0));
         let window_h = self.state.gantt.viewport_h + 200.0;
         let window_w = self.state.gantt.viewport_w.max(320.0);
-        let popover_h = 340.0;
+        let popover_h = 356.0;
         let popover_w = 280.0;
         if y + popover_h > window_h {
             y = (y - popover_h).max(8.0);
@@ -3436,7 +3486,9 @@ impl PlannerView {
                                 .id("gantt-dates-error")
                                 .debug_selector(|| "gantt-dates-error".into())
                                 .w_full()
-                                .h(px(16.))
+                                .h(px(DATES_ERROR_SLOT_H))
+                                .max_h(px(DATES_ERROR_SLOT_H))
+                                .overflow_hidden()
                                 .text_xs()
                                 .text_color(cx.theme().danger)
                                 .whitespace_normal()
@@ -3797,7 +3849,7 @@ impl PlannerView {
                                     .bg(if hovered {
                                         hover_bg
                                     } else if selected && !dim_selection {
-                                        selected_bg.opacity(0.22)
+                                        selected_bg.opacity(SELECTED_ROW_TINT)
                                     } else if striped {
                                         stripe
                                     } else {
@@ -4150,6 +4202,12 @@ impl PlannerView {
         let hovered = self.state.gantt.hovered_id == Some(id);
         let can_resize = !summary && !unscheduled && !milestone && !marker && !open_ended;
         let show_handles = can_resize && hovered && !dragging;
+        let linking = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link);
         let bar_h = if milestone || marker {
             MILESTONE_SIZE
         } else if summary {
@@ -4295,7 +4353,11 @@ impl PlannerView {
                             .top_0()
                             .bottom_0()
                             .w(px(visible_progress_w))
-                            .when(summary, |el| el.bg(rgb(bar.color)))
+                            .when(summary, |el| {
+                                el.bg(rgb(bar.color)).tooltip(move |window, cx| {
+                                    Tooltip::new(PROGRESS_ROLLUP_TIP).build(window, cx)
+                                })
+                            })
                             .when(!summary, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.22))),
                     )
                 })
@@ -4396,7 +4458,7 @@ impl PlannerView {
                 (
                     "end",
                     "resize-end",
-                    bar.x + bar.width,
+                    bar.x + bar.width - RESIZE_END_HIT,
                     RESIZE_END_HIT,
                     GestureKind::ResizeEnd,
                 ),
@@ -4418,6 +4480,7 @@ impl PlannerView {
                         .top(px(bar_top))
                         .h(px(bar_h))
                         .w(px(handle_w))
+                        .when(!linking, |el| el.occlude())
                         .when(show_handles, |el| el.bg(cx.theme().primary))
                         .when(!show_handles, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.01)))
                         .cursor_col_resize()
@@ -4425,6 +4488,14 @@ impl PlannerView {
                             if *hovered {
                                 this.set_hovered(Some(id), cx);
                             }
+                        }))
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+                                gesture.kind == GestureKind::Link && gesture.id != id
+                            }) {
+                                this.state.gantt.set_link_target(id);
+                            }
+                            this.on_bar_drag_move(event, cx);
                         }))
                         .on_mouse_down(
                             MouseButton::Left,
@@ -5236,7 +5307,7 @@ impl PlannerView {
         }
         let form = self.state.form.as_ref().expect("form");
         let title = form.title();
-        let heading = form.item_title();
+        let heading = form.heading_title();
         let work_item_type = form.model.work_item_type.clone();
         let pages = form.model.pages.clone();
         let active = form.active_page;
@@ -5326,13 +5397,18 @@ impl PlannerView {
                                                     .child(title),
                                             ),
                                     )
-                                    .child(div().text_lg().truncate().child(
-                                        if heading.is_empty() {
-                                            "Untitled".to_string()
-                                        } else {
-                                            heading
-                                        },
-                                    )),
+                                    .child(
+                                        div()
+                                            .id("work-item-form-heading")
+                                            .debug_selector(|| "work-item-form-heading".into())
+                                            .text_lg()
+                                            .truncate()
+                                            .child(if heading.is_empty() {
+                                                "Untitled".to_string()
+                                            } else {
+                                                heading
+                                            }),
+                                    ),
                             )
                             .child(
                                 Button::new("close-form")
@@ -6213,6 +6289,7 @@ impl PlannerView {
         let mut working = self.state.clone();
         let id = pending.id;
         self.date_save_busy.insert(id);
+        self.arm_saving_status(cx);
         let after_start = pending.after_start.clone();
         let after_target = pending.after_target.clone();
         let previous = pending.previous.clone();
@@ -6226,6 +6303,7 @@ impl PlannerView {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
                 this.date_save_busy.remove(&id);
+                this.arm_saving_status(cx);
                 if let Ok((working, result)) = outcome {
                     let still_after = this.state.nodes.iter().any(|node| {
                         node.id == id
@@ -6539,6 +6617,17 @@ impl PlannerView {
 
     pub fn set_busy_for_test(&mut self, busy: bool) {
         self.io_busy = busy;
+        if busy && self.saving_shown_at.is_none() {
+            self.saving_shown_at = Some(Instant::now());
+        }
+    }
+
+    pub fn sync_status_for_test(&self) -> String {
+        self.sync_status_text()
+    }
+
+    pub fn form_heading_for_test(&self) -> Option<String> {
+        self.state.form.as_ref().map(|form| form.heading_title())
     }
 
     pub fn simulate_toast_hover_for_test(&mut self, hovered: bool, cx: &mut Context<Self>) {
@@ -7225,7 +7314,7 @@ fn dates_parse_hint() -> String {
     let target = start.saturating_add(6.days());
     let a = compact_date(start);
     let b = compact_date(target);
-    format!("Could not parse dates. Use {a} → {b}, {a} -> {b}, {a} to {b}, or a start date only.")
+    format!("Could not parse. Use {a} → {b} or a start date.")
 }
 
 /// `None` when the Dates field is empty or a recognised range.

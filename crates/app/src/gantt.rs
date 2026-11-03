@@ -18,6 +18,8 @@ pub const SPLITTER_STEP: f32 = 16.0;
 pub const HANDLE_WIDTH: f32 = 8.0;
 /// Extra-wide end-cap so grabbing a bar's right edge is not an 8px hunt.
 pub const RESIZE_END_HIT: f32 = 16.0;
+/// Selected tree/timeline row tint. Stronger than hover so the current row reads.
+pub const SELECTED_ROW_TINT: f32 = 0.4;
 /// Pixels per tree depth. A spacer child, not padding, so painted x matches depth.
 pub const TREE_INDENT: f32 = 20.0;
 pub const LINK_HANDLE: f32 = 14.0;
@@ -1658,7 +1660,7 @@ impl GanttView {
                 // the successor's right so the elbow stays between the bars
                 // instead of running out to the far-left chart edge.
                 let backward = pred_end > bar.x + 1.0;
-                let (x_head, x_out, x_in) = if backward {
+                let (x_head, x_out, mut x_in) = if backward {
                     let x_head = succ_right + HEAD_GAP;
                     let x_out = if pred.x >= succ_right - 1.0 {
                         pred.x - STUB
@@ -1670,6 +1672,25 @@ impl GanttView {
                     let x_head = bar.x - HEAD_GAP;
                     (x_head, pred_end + STUB, x_head - STUB)
                 };
+                let lo = pred.y.min(bar.y);
+                let hi = pred.y.max(bar.y);
+                let intervening: Vec<&BarLayout> = bars
+                    .iter()
+                    .filter(|mid| {
+                        mid.id != pred.id
+                            && mid.id != bar.id
+                            && mid.y > lo + 1.0
+                            && mid.y < hi - 1.0
+                    })
+                    .collect();
+                if !intervening.is_empty() {
+                    let inbound_left = !backward;
+                    let succ_edge = if backward { succ_right } else { bar.x };
+                    let x_vert = clear_vertical_x(x_in, &intervening, succ_edge, inbound_left);
+                    if (x_vert - x_in).abs() > 0.5 {
+                        x_in = x_vert;
+                    }
+                }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
                 // Stay in the predecessor row's gutter so the outgoing
                 // vertical does not run through bars on rows in between.
@@ -1789,6 +1810,66 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
     } else {
         bar.x + painted_w + HANDLE_WIDTH + LINK_HANDLE_HIT + 16.0 + title_w
     }
+}
+
+/// Body plus an external title, so a vertical drop does not run through a row.
+fn bar_occupied_x(bar: &BarLayout) -> (f32, f32) {
+    let left = if bar.milestone || bar.marker {
+        bar.x - 2.0
+    } else {
+        bar.x - HANDLE_WIDTH
+    };
+    (left, bar_label_right(bar))
+}
+
+fn x_hits_span(x: f32, left: f32, right: f32) -> bool {
+    x >= left - 1.0 && x <= right + 1.0
+}
+
+/// Keep an inbound vertical in a gap that misses intervening bars and labels.
+fn clear_vertical_x(
+    pref: f32,
+    intervening: &[&BarLayout],
+    succ_edge: f32,
+    inbound_left: bool,
+) -> f32 {
+    let blocked: Vec<(f32, f32)> = intervening.iter().map(|bar| bar_occupied_x(bar)).collect();
+    if blocked
+        .iter()
+        .all(|(left, right)| !x_hits_span(pref, *left, *right))
+    {
+        return pref;
+    }
+    if inbound_left {
+        let intervening_right = blocked
+            .iter()
+            .map(|(_, right)| *right)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let gap_left = intervening_right + 6.0;
+        let gap_right = succ_edge - 4.0;
+        if gap_right - gap_left >= 4.0 {
+            return pref.clamp(gap_left, gap_right);
+        }
+        let intervening_left = blocked
+            .iter()
+            .map(|(left, _)| *left)
+            .fold(f32::INFINITY, f32::min);
+        return intervening_left - 8.0;
+    }
+    let intervening_left = blocked
+        .iter()
+        .map(|(left, _)| *left)
+        .fold(f32::INFINITY, f32::min);
+    let gap_right = intervening_left - 6.0;
+    let gap_left = succ_edge + 4.0;
+    if gap_right - gap_left >= 4.0 {
+        return pref.clamp(gap_left, gap_right);
+    }
+    blocked
+        .iter()
+        .map(|(_, right)| *right)
+        .fold(f32::NEG_INFINITY, f32::max)
+        + 8.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3994,6 +4075,48 @@ mod tests {
             arrows[0].lane_y < mid.y,
             "the outgoing elbow must stay in the predecessor gutter, not drop through #{}, lane {} mid {}",
             mid.id,
+            arrows[0].lane_y,
+            mid.y
+        );
+        let (mid_left, mid_right) = (mid.x, bar_label_right(mid));
+        assert!(
+            arrows[0].x2 < mid_left - 1.0 || arrows[0].x2 > mid_right + 1.0,
+            "the inbound vertical must not cross the Go-live label, x2={} label={mid_left}..{mid_right}",
+            arrows[0].x2
+        );
+    }
+
+    #[test]
+    fn intervening_cart_ui_row_is_not_crossed_by_the_inbound_vertical() {
+        let mut pred = node(1, None);
+        pred.title = "Persist cart".into();
+        let mut mid = node(2, Some(1));
+        mid.title = "Cart UI".into();
+        let mut succ = node(3, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1];
+        let nodes = vec![pred, mid, succ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 1);
+        let mid = bars.iter().find(|bar| bar.id == 2).unwrap();
+        let (left, right) = (mid.x - HANDLE_WIDTH, bar_label_right(mid));
+        assert!(
+            arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
+            "the inbound vertical must skip the Cart UI row, x2={} cart={left}..{right}",
+            arrows[0].x2
+        );
+        assert!(
+            arrows[0].lane_y < mid.y || arrows[0].lane_y >= mid.y + ROW_HEIGHT,
+            "the horizontal lane must not run through the Cart UI row body, lane {} mid {}",
             arrows[0].lane_y,
             mid.y
         );

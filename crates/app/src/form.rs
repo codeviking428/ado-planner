@@ -74,6 +74,17 @@ impl FormDraft {
             .unwrap_or_default()
     }
 
+    /// Dialog heading: the title as of open/save, not the live Title field.
+    pub fn heading_title(&self) -> String {
+        self.model
+            .values
+            .get("System.Title")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| self.item_title())
+    }
+
     pub fn set_string(&mut self, reference: &str, value: String) {
         self.values
             .insert(reference.to_string(), Value::String(value));
@@ -683,8 +694,16 @@ mod tests {
                 }],
             }],
         });
-        let draft = FormDraft::from_model(model);
+        let mut draft = FormDraft::from_model(model);
         assert_eq!(draft.item_title(), "Hello");
+        assert_eq!(draft.heading_title(), "Hello");
+        draft.set_string("System.Title", "Typed while open".into());
+        assert_eq!(draft.item_title(), "Typed while open");
+        assert_eq!(
+            draft.heading_title(),
+            "Hello",
+            "the dialog heading must stay on the opened title until save"
+        );
         assert!(draft.title().contains("#1"));
         assert!(draft.is_plain_html("System.Description"));
         assert!(

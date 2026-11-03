@@ -95,6 +95,17 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
         cx.debug_bounds("gantt-sync-status").is_some(),
         "the toolbar must show a subtle save/sync status"
     );
+    view.update(cx, |view, _| {
+        assert_eq!(view.sync_status_for_test(), "Synced");
+        view.set_busy_for_test(true);
+        assert_eq!(view.sync_status_for_test(), "Saving…");
+        view.set_busy_for_test(false);
+        assert_eq!(
+            view.sync_status_for_test(),
+            "Saving…",
+            "Saving… must stay visible for a short hold after I/O clears"
+        );
+    });
     assert!(
         cx.debug_bounds("header-filters-label").is_some(),
         "Roots/Types/States must be grouped under a Filters label"
@@ -593,6 +604,65 @@ fn rendered_unscheduled_chip_and_form_header(cx: &mut gpui_kit::TestAppContext) 
         cx.debug_bounds("work-item-form-header")
             .is_some_and(|bounds| bounds.size.height > gpui_kit::px(24.)),
         "item panel should paint a crisp header"
+    );
+}
+
+#[gpui_kit::test]
+fn form_heading_updates_on_save_not_while_typing(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert(
+        "System.Title".into(),
+        serde_json::Value::String("Persist cart".into()),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: vec![ado_core::FormControl {
+            id: "System.Title".into(),
+            reference_name: "System.Title".into(),
+            label: "Title".into(),
+            kind: ado_core::FormControlKind::String,
+            required: true,
+            read_only: false,
+            visible: true,
+            options: None,
+        }],
+        pages: Vec::new(),
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(
+                view.form_heading_for_test().as_deref(),
+                Some("Persist cart")
+            );
+            view.type_form_field("System.Title", "Renamed live", window, cx);
+            assert_eq!(
+                view.form_heading_for_test().as_deref(),
+                Some("Persist cart"),
+                "the dialog heading must stay on the opened title while typing"
+            );
+            assert_eq!(
+                view.state.form.as_ref().map(|form| form.item_title()),
+                Some("Renamed live".into()),
+                "the Title field must still take the typed value"
+            );
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("work-item-form-heading").is_some(),
+        "the dialog must paint a heading distinct from the Title field"
     );
 }
 
@@ -3489,10 +3559,16 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         f32::from(start.origin.x),
         f32::from(bar.origin.x)
     );
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+    let handle_left = f32::from(resize.origin.x);
+    let handle_right = handle_left + f32::from(resize.size.width);
     assert!(
-        f32::from(resize.origin.x) + 1.0
-            >= f32::from(bar.origin.x) + f32::from(bar.size.width) - 1.0,
-        "end resize grip must sit on or outside the bar's right edge"
+        handle_left < bar_right - 1.0,
+        "end resize grip must overlap the bar's right interior, handle x {handle_left} vs bar right {bar_right}"
+    );
+    assert!(
+        handle_right >= bar_right - 1.0,
+        "end resize grip must cover the bar's right edge, handle right {handle_right} vs bar right {bar_right}"
     );
 }
 
@@ -4020,6 +4096,44 @@ fn resize_starts_on_mouse_down_without_hover(cx: &mut gpui_kit::TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn hovered_end_grip_wins_hit_test_over_move(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.state.gantt.hovered_id = Some(2);
+        cx.notify();
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-resize-handle-2-end")
+        .expect("hovered leaf bar must show an end grip");
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("mouse-down on the visible end grip must start a resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "the end grip must win the hit-test over Move, got {:?}",
+            gesture.kind
+        );
+        assert_eq!(gesture.id, 2);
+    });
+}
+
+#[gpui_kit::test]
 fn second_zoom_mid_animation_starts_from_the_interpolated_camera(
     cx: &mut gpui_kit::TestAppContext,
 ) {
@@ -4292,6 +4406,15 @@ fn picker_error_slot_is_reserved_before_a_parse_error(cx: &mut gpui_kit::TestApp
         "the picker must not jump when a parse error appears, before={} after={}",
         f32::from(picker_before.size.height),
         f32::from(picker_after.size.height)
+    );
+    let month = cx
+        .debug_bounds("gantt-dates-month-label")
+        .expect("month header");
+    let error_bottom = f32::from(after.origin.y) + f32::from(after.size.height);
+    assert!(
+        error_bottom <= f32::from(month.origin.y) + 1.0,
+        "the date error must stay above the month header, error bottom {error_bottom} vs month y {}",
+        f32::from(month.origin.y)
     );
 }
 
