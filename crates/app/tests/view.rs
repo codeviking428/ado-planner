@@ -2190,6 +2190,48 @@ fn single_click_selects_a_bar_and_enter_opens_details(cx: &mut gpui_kit::TestApp
 }
 
 #[gpui_kit::test]
+fn clicking_a_bar_focuses_planner_keys_for_nudge(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.teams = vec![ado_core::Team {
+        id: "1".into(),
+        name: "Platform".into(),
+    }];
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let trigger = cx.debug_bounds("team-trigger").expect("team trigger");
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, _| {
+            assert!(
+                !view.planner_keys_are_focused(window),
+                "opening a scope picker must take focus off the planner keys"
+            );
+        });
+    });
+    let bar = cx.debug_bounds("gantt-bar-1").expect("bar");
+    cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, _| {
+            assert_eq!(view.state.gantt.selected_id, Some(1));
+            assert!(
+                view.planner_keys_are_focused(window),
+                "clicking a bar must focus planner keys so ←/→ can nudge"
+            );
+        });
+    });
+}
+
+#[gpui_kit::test]
 fn mouse_up_clears_hover_even_when_the_pointer_stays_on_the_bar(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();

@@ -479,6 +479,16 @@ impl PlannerView {
         }
     }
 
+    fn focus_planner(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inline_edit.is_none() {
+            window.focus(&self.form_focus, cx);
+        }
+    }
+
+    pub fn planner_keys_are_focused(&self, window: &Window) -> bool {
+        self.form_focus.is_focused(window)
+    }
+
     pub fn inline_picker_date(&self, cx: &App) -> Option<PickerDate> {
         self.inline_dates
             .as_ref()
@@ -3493,7 +3503,7 @@ impl PlannerView {
                                     }))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                             if this.state.gantt.gesture.is_some()
                                                 || this.state.gantt.context_menu.is_some()
                                             {
@@ -3515,6 +3525,7 @@ impl PlannerView {
                                                 this.state.gantt.schedule_drag = Some(id);
                                                 this.state.gantt.selected_id = Some(id);
                                                 this.state.gantt.hovered_id = Some(id);
+                                                this.focus_planner(window, cx);
                                                 cx.notify();
                                                 return;
                                             }
@@ -3531,6 +3542,7 @@ impl PlannerView {
                                                 return;
                                             };
                                             this.state.gantt.selected_id = Some(id);
+                                            this.focus_planner(window, cx);
                                             this.dismiss_overlays();
                                             let _ = this
                                                 .state
@@ -3918,9 +3930,10 @@ impl PlannerView {
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         this.state.gantt.selected_id = Some(id);
+                        this.focus_planner(window, cx);
                         if event.click_count >= 2 {
                             this.open_form(id, cx);
                             return;
@@ -3989,8 +4002,10 @@ impl PlannerView {
                         }))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
+                            cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
+                                this.state.gantt.selected_id = Some(id);
+                                this.focus_planner(window, cx);
                                 this.dismiss_overlays();
                                 let _ = this.state.begin_bar_gesture(id, GestureKind::Link, origin);
                                 cx.notify();
@@ -4047,10 +4062,11 @@ impl PlannerView {
                         }))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
+                            cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.dismiss_overlays();
                                 this.state.gantt.selected_id = Some(id);
+                                this.focus_planner(window, cx);
                                 let _ = this.state.begin_bar_gesture(id, kind, origin);
                                 cx.notify();
                             }),
