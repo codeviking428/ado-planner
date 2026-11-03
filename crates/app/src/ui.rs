@@ -759,11 +759,9 @@ impl PlannerView {
                     Err(_) => tracing::warn!("planner action cancelled"),
                 }
                 this.form_loading = None;
-                if let Some((toast_id, action)) = this.pending_toast_undo.take() {
-                    this.apply_toast_undo(toast_id, action, cx);
-                }
+                this.replay_pending_toast_undo(cx);
                 if let Some(team) = this.pending_team.take() {
-                    this.start_team_switch(team, cx);
+                    this.queue_team_switch(team, cx);
                 }
                 if !this.update_checked && this.state.session_info.signed_in {
                     this.update_checked = true;
@@ -1442,12 +1440,29 @@ impl PlannerView {
     }
 
     pub fn apply_toast_undo(&mut self, toast_id: u64, action: UndoAction, cx: &mut Context<Self>) {
-        if !self
-            .state
-            .toasts
-            .items
-            .iter()
-            .any(|toast| toast.id == toast_id)
+        self.apply_toast_undo_with(toast_id, action, true, cx);
+    }
+
+    fn replay_pending_toast_undo(&mut self, cx: &mut Context<Self>) {
+        if let Some((toast_id, action)) = self.pending_toast_undo.take() {
+            self.apply_toast_undo_with(toast_id, action, false, cx);
+        }
+    }
+
+    fn apply_toast_undo_with(
+        &mut self,
+        toast_id: u64,
+        action: UndoAction,
+        require_toast: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if require_toast
+            && !self
+                .state
+                .toasts
+                .items
+                .iter()
+                .any(|toast| toast.id == toast_id)
         {
             return;
         }
@@ -1467,23 +1482,54 @@ impl PlannerView {
             cx.notify();
             return;
         }
-        // spawn_unbounded so a date persist (which does not take io_busy) or a
-        // still-in-flight link save cannot turn Undo into a silent dismiss.
+        // Queue while spawn_state holds io_busy so Undo is not a silent dismiss.
+        // Replay even if the toast later expires or is dismissed.
         if self.io_busy {
             self.pending_toast_undo = Some((toast_id, action));
             cx.notify();
             return;
         }
-        self.spawn_unbounded(cx, move |mut state| async move {
-            let result = state.apply_undo(action.clone()).await;
-            if result.is_ok() {
-                state.toasts.push(ToastKind::Success, undid.clone());
-            }
-            (state, result)
-        });
+        self.spawn_toast_undo(cx, action, undid);
         self.state.toasts.dismiss_undo();
         self.state.toasts.dismiss(toast_id);
         cx.notify();
+    }
+
+    fn spawn_toast_undo(&mut self, cx: &mut Context<Self>, action: UndoAction, undid: String) {
+        self.io_busy = true;
+        let runtime = self.state.runtime.clone();
+        let mut working = self.state.clone();
+        let merge_action = action.clone();
+        let rx = runtime.spawn_result(async move {
+            let result = working.apply_undo(action).await;
+            (working, result)
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                this.io_busy = false;
+                match outcome {
+                    Ok((working, Ok(()))) => {
+                        this.state.merge_undo_action(&working, &merge_action);
+                        this.state.toasts.push(ToastKind::Success, undid);
+                    }
+                    Ok((working, Err(err))) => {
+                        tracing::warn!("toast undo failed: {err}");
+                        if let Some(msg) = working.toasts.last_error_message() {
+                            this.state.toasts.push(ToastKind::Error, msg.to_string());
+                        }
+                    }
+                    Err(_) => tracing::warn!("toast undo cancelled"),
+                }
+                this.replay_pending_toast_undo(cx);
+                if let Some(team) = this.pending_team.take() {
+                    this.queue_team_switch(team, cx);
+                }
+                this.note_toasts_changed(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn undo_last(&mut self, cx: &mut Context<Self>) {
@@ -6002,6 +6048,14 @@ impl PlannerView {
 
     pub fn set_busy_for_test(&mut self, busy: bool) {
         self.io_busy = busy;
+    }
+
+    pub fn replay_pending_toast_undo_for_test(&mut self, cx: &mut Context<Self>) {
+        self.replay_pending_toast_undo(cx);
+    }
+
+    pub fn pending_toast_undo_id(&self) -> Option<u64> {
+        self.pending_toast_undo.as_ref().map(|(id, _)| *id)
     }
 
     pub fn set_form_loading_for_test(&mut self, id: i64, title: impl Into<String>) {

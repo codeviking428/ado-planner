@@ -3712,6 +3712,116 @@ fn toast_undo_while_busy_is_not_dropped(cx: &mut gpui_kit::TestAppContext) {
                 .any(|toast| toast.undo.is_some()),
             "the Undo toast must stay until the queued action runs"
         );
+        assert_eq!(
+            view.pending_toast_undo_id(),
+            Some(toast_id),
+            "busy Undo must keep the action until I/O frees"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn queued_toast_undo_survives_expiry(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.predecessors = vec![1];
+    }
+    state.toasts.push_undo(
+        "Added link: A → B",
+        UndoAction::RemoveLink {
+            successor_id: 2,
+            predecessor_id: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| {
+        view.set_busy_for_test(true);
+        let toast_id = view
+            .state
+            .toasts
+            .items
+            .last()
+            .map(|toast| toast.id)
+            .unwrap();
+        let action = view
+            .state
+            .toasts
+            .items
+            .last()
+            .and_then(|toast| toast.undo.clone())
+            .unwrap();
+        view.apply_toast_undo(toast_id, action, cx);
+        for toast in &mut view.state.toasts.items {
+            toast.created_at = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        }
+        view.state.toasts.expire();
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .all(|toast| toast.id != toast_id),
+            "the queued Undo toast may expire before I/O frees"
+        );
+        view.set_busy_for_test(false);
+        view.replay_pending_toast_undo_for_test(cx);
+        assert!(
+            view.pending_toast_undo_id().is_none(),
+            "replay must consume the queued Undo even after the toast is gone"
+        );
+        assert!(
+            view.is_busy(),
+            "replayed toast Undo must take the I/O slot instead of spawn_unbounded"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn toast_undo_serializes_with_planner_io(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.predecessors = vec![1];
+    }
+    state.toasts.push_undo(
+        "Added link: A → B",
+        UndoAction::RemoveLink {
+            successor_id: 2,
+            predecessor_id: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| {
+        let toast_id = view
+            .state
+            .toasts
+            .items
+            .last()
+            .map(|toast| toast.id)
+            .unwrap();
+        let action = view
+            .state
+            .toasts
+            .items
+            .last()
+            .and_then(|toast| toast.undo.clone())
+            .unwrap();
+        view.apply_toast_undo(toast_id, action, cx);
+        assert!(
+            view.is_busy(),
+            "toast Undo must hold io_busy so a later team switch or add-item cannot adopt a stale clone"
+        );
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .all(|toast| toast.undo.is_none()),
+            "starting Undo must consume the control"
+        );
     });
 }
 
