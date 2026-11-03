@@ -1811,15 +1811,14 @@ impl GanttView {
                     pred.x + pred.width
                 };
                 // Forward FS: inbound from the left of the successor.
-                // Prefer a short elbow (12px inbound) even when the source
-                // starts after the target — a wrap drop at the source end
-                // draws a long vertical through intervening rows (Go-live
-                // after Move children too). Wrap only if that inbound still
-                // hits a row body. Never attach to the successor's right.
-                let wrap_around = pred.x > bar.x + 1.0;
+                // When the target starts before the source ends, loop locally:
+                // stub a few px past the source end, drop, run back to just
+                // before the target start. Never slide that drop to the chart
+                // left edge around intervening rows or gutter pills.
+                let wrap_around = pred_end > bar.x + STUB;
                 let x_head = bar.x;
                 let x_out = pred_end + STUB;
-                let mut x_in = x_head - STUB;
+                let mut x_in = if wrap_around { x_out } else { x_head - STUB };
                 let lo = pred.y.min(bar.y);
                 let hi = pred.y.max(bar.y);
                 let intervening: Vec<&BarLayout> = bars
@@ -1829,6 +1828,9 @@ impl GanttView {
                             && mid.id != bar.id
                             && mid.y > lo + 1.0
                             && mid.y < hi - 1.0
+                            && mid.kind != GanttBarKind::Unscheduled
+                            && mid.kind != GanttBarKind::NoFields
+                            && !mid.marker
                     })
                     .collect();
                 // Year/Quarter bars are slivers; their titles still paint at
@@ -1836,21 +1838,13 @@ impl GanttView {
                 // tens of days away (stray line at x≈532). Occupy the
                 // body only at those zooms.
                 let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
-                if !intervening.is_empty() {
+                if !intervening.is_empty() && !wrap_around {
                     let x_vert =
                         clear_vertical_x(x_in, &intervening, bar.x, true, x_head, include_labels);
                     if (x_vert - x_in).abs() > 0.5 {
                         x_in = x_vert;
                     }
                     x_in = clamp_inbound_stub(x_in, x_head, true, &intervening, include_labels);
-                    if wrap_around
-                        && intervening.iter().any(|mid| {
-                            let (left, right) = bar_occupied_x(mid, include_labels);
-                            x_hits_span(x_in, left, right)
-                        })
-                    {
-                        x_in = x_out;
-                    }
                 }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
                 // Stay in the predecessor row's gutter so the outgoing
@@ -4738,7 +4732,7 @@ mod tests {
     }
 
     #[test]
-    fn moved_parent_link_uses_a_short_elbow_not_a_go_live_drop() {
+    fn moved_parent_link_loops_at_the_source_end_not_go_live() {
         // Mock tree after dragging Persist cart later and "Move children too":
         // children shift with the parent; Go-live (not a child) stays put.
         let mut epic = node(1001, None);
@@ -4781,30 +4775,109 @@ mod tests {
             .expect("#1003→#1012");
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 1012).unwrap();
-        let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
         assert!(
             pred.x > succ.x + 1.0,
             "fixture must place the moved parent after the successor start"
         );
         assert_later_source_inbounds_from_left(arrow, pred, succ, gantt.timeline_width);
         assert!(
-            !arrow.wraps_around_successor(),
-            "moved-parent links must be a short elbow, not a wrap drop at the source end, x1={} x2={} x_head={}",
+            arrow.wraps_around_successor(),
+            "moved-parent links must loop at the source end, not a chart-wide detour, x1={} x2={} x_head={}",
             arrow.x1,
             arrow.x2,
             arrow.x_head
         );
-        let (left, right) = bar_occupied_x(go_live, true);
         assert!(
-            arrow.x2 < left - 1.0 || arrow.x2 > right + 1.0,
-            "the inbound vertical must not run through Go-live, x2={} go-live={left}..{right}",
+            (arrow.x2 - arrow.x1).abs() < 1.5,
+            "the drop must stay at the source stub, x1={} x2={}",
+            arrow.x1,
             arrow.x2
         );
         assert!(
-            (arrow.x2 - arrow.x1).abs() > ROW_HEIGHT,
-            "the long run must be the horizontal at the predecessor gutter, not a vertical through Go-live, x1={} x2={}",
+            arrow.x2 > 80.0,
+            "must not detour to the chart left edge, x2={}",
+            arrow.x2
+        );
+        assert!(
+            (arrow.x2 - (pred.x + pred.width + 12.0)).abs() < 2.0
+                || (arrow.x1 - arrow.x2).abs() < 1.5,
+            "the loop must drop a few px past the source end, x2={} pred_end={}",
+            arrow.x2,
+            pred.x + pred.width
+        );
+    }
+
+    #[test]
+    fn backward_link_loops_locally_not_to_the_chart_left() {
+        let mut pred = node(1003, Some(1002));
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-08-04T00:00:00Z".into());
+        pred.target_date = Some("2026-08-21T00:00:00Z".into());
+        let mut child = node(1005, Some(1003));
+        child.title = "Cart UI".into();
+        child.start_date = Some("2026-07-21T00:00:00Z".into());
+        child.target_date = None;
+        let mut unscheduled = node(1014, Some(1002));
+        unscheduled.title = "Backlog grooming".into();
+        unscheduled.start_date = None;
+        unscheduled.target_date = None;
+        let mut go_live = node(1013, Some(1001));
+        go_live.title = "Go-live milestone".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        let mut succ = node(1012, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1003];
+        let nodes = vec![
+            node(1001, None),
+            node(1002, Some(1001)),
+            pred,
+            child,
+            unscheduled,
+            go_live,
+            succ,
+        ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+            .expect("#1003→#1012");
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1012).unwrap();
+        assert!(pred.x + pred.width > succ.x + 12.0);
+        assert_later_source_inbounds_from_left(arrow, pred, succ, gantt.timeline_width);
+        assert!(
+            arrow.wraps_around_successor(),
+            "target-starts-before-source-ends must loop at the source stub, x1={} x2={} x_head={}",
+            arrow.x1,
+            arrow.x2,
+            arrow.x_head
+        );
+        assert!(
+            (arrow.x2 - arrow.x1).abs() < 1.5,
+            "the drop must stay a few px past the source end, x1={} x2={}",
             arrow.x1,
             arrow.x2
+        );
+        assert!(
+            arrow.x2 > 80.0,
+            "must not run down the chart left edge, x2={}",
+            arrow.x2
+        );
+        assert!(
+            (arrow.stub_start() - (arrow.x_head - 12.0)).abs() < 2.5,
+            "inbound must sit just before the target start, stub={} x_head={}",
+            arrow.stub_start(),
+            arrow.x_head
         );
     }
 

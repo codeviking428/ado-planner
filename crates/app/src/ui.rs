@@ -3708,10 +3708,16 @@ impl PlannerView {
                         .id(("dates-overflow", id as u64))
                         .debug_selector(|| "gantt-dates-overflow".into())
                         .flex_shrink_0()
-                        .w(px(10.))
+                        .w(px(16.))
+                        .h(px(16.))
+                        .rounded_full()
                         .flex()
                         .items_center()
                         .justify_center()
+                        .bg(cx.theme().warning)
+                        .text_color(cx.theme().background)
+                        .text_xs()
+                        .font_weight(gpui_kit::FontWeight::BOLD)
                         .occlude()
                         .tooltip(move |window, cx| {
                             Tooltip::new(overflow_tip.clone()).build(window, cx)
@@ -4265,6 +4271,17 @@ impl PlannerView {
                                 })
                             }),
                     )
+                    .child(
+                        div()
+                            .id("gantt-today")
+                            .debug_selector(|| "gantt-today".into())
+                            .absolute()
+                            .left(px(today_x))
+                            .top_0()
+                            .bottom_0()
+                            .w(px(3.))
+                            .bg(today_color),
+                    )
                     .children({
                         let arrows = self.state.gantt.layout_dependency_arrows(bars);
                         arrows
@@ -4277,17 +4294,6 @@ impl PlannerView {
                     .children(bars.iter().filter_map(|bar| {
                         self.render_gantt_link_handles(bar, dragging, cx)
                     }))
-                    .child(
-                        div()
-                            .id("gantt-today")
-                            .debug_selector(|| "gantt-today".into())
-                            .absolute()
-                            .left(px(today_x))
-                            .top_0()
-                            .bottom_0()
-                            .w(px(3.))
-                            .bg(today_color),
-                    )
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
                             if gesture.kind != GestureKind::Link {
@@ -4841,14 +4847,20 @@ impl PlannerView {
                     .id(("gantt-overflow", id as u64))
                     .debug_selector(|| "gantt-parent-overflow".into())
                     .absolute()
-                    .left(px(bar.x + bar.width.max(8.0) - 2.0))
-                    .top(px(bar_top - 2.0))
-                    .w(px(8.))
-                    .h(px(bar_h + 4.0))
-                    .rounded_sm()
-                    .bg(warn.opacity(0.85))
+                    .left(px(bar.x + bar.width.max(8.0) - 10.0))
+                    .top(px((bar_top - 6.0).max(0.0)))
+                    .size(px(16.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(warn)
+                    .text_color(cx.theme().background)
+                    .text_xs()
+                    .font_weight(gpui_kit::FontWeight::BOLD)
                     .occlude()
                     .tooltip(move |window, cx| Tooltip::new(overflow_tip.clone()).build(window, cx))
+                    .child("!")
                     .into_any_element(),
             );
         }
@@ -5041,13 +5053,17 @@ impl PlannerView {
         }
         let hovered = self.state.gantt.hovered_id == Some(id);
         let show_dot = hovered;
+        let can_resize = bar.can_resize();
         let (local_left, local_right) = self.painted_timeline_edges(bar);
-        let start_x = local_left - LINK_HANDLE_HIT;
+        // Pink start dot sits on the left edge so it resizes (and beats an
+        // incoming ▶). The end hit stays just past the bar so a drag still
+        // starts a link; the inner 8px grip covers the painted right edge.
+        let start_x = local_left - LINK_HANDLE_HIT / 2.0;
         let end_x = local_right + 2.0;
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
         let layout = bar.clone();
-        let handles =
-            [("link-start", start_x), ("link-end", end_x)].map(|(handle_id, handle_x)| {
+        let handles = [("link-start", start_x, true), ("link-end", end_x, false)].map(
+            |(handle_id, handle_x, at_start)| {
                 let selector = format!("gantt-link-handle-{id}-{handle_id}");
                 let origin = handle_x + LINK_HANDLE_HIT / 2.0;
                 let layout = layout.clone();
@@ -5085,17 +5101,27 @@ impl PlannerView {
                             cx.stop_propagation();
                             let x: f32 = event.position.x.into();
                             let painted = this.painted_bar_for(id, &layout);
-                            if x >= painted.left && x <= painted.right {
+                            let kind = if can_resize && at_start {
+                                GestureKind::ResizeStart
+                            } else if x >= painted.left && x <= painted.right {
                                 this.begin_classified_bar_gesture(id, &layout, x, window, cx);
                                 return;
-                            }
-                            this.continue_or_begin_bar_gesture(
-                                id,
-                                GestureKind::Link,
-                                origin,
-                                window,
-                                cx,
-                            );
+                            } else {
+                                GestureKind::Link
+                            };
+                            let origin = if kind == GestureKind::Link {
+                                origin
+                            } else {
+                                let _ = this.classify_bar_hit(id, &layout, x);
+                                this.pointer_layout_x(x, Some(id))
+                            };
+                            this.continue_or_begin_bar_gesture(id, kind, origin, window, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.commit_gesture(window, cx);
                         }),
                     )
                     .child(
@@ -5115,7 +5141,8 @@ impl PlannerView {
                                 )
                             }),
                     )
-            });
+            },
+        );
         Some(
             div()
                 .absolute()
@@ -5136,6 +5163,7 @@ impl PlannerView {
         bar: &crate::gantt::BarLayout,
         timeline_w: f32,
         show_link_handles: bool,
+        today_x: Option<f32>,
     ) -> Option<(f32, f32)> {
         if Self::bar_title_fits_inside(bar) {
             return None;
@@ -5159,11 +5187,25 @@ impl PlannerView {
         let right_x = bar_right + label_gap;
         let left_x = bar.x - estimated - 6.0;
         let prefer_left = right_x + estimated > timeline_w - 4.0 && left_x >= 0.0;
-        let label_x = if prefer_left { left_x } else { right_x };
+        let mut label_x = if prefer_left { left_x } else { right_x };
         if label_x >= timeline_w || label_x + 8.0 < 0.0 {
             return None;
         }
-        let max_w = (timeline_w - label_x - 4.0).max(24.0);
+        let mut max_w = (timeline_w - label_x - 4.0).max(24.0);
+        if let Some(today) = today_x {
+            let label_right = label_x + estimated.min(max_w);
+            if label_x < today && label_right > today - 4.0 {
+                if left_x >= 0.0 && left_x + estimated <= today - 4.0 {
+                    label_x = left_x;
+                    max_w = (today - 8.0 - label_x).max(24.0);
+                } else {
+                    max_w = (today - 8.0 - label_x).max(0.0);
+                    if max_w < 8.0 {
+                        return None;
+                    }
+                }
+            }
+        }
         Some((label_x, max_w))
     }
 
@@ -5182,7 +5224,9 @@ impl PlannerView {
             return None;
         }
         let timeline_w = self.state.gantt.timeline_width.max(1.0);
-        let (label_x, max_w) = Self::bar_external_label_frame(bar, timeline_w, true)?;
+        let today_x = self.state.gantt.today_x(jiff::Zoned::now().date());
+        let (label_x, max_w) =
+            Self::bar_external_label_frame(bar, timeline_w, true, Some(today_x))?;
         let label = bar.title.clone();
         Some(
             div()
@@ -5319,7 +5363,9 @@ impl PlannerView {
                 "stub",
                 cx,
             ))
-            .child(self.arrow_head_hit(arrow, min_x, min_y, color, cx))
+            .when(self.state.gantt.hovered_id != Some(to_id), |el| {
+                el.child(self.arrow_head_hit(arrow, min_x, min_y, color, cx))
+            })
             .when(selected, |el| {
                 el.child(self.link_remove_button(arrow, min_x, min_y, cx))
             })
@@ -5591,7 +5637,9 @@ impl PlannerView {
             .left(px(if arrow.inbound_right {
                 arrow.x_head - min_x - 4.0
             } else {
-                arrow.x_head - min_x - 16.0
+                // Sit on the inbound stub, left of the successor's start
+                // handle so ▶ is not buried under the hover dot.
+                arrow.stub_start() - min_x - 16.0
             }))
             .top(px(arrow.y2 - min_y - 10.0))
             .w(px(18.))
@@ -8389,7 +8437,7 @@ mod bar_label_tests {
             open_ended: false,
         };
         assert!(
-            PlannerView::bar_external_label_frame(&bar, 800.0, false).is_none(),
+            PlannerView::bar_external_label_frame(&bar, 800.0, false, None).is_none(),
             "an off-screen Today diamond must not float a title at the right edge"
         );
     }
@@ -8417,7 +8465,7 @@ mod bar_label_tests {
             "a bar that starts off-screen must keep its title in the visible fragment"
         );
         assert!(
-            PlannerView::bar_external_label_frame(&bar, 800.0, false).is_none(),
+            PlannerView::bar_external_label_frame(&bar, 800.0, false, None).is_none(),
             "must not float the title over the grid to the left of a clipped bar"
         );
     }
@@ -8480,8 +8528,39 @@ mod bar_label_tests {
             "a title wider than the bar must paint outside instead of truncating"
         );
         assert!(
-            PlannerView::bar_external_label_frame(&bar, 800.0, false).is_some(),
+            PlannerView::bar_external_label_frame(&bar, 800.0, false, None).is_some(),
             "the outside label must have a frame on the timeline"
+        );
+    }
+
+    #[test]
+    fn year_view_cart_label_does_not_cross_today() {
+        // Year zoom-out: Cart is a short sliver (Jul–Aug) whose outside
+        // title would otherwise run across Today (Nov).
+        let bar = BarLayout {
+            id: 1002,
+            kind: GanttBarKind::Scheduled,
+            x: 110.0,
+            width: 24.0,
+            y: 40.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let today_x = 184.0;
+        let (label_x, max_w) =
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x))
+                .expect("Cart is too short for an inside title on Year");
+        assert!(
+            label_x + max_w <= today_x - 4.0 || label_x >= today_x + 4.0,
+            "Year Cart label must not sit on the Today line, label={label_x}..{} today={today_x}",
+            label_x + max_w
         );
     }
 }

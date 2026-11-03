@@ -54,6 +54,16 @@ fn draw(cx: &mut VisualTestContext) {
     });
 }
 
+/// Outer half of the end handle (past the pink resize dot) starts a link.
+fn grab_link_handle(
+    handle: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> gpui_kit::Point<gpui_kit::Pixels> {
+    point(
+        handle.origin.x + handle.size.width - px(1.),
+        handle.origin.y + handle.size.height / 2.0,
+    )
+}
+
 #[gpui_kit::test]
 fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
@@ -1473,11 +1483,16 @@ fn dragging_a_link_dot_starts_a_link_not_a_resize(cx: &mut gpui_kit::TestAppCont
         .debug_bounds("gantt-link-handle-1-link-end")
         .expect("selected bar must show a link dot outside the bar");
     let bar = cx.debug_bounds("gantt-bar-1").expect("bar");
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
     assert!(
-        f32::from(handle.origin.x) + 1.0 >= f32::from(bar.origin.x) + f32::from(bar.size.width),
-        "link dot must sit outside the bar end so a drag is not a resize"
+        f32::from(handle.origin.x) + f32::from(handle.size.width) > bar_right + 1.0,
+        "link hit must extend past the bar end so the outer half can link"
     );
-    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_down(
+        grab_link_handle(handle),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
     draw(cx);
     view.update(cx, |view, _| {
         let gesture = view.state.gantt.gesture.as_ref().expect("link gesture");
@@ -2727,9 +2742,9 @@ fn right_link_handle_drag_does_not_unschedule_start_only(cx: &mut gpui_kit::Test
     let handle = cx
         .debug_bounds("gantt-link-handle-2-link-end")
         .expect("start-only bar must show a right link handle");
-    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    let start = grab_link_handle(handle);
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
     draw(cx);
-    let start = handle.center();
     cx.simulate_mouse_move(
         point(start.x + px(40.), start.y),
         Some(MouseButton::Left),
@@ -2839,7 +2854,11 @@ fn link_handle_press_works_without_hovering_first(cx: &mut gpui_kit::TestAppCont
     let handle = cx
         .debug_bounds("gantt-link-handle-1-link-end")
         .expect("link handle hit area must exist without a prior hover");
-    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_down(
+        grab_link_handle(handle),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
     draw(cx);
     view.update(cx, |view, _| {
         assert_eq!(
@@ -2870,7 +2889,11 @@ fn releasing_a_link_drag_on_empty_space_clears_the_rubber_band(cx: &mut gpui_kit
     let handle = cx
         .debug_bounds("gantt-link-handle-1-link-end")
         .expect("link handle");
-    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_down(
+        grab_link_handle(handle),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
     draw(cx);
     let away = point(handle.center().x + px(80.), handle.center().y - px(80.));
     cx.simulate_mouse_move(away, Some(MouseButton::Left), Modifiers::default());
@@ -2909,7 +2932,11 @@ fn releasing_a_link_drag_at_a_target_edge_arms_the_link(cx: &mut gpui_kit::TestA
     let handle = cx
         .debug_bounds("gantt-link-handle-1-link-end")
         .expect("link handle");
-    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_down(
+        grab_link_handle(handle),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
     draw(cx);
     let target = cx.debug_bounds("gantt-bar-2").expect("target bar");
     let edge = point(
@@ -2966,7 +2993,11 @@ fn releasing_a_link_drag_on_empty_space_clears_link_selection(cx: &mut gpui_kit:
     let handle = cx
         .debug_bounds("gantt-link-handle-1-link-end")
         .expect("link handle");
-    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_down(
+        grab_link_handle(handle),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
     draw(cx);
     let away = point(handle.center().x + px(80.), handle.center().y - px(80.));
     cx.simulate_mouse_move(away, Some(MouseButton::Left), Modifiers::default());
@@ -2986,7 +3017,11 @@ fn releasing_a_link_drag_on_empty_space_clears_link_selection(cx: &mut gpui_kit:
     let handle = cx
         .debug_bounds("gantt-link-handle-1-link-end")
         .expect("link handle after cancel");
-    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_down(
+        grab_link_handle(handle),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
     draw(cx);
     view.update(cx, |view, _| {
         assert_eq!(
@@ -3127,6 +3162,19 @@ fn dates_cell_stays_one_line_with_a_conflict_marker(cx: &mut gpui_kit::TestAppCo
     assert!(
         mark_right <= cell_right - 2.0,
         "the amber ! must sit inside the Dates column, not clipped at the edge, mark_right={mark_right} cell_right={cell_right}"
+    );
+    assert!(
+        f32::from(mark.size.width) >= 14.0 && f32::from(mark.size.height) >= 14.0,
+        "the Dates ! must be a visible badge, got {:?}",
+        mark.size
+    );
+    let bar_mark = cx
+        .debug_bounds("gantt-parent-overflow")
+        .expect("bar overflow badge");
+    assert!(
+        f32::from(bar_mark.size.width) >= 14.0 && f32::from(bar_mark.size.height) >= 14.0,
+        "the bar ! must be a visible badge, got {:?}",
+        bar_mark.size
     );
 }
 
@@ -4601,6 +4649,65 @@ fn left_end_resize_clears_preview_chip_on_mouse_up(cx: &mut gpui_kit::TestAppCon
         cx.debug_bounds("gantt-drag-preview").is_none(),
         "the preview chip must clear after a left-end commit without another mouse-move"
     );
+}
+
+#[gpui_kit::test]
+fn start_handle_dot_is_part_of_the_resize_hit_zone(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(2);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    // Pink start dot sits on the left edge; a click just outside the painted
+    // bar must still begin ResizeStart, not select an incoming link.
+    let mid_y = bar.origin.y + bar.size.height / 2.0;
+    let grip = point(bar.origin.x - px(4.), mid_y);
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("the start-handle dot must begin a resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeStart,
+            "clicking the start handle dot must resize, not select a link, got {:?}",
+            gesture.kind
+        );
+        assert!(
+            view.state.gantt.selected_link.is_none(),
+            "bar handles must win over incoming links"
+        );
+        view.state.cancel_gesture();
+        view.state.gantt.hovered_id = Some(2);
+    });
+    draw(cx);
+    let end = point(bar.origin.x + bar.size.width - px(3.), mid_y);
+    cx.simulate_mouse_down(end, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("the painted right edge must still resize");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::ResizeEnd,
+            "clicking the bar's right edge must resize, got {:?}",
+            gesture.kind
+        );
+    });
 }
 
 fn click_painted_bar_inset(
