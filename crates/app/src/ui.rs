@@ -46,12 +46,13 @@ use crate::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH,
     DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
     LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH,
-    NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP, OffscreenEdge,
+    NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
     PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT,
     SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH,
-    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_offscreen_edge, bar_title_is_inside,
-    bar_title_paint_px, dependency_link_tooltip, header_label_px, parent_date_overflow,
-    parent_overflow_tip, timeline_is_empty_of_scheduled, today_pill_left,
+    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_outside_label_frame, bar_title_is_inside,
+    bar_title_paint_px, dependency_link_tooltip, header_label_px, offscreen_edge_chip,
+    outside_title_right_gap, parent_date_overflow, parent_overflow_tip,
+    timeline_is_empty_of_scheduled, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -4739,21 +4740,10 @@ impl PlannerView {
         let marker = bar.marker;
         let open_ended = bar.open_ended;
         let clip_pad = (-bar.x).max(0.0);
-        let timeline_w = self.state.gantt.timeline_width.max(1.0);
-        let today_x = self.state.gantt.today_x(jiff::Zoned::now().date());
-        let overflow = parent_date_overflow(&self.state.nodes, id);
-        let outside =
-            Self::bar_external_label_frame(bar, timeline_w, true, Some(today_x), overflow);
-        // Wide Year bars that cannot host a 40px outside chip before Today
-        // (Checkout rewrite) keep a truncated inside title so the row is
-        // never blank. Slivers still use the outside chip.
-        let inside = Self::bar_title_fits_inside(bar)
-            || (outside.is_none()
-                && !milestone
-                && !marker
-                && !unscheduled
-                && !no_fields
-                && bar_offscreen_edge(bar, timeline_w).is_none());
+        // Only paint inside when the glyphs actually fit. The previous
+        // "outside None → truncated inside" fallback is what launched Year
+        // as "Pers…" / a blank Cart row.
+        let inside = Self::bar_title_fits_inside(bar);
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
         let can_resize = bar.can_resize();
@@ -5003,7 +4993,11 @@ impl PlannerView {
                     this.set_bar_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
                 .when(
-                    !dragging
+                    // Outside titles carry the hover tip on the chip so the
+                    // 16px Persist cart handles are not sitting in a wide
+                    // tooltip centered on the sliver.
+                    inside
+                        && !dragging
                         && !self.details_overlay()
                         && self.state.gantt.pin_bar_tooltip != Some(id),
                     |el| {
@@ -5483,97 +5477,7 @@ impl PlannerView {
         today_x: Option<f32>,
         overflow_badge: bool,
     ) -> Option<(f32, f32)> {
-        if Self::bar_title_fits_inside(bar) {
-            return None;
-        }
-        let title_width = bar_title_paint_px(&bar.title);
-        let painted_w = if bar.milestone || bar.marker {
-            MILESTONE_SIZE
-        } else {
-            bar.width.max(8.0)
-        };
-        let bar_right = bar.x + painted_w;
-        if bar_right < 0.0 || bar.x > timeline_w {
-            return None;
-        }
-        // Keep outside titles on the right of the bar. Flipping to the left
-        // after a right-edge resize (#1014) is the jump the review caught.
-        // Clip to MIN_OUTSIDE rather than hiding Year slivers ("Pers…",
-        // "Go-l…") — a readable fragment beside the bar beats a blank row.
-        if bar.milestone {
-            return Self::milestone_external_label_frame(bar, timeline_w, title_width, today_x);
-        }
-        let label_gap = outside_title_right_gap(false, show_link_handles, overflow_badge);
-        let estimated = title_width.max(24.0);
-        let label_x = bar_right + label_gap;
-        if let Some(frame) = Self::clip_outside_frame(label_x, estimated, timeline_w, today_x) {
-            return Some(frame);
-        }
-        // Today left less than MIN_OUTSIDE on the right: try the left side
-        // rather than jumping through the line. Do not flip for a right-edge
-        // clip (#1014). Sit past the inbound 16px handle.
-        if today_x.is_some() {
-            let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
-            if let Some(frame) = Self::clip_outside_frame(left_x, estimated, timeline_w, today_x) {
-                return Some(frame);
-            }
-        }
-        None
-    }
-
-    /// Place an outside chip at `label_x`. Prefer the full title; clip to the
-    /// remaining width before Today / the timeline edge when at least
-    /// MIN_OUTSIDE (40px) is free. Never cross Today.
-    fn clip_outside_frame(
-        label_x: f32,
-        estimated: f32,
-        timeline_w: f32,
-        today_x: Option<f32>,
-    ) -> Option<(f32, f32)> {
-        const MIN_OUTSIDE: f32 = 40.0;
-        if label_x >= timeline_w - 8.0 || label_x + 8.0 < 0.0 {
-            return None;
-        }
-        let mut max_w = (timeline_w - label_x - 4.0).max(0.0);
-        if max_w < MIN_OUTSIDE {
-            return None;
-        }
-        if let Some(today) = today_x
-            && label_x < today
-            && label_x + estimated.min(max_w) > today - 4.0
-        {
-            let before = (today - 8.0 - label_x).max(0.0);
-            if before >= MIN_OUTSIDE {
-                max_w = before.min(max_w);
-            } else {
-                return None;
-            }
-        }
-        if max_w >= estimated {
-            Some((label_x, estimated))
-        } else {
-            Some((label_x, max_w))
-        }
-    }
-
-    /// Sit the chip on the diamond. Prefer the right; clip to a readable
-    /// fragment before Today when the full title does not fit; flip left
-    /// only when the right remainder is under MIN_OUTSIDE.
-    fn milestone_external_label_frame(
-        bar: &crate::gantt::BarLayout,
-        timeline_w: f32,
-        title_width: f32,
-        today_x: Option<f32>,
-    ) -> Option<(f32, f32)> {
-        const GAP: f32 = 6.0;
-        let estimated = title_width.max(24.0);
-        let diamond_right = bar.x + MILESTONE_SIZE;
-        let right_x = diamond_right + GAP;
-        if let Some(frame) = Self::clip_outside_frame(right_x, estimated, timeline_w, today_x) {
-            return Some(frame);
-        }
-        let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
-        Self::clip_outside_frame(left_x, estimated, timeline_w, today_x)
+        bar_outside_label_frame(bar, timeline_w, show_link_handles, today_x, overflow_badge)
     }
 
     /// ‹ / › on the row when a dated bar sits fully past the timeline clip.
@@ -5583,13 +5487,8 @@ impl PlannerView {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let timeline_w = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
-        let edge = bar_offscreen_edge(bar, timeline_w)?;
+        let (x, chip_w, label, side) = offscreen_edge_chip(bar, timeline_w)?;
         let id = bar.id;
-        const EDGE_W: f32 = 16.0;
-        let (x, glyph, side) = match edge {
-            OffscreenEdge::Left => (2.0, "‹", "left"),
-            OffscreenEdge::Right => ((timeline_w - EDGE_W - 2.0).max(2.0), "›", "right"),
-        };
         let bar_h = bar.paint_h();
         let bar_top = bar.paint_top();
         let selector = format!("gantt-bar-edge-{side}-{id}");
@@ -5600,18 +5499,21 @@ impl PlannerView {
                 .absolute()
                 .left(px(x))
                 .top(px(bar.y + bar_top))
-                .w(px(EDGE_W))
+                .w(px(chip_w))
                 .h(px(bar_h.max(16.0)))
                 .flex()
                 .items_center()
-                .justify_center()
+                .px_1()
+                .gap_1()
+                .overflow_hidden()
+                .whitespace_nowrap()
                 .rounded_sm()
                 .bg(cx.theme().background.opacity(0.92))
                 .border_1()
                 .border_color(rgb(bar.color).opacity(0.7))
                 .text_color(rgb(bar.color))
-                .text_sm()
-                .child(glyph)
+                .text_xs()
+                .child(label)
                 .into_any_element(),
         )
     }
@@ -5786,13 +5688,14 @@ impl PlannerView {
             return None;
         }
         let timeline_w = self.state.gantt.timeline_width.max(1.0);
-        let today_x = self.state.gantt.today_x(jiff::Zoned::now().date());
+        let today = jiff::Zoned::now().date();
+        let today_px = self.state.gantt.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
         let overflow = parent_date_overflow(&self.state.nodes, id);
-        // Year/Quarter used to skip Today so slivers would not jump off the
-        // bar; clip before Today instead so "Checkout rewrite" cannot run
-        // through the line. Remainder under MIN_OUTSIDE (40px) hides.
+        // Full title beside a sliver. Prefer the right; flip left to miss
+        // Today; last resort still paints the full glyphs (never "Pers…").
         let (label_x, max_w) =
-            Self::bar_external_label_frame(bar, timeline_w, true, Some(today_x), overflow)?;
+            Self::bar_external_label_frame(bar, timeline_w, true, today_x, overflow)?;
         let label = bar.title.clone();
         let estimated = bar_title_paint_px(&bar.title).max(24.0);
         let truncate = max_w + 0.1 < estimated;
@@ -5812,6 +5715,11 @@ impl PlannerView {
                 .text_xs()
                 .text_color(muted_fg)
                 .when(!dragging, |el| el.occlude())
+                .when(!dragging && !self.details_overlay(), |el| {
+                    let tip = bar_hover_tooltip(bar, &self.state.nodes);
+                    el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .tooltip_show_delay(Duration::from_millis(150))
+                })
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_hovered(Some(id), cx);
@@ -8917,22 +8825,6 @@ enum TypedDateRange {
     Invalid,
 }
 
-/// Gap from the bar's left edge to a flipped outside title. The inbound
-/// link handle sits at `local_left - LINK_HANDLE_HIT - 2` (16px hit box).
-const OUTSIDE_TITLE_LEFT_GAP: f32 = LINK_HANDLE_HIT + LINK_HANDLE_GAP;
-
-fn outside_title_right_gap(milestone: bool, show_link_handles: bool, overflow_badge: bool) -> f32 {
-    if milestone {
-        6.0
-    } else if overflow_badge {
-        LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0
-    } else if show_link_handles {
-        LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
-    } else {
-        10.0
-    }
-}
-
 /// Extra past the painted bar so a same-row drag preview sits after an
 /// outside title (handles/`!` gap plus the painted chip) instead of on it.
 fn drag_preview_row_extra(bar: &crate::gantt::BarLayout, overflow: bool) -> f32 {
@@ -9490,18 +9382,26 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
         };
+        let estimated = bar_title_paint_px(&bar.title);
         let today_x = 250.0;
         let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false);
         if let Some((label_x, max_w)) = frame {
             assert!(
-                label_x + max_w <= today_x - 4.0,
-                "Year Checkout rewrite must not run through Today, label={label_x}+{max_w} today={today_x}"
+                max_w + 0.1 >= estimated,
+                "Checkout rewrite must keep the full title, max_w={max_w} estimated={estimated}"
+            );
+            assert!(
+                label_x + max_w <= today_x - 4.0
+                    || label_x >= today_x + 4.0
+                    || max_w + 0.1 >= estimated,
+                "prefer missing Today; last resort still paints the full title, label={label_x}+{max_w} today={today_x}"
             );
         }
-        let crossing = PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(220.0), false);
+        let crossing = PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(220.0), false)
+            .expect("a title that cannot fit before Today must still paint at full width");
         assert!(
-            crossing.is_none() || crossing.is_some_and(|(x, w)| x + w <= 220.0 - 4.0),
-            "a title that cannot fit before Today must hide instead of jumping through it, got {crossing:?}"
+            crossing.1 + 0.1 >= estimated,
+            "must not hide or clip Checkout rewrite to a fragment, got {crossing:?}"
         );
     }
 
@@ -9707,7 +9607,7 @@ mod bar_label_tests {
             open_ended: false,
         };
         let diamond_right = bar.x + MILESTONE_SIZE;
-        let estimated = bar.title.chars().count() as f32 * 8.0 + 16.0;
+        let estimated = bar_title_paint_px(&bar.title);
         // Room on the right for the full title, so Today no longer shrinks
         // or jumps the chip. A 104px gap used to cross the line.
         let today_x = diamond_right + 6.0 + estimated + 40.0;
@@ -9751,7 +9651,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
         };
-        let estimated = bar.title.chars().count() as f32 * 8.0 + 16.0;
+        let estimated = bar_title_paint_px(&bar.title);
         let diamond_right = bar.x + MILESTONE_SIZE;
         let today_x = diamond_right + 40.0;
         let (label_x, max_w) =
@@ -9790,7 +9690,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
         };
-        let estimated = bar.title.chars().count() as f32 * 8.0 + 16.0;
+        let estimated = bar_title_paint_px(&bar.title);
         let today_x = 400.0;
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
@@ -9815,7 +9715,7 @@ mod bar_label_tests {
     }
 
     #[test]
-    fn year_narrow_bar_clips_before_today_instead_of_hiding() {
+    fn year_narrow_bar_keeps_the_full_title_when_today_is_tight() {
         let bar = BarLayout {
             id: 1003,
             kind: GanttBarKind::Scheduled,
@@ -9833,37 +9733,28 @@ mod bar_label_tests {
             open_ended: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let label_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
-        // Room for a readable fragment, not the full title.
-        let today_x = label_x + 8.0 + 56.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let today_x = right_x + 56.0;
         assert!(
-            today_x - 8.0 - label_x < estimated,
+            today_x - right_x < estimated,
             "precondition: full title cannot fit before Today"
         );
         let (x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
-                .expect("Year Persist cart must stay visible when 40px remains before Today");
+                .expect("Year Persist cart must paint a full outside title");
         assert!(
-            max_w >= 40.0,
-            "clipped Persist cart must stay readable, max_w={max_w}"
+            max_w + 0.1 >= estimated,
+            "must keep the full title, not Pers…, max_w={max_w} estimated={estimated}"
         );
         assert!(
-            max_w + 0.1 < estimated,
-            "must clip rather than demand the full title, max_w={max_w} estimated={estimated}"
-        );
-        assert!(
-            x + max_w <= today_x - 4.0,
-            "clipped Persist cart must not run through Today, label={x}+{max_w} today={today_x}"
-        );
-        assert!(
-            x + 1.0 >= bar.x + bar.width,
-            "clipped title must sit beside the bar, x={x} bar_right={}",
-            bar.x + bar.width
+            (x - right_x).abs() < 0.5 || x + max_w <= bar.x + 0.1,
+            "full title sits beside the bar, x={x} right_x={right_x} bar.x={}",
+            bar.x
         );
     }
 
     #[test]
-    fn year_milestone_clips_before_today_instead_of_hiding() {
+    fn year_milestone_keeps_the_full_title_when_today_is_tight() {
         let bar = BarLayout {
             id: 1013,
             kind: GanttBarKind::Scheduled,
@@ -9881,31 +9772,28 @@ mod bar_label_tests {
             open_ended: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let label_x = bar.x + MILESTONE_SIZE + 6.0;
-        let today_x = label_x + 8.0 + 56.0;
+        let right_x = bar.x + MILESTONE_SIZE + 6.0;
+        let today_x = right_x + 56.0;
         assert!(
-            today_x - 8.0 - label_x < estimated,
+            today_x - right_x < estimated,
             "precondition: full Go-live title cannot fit before Today"
         );
         let (x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
-                .expect("Year Go-live must stay visible when 40px remains before Today");
+                .expect("Year Go-live must paint a full outside title");
         assert!(
-            max_w >= 40.0,
-            "clipped Go-live must stay readable, max_w={max_w}"
+            max_w + 0.1 >= estimated,
+            "must keep the full Go-live title, not Go-l…, max_w={max_w} estimated={estimated}"
         );
         assert!(
-            max_w + 0.1 < estimated,
-            "must clip rather than hide Go-live, max_w={max_w} estimated={estimated}"
-        );
-        assert!(
-            x + max_w <= today_x - 4.0,
-            "clipped Go-live must not run through Today, label={x}+{max_w} today={today_x}"
+            (x - right_x).abs() < 0.5 || x + max_w <= bar.x + 0.1,
+            "full title sits beside the diamond, x={x} right_x={right_x} bar.x={}",
+            bar.x
         );
     }
 
     #[test]
-    fn year_go_live_chip_flips_left_of_a_tight_clip() {
+    fn year_go_live_chip_keeps_full_title_on_a_tight_clip() {
         let bar = BarLayout {
             id: 1013,
             kind: GanttBarKind::Scheduled,
@@ -9922,18 +9810,18 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
         };
-        let estimated = bar.title.chars().count() as f32 * 8.0 + 16.0;
+        let estimated = bar_title_paint_px(&bar.title);
+        let diamond_right = bar.x + MILESTONE_SIZE;
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 512.0, true, None, false)
                 .expect("Year Go-live must keep an outside chip");
         assert!(
-            label_x + estimated <= bar.x + 0.1,
-            "a tight right clip must flip the full title left of the diamond, label_x={label_x} bar.x={} estimated={estimated}",
-            bar.x
+            (label_x - (diamond_right + 6.0)).abs() < 0.5,
+            "a tight clip must keep the full title on the right of the diamond, label_x={label_x} diamond={diamond_right}"
         );
         assert!(
             max_w + 0.1 >= estimated,
-            "flipped Year Go-live must keep the full title width, max_w={max_w} estimated={estimated}"
+            "must keep the full Go-live title, not Go-l…, max_w={max_w} estimated={estimated}"
         );
     }
 
