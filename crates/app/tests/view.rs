@@ -3,7 +3,7 @@
 use ado_core::{IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
-    BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH,
+    BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
     MIN_TIMELINE_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
     bar_hover_tooltip, insert_index_for_child,
 };
@@ -3997,6 +3997,47 @@ fn dismissing_a_hovered_toast_unpauses_expiry(cx: &mut gpui_kit::TestAppContext)
 }
 
 #[gpui_kit::test]
+fn bottom_band_does_not_pause_undone_toast_expiry(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.toasts.push_undo(
+        "Undone",
+        UndoAction::RestoreDates {
+            id: 2,
+            start_date: Some("2026-07-06T00:00:00Z".into()),
+            target_date: Some("2026-07-20T00:00:00Z".into()),
+            rev: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("planner-toast").is_some(),
+        "the Undone toast must paint"
+    );
+    cx.simulate_mouse_move(point(px(24.), px(780.)), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            !view.toast_pause_for_test(),
+            "the empty bottom band must not hover-pause toast expiry"
+        );
+        view.state.toasts.items[0].created_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        view.state.toasts.expire();
+        assert!(
+            view.state.toasts.items.is_empty(),
+            "an Undone toast must auto-dismiss after its TTL"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn mouse_up_clears_hover_even_when_the_pointer_stays_on_the_bar(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -4014,7 +4055,10 @@ fn mouse_up_clears_hover_even_when_the_pointer_stays_on_the_bar(cx: &mut gpui_ki
     draw(cx);
     view.update(cx, |view, _| {
         assert_eq!(view.state.gantt.hovered_id, None);
-        assert!(view.state.gantt.hover_locked);
+        assert!(
+            !view.state.gantt.hover_locked,
+            "mouse-up must not lock hover or the next tooltip waits a second"
+        );
     });
     view.update(cx, |view, _| {
         assert_eq!(
@@ -4336,6 +4380,33 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
     assert!(
         handle_right <= bar_right + 0.5 && handle_right + 4.0 >= bar_right,
         "end resize grip must stay inside the painted bar, handle right {handle_right} vs bar right {bar_right}"
+    );
+    let grip = cx
+        .debug_bounds("gantt-resize-grip-2-end")
+        .expect("hovered leaf bar must show a visible edge grip");
+    let dot = cx
+        .debug_bounds("gantt-link-dot-2-link-end")
+        .expect("hovered leaf bar must show a link connector");
+    assert!(
+        (f32::from(grip.size.width) - 3.0).abs() < 1.0,
+        "the resize grip must be a 3px edge pill, got {}",
+        f32::from(grip.size.width)
+    );
+    assert!(
+        (f32::from(dot.size.width) - LINK_HANDLE).abs() < 1.0
+            && (f32::from(dot.size.height) - LINK_HANDLE).abs() < 1.0,
+        "the link connector must be an 8px circle, got {:?}",
+        dot.size
+    );
+    let grip_right = f32::from(grip.origin.x) + f32::from(grip.size.width);
+    let dot_left = f32::from(dot.origin.x);
+    assert!(
+        dot_left >= bar_right - 0.5,
+        "the link dot must sit outside the bar so it is not a second resize grip, dot {dot_left} vs bar {bar_right}"
+    );
+    assert!(
+        grip_right <= bar_right + 0.5,
+        "the visible resize grip must stay inside the bar, grip right {grip_right} vs bar {bar_right}"
     );
 }
 
@@ -5392,6 +5463,10 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
         assert_eq!(
             view.state.gantt.pin_bar_tooltip, None,
             "mouse-up must not pin the pre-drag tooltip"
+        );
+        assert!(
+            !view.state.gantt.hover_locked,
+            "drop must not lock hover or the first tooltip after a drag waits ~1s"
         );
     });
     assert!(

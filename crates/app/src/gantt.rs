@@ -28,8 +28,12 @@ pub const YEAR_MIN_BAR_WIDTH: f32 = 16.0;
 const MIN_BAR_WIDTH: f32 = 6.0;
 /// Pixels per tree depth. A spacer child, not padding, so painted x matches depth.
 pub const TREE_INDENT: f32 = 20.0;
-pub const LINK_HANDLE: f32 = 14.0;
-pub const LINK_HANDLE_HIT: f32 = 18.0;
+/// Painted link connector. Smaller than the inner resize grip so the
+/// circle is not mistaken for an edge handle.
+pub const LINK_HANDLE: f32 = 8.0;
+pub const LINK_HANDLE_HIT: f32 = 16.0;
+/// Parallel dependency lanes stay at least this far apart (stroke is 2px).
+pub const PARALLEL_LANE_MIN: f32 = 10.0;
 /// Parent-overflow `!` on the bar. Matches the Dates-column badge so the
 /// glyph reads at ~14px instead of shrinking to a 9px mark.
 pub const OVERFLOW_BADGE: f32 = 16.0;
@@ -1804,9 +1808,18 @@ impl GanttView {
         {
             ticks[index].0 = today + SHIFT;
         }
+        // Year month names sit on the row below Today. Keep "Nov" even when
+        // the Today pill is nearby; the pill is nudged instead of dropping
+        // the tick.
+        let min_gap = if matches!(self.scale, GanttScale::Year) {
+            10.0
+        } else {
+            TICK_MIN_GAP
+        };
         let labels = Self::space_header_labels(
-            Self::sticky_header_labels(ticks, false, TICK_MIN_GAP),
-            TICK_MIN_GAP,
+            Self::sticky_header_labels(ticks, false, min_gap),
+            min_gap,
+            !matches!(self.scale, GanttScale::Year),
         );
         Self::fit_labels_to_width(labels, width)
     }
@@ -1876,13 +1889,24 @@ impl GanttView {
         out
     }
 
-    fn space_header_labels(labels: Vec<(f32, String)>, min_gap: f32) -> Vec<(f32, String)> {
+    fn space_header_labels(
+        labels: Vec<(f32, String)>,
+        min_gap: f32,
+        text_aware: bool,
+    ) -> Vec<(f32, String)> {
         let mut labels = labels;
         labels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let mut out: Vec<(f32, String)> = Vec::new();
         for (x, label) in labels {
             if let Some((prev_x, prev_label)) = out.last() {
-                let need = header_label_px(prev_label).max(min_gap);
+                // Year month names sit on the row below Today. Keep "Nov"
+                // even when "Oct" is 29px wide and the column is ~28px;
+                // the Today pill is nudged instead of dropping the tick.
+                let need = if text_aware {
+                    header_label_px(prev_label).max(min_gap)
+                } else {
+                    min_gap
+                };
                 if x - prev_x < need {
                     continue;
                 }
@@ -2051,7 +2075,7 @@ impl GanttView {
     pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
         const STUB: f32 = 12.0;
         const INCOMING_FAN: f32 = 10.0;
-        const LANE_SEP: f32 = 6.0;
+        const LANE_SEP: f32 = PARALLEL_LANE_MIN;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
         let mut out = Vec::new();
         for bar in bars {
@@ -2227,7 +2251,7 @@ impl GanttView {
                     continue;
                 }
                 let x_shift = rank as f32 * INCOMING_FAN;
-                let lane_shift = rank as f32 * LANE_SEP.max(8.0);
+                let lane_shift = rank as f32 * LANE_SEP;
                 out[index].x1 += x_shift;
                 let dir = if out[index].y2 >= out[index].y1 {
                     -1.0
@@ -2237,12 +2261,80 @@ impl GanttView {
                 out[index].lane_y += dir * lane_shift;
             }
         }
+        separate_parallel_lanes(&mut out);
         let clip_right = (self.timeline_width - 10.0).max(24.0);
         let clip_left = gutter_clear_x(bars);
         for arrow in &mut out {
             clip_arrow_to_timeline(arrow, clip_left, clip_right);
         }
         out
+    }
+}
+
+fn arrow_horizontal_span(arrow: &DependencyArrow) -> (f32, f32) {
+    (arrow.x1.min(arrow.x2), arrow.x1.max(arrow.x2))
+}
+
+fn x_spans_overlap(a: (f32, f32), b: (f32, f32)) -> bool {
+    a.0 <= b.1 + 8.0 && b.0 <= a.1 + 8.0
+}
+
+/// Keep parallel elbows at least `PARALLEL_LANE_MIN` apart, including two
+/// links that do not share a predecessor or successor (Persist cart →
+/// Go-live vs Cart UI → spike).
+fn separate_parallel_lanes(arrows: &mut [DependencyArrow]) {
+    if arrows.len() < 2 {
+        return;
+    }
+    for _ in 0..arrows.len() {
+        let mut moved = false;
+        for i in 0..arrows.len() {
+            for j in i + 1..arrows.len() {
+                let span_i = arrow_horizontal_span(&arrows[i]);
+                let span_j = arrow_horizontal_span(&arrows[j]);
+                if !x_spans_overlap(span_i, span_j) {
+                    continue;
+                }
+                let dy = arrows[j].lane_y - arrows[i].lane_y;
+                if dy.abs() >= PARALLEL_LANE_MIN {
+                    // A horizontal run must also miss the other arrowhead.
+                    let head_i = (arrows[i].lane_y - arrows[j].y2).abs();
+                    let head_j = (arrows[j].lane_y - arrows[i].y2).abs();
+                    if head_i >= PARALLEL_LANE_MIN && head_j >= PARALLEL_LANE_MIN {
+                        continue;
+                    }
+                    if head_i < PARALLEL_LANE_MIN {
+                        let push = PARALLEL_LANE_MIN - head_i;
+                        if arrows[i].lane_y >= arrows[j].y2 {
+                            arrows[i].lane_y += push;
+                        } else {
+                            arrows[i].lane_y -= push;
+                        }
+                        moved = true;
+                    }
+                    if head_j < PARALLEL_LANE_MIN {
+                        let push = PARALLEL_LANE_MIN - head_j;
+                        if arrows[j].lane_y >= arrows[i].y2 {
+                            arrows[j].lane_y += push;
+                        } else {
+                            arrows[j].lane_y -= push;
+                        }
+                        moved = true;
+                    }
+                    continue;
+                }
+                let push = PARALLEL_LANE_MIN - dy.abs();
+                if arrows[j].lane_y >= arrows[i].lane_y {
+                    arrows[j].lane_y += push;
+                } else {
+                    arrows[i].lane_y += push;
+                }
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
     }
 }
 
@@ -2297,6 +2389,21 @@ pub(crate) fn today_pill_left(today_x: f32, width: f32) -> f32 {
     } else {
         (today_x + TODAY_PILL_GAP).max(4.0)
     }
+}
+
+/// Year ticks stay put; slide the Today pill so it does not sit on "Nov".
+pub(crate) fn nudge_today_off_ticks(pill_x: f32, ticks: &[(f32, String)], width: f32) -> f32 {
+    let mut x = pill_x;
+    let pill_right = x + TODAY_PILL_W;
+    for (tick_x, label) in ticks {
+        let tick_w = header_label_px(label);
+        let tick_right = *tick_x + tick_w;
+        if tick_right < x - 2.0 || *tick_x > pill_right + 2.0 {
+            continue;
+        }
+        x = (tick_right + TODAY_PILL_GAP).min(width - TODAY_PILL_W - 4.0);
+    }
+    x.max(4.0)
 }
 
 fn dodge_majors_off_today_pill(
@@ -2415,7 +2522,7 @@ fn parent_overflow_span(nodes: &[WorkItemNode], id: i64) -> Option<(Option<Date>
 }
 
 fn bar_title_px(title: &str) -> f32 {
-    title.chars().count() as f32 * 6.5 + 16.0
+    title.chars().count() as f32 * 8.0 + 16.0
 }
 
 /// Inside when the visible text area can hold the title; otherwise the label
@@ -2447,9 +2554,9 @@ pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
         0.0
     };
     let inner = (visible_w - grip * 2.0 - h_pad - cue).max(0.0);
-    if clip_pad > 0.0 && inner < BAR_LABEL_INSIDE_MIN {
-        // A clipped-left sliver at the viewport edge (Quarter Checkout /
-        // Cart) must not pin two titles on top of each other at x = 0.
+    if inner < BAR_LABEL_INSIDE_MIN {
+        // Short Quarter/Year slivers ("Cart", "Checkout rewrite") must not
+        // clip to "Ur" / "ut rewrite" inside the bar.
         return false;
     }
     inner >= bar_title_px(&bar.title)
@@ -3970,6 +4077,39 @@ mod tests {
     }
 
     #[test]
+    fn quarter_short_bars_place_titles_outside() {
+        let cases = [
+            (
+                "Checkout rewrite",
+                "2026-07-01T00:00:00Z",
+                "2026-07-20T00:00:00Z",
+            ),
+            ("Cart", "2026-07-06T00:00:00Z", "2026-07-14T00:00:00Z"),
+        ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Quarter,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        for (title, start, target) in cases {
+            let mut item = node(1, None);
+            item.title = title.into();
+            item.start_date = Some(start.into());
+            item.target_date = Some(target.into());
+            let rows = gantt.flatten(&[item.clone()]);
+            let bars = gantt.layout_bars(&[item], &rows, &[], 720.0);
+            assert_eq!(bars.len(), 1, "{title}");
+            assert!(
+                !bar_title_is_inside(&bars[0]),
+                "Quarter {title:?} at width {} must sit outside instead of clipping",
+                bars[0].width
+            );
+        }
+    }
+
+    #[test]
     fn short_bars_keep_a_title_for_an_outside_label() {
         let nodes = vec![node(1, None)];
         let gantt = GanttView {
@@ -4598,7 +4738,7 @@ mod tests {
         let dx = (arrows[0].x_head - arrows[1].x_head).abs();
         let dy = (arrows[0].lane_y - arrows[1].lane_y).abs();
         assert!(
-            dx >= 8.0 || dy >= 5.0,
+            dx >= 8.0 || dy >= PARALLEL_LANE_MIN - 0.5,
             "two links into the same bar must not share one polyline, dx={dx} dy={dy}"
         );
         for arrow in &arrows {
@@ -4657,12 +4797,107 @@ mod tests {
         let dx = (arrows[0].x1 - arrows[1].x1).abs();
         let dy = (arrows[0].lane_y - arrows[1].lane_y).abs();
         assert!(
-            dx >= 8.0 || dy >= 6.0,
+            dx >= 8.0 || dy >= PARALLEL_LANE_MIN,
             "Persist cart → spike and Persist cart → Go-live must not share one vertical, dx={dx} dy={dy} x1={},{} lane={},{}",
             arrows[0].x1,
             arrows[1].x1,
             arrows[0].lane_y,
             arrows[1].lane_y
+        );
+    }
+
+    #[test]
+    fn adjacent_row_parallel_lanes_are_at_least_ten_apart() {
+        let a = DependencyArrow {
+            from_id: 1003,
+            to_id: 1013,
+            x1: 200.0,
+            y1: 20.0,
+            x2: 420.0,
+            y2: 180.0,
+            x_head: 400.0,
+            lane_y: 39.0,
+            inbound_right: false,
+        };
+        let b = DependencyArrow {
+            from_id: 1005,
+            to_id: 1012,
+            x1: 210.0,
+            y1: 60.0,
+            x2: 380.0,
+            y2: 220.0,
+            x_head: 360.0,
+            lane_y: 41.0,
+            inbound_right: false,
+        };
+        let mut arrows = vec![a, b];
+        separate_parallel_lanes(&mut arrows);
+        let dy = (arrows[0].lane_y - arrows[1].lane_y).abs();
+        assert!(
+            dy >= PARALLEL_LANE_MIN,
+            "Persist cart → Go-live must not brush Cart UI → spike, dy={dy} lane={},{}",
+            arrows[0].lane_y,
+            arrows[1].lane_y
+        );
+    }
+
+    #[test]
+    fn persist_cart_go_live_clears_the_cart_ui_spike_lane() {
+        let mut persist = node(1003, Some(1002));
+        persist.title = "Persist cart".into();
+        persist.start_date = Some("2026-07-06T00:00:00Z".into());
+        persist.target_date = Some("2026-07-20T00:00:00Z".into());
+        persist.work_item_type = "User Story".into();
+        let mut cart_ui = node(1005, Some(1003));
+        cart_ui.title = "Cart UI".into();
+        cart_ui.start_date = Some("2026-07-21T00:00:00Z".into());
+        cart_ui.target_date = None;
+        cart_ui.work_item_type = "Task".into();
+        let mut spike = node(1012, None);
+        spike.title = "Unparented spike".into();
+        spike.start_date = Some("2026-07-21T00:00:00Z".into());
+        spike.target_date = Some("2026-08-04T00:00:00Z".into());
+        spike.predecessors = vec![1005];
+        spike.work_item_type = "Task".into();
+        let mut go_live = node(1013, Some(1001));
+        go_live.title = "Go-live milestone".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        go_live.predecessors = vec![1003];
+        let nodes = vec![
+            node(1001, None),
+            node(1002, Some(1001)),
+            persist,
+            cart_ui,
+            go_live,
+            spike,
+        ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let persist_live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Persist cart → Go-live");
+        let cart_spike = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1005 && arrow.to_id == 1012)
+            .expect("Cart UI → spike");
+        let dy = (persist_live.lane_y - cart_spike.lane_y).abs();
+        let miss_head = (persist_live.lane_y - cart_spike.y2).abs() >= PARALLEL_LANE_MIN
+            && (cart_spike.lane_y - persist_live.y2).abs() >= PARALLEL_LANE_MIN;
+        assert!(
+            dy >= PARALLEL_LANE_MIN && miss_head,
+            "Persist cart → Go-live must sit ≥{PARALLEL_LANE_MIN}px off Cart UI → spike, dy={dy} lanes={},{} heads={},{}",
+            persist_live.lane_y,
+            cart_spike.lane_y,
+            persist_live.y2,
+            cart_spike.y2
         );
     }
 
@@ -5430,10 +5665,14 @@ mod tests {
         let succ = bars.iter().find(|bar| bar.id == 3).unwrap();
         let mid = bars.iter().find(|bar| bar.id == 2).unwrap();
         assert_exits_right_without_left_detour(&arrows[0], pred, succ, gantt.timeline_width);
-        let (left, right) = (mid.x - HANDLE_WIDTH, bar_label_right(mid));
+        // Wrap routing occupies the bar body, not an outside title (Year
+        // labels would shove the loop). The drop sits at the source stub,
+        // right of Go-live's painted body.
+        let body_left = mid.x - HANDLE_WIDTH;
+        let body_right = mid.x + mid.width.max(8.0) + 4.0;
         assert!(
-            arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
-            "the wrap drop must not sit on the intervening row, x2={} mid={left}..{right}",
+            arrows[0].x2 < body_left - 1.0 || arrows[0].x2 > body_right + 1.0,
+            "the wrap drop must not sit on the intervening bar, x2={} mid={body_left}..{body_right}",
             arrows[0].x2
         );
     }
@@ -6940,19 +7179,31 @@ mod tests {
     #[test]
     fn year_view_keeps_the_nov_tick_under_today() {
         let today = Date::new(2026, 11, 2).unwrap();
-        let gantt = GanttView {
-            origin: today.saturating_sub(40.days()),
-            scale: GanttScale::Year,
-            zoom: 1.0,
-            timeline_width: 800.0,
-            ..Default::default()
-        };
-        let today_x = gantt.today_x(today);
-        let ticks = gantt.header_tick_labels_except(800.0, Some(today_x));
-        assert!(
-            ticks.iter().any(|(_, label)| label == "Nov"),
-            "Year ticks sit on the row below Today and must keep Nov, got {ticks:?}"
-        );
+        for zoom in [1.0, 0.6] {
+            let gantt = GanttView {
+                origin: today.saturating_sub(40.days()),
+                scale: GanttScale::Year,
+                zoom,
+                timeline_width: 800.0,
+                ..Default::default()
+            };
+            let today_x = gantt.today_x(today);
+            let ticks = gantt.header_tick_labels_except(800.0, Some(today_x));
+            assert!(
+                ticks.iter().any(|(_, label)| label == "Nov"),
+                "Year ticks at zoom {zoom} must keep Nov next to Today, got {ticks:?}"
+            );
+            let pill = today_pill_left(today_x, 800.0);
+            let nudged = nudge_today_off_ticks(pill, &ticks, 800.0);
+            if let Some((nov_x, _)) = ticks.iter().find(|(_, label)| label == "Nov") {
+                let nov_right = *nov_x + header_label_px("Nov");
+                assert!(
+                    nudged >= nov_right + TODAY_PILL_GAP - 0.5
+                        || nudged + TODAY_PILL_W <= *nov_x + 0.5,
+                    "Today pill at {nudged} must clear Nov at {nov_x}..{nov_right}"
+                );
+            }
+        }
     }
 
     #[test]

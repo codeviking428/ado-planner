@@ -49,8 +49,8 @@ use crate::gantt::{
     NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP, PLACEHOLDER_BAR_H, ROW_HEIGHT,
     SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H,
     SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT,
-    bar_hover_tooltip, bar_title_is_inside, header_label_px, parent_date_overflow,
-    parent_overflow_tip, timeline_is_empty_of_scheduled, today_pill_left,
+    bar_hover_tooltip, bar_title_is_inside, header_label_px, nudge_today_off_ticks,
+    parent_date_overflow, parent_overflow_tip, timeline_is_empty_of_scheduled, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -1637,18 +1637,6 @@ impl PlannerView {
             .right_0()
             .items_center()
             .gap_2()
-            .occlude()
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                this.set_toast_hover(*hovered, cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.arm_toast_pointer();
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .children(self.state.toasts.items.iter().map(|toast| {
                 let id = toast.id;
                 let copyable = toast.copyable;
@@ -3821,7 +3809,8 @@ impl PlannerView {
                         .justify_center()
                         .bg(cx.theme().warning)
                         .text_color(cx.theme().background)
-                        .text_xs()
+                        .text_size(px(14.))
+                        .line_height(gpui_kit::relative(1.))
                         .font_weight(gpui_kit::FontWeight::BOLD)
                         .occlude()
                         .tooltip(move |window, cx| {
@@ -4149,7 +4138,12 @@ impl PlannerView {
         // at y=22; putting Today there overlaps "Nov".
         let today_label_top = 2.0;
         let today_label_x = if today_on_screen {
-            today_pill_left(today_x, width)
+            let pill = today_pill_left(today_x, width);
+            if matches!(self.state.gantt.scale, GanttScale::Year) {
+                nudge_today_off_ticks(pill, &tick_labels, width)
+            } else {
+                pill
+            }
         } else {
             f32::MAX
         };
@@ -4689,7 +4683,7 @@ impl PlannerView {
         let progress_w =
             (bar.width.max(8.0) * progress_value).max(if progress_value > 0.0 { 4.0 } else { 0.0 });
         let visible_progress_w = (progress_w - clip_pad).max(0.0);
-        let inner_label_fg = painted_bar_title_color(bar);
+        let inner_label_fg = painted_bar_title_color(bar, cx.theme().background);
         let bar_selector = format!("gantt-bar-{id}");
         let progress_selector = format!("gantt-bar-progress-{id}");
         let painted_bars = self.painted_bar_bounds.clone();
@@ -4910,12 +4904,12 @@ impl PlannerView {
                 }))
                 .when(
                     !dragging
-                        && !self.state.gantt.hover_locked
                         && !self.details_overlay()
                         && self.state.gantt.pin_bar_tooltip != Some(id),
                     |el| {
                         let tip = bar_hover_tooltip(bar, &self.state.nodes);
                         el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                            .tooltip_show_delay(Duration::from_millis(150))
                     },
                 )
                 .on_mouse_move(
@@ -5068,16 +5062,16 @@ impl PlannerView {
         let grip_w = bar.inner_grip_width();
         let layout = bar.clone();
         let grips = if bar.open_ended && !bar.can_resize() {
-            vec![("start", "resize-start", true)]
+            vec![("start", "resize-start", "resize-grip-start", true)]
         } else {
             vec![
-                ("start", "resize-start", true),
-                ("end", "resize-end", false),
+                ("start", "resize-start", "resize-grip-start", true),
+                ("end", "resize-end", "resize-grip-end", false),
             ]
         };
         grips
             .into_iter()
-            .map(|(name, handle_id, at_start)| {
+            .map(|(name, handle_id, grip_id, at_start)| {
                 let selector = format!("gantt-resize-handle-{id}-{name}");
                 let layout = layout.clone();
                 div()
@@ -5090,9 +5084,25 @@ impl PlannerView {
                     .bottom_0()
                     .w(px(grip_w))
                     .when(!linking, |el| el.occlude())
-                    .when(show_handles, |el| el.bg(cx.theme().primary))
-                    .when(!show_handles, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.01)))
+                    .bg(gpui_kit::hsla(0., 0., 0., 0.01))
                     .cursor(CursorStyle::ResizeLeftRight)
+                    .when(show_handles, |el| {
+                        el.child(
+                            div()
+                                .id((grip_id, id as u64))
+                                .debug_selector(move || format!("gantt-resize-grip-{id}-{name}"))
+                                .absolute()
+                                .when(at_start, |el| el.left(px(2.)))
+                                .when(!at_start, |el| el.right(px(2.)))
+                                .top(px(3.))
+                                .bottom(px(3.))
+                                .w(px(3.))
+                                .rounded_full()
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().primary),
+                        )
+                    })
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.set_bar_hovered(Some(id), cx);
@@ -5237,9 +5247,9 @@ impl PlannerView {
         // the overflow ! so the badge wins hits and the end grip stays free.
         let start_x = local_left - LINK_HANDLE_HIT - 2.0;
         let overflow_pad = if parent_date_overflow(&self.state.nodes, id) {
-            OVERFLOW_BADGE + OVERFLOW_BADGE_GAP + 4.0
+            OVERFLOW_BADGE + OVERFLOW_BADGE_GAP + 6.0
         } else {
-            4.0
+            6.0
         };
         let end_x = local_right + overflow_pad;
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
@@ -5259,7 +5269,7 @@ impl PlannerView {
                     .justify_center()
                     .when(show_dot || selected || dragging, |el| el.occlude())
                     .bg(gpui_kit::hsla(0., 0., 0., 0.01))
-                    .cursor_pointer()
+                    .cursor(CursorStyle::DragLink)
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.set_bar_hovered(Some(id), cx);
@@ -5402,7 +5412,7 @@ impl PlannerView {
         if Self::bar_title_fits_inside(bar) {
             return None;
         }
-        let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
+        let title_width = bar.title.chars().count() as f32 * 8.0 + 16.0;
         let label_gap = if show_link_handles {
             HANDLE_WIDTH + LINK_HANDLE_HIT + 16.0
         } else {
@@ -5494,7 +5504,7 @@ impl PlannerView {
                 .justify_center()
                 .bg(warn)
                 .text_color(cx.theme().background)
-                .text_sm()
+                .text_size(px(14.))
                 .line_height(gpui_kit::relative(1.))
                 .font_weight(gpui_kit::FontWeight::BOLD)
                 .occlude()
@@ -7400,7 +7410,6 @@ impl PlannerView {
             return;
         }
         self.state.gantt.clear_hover();
-        self.state.gantt.hover_locked = true;
         if let Some(mut pending) = self.state.commit_date_gesture_now() {
             self.last_committed_start_for_test = pending.start;
             self.last_committed_target_for_test = pending.target;
@@ -8533,25 +8542,45 @@ enum TypedDateRange {
     Invalid,
 }
 
-fn inner_bar_label_color(color: u32) -> gpui_kit::Hsla {
-    let r = ((color >> 16) & 0xff) as f32 / 255.0;
-    let g = ((color >> 8) & 0xff) as f32 / 255.0;
-    let b = (color & 0xff) as f32 / 255.0;
-    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    if lum > 0.55 {
-        gpui_kit::hsla(0., 0., 0.10, 1.)
+fn srgb_luminance(r: f32, g: f32, b: f32) -> f32 {
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+fn ink_for_luminance(lum: f32) -> gpui_kit::Hsla {
+    if lum > 0.45 {
+        gpui_kit::hsla(0., 0., 0.05, 1.)
     } else {
         gpui_kit::hsla(0., 0., 0.98, 1.)
     }
 }
 
-fn painted_bar_title_color(bar: &crate::gantt::BarLayout) -> gpui_kit::Hsla {
-    // Open-ended and summary bars paint a wash, not the solid type color.
-    // Using the saturated type color keeps "Cart UI" readable on Day/Week.
+fn inner_bar_label_color_darkened(color: u32, darken: f32) -> gpui_kit::Hsla {
+    let scale = (1.0 - darken).clamp(0.0, 1.0);
+    let r = ((color >> 16) & 0xff) as f32 / 255.0 * scale;
+    let g = ((color >> 8) & 0xff) as f32 / 255.0 * scale;
+    let b = (color & 0xff) as f32 / 255.0 * scale;
+    ink_for_luminance(srgb_luminance(r, g, b))
+}
+
+fn painted_bar_title_color(
+    bar: &crate::gantt::BarLayout,
+    canvas: gpui_kit::Hsla,
+) -> gpui_kit::Hsla {
+    // Open-ended / summary bars are a wash over the grid. Measure that
+    // painted colour, not the saturated type swatch, so orange Cart UI
+    // stays dark-ink on a light Day/Week wash.
     if bar.open_ended || bar.summary {
-        rgb(bar.color).into()
+        let alpha = if bar.open_ended { 0.22 } else { 0.55 };
+        let painted = canvas.blend(rgb(bar.color).opacity(alpha).into());
+        let rgb = painted.to_rgb();
+        ink_for_luminance(srgb_luminance(rgb.r, rgb.g, rgb.b))
     } else {
-        inner_bar_label_color(bar.color)
+        let darken = if bar.progress.unwrap_or(0.0) > 0.0 {
+            0.22
+        } else {
+            0.0
+        };
+        inner_bar_label_color_darkened(bar.color, darken)
     }
 }
 
@@ -8713,7 +8742,6 @@ impl Render for PlannerView {
                 }
                 let x: f32 = event.position.x.into();
                 let y: f32 = event.position.y.into();
-                this.state.gantt.hover_locked = true;
                 if this.state.gantt.gesture.is_some() {
                     this.state.gantt.clear_hover();
                     this.release_bar_gesture(x, y, window, cx);
@@ -8942,7 +8970,7 @@ mod bar_label_tests {
     }
 
     #[test]
-    fn clipped_left_bars_pin_the_title_inside() {
+    fn clipped_left_bars_place_titles_outside_to_the_right() {
         let bar = BarLayout {
             id: 1,
             kind: GanttBarKind::Scheduled,
@@ -8960,12 +8988,14 @@ mod bar_label_tests {
             open_ended: false,
         };
         assert!(
-            PlannerView::bar_title_fits_inside(&bar),
-            "a bar that starts off-screen must keep its title in the visible fragment"
+            !PlannerView::bar_title_fits_inside(&bar),
+            "a title wider than the visible fragment must sit outside instead of clipping"
         );
+        let (label_x, _) = PlannerView::bar_external_label_frame(&bar, 800.0, false, None)
+            .expect("the title must have an outside frame");
         assert!(
-            PlannerView::bar_external_label_frame(&bar, 800.0, false, None).is_none(),
-            "must not float the title over the grid to the left of a clipped bar"
+            label_x >= 0.0 && label_x >= bar.x + bar.width - 1.0,
+            "must not float the title over the grid to the left of a clipped bar, label_x={label_x}"
         );
         let cart = BarLayout {
             id: 1002,
@@ -9073,7 +9103,7 @@ mod bar_label_tests {
             label_x + max_w
         );
         assert!(
-            max_w + 0.1 >= "Cart".chars().count() as f32 * 6.5,
+            max_w + 0.1 >= "Cart".chars().count() as f32 * 8.0,
             "Year Cart must keep a full-width outside label, not clip to a letter, max_w={max_w}"
         );
     }
@@ -9113,6 +9143,65 @@ mod bar_label_tests {
                 "an outside label must stay readable, not clip to a letter, max_w={max_w}"
             );
         }
+    }
+
+    #[test]
+    fn green_and_orange_bars_use_dark_ink() {
+        for (name, color) in [("User Story", 0xa6e3a1), ("Task", 0xfab387)] {
+            let ink = inner_bar_label_color_darkened(color, 0.0);
+            assert!(
+                ink.l < 0.2,
+                "{name} bars must use dark title ink, l={}",
+                ink.l
+            );
+            let progressed = inner_bar_label_color_darkened(color, 0.22);
+            assert!(
+                progressed.l < 0.2,
+                "{name} bars with a progress overlay must stay dark-ink, l={}",
+                progressed.l
+            );
+        }
+        let canvas = gpui_kit::hsla(0., 0., 0.96, 1.);
+        let spike = BarLayout {
+            id: 1012,
+            kind: GanttBarKind::Scheduled,
+            x: 20.0,
+            width: 200.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Unparented spike".into(),
+            color: 0xfab387,
+            progress: Some(0.4),
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let persist = BarLayout {
+            id: 1003,
+            title: "Persist cart".into(),
+            color: 0xa6e3a1,
+            progress: None,
+            ..spike.clone()
+        };
+        assert!(
+            painted_bar_title_color(&persist, canvas).l < 0.2,
+            "Week/Day Persist cart must not paint white on green"
+        );
+        assert!(
+            painted_bar_title_color(&spike, canvas).l < 0.2,
+            "Week/Day Unparented spike must not paint white on orange"
+        );
+        let cart_ui = BarLayout {
+            open_ended: true,
+            progress: None,
+            ..spike
+        };
+        assert!(
+            painted_bar_title_color(&cart_ui, canvas).l < 0.2,
+            "an open-ended orange wash must keep dark ink"
+        );
     }
 
     #[test]
