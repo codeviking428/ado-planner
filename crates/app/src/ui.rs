@@ -179,6 +179,9 @@ pub struct PlannerView {
     schedule_live_x: Option<f32>,
     /// Nested hover count so moving onto Undo does not unpause expiry.
     toast_hover_depth: u32,
+    /// Hover-pause only after the pointer moves, so a toast that appears
+    /// under the cursor (bottom of a resize) still auto-dismisses.
+    toast_pause_ready: bool,
     /// Pointer is down on a toast; skip Gantt mouse-up commit for this click.
     toast_pointer: bool,
     /// Toast Undo clicked while spawn_state is busy; replay when I/O frees.
@@ -446,6 +449,7 @@ impl PlannerView {
             bar_press_shift: false,
             schedule_live_x: None,
             toast_hover_depth: 0,
+            toast_pause_ready: false,
             toast_pointer: false,
             pending_toast_undo: None,
             toast_undo_inflight: false,
@@ -1808,7 +1812,7 @@ impl PlannerView {
         if self.state.toasts.items.is_empty() {
             self.toast_hover_depth = 0;
         }
-        self.state.toasts.paused = self.toast_hover_depth > 0;
+        self.state.toasts.paused = self.toast_hover_depth > 0 && self.toast_pause_ready;
         cx.notify();
     }
 
@@ -1818,6 +1822,14 @@ impl PlannerView {
         } else {
             self.toast_hover_depth = self.toast_hover_depth.min(1);
         }
+        self.state.toasts.paused = self.toast_hover_depth > 0 && self.toast_pause_ready;
+    }
+
+    fn arm_toast_pause_from_pointer(&mut self) {
+        if self.toast_pause_ready {
+            return;
+        }
+        self.toast_pause_ready = true;
         self.state.toasts.paused = self.toast_hover_depth > 0;
     }
 
@@ -4385,16 +4397,16 @@ impl PlannerView {
                             .map(|arrow| self.render_dependency_arrow(&arrow, cx))
                     })
                     .children(bars.iter().filter_map(|bar| {
-                        self.render_gantt_bar_label(bar, dragging, muted_fg, cx)
+                        self.render_open_ended_cue(bar, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
                         self.render_gantt_link_handles(bar, dragging, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
-                        self.render_open_ended_cue(bar, cx)
+                        self.render_parent_overflow_badge(bar, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
-                        self.render_parent_overflow_badge(bar, cx)
+                        self.render_gantt_bar_label(bar, dragging, muted_fg, cx)
                     }))
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
@@ -4889,7 +4901,7 @@ impl PlannerView {
                             .truncate()
                             .text_xs()
                             .text_color(inner_label_fg)
-                            .child(bar.title.clone()),
+                            .child(bar_title_chip(bar.title.clone(), inner_label_fg)),
                     )
                 })
                 .children(self.bar_inner_resize_grips(bar, dragging, cx))
@@ -5397,13 +5409,16 @@ impl PlannerView {
         timeline_w: f32,
         show_link_handles: bool,
         today_x: Option<f32>,
+        overflow_badge: bool,
     ) -> Option<(f32, f32)> {
         if Self::bar_title_fits_inside(bar) {
             return None;
         }
         let title_width = bar.title.chars().count() as f32 * 8.0 + 16.0;
-        let label_gap = if show_link_handles {
-            HANDLE_WIDTH + LINK_HANDLE_HIT + 16.0
+        let label_gap = if overflow_badge {
+            LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0
+        } else if show_link_handles {
+            LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
         } else {
             10.0
         };
@@ -5524,8 +5539,9 @@ impl PlannerView {
             self.state.gantt.scale,
             GanttScale::Quarter | GanttScale::Year
         );
+        let overflow = parent_date_overflow(&self.state.nodes, id);
         let (label_x, max_w) =
-            Self::bar_external_label_frame(bar, timeline_w, true, Some(today_x))?;
+            Self::bar_external_label_frame(bar, timeline_w, true, Some(today_x), overflow)?;
         if cramped && max_w < 56.0 {
             return None;
         }
@@ -5545,10 +5561,8 @@ impl PlannerView {
                 .truncate()
                 .text_xs()
                 .text_color(muted_fg)
-                .px_1()
-                .bg(cx.theme().background)
                 .when(!dragging, |el| el.occlude())
-                .child(label)
+                .child(bar_title_chip(label, muted_fg))
                 .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                     this.apply_scroll(event, cx);
                 }))
@@ -7869,6 +7883,7 @@ impl PlannerView {
     }
 
     pub fn simulate_toast_hover_for_test(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.toast_pause_ready = true;
         self.set_toast_hover(hovered, cx);
     }
 
@@ -8128,6 +8143,9 @@ impl PlannerView {
     }
 
     fn note_toasts_changed(&mut self, cx: &mut Context<Self>) {
+        self.toast_pause_ready = false;
+        self.toast_hover_depth = 0;
+        self.state.toasts.paused = false;
         self.clamp_toast_hover();
         self.toast_expiry_gen += 1;
         self.toast_expiry_armed = false;
@@ -8135,15 +8153,7 @@ impl PlannerView {
     }
 
     fn schedule_toast_expiry(&mut self, cx: &mut Context<Self>) {
-        if self.toast_expiry_armed
-            || self.state.toasts.items.is_empty()
-            || self
-                .state
-                .toasts
-                .items
-                .iter()
-                .all(|toast| toast.kind == ToastKind::Error)
-        {
+        if self.toast_expiry_armed || self.state.toasts.items.is_empty() {
             return;
         }
         self.toast_expiry_armed = true;
@@ -8532,6 +8542,22 @@ enum TypedDateRange {
     Invalid,
 }
 
+fn bar_title_chip(title: String, ink: gpui_kit::Hsla) -> gpui_kit::Div {
+    let chip = if ink.l > 0.5 {
+        gpui_kit::hsla(0., 0., 0., 0.5)
+    } else {
+        gpui_kit::hsla(0., 0., 1., 0.78)
+    };
+    div()
+        .debug_selector(|| "gantt-bar-title-chip".into())
+        .px_1()
+        .rounded_sm()
+        .bg(chip)
+        .text_color(ink)
+        .truncate()
+        .child(title)
+}
+
 fn srgb_luminance(r: f32, g: f32, b: f32) -> f32 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
@@ -8738,6 +8764,9 @@ impl Render for PlannerView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_mouse_move(cx.listener(|this, _, _, _| {
+                this.arm_toast_pause_from_pointer();
+            }))
             .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                 if this.toast_pointer {
                     this.toast_pointer = false;
@@ -8974,7 +9003,7 @@ mod bar_label_tests {
             open_ended: false,
         };
         assert!(
-            PlannerView::bar_external_label_frame(&bar, 800.0, false, None).is_none(),
+            PlannerView::bar_external_label_frame(&bar, 800.0, false, None, false).is_none(),
             "an off-screen Today diamond must not float a title at the right edge"
         );
     }
@@ -9001,7 +9030,7 @@ mod bar_label_tests {
             !PlannerView::bar_title_fits_inside(&bar),
             "a title wider than the visible fragment must sit outside instead of clipping"
         );
-        let (label_x, _) = PlannerView::bar_external_label_frame(&bar, 800.0, false, None)
+        let (label_x, _) = PlannerView::bar_external_label_frame(&bar, 800.0, false, None, false)
             .expect("the title must have an outside frame");
         assert!(
             label_x >= 0.0 && label_x >= bar.x + bar.width - 1.0,
@@ -9078,7 +9107,7 @@ mod bar_label_tests {
             "a title wider than the bar must paint outside instead of truncating"
         );
         assert!(
-            PlannerView::bar_external_label_frame(&bar, 800.0, false, None).is_some(),
+            PlannerView::bar_external_label_frame(&bar, 800.0, false, None, false).is_some(),
             "the outside label must have a frame on the timeline"
         );
     }
@@ -9105,7 +9134,7 @@ mod bar_label_tests {
         };
         let today_x = 184.0;
         let (label_x, max_w) =
-            PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x))
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
                 .expect("Cart is too short for an inside title on Year");
         assert!(
             label_x + max_w <= today_x - 4.0 || label_x >= today_x + 4.0,
@@ -9140,7 +9169,7 @@ mod bar_label_tests {
             !PlannerView::bar_title_fits_inside(&bar),
             "precondition: #1014 title is wider than the bar"
         );
-        let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, None);
+        let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false);
         if let Some((label_x, max_w)) = frame {
             assert!(
                 label_x >= bar.x + bar.width - 1.0,
@@ -9153,6 +9182,48 @@ mod bar_label_tests {
                 "an outside label must stay readable, not clip to a letter, max_w={max_w}"
             );
         }
+    }
+
+    #[test]
+    fn overflow_badge_shifts_the_outside_title() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 200.0,
+            width: 40.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0xa6e3a1,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        assert!(
+            !PlannerView::bar_title_fits_inside(&bar),
+            "precondition: Persist cart title is wider than the bar"
+        );
+        let (plain_x, _) = PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
+            .expect("outside title");
+        let (badge_x, _) = PlannerView::bar_external_label_frame(&bar, 800.0, true, None, true)
+            .expect("outside title next to !");
+        let badge_right = bar.x
+            + bar.width
+            + LINK_HANDLE_GAP
+            + LINK_HANDLE_HIT
+            + OVERFLOW_BADGE_GAP
+            + OVERFLOW_BADGE;
+        assert!(
+            badge_x >= badge_right - 0.5,
+            "the title must start past the !, label_x={badge_x} badge_right={badge_right}"
+        );
+        assert!(
+            badge_x >= plain_x + OVERFLOW_BADGE - 0.5,
+            "showing the ! must shift the title right, plain={plain_x} with_badge={badge_x}"
+        );
     }
 
     #[test]
@@ -9292,7 +9363,7 @@ mod bar_label_tests {
             "a Day-view start-only Cart UI bar is wide enough for an inside title"
         );
         assert!(
-            PlannerView::bar_external_label_frame(&bar, 800.0, true, None).is_none(),
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false).is_none(),
             "must not float a fragment at the viewport edge when the title fits inside"
         );
         let at_clip = BarLayout {
@@ -9300,7 +9371,7 @@ mod bar_label_tests {
             width: 48.0,
             ..bar
         };
-        let frame = PlannerView::bar_external_label_frame(&at_clip, 800.0, true, None);
+        let frame = PlannerView::bar_external_label_frame(&at_clip, 800.0, true, None, false);
         if let Some((label_x, max_w)) = frame {
             assert!(
                 max_w >= 40.0,

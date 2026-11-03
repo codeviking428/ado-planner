@@ -255,6 +255,15 @@ impl Toasts {
         let _ = self.take(id);
     }
 
+    fn ttl(toast: &Toast) -> Duration {
+        match toast.kind {
+            ToastKind::Error => ERROR_TTL,
+            ToastKind::Warning => WARNING_TTL,
+            ToastKind::Success if toast.undo.is_some() || toast.redo.is_some() => UNDO_TTL,
+            ToastKind::Success => SUCCESS_TTL,
+        }
+    }
+
     pub fn expire(&mut self) {
         if self.items.is_empty() {
             self.paused = false;
@@ -264,18 +273,8 @@ impl Toasts {
             return;
         }
         let now = Instant::now();
-        self.items.retain(|toast| match toast.kind {
-            ToastKind::Error => now.saturating_duration_since(toast.created_at) < ERROR_TTL,
-            ToastKind::Success => {
-                let ttl = if toast.undo.is_some() || toast.redo.is_some() {
-                    UNDO_TTL
-                } else {
-                    SUCCESS_TTL
-                };
-                now.saturating_duration_since(toast.created_at) < ttl
-            }
-            ToastKind::Warning => now.saturating_duration_since(toast.created_at) < WARNING_TTL,
-        });
+        self.items
+            .retain(|toast| now.saturating_duration_since(toast.created_at) < Self::ttl(toast));
         self.cap();
     }
 
@@ -487,6 +486,53 @@ mod tests {
         assert_eq!(toasts.items[0].message, "Moved B");
         assert!(toasts.items[0].undo.is_some());
         assert!(toasts.items[0].redo.is_none());
+    }
+
+    fn assert_expires(name: &str, mut toasts: Toasts, ttl: Duration) {
+        toasts.items[0].created_at = Instant::now() - (ttl - Duration::from_millis(200));
+        toasts.expire();
+        assert_eq!(
+            toasts.items.len(),
+            1,
+            "{name} must still show just before TTL"
+        );
+        toasts.items[0].created_at = Instant::now() - ttl;
+        toasts.expire();
+        assert!(
+            toasts.items.is_empty(),
+            "{name} must auto-dismiss at {ttl:?}"
+        );
+    }
+
+    #[test]
+    fn every_toast_kind_expires_at_its_ttl() {
+        let mut success = Toasts::default();
+        success.push(ToastKind::Success, "Saved");
+        assert_expires("success", success, SUCCESS_TTL);
+
+        let mut warning = Toasts::default();
+        warning.push(ToastKind::Warning, "Nudge");
+        assert_expires("warning", warning, WARNING_TTL);
+
+        let mut error = Toasts::default();
+        error.push(ToastKind::Error, "rev mismatch");
+        assert_expires("error", error, ERROR_TTL);
+
+        let mut undo = Toasts::default();
+        undo.push_undo(
+            "Moved Persist cart",
+            UndoAction::RestoreDates {
+                id: 1,
+                start_date: None,
+                target_date: None,
+                rev: 1,
+            },
+        );
+        assert_expires("undo", undo, UNDO_TTL);
+
+        let mut redo = Toasts::default();
+        redo.push_stack("Undone", None, Some(UndoAction::StackRedo));
+        assert_expires("redo", redo, UNDO_TTL);
     }
 
     #[test]

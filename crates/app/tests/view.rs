@@ -197,6 +197,10 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
         "at least one Gantt bar should be painted"
     );
     assert!(
+        cx.debug_bounds("gantt-bar-title-chip").is_some(),
+        "bar titles must sit on a contrast chip so mid-tone fills stay readable"
+    );
+    assert!(
         cx.debug_bounds("unscheduled-empty-hint").is_none(),
         "a scheduled backlog must not show the empty-timeline hint"
     );
@@ -1218,8 +1222,8 @@ fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext)
     let spike_x = f32::from(spike.origin.x) + f32::from(spike.size.width) / 2.0;
     let dx = (persist_x - spike_x).abs();
     assert!(
-        dx >= 6.0,
-        "rendered Persist cart → Go-live inv at {persist_x} must sit ≥6px from Cart UI → spike at {spike_x} (dx={dx})"
+        dx >= 8.0,
+        "rendered Persist cart → Go-live inv at {persist_x} must sit ≥8px from Cart UI → spike at {spike_x} (dx={dx})"
     );
 }
 
@@ -4012,6 +4016,42 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
             gesture.kind
         );
     });
+}
+
+#[gpui_kit::test]
+fn overflow_badge_does_not_cover_the_outside_title(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 1) {
+        node.target_date = Some("2026-07-10T00:00:00Z".into());
+    }
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.title = "Persist cart".into();
+        node.start_date = Some("2026-08-04T00:00:00Z".into());
+        node.target_date = Some("2026-08-21T00:00:00Z".into());
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let badge = cx
+        .debug_bounds("gantt-parent-overflow")
+        .expect("overflow !");
+    let label = cx
+        .debug_bounds("gantt-bar-label-2")
+        .expect("Persist cart outside title");
+    let badge_right = f32::from(badge.origin.x) + f32::from(badge.size.width);
+    let label_left = f32::from(label.origin.x);
+    assert!(
+        label_left >= badge_right - 1.0,
+        "the Persist cart title must sit past the !, label_left={label_left} badge_right={badge_right}"
+    );
 }
 
 #[gpui_kit::test]

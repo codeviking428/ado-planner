@@ -36,6 +36,9 @@ pub const LINK_HANDLE_HIT: f32 = 16.0;
 pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// Parallel dependency lanes stay at least this far apart (stroke is 2px).
 pub const PARALLEL_LANE_MIN: f32 = 10.0;
+/// Inbound/wrap verticals. 16px centre-to-centre so the 2px stroke still
+/// reads as ≥8px after clip and antialiasing (live measure was 4–7px).
+pub const PARALLEL_VERT_MIN: f32 = 16.0;
 /// Parent-overflow `!` on the bar. The circle is larger than the glyph so a
 /// 20px font still reads as a true 14px bang instead of a 10px mark.
 pub const OVERFLOW_BADGE: f32 = 22.0;
@@ -2455,10 +2458,10 @@ fn separate_parallel_verticals(arrows: &mut [DependencyArrow], clip_left: f32, c
                 for (ki, xi) in verts_i {
                     for (kj, xj) in verts_j {
                         let dx = xj - xi;
-                        if dx.abs() >= PARALLEL_LANE_MIN {
+                        if dx.abs() >= PARALLEL_VERT_MIN {
                             continue;
                         }
-                        let push = (PARALLEL_LANE_MIN - dx.abs()).max(1.0);
+                        let push = (PARALLEL_VERT_MIN - dx.abs()).max(1.0);
                         let (right, right_k, left, left_k) = if xj >= xi {
                             (j, kj, i, ki)
                         } else {
@@ -2478,8 +2481,8 @@ fn separate_parallel_verticals(arrows: &mut [DependencyArrow], clip_left: f32, c
                     }
                     if let Some(frozen) = frozen_j {
                         let dx = frozen - xi;
-                        if dx.abs() < PARALLEL_LANE_MIN {
-                            let push = (PARALLEL_LANE_MIN - dx.abs()).max(1.0);
+                        if dx.abs() < PARALLEL_VERT_MIN {
+                            let push = (PARALLEL_VERT_MIN - dx.abs()).max(1.0);
                             let delta = if xi >= frozen { push } else { -push };
                             if shift_vertical(&mut arrows[i], ki, delta, clip_left, clip_right) {
                                 moved = true;
@@ -2490,8 +2493,8 @@ fn separate_parallel_verticals(arrows: &mut [DependencyArrow], clip_left: f32, c
                 if let Some(frozen) = frozen_i {
                     for (kj, xj) in verts_j {
                         let dx = xj - frozen;
-                        if dx.abs() < PARALLEL_LANE_MIN {
-                            let push = (PARALLEL_LANE_MIN - dx.abs()).max(1.0);
+                        if dx.abs() < PARALLEL_VERT_MIN {
+                            let push = (PARALLEL_VERT_MIN - dx.abs()).max(1.0);
                             let delta = if xj >= frozen { push } else { -push };
                             if shift_vertical(&mut arrows[j], kj, delta, clip_left, clip_right) {
                                 moved = true;
@@ -5034,7 +5037,7 @@ mod tests {
         separate_parallel_verticals(&mut arrows, 0.0, 800.0);
         let dx = overlapping_vertical_gap(&arrows[0], &arrows[1]).expect("Y-overlapping verticals");
         assert!(
-            dx >= PARALLEL_LANE_MIN,
+            dx >= PARALLEL_VERT_MIN,
             "1px-stacked inbound verticals must separate, dx={dx} x2={},{}",
             arrows[0].x2,
             arrows[1].x2
@@ -5183,8 +5186,8 @@ mod tests {
             .fold(f32::MAX, f32::min)
         });
         assert!(
-            dx >= 6.0,
-            "{:?}: Persist cart → Go-live vertical must sit ≥6px from Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={} lanes={},{}",
+            dx >= 8.0,
+            "{:?}: Persist cart → Go-live vertical must sit ≥8px from Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={} lanes={},{}",
             scale,
             persist_live.x1,
             persist_live.x2,
@@ -5196,7 +5199,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_fixture_parallel_verticals_are_at_least_six_apart() {
+    fn mock_fixture_parallel_verticals_are_at_least_eight_apart() {
         for width in [512.0, 800.0, 1200.0] {
             assert_mock_fixture_parallel_verticals(GanttScale::Month, width);
             assert_mock_fixture_parallel_verticals(GanttScale::Week, width);
@@ -5255,8 +5258,8 @@ mod tests {
             .fold(f32::MAX, f32::min)
         });
         assert!(
-            dx >= 6.0,
-            "a newly created Persist cart → Go-live must sit ≥6px off Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={}",
+            dx >= 8.0,
+            "a newly created Persist cart → Go-live must sit ≥8px off Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={}",
             persist_live.x1,
             persist_live.x2,
             cart_spike.x1,
