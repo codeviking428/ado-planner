@@ -5181,14 +5181,34 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
             view.state.gantt.gesture.is_none(),
             "mouse-up must end the resize gesture"
         );
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip,
+            Some(2),
+            "drop must pin the bar tooltip"
+        );
     });
     assert!(
         cx.debug_bounds("gantt-drag-preview").is_none(),
         "the preview chip must clear when the resize ends, without waiting for another mouse-move"
     );
+    let tip = cx.debug_bounds("gantt-bar-tooltip");
     assert!(
-        cx.debug_bounds("gantt-bar-tooltip").is_some(),
-        "the bar tooltip must appear after a drop without waiting for another mouse-move"
+        tip.is_some(),
+        "the bar tooltip must appear after a drop without waiting for another mouse-move, bounds={tip:?}"
+    );
+    let bar_after = cx.debug_bounds("gantt-bar-2").expect("resized bar");
+    let tip = cx
+        .debug_bounds("gantt-bar-tooltip")
+        .expect("pinned tooltip");
+    assert!(
+        f32::from(tip.origin.y) + f32::from(tip.size.height) <= f32::from(bar_after.origin.y) + 2.0,
+        "the pinned tooltip must sit above the bar, not over the right label, tip={tip:?} bar={bar_after:?}"
+    );
+    cx.simulate_mouse_move(point(px(8.), px(8.)), None, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-tooltip").is_none(),
+        "leaving the bar must clear the pinned tooltip"
     );
 }
 

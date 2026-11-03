@@ -2850,7 +2850,8 @@ impl PlannerState {
                         } if *sid == *successor_id && *pid == *predecessor_id
                     )
                 }) {
-                    self.history.undo.remove(index);
+                    let entry = self.history.undo.remove(index);
+                    self.history.redo.push(entry);
                 }
             }
             UndoAction::DeleteCreated { id, .. } => {
@@ -4317,6 +4318,62 @@ mod toast_copy_tests {
         assert_eq!(
             undone_message("Renamed \"Cart\" to \"Basket\""),
             "Undone renamed \"Cart\" to \"Basket\""
+        );
+    }
+
+    #[test]
+    fn toast_undo_of_a_link_moves_the_entry_to_redo() {
+        use crate::toasts::{HistoryEntry, UndoAction};
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-link-redo")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        state.history.push(HistoryEntry::Link {
+            successor_id: 2,
+            predecessor_id: 1,
+            linked: true,
+        });
+        let working = state.clone();
+        state.merge_undo_action(
+            &working,
+            &UndoAction::RemoveLink {
+                successor_id: 2,
+                predecessor_id: 1,
+            },
+        );
+        assert!(
+            state.history.undo.is_empty(),
+            "toast Undo must consume the link entry"
+        );
+        assert!(
+            matches!(
+                state.history.redo.last(),
+                Some(HistoryEntry::Link {
+                    successor_id: 2,
+                    predecessor_id: 1,
+                    linked: true
+                })
+            ),
+            "undoing a link must leave Redo, got {:?}",
+            state.history.redo.last()
+        );
+        state.push_stack_toast("Undone added link: \"A\" → \"B\"", true);
+        let toast = state.toasts.items.last().expect("undone link toast");
+        assert!(
+            matches!(toast.redo, Some(UndoAction::StackRedo)),
+            "the undone link toast must offer Redo, got {:?}",
+            toast.redo
+        );
+        assert!(
+            toast.undo.is_none(),
+            "the undone link toast must not also keep Undo, got {:?}",
+            toast.undo
         );
     }
 

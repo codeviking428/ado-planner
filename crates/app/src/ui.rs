@@ -1224,11 +1224,18 @@ impl PlannerView {
     fn set_bar_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
         // After a drop the bar remounts and GPUI fires hover-leave. Keep a
         // pinned tooltip; do not treat that remount as the pointer leaving.
-        if id.is_none() && self.state.gantt.hover_locked {
-            return;
-        }
         if id.is_none() {
+            if self.state.gantt.pin_bar_tooltip.is_some()
+                && (self.state.gantt.hover_locked || self.state.gantt.pin_ignore_leave)
+            {
+                return;
+            }
             self.state.gantt.pin_bar_tooltip = None;
+            if self.state.gantt.hover_locked {
+                self.state.gantt.hover_locked = false;
+                cx.notify();
+                return;
+            }
         }
         if self.state.gantt.bar_hovered_id != id {
             self.state.gantt.bar_hovered_id = id;
@@ -4895,35 +4902,6 @@ impl PlannerView {
                             .child(bar.title.clone()),
                     )
                 })
-                .when(overflow, |el| {
-                    let overflow_tip = overflow_tip.clone();
-                    let warn = cx.theme().warning;
-                    // Sit just left of the 8px end grip so the badge cannot
-                    // swallow right-edge resize. Grips are later children
-                    // with occlude, so they still win any leftover overlap.
-                    el.child(
-                        div()
-                            .id(("gantt-overflow", id as u64))
-                            .debug_selector(|| "gantt-parent-overflow".into())
-                            .absolute()
-                            .right(px(grip_w))
-                            .top(px(((bar_h - 16.0) / 2.0).max(0.0)))
-                            .size(px(16.))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(warn)
-                            .text_color(cx.theme().background)
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .occlude()
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(overflow_tip.clone()).build(window, cx)
-                            })
-                            .child("!"),
-                    )
-                })
                 .children(self.bar_inner_resize_grips(bar, dragging, cx))
                 .children(self.bar_summary_edge_affordances(bar, dragging, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -5019,6 +4997,39 @@ impl PlannerView {
                 )
                 .into_any_element(),
         ];
+        if overflow {
+            let painted_w = if milestone || marker {
+                MILESTONE_SIZE
+            } else {
+                bar.width.max(8.0)
+            };
+            const BADGE: f32 = 16.0;
+            let overflow_tip = overflow_tip.clone();
+            let warn = cx.theme().warning;
+            // Outside the bar's overflow clip so Month slivers still show a
+            // 16px badge, and left of the end grip so resize keeps the edge.
+            items.push(
+                div()
+                    .id(("gantt-overflow", id as u64))
+                    .debug_selector(|| "gantt-parent-overflow".into())
+                    .absolute()
+                    .left(px((bar.x + painted_w - grip_w - BADGE).max(bar.x)))
+                    .top(px(bar_top - 4.0))
+                    .size(px(BADGE))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(warn)
+                    .text_color(cx.theme().background)
+                    .text_sm()
+                    .font_weight(gpui_kit::FontWeight::BOLD)
+                    .occlude()
+                    .tooltip(move |window, cx| Tooltip::new(overflow_tip.clone()).build(window, cx))
+                    .child("!")
+                    .into_any_element(),
+            );
+        }
         if self.state.gantt.pin_bar_tooltip == Some(id) && !dragging && !self.details_overlay() {
             let tip = bar_hover_tooltip(bar, &self.state.nodes);
             items.push(
@@ -5027,7 +5038,7 @@ impl PlannerView {
                     .debug_selector(|| "gantt-bar-tooltip".into())
                     .absolute()
                     .left(px(bar.x))
-                    .top(px((bar_top - 28.0).max(0.0)))
+                    .top(px(bar_top - 36.0))
                     .px_2()
                     .py_1()
                     .rounded_md()
@@ -5036,7 +5047,6 @@ impl PlannerView {
                     .text_xs()
                     .border_1()
                     .border_color(cx.theme().border)
-                    .occlude()
                     .child(tip)
                     .into_any_element(),
             );
@@ -7163,6 +7173,26 @@ impl PlannerView {
         self.timeline_local_x(window_x)
     }
 
+    fn clear_pinned_tooltip_if_pointer_left(
+        &mut self,
+        window_x: f32,
+        _window_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.state.gantt.pin_bar_tooltip else {
+            return;
+        };
+        let Some(painted) = self.painted_bar_bounds.borrow().get(&id).copied() else {
+            return;
+        };
+        if window_x >= painted.left && window_x <= painted.right {
+            return;
+        }
+        self.state.gantt.pin_bar_tooltip = None;
+        self.state.gantt.pin_ignore_leave = false;
+        cx.notify();
+    }
+
     fn classify_bar_hit(
         &mut self,
         id: i64,
@@ -7342,6 +7372,7 @@ impl PlannerView {
             // without waiting for a new mouse-enter, but keep hover cleared
             // so row highlight and link handles do not stick after a drop.
             self.state.gantt.pin_bar_tooltip = Some(pending.id);
+            self.state.gantt.pin_ignore_leave = true;
             self.enqueue_date_save(cx, pending);
         }
         self.request_repaint(Some(window), cx);
@@ -8694,6 +8725,7 @@ impl Render for PlannerView {
                 }
                 let x: f32 = event.position.x.into();
                 let y: f32 = event.position.y.into();
+                this.clear_pinned_tooltip_if_pointer_left(x, y, cx);
                 if let Some((origin_x, origin_w)) = this.state.gantt.splitter_drag {
                     this.state.gantt.set_tree_width_for_pane(
                         origin_w + x - origin_x,

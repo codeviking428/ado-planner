@@ -622,6 +622,9 @@ pub struct GanttView {
     /// After a date drop, keep that bar's tooltip mounted without waiting for
     /// a new mouse-enter. Cleared when hover leaves the bar.
     pub pin_bar_tooltip: Option<i64>,
+    /// Skip the remount hover-leave that fires right after a date drop so the
+    /// pinned tooltip is not cleared while the pointer is still on the bar.
+    pub pin_ignore_leave: bool,
     pub collapsed: HashSet<i64>,
     pub gesture: Option<Gesture>,
     pub pending_nudge: Option<PendingNudge>,
@@ -669,6 +672,7 @@ impl Default for GanttView {
             selected_link: None,
             hovered_link: None,
             pin_bar_tooltip: None,
+            pin_ignore_leave: false,
             collapsed: HashSet::new(),
             gesture: None,
             pending_nudge: None,
@@ -888,7 +892,9 @@ impl GanttView {
         self.hovered_id = None;
         self.bar_hovered_id = None;
         self.hovered_link = None;
-        self.pin_bar_tooltip = None;
+        if !self.pin_ignore_leave {
+            self.pin_bar_tooltip = None;
+        }
     }
 
     pub fn pointer_in_canvas(&self, x: f32, y: f32) -> bool {
