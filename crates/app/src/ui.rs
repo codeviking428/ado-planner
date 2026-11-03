@@ -4428,17 +4428,6 @@ impl PlannerView {
                                 })
                             }),
                     )
-                    .child(
-                        div()
-                            .id("gantt-today")
-                            .debug_selector(|| "gantt-today".into())
-                            .absolute()
-                            .left(px(today_x))
-                            .top_0()
-                            .bottom_0()
-                            .w(px(3.))
-                            .bg(today_color),
-                    )
                     .children({
                         let arrows = self.state.gantt.layout_dependency_arrows(bars);
                         arrows
@@ -4620,6 +4609,17 @@ impl PlannerView {
                             })
                             .collect::<Vec<_>>()
                     }),
+            )
+            .child(
+                div()
+                    .id("gantt-today")
+                    .debug_selector(|| "gantt-today".into())
+                    .absolute()
+                    .left(px(today_x))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(3.))
+                    .bg(today_color),
             )
             .when(today_on_screen, |el| {
                 el.child(
@@ -9753,9 +9753,16 @@ mod bar_label_tests {
             "must keep the full title, not Pers…, max_w={max_w} estimated={estimated}"
         );
         assert!(
-            (x - right_x).abs() < 0.5 || x + max_w <= bar.x + 0.1,
-            "full title sits beside the bar, x={x} right_x={right_x} bar.x={}",
+            (x - right_x).abs() < 0.5
+                || x + max_w <= bar.x + 0.1
+                || x >= today_x + 8.0
+                || x + max_w <= today_x - 8.0,
+            "full title sits beside the bar or just off Today, x={x} right_x={right_x} today={today_x} bar.x={}",
             bar.x
+        );
+        assert!(
+            x + max_w <= today_x - 8.0 || x >= today_x + 8.0,
+            "Today-tight Persist cart must miss the line, label={x}+{max_w} today={today_x}"
         );
     }
 
@@ -9792,9 +9799,18 @@ mod bar_label_tests {
             "must keep the full Go-live title, not Go-l…, max_w={max_w} estimated={estimated}"
         );
         assert!(
-            (x - right_x).abs() < 0.5 || x + max_w <= bar.x + 0.1,
-            "full title sits beside the diamond, x={x} right_x={right_x} bar.x={}",
+            (x - right_x).abs() < 0.5 || x + max_w <= bar.x + 0.1 || x >= today_x + 8.0,
+            "full title sits beside the diamond or just right of Today, x={x} right_x={right_x} today={today_x} bar.x={}",
             bar.x
+        );
+        assert!(
+            x + max_w <= today_x - 8.0 || x >= today_x + 8.0,
+            "Today-tight Go-live must miss the line, label={x}+{max_w} today={today_x}"
+        );
+        assert!(
+            x + 1.0 >= bar.x + MILESTONE_SIZE,
+            "Go-live must stay on the right of the diamond, x={x} diamond={}",
+            bar.x + MILESTONE_SIZE
         );
     }
 

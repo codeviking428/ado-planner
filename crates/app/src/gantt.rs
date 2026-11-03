@@ -94,6 +94,9 @@ pub const ASSIGNEE_COL_WIDTH: f32 = 88.0;
 pub const EXPANDER_SLOT: f32 = 18.0;
 pub const TODAY_PILL_W: f32 = 44.0;
 pub const TODAY_PILL_GAP: f32 = 6.0;
+/// Keep outside-title chips off the Today line (line is 3px wide).
+/// 11px from the line's left edge is 8px past its right edge.
+const TODAY_LABEL_CLEARANCE: f32 = 11.0;
 /// Keep year/month majors off the Today pill; Year "2027" must not crowd it.
 const HEADER_TODAY_LABEL_GAP: f32 = 72.0;
 
@@ -2454,26 +2457,27 @@ impl GanttView {
     }
 }
 
-/// Horizontal run in the padding below (or above) the predecessor bar so
-/// a 2px stroke stays in that row gap instead of riding the next row
-/// (Persist cart → Go-live along Cart UI) or through an open-ended cue
-/// (Cart UI → spike). When the source title sits outside the bar, keep the
-/// run off that chip (live measure was ~3px under "Persist cart").
+/// Gap below the source bar/chip and above the next row, so a 2px stroke
+/// can sit in the middle instead of 3px above Cart UI (the next row).
+fn source_row_gap(pred: &BarLayout) -> (f32, f32) {
+    let bar_bottom = pred.y + pred.paint_top() + pred.paint_h();
+    let content_bottom = if bar_title_is_inside(pred) || bar_is_gutter(pred) {
+        bar_bottom
+    } else {
+        let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
+        bar_bottom.max(label_top + OUTSIDE_LABEL_H)
+    };
+    (content_bottom, pred.y + ROW_HEIGHT)
+}
+
 fn arrow_lane_y(pred: &BarLayout, succ: &BarLayout) -> f32 {
     const STROKE: f32 = 2.0;
     const CLEAR: f32 = 6.0;
     if succ.y > pred.y {
-        let bar_clear = pred.y + pred.paint_top() + pred.paint_h() + CLEAR;
-        let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
-        if !bar_title_is_inside(pred) {
-            let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-            // Stay in the source row (12px is exactly ROW_HEIGHT / Cart UI)
-            // and keep ≥6px below the outside chip.
-            let label_clear = label_top + OUTSIDE_LABEL_H + CLEAR;
-            bar_clear.max(label_clear).min(in_row)
-        } else {
-            bar_clear.min(in_row)
-        }
+        let (gap_top, gap_bottom) = source_row_gap(pred);
+        let min_lane = (gap_top + CLEAR).min(gap_bottom - STROKE - 1.0);
+        let max_lane = (gap_bottom - STROKE - 1.0).max(min_lane);
+        (min_lane + max_lane) / 2.0
     } else {
         let above_bar = pred.y + pred.paint_top() - STROKE;
         above_bar.max(pred.y + STROKE)
@@ -2925,10 +2929,10 @@ fn clamp_lanes_off_source_titles(arrows: &mut [DependencyArrow], bars: &[BarLayo
         if arrow.y2 <= arrow.y1 {
             continue;
         }
-        let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-        let min_lane = label_top + OUTSIDE_LABEL_H + CLEAR;
-        let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
-        arrow.lane_y = arrow.lane_y.max(min_lane).min(in_row);
+        let (gap_top, gap_bottom) = source_row_gap(pred);
+        let min_lane = (gap_top + CLEAR).min(gap_bottom - STROKE - 1.0);
+        let max_lane = (gap_bottom - STROKE - 1.0).max(min_lane);
+        arrow.lane_y = ((min_lane + max_lane) / 2.0).clamp(min_lane, max_lane);
     }
     let mut by_from: HashMap<i64, Vec<usize>> = HashMap::new();
     for (index, arrow) in arrows.iter().enumerate() {
@@ -2946,10 +2950,10 @@ fn clamp_lanes_off_source_titles(arrows: &mut [DependencyArrow], bars: &[BarLayo
         }
         indexes.sort_by_key(|&index| arrows[index].to_id);
         let pred = by_id[&arrows[indexes[0]].from_id];
-        let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-        let min_lane = label_top + OUTSIDE_LABEL_H + CLEAR;
-        let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
-        let span = in_row - min_lane;
+        let (gap_top, gap_bottom) = source_row_gap(pred);
+        let min_lane = (gap_top + CLEAR).min(gap_bottom - STROKE - 1.0);
+        let max_lane = (gap_bottom - STROKE - 1.0).max(min_lane);
+        let span = max_lane - min_lane;
         if span < 2.0 {
             continue;
         }
@@ -3182,7 +3186,7 @@ fn full_outside_title_fits(
     }
     if let Some(today) = today_x
         && label_x < today
-        && label_x + estimated > today - 8.0
+        && label_x + estimated > today - TODAY_LABEL_CLEARANCE
     {
         return false;
     }
@@ -3192,8 +3196,8 @@ fn full_outside_title_fits(
 /// Overlay frame for a title that does not fit inside the bar. Always the
 /// full glyph width — never a 40px "Pers…" clip. Prefer the right of the
 /// bar; flip left when the full title cannot sit on the right (clip or
-/// Today) if the left side can hold it; last resort keeps the full title
-/// on the right even if it crosses Today.
+/// Today) if the left side can hold it; otherwise park just beside Today
+/// rather than painting through the line.
 pub fn bar_outside_label_frame(
     bar: &BarLayout,
     timeline_w: f32,
@@ -3227,8 +3231,9 @@ pub fn bar_outside_label_frame(
     if full_outside_title_fits(right_x, estimated, timeline_w, today_x) {
         return Some((right_x, estimated));
     }
-    let today_blocks_right =
-        today_x.is_some_and(|today| right_x < today && right_x + estimated > today - 8.0);
+    let today_blocks_right = today_x.is_some_and(|today| {
+        right_x < today && right_x + estimated > today - TODAY_LABEL_CLEARANCE
+    });
     // Milestones stay on the right of the diamond across Week/Month/Quarter
     // even when the full title clips at the timeline edge. Flip left only
     // when Today blocks the right side, or the title would not even start
@@ -3241,17 +3246,17 @@ pub fn bar_outside_label_frame(
     if full_outside_title_fits(left_x, estimated, timeline_w, today_x) {
         return Some((left_x, estimated));
     }
-    // Last-resort right would paint through Today (launch Year Cart UI
-    // next to the Today line). Prefer a left chip when that side is only
+    // Last-resort right would paint through Today (launch Year Persist cart
+    // / Go-live / Cart UI). Prefer a left chip when that side is only
     // slightly past x=0 so the dodge covers outside-placed titles too.
     // A deeply negative left_x (Persist cart ~144px at bar.x=40) would
-    // clamp onto Today; those keep the last-resort right. Milestones
-    // stay on the right of the diamond even if that crosses Today —
-    // Week/Month/Quarter must keep the same side.
+    // clamp onto Today; those try a Today-adjacent slot instead.
     if today_blocks_right && !bar.milestone && !bar.marker {
         let clamped = left_x.max(2.0);
-        let misses_today = today_x
-            .is_none_or(|today| clamped >= today + 8.0 || clamped + estimated <= today - 8.0);
+        let misses_today = today_x.is_none_or(|today| {
+            clamped >= today + TODAY_LABEL_CLEARANCE
+                || clamped + estimated <= today - TODAY_LABEL_CLEARANCE
+        });
         // A clamp to x=2 can cover the sliver (Year Cart next to Today).
         // Only flip left when the chip also sits beside the bar.
         let misses_bar = clamped + estimated <= bar.x + 0.1;
@@ -3259,7 +3264,50 @@ pub fn bar_outside_label_frame(
             return Some((clamped, estimated));
         }
     }
+    if let Some(today) = today_x
+        && today_blocks_right
+    {
+        let after = today + TODAY_LABEL_CLEARANCE;
+        let before = today - TODAY_LABEL_CLEARANCE - estimated;
+        let closer_first = if (before - right_x).abs() <= (after - right_x).abs() {
+            [before, after]
+        } else {
+            [after, before]
+        };
+        for slot in closer_first {
+            if today_adjacent_slot_holds(slot, estimated, timeline_w, bar) {
+                return Some((slot, estimated));
+            }
+        }
+    }
     Some((right_x, estimated))
+}
+
+fn chip_covers_bar(chip_x: f32, estimated: f32, bar: &BarLayout) -> bool {
+    let painted_w = if bar.milestone || bar.marker {
+        MILESTONE_SIZE
+    } else {
+        bar.width.max(8.0)
+    };
+    chip_x < bar.x + painted_w && chip_x + estimated > bar.x
+}
+
+fn today_adjacent_slot_holds(slot: f32, estimated: f32, timeline_w: f32, bar: &BarLayout) -> bool {
+    // Start on-screen; a few px of clip at the right edge is the same
+    // last-resort the milestone chip already uses at a tight clip.
+    if slot < 0.0 || slot >= timeline_w - 4.0 {
+        return false;
+    }
+    if slot + estimated.min(48.0) > timeline_w {
+        return false;
+    }
+    if chip_covers_bar(slot, estimated, bar) {
+        return false;
+    }
+    if (bar.milestone || bar.marker) && slot + 1.0 < bar.x + MILESTONE_SIZE {
+        return false;
+    }
+    true
 }
 
 /// ‹ / › chip when a dated bar sits fully past the timeline clip.
@@ -6409,6 +6457,16 @@ mod tests {
             live.lane_y,
             cart_ui.y
         );
+        let (gap_top, gap_bottom) = source_row_gap(pred);
+        let min_lane = (gap_top + 6.0).min(gap_bottom - 3.0);
+        let max_lane = (gap_bottom - 3.0).max(min_lane);
+        let mid = (min_lane + max_lane) / 2.0;
+        assert!(
+            (live.lane_y - mid).abs() < 1.0,
+            "horizontal must sit in the middle of the row gap, lane={} mid={} gap={gap_top}..{gap_bottom}",
+            live.lane_y,
+            mid
+        );
         let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
         assert!(
             live.lane_y + 1.0 >= label_top + OUTSIDE_LABEL_H + 6.0,
@@ -6593,6 +6651,10 @@ mod tests {
             x + w,
             bar.x
         );
+        assert!(
+            x + w <= today_x - TODAY_LABEL_CLEARANCE || x >= today_x + TODAY_LABEL_CLEARANCE,
+            "Today dodge must miss the line, label={x}+{w} today={today_x}"
+        );
     }
 
     #[test]
@@ -6636,19 +6698,11 @@ mod tests {
                 bar.title
             );
             if let Some(today) = today_x {
-                let room_before_today = today - 8.0;
-                let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
-                let left_misses_bar = left_x.max(2.0) + estimated <= bar.x + 0.1;
-                let can_sit_left_of_today = (estimated + 10.0 <= room_before_today
-                    && left_misses_bar)
-                    || x + estimated <= room_before_today + 0.5;
-                if can_sit_left_of_today && x < today {
-                    assert!(
-                        x + w <= today - 8.0 || x >= today + 8.0,
-                        "launch Year {} outside label must miss Today when there is room, label={x}+{w} today={today}",
-                        bar.title
-                    );
-                }
+                assert!(
+                    x + w <= today - TODAY_LABEL_CLEARANCE || x >= today + TODAY_LABEL_CLEARANCE,
+                    "launch Year {} outside label must miss Today, label={x}+{w} today={today}",
+                    bar.title
+                );
             }
         }
     }

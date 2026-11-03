@@ -3858,6 +3858,12 @@ fn year_today_label_does_not_overlap_month_ticks(cx: &mut gpui_kit::TestAppConte
         attached_right || attached_left,
         "Year Today pill at {pill_x}..{pill_right} must stay on the line at {line_x}..{line_right}, not slide onto year labels"
     );
+    let line_top = f32::from(today_line.origin.y);
+    let line_bottom = line_top + f32::from(today_line.size.height);
+    assert!(
+        today_top + 1.0 >= line_top && today_bottom <= line_bottom + 1.0,
+        "Year Today pill at {today_top}..{today_bottom} must sit on its line at {line_top}..{line_bottom}"
+    );
     let mut tick_count = 0;
     for selector in [
         "gantt-tick-0",
@@ -4130,9 +4136,18 @@ fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
         let on_right =
             label_left + 4.0 >= bar_right - 8.0 && (label_left - bar_right).abs() < 120.0;
         let on_left = label_left + 8.0 <= bar_left + 4.0 && (bar_left - label_left).abs() < 160.0;
+        let today_adjacent = cx.debug_bounds("gantt-today").is_some_and(|today| {
+            let line_x = f32::from(today.origin.x);
+            let line_right = line_x + f32::from(today.size.width);
+            let label_right = label_left + f32::from(label.size.width);
+            let misses = label_right <= line_x - 6.0 || label_left >= line_right + 6.0;
+            let near_today =
+                (label_left - line_right).abs() < 16.0 || (line_x - label_right).abs() < 16.0;
+            misses && near_today
+        });
         assert!(
-            on_right || on_left,
-            "Year {title} label must sit next to its bar, not at the Today line, label_x={label_left} bar={bar_left}..{bar_right}"
+            on_right || on_left || today_adjacent,
+            "Year {title} label must sit next to its bar or just off Today, label_x={label_left} bar={bar_left}..{bar_right}"
         );
     }
 }
@@ -4203,6 +4218,13 @@ fn year_toolbar_launch_paints_full_outside_titles(cx: &mut gpui_kit::TestAppCont
             bar_title_paint_px("Persist cart"),
         ),
         (
+            1005,
+            "Cart UI",
+            "gantt-bar-label-1005",
+            "gantt-bar-1005",
+            bar_title_paint_px("Cart UI"),
+        ),
+        (
             1012,
             "Unparented spike",
             "gantt-bar-label-1012",
@@ -4240,6 +4262,56 @@ fn year_toolbar_launch_paints_full_outside_titles(cx: &mut gpui_kit::TestAppCont
                 || inside_bar
                 || today_dodge_left,
             "launch Year {title} must sit beside, inside, or Today-dodged left of the bar, label={label_left}..{label_right} bar={bar_left}..{bar_right}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn year_toolbar_launch_outside_titles_miss_today(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    let nodes = state.nodes.clone();
+    // apply_hierarchy auto_fit, then Year — before the Today button is pressed.
+    state.gantt.auto_fit(&nodes, &[], 800.0);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let year = cx.debug_bounds("gantt-scale-Year").expect("Year toolbar");
+    cx.simulate_click(year.center(), Modifiers::default());
+    draw(cx);
+    let today_line = cx
+        .debug_bounds("gantt-today")
+        .expect("launch Year Today line");
+    let line_x = f32::from(today_line.origin.x);
+    let line_right = line_x + f32::from(today_line.size.width);
+    for (title, selector) in [
+        ("Persist cart", "gantt-bar-label-1003"),
+        ("Cart UI", "gantt-bar-label-1005"),
+        ("Go-live milestone", "gantt-bar-label-1013"),
+    ] {
+        let label = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("launch Year {title} must paint an outside label"));
+        let label_left = f32::from(label.origin.x);
+        let label_right = label_left + f32::from(label.size.width);
+        assert!(
+            label_right <= line_x - 6.0 || label_left >= line_right + 6.0,
+            "launch Year {title} must miss the Today line by ≥6px, label={label_left}..{label_right} today={line_x}..{line_right}"
+        );
+    }
+    if let Some(pill) = cx.debug_bounds("gantt-today-label") {
+        let pill_top = f32::from(pill.origin.y);
+        let pill_bottom = pill_top + f32::from(pill.size.height);
+        let line_top = f32::from(today_line.origin.y);
+        let line_bottom = line_top + f32::from(today_line.size.height);
+        assert!(
+            pill_top + 1.0 >= line_top && pill_bottom <= line_bottom + 1.0,
+            "launch Year Today pill at {pill_top}..{pill_bottom} must sit on its line at {line_top}..{line_bottom}"
         );
     }
 }
