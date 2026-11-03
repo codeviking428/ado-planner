@@ -3964,8 +3964,13 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         cx.debug_bounds("gantt-link-handle-2-link-end").is_some(),
         "a selected bar must expose a hittable link handle without hovering first"
     );
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-end").is_none(),
+        "a selected row must not paint resize dots until the bar is hovered"
+    );
     view.update(cx, |view, cx| {
         view.state.gantt.hovered_id = Some(2);
+        view.state.gantt.bar_hovered_id = Some(2);
         cx.notify();
     });
     draw(cx);
@@ -5149,6 +5154,7 @@ fn toast_undo_and_scale_switch_clear_hover_dots(cx: &mut gpui_kit::TestAppContex
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
     state.gantt.hovered_id = Some(2);
+    state.gantt.bar_hovered_id = Some(2);
     state.gantt.selected_id = Some(2);
     let before_start = Some("2026-07-06T00:00:00Z".into());
     let before_target = Some("2026-07-20T00:00:00Z".into());
@@ -5169,6 +5175,7 @@ fn toast_undo_and_scale_switch_clear_hover_dots(cx: &mut gpui_kit::TestAppContex
     draw(cx);
     view.update(cx, |view, cx| {
         view.state.gantt.hovered_id = Some(2);
+        view.state.gantt.bar_hovered_id = Some(2);
         cx.notify();
     });
     draw(cx);
@@ -5191,6 +5198,7 @@ fn toast_undo_and_scale_switch_clear_hover_dots(cx: &mut gpui_kit::TestAppContex
     );
     view.update(cx, |view, cx| {
         view.state.gantt.hovered_id = Some(2);
+        view.state.gantt.bar_hovered_id = Some(2);
         cx.notify();
     });
     draw(cx);
@@ -5215,6 +5223,7 @@ fn mouse_leave_clears_hover_dots_while_locked(cx: &mut gpui_kit::TestAppContext)
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
     state.gantt.hovered_id = Some(2);
+    state.gantt.bar_hovered_id = Some(2);
     state.gantt.selected_id = Some(2);
     state.gantt.hover_locked = true;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
@@ -5239,6 +5248,35 @@ fn mouse_leave_clears_hover_dots_while_locked(cx: &mut gpui_kit::TestAppContext)
     assert!(
         cx.debug_bounds("gantt-link-dot-2-link-end").is_none(),
         "mouse leave must hide the pink end dot"
+    );
+}
+
+#[gpui_kit::test]
+fn selected_row_without_bar_hover_hides_resize_dots(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(2);
+    state.gantt.hovered_id = Some(2);
+    state.gantt.bar_hovered_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-end").is_none(),
+        "selecting a row (or hovering the tree) must not paint resize dots"
+    );
+    view.update(cx, |view, cx| {
+        view.state.gantt.bar_hovered_id = Some(2);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-end").is_some(),
+        "hovering the bar must paint the pink end dot"
     );
 }
 

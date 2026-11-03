@@ -22,8 +22,10 @@ pub const HANDLE_WIDTH: f32 = 8.0;
 pub const SELECTED_ROW_TINT: f32 = 0.65;
 /// Left accent on the selected tree/timeline row.
 pub const SELECTED_ACCENT_W: f32 = 3.0;
-/// Year-scale bars shorter than this still paint a hittable sliver.
-pub const YEAR_MIN_BAR_WIDTH: f32 = 6.0;
+/// Year-scale bars shorter than this still paint a hittable body, not a sliver.
+pub const YEAR_MIN_BAR_WIDTH: f32 = 16.0;
+/// Floor so a zero-width day still paints on Month/Week/Quarter.
+const MIN_BAR_WIDTH: f32 = 6.0;
 /// Pixels per tree depth. A spacer child, not padding, so painted x matches depth.
 pub const TREE_INDENT: f32 = 20.0;
 pub const LINK_HANDLE: f32 = 14.0;
@@ -388,7 +390,7 @@ impl BarLayout {
     }
 
     /// 8px rollup edges only when they leave a Move body in the center.
-    /// Target-only diamonds (16px) and year-scale slivers (6px) stay all-Move.
+    /// Target-only diamonds (16px) and year-scale slivers stay all-Move.
     pub fn shows_rollup_edges(&self) -> bool {
         self.summary && !self.milestone && !self.marker && self.width > HANDLE_WIDTH * 2.0
     }
@@ -596,6 +598,9 @@ pub struct GanttView {
     pub timeline_width: f32,
     pub selected_id: Option<i64>,
     pub hovered_id: Option<i64>,
+    /// Pointer is on the bar (or its handles), not merely the selected row.
+    /// Resize/link dots paint from this, so a selected tree row stays clean.
+    pub bar_hovered_id: Option<i64>,
     pub selected_link: Option<(i64, i64)>,
     pub hovered_link: Option<(i64, i64)>,
     pub collapsed: HashSet<i64>,
@@ -638,6 +643,7 @@ impl Default for GanttView {
             timeline_width: 800.0,
             selected_id: None,
             hovered_id: None,
+            bar_hovered_id: None,
             selected_link: None,
             hovered_link: None,
             collapsed: HashSet::new(),
@@ -853,6 +859,7 @@ impl GanttView {
 
     pub fn clear_hover(&mut self) {
         self.hovered_id = None;
+        self.bar_hovered_id = None;
         self.hovered_link = None;
     }
 
@@ -1262,7 +1269,7 @@ impl GanttView {
                 };
                 let mut x = self.x_for_date(start);
                 let end = ado_core::to_gantt_inclusive_target(target);
-                let mut width = (self.x_for_date(end) - x).max(YEAR_MIN_BAR_WIDTH);
+                let mut width = (self.x_for_date(end) - x).max(MIN_BAR_WIDTH);
                 if marker {
                     width = MILESTONE_SIZE;
                     x = UNSCHEDULED_GUTTER_X;
@@ -1932,14 +1939,16 @@ impl GanttView {
                     pred.x + pred.width
                 };
                 // Forward FS: inbound from the left of the successor.
-                // When the target starts before the source ends, loop locally:
-                // stub a few px past the source end, drop, run back to just
-                // before the target start. Never slide that drop to the chart
-                // left edge around intervening rows or gutter pills.
+                // When the target starts before the source ends, prefer a
+                // short inbound if that column already sits in a gap
+                // (misses intervening bar bodies). Otherwise loop at the
+                // source stub and slide the drop into a local gap — never
+                // to the chart left edge around intervening rows or gutter
+                // pills.
                 let wrap_around = pred_end > bar.x + STUB;
                 let x_head = bar.x;
                 let x_out = pred_end + STUB;
-                let mut x_in = if wrap_around { x_out } else { x_head - STUB };
+                let mut x_in = x_head - STUB;
                 let lo = pred.y.min(bar.y);
                 let hi = pred.y.max(bar.y);
                 let intervening: Vec<&BarLayout> = bars
@@ -1959,11 +1968,11 @@ impl GanttView {
                 // tens of days away (stray line at x≈532). Occupy the
                 // body only at those zooms.
                 let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
-                if wrap_around && !intervening.is_empty() {
-                    // Keep the local loop; slide the drop into a gap so the
-                    // long vertical does not run through intervening bar
-                    // bodies. Skip labels: a title to the right of a short
-                    // marker must not shove the drop away from the source.
+                if wrap_around && inbound_x_hits_intervening(x_in, &intervening, include_labels) {
+                    // Short inbound would cross a row body. Wrap at the
+                    // source stub and slide into a gap that misses every
+                    // intervening span (skip labels so a title to the
+                    // right of a short marker does not shove the drop).
                     x_in = clear_wrap_drop_x(x_out, &intervening, false, x_head);
                 } else if !intervening.is_empty() && !wrap_around {
                     let x_vert =
@@ -2166,6 +2175,13 @@ fn bar_occupied_x(bar: &BarLayout, include_label: bool) -> (f32, f32) {
 
 fn x_hits_span(x: f32, left: f32, right: f32) -> bool {
     x >= left - 1.0 && x <= right + 1.0
+}
+
+fn inbound_x_hits_intervening(x: f32, intervening: &[&BarLayout], include_labels: bool) -> bool {
+    intervening.iter().any(|bar| {
+        let (left, right) = bar_occupied_x(bar, include_labels);
+        x_hits_span(x, left, right)
+    })
 }
 
 /// Keep an inbound vertical in a gap that misses intervening bars and labels,
@@ -2789,7 +2805,7 @@ mod tests {
             "hit-test on a short parent must still pick Move"
         );
         let sliver = BarLayout {
-            width: YEAR_MIN_BAR_WIDTH,
+            width: 6.0,
             ..diamond
         };
         assert!(!sliver.shows_rollup_edges());
@@ -3294,8 +3310,13 @@ mod tests {
                 !bars[0].open_ended,
                 "{scale:?} start-only must stay a normal bar, not a ▸ marker"
             );
+            let min = if scale == GanttScale::Year {
+                YEAR_MIN_BAR_WIDTH
+            } else {
+                MIN_BAR_WIDTH
+            };
             assert!(
-                bars[0].width + 0.1 >= YEAR_MIN_BAR_WIDTH,
+                bars[0].width + 0.1 >= min,
                 "{scale:?} bar must stay visible, width={}",
                 bars[0].width
             );
@@ -3314,12 +3335,7 @@ mod tests {
         assert_eq!(bars.len(), 1);
         assert!(
             bars[0].width + 0.1 >= YEAR_MIN_BAR_WIDTH,
-            "Year-view bars must keep a ~6px sliver, width={}",
-            bars[0].width
-        );
-        assert!(
-            !bars[0].can_resize(),
-            "a Year sliver narrower than two grips must stay a move, width={}",
+            "Year-view bars must keep a {YEAR_MIN_BAR_WIDTH}px body, width={}",
             bars[0].width
         );
     }
@@ -5049,29 +5065,37 @@ mod tests {
             "fixture must place the moved parent after the successor start"
         );
         assert_later_source_inbounds_from_left(arrow, pred, succ, gantt.timeline_width);
+        let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        let (child_left, child_right) = bar_occupied_x(child, false);
+        let (live_left, live_right) = bar_occupied_x(go_live, false);
         assert!(
-            arrow.wraps_around_successor(),
-            "moved-parent links must loop at the source end, not a chart-wide detour, x1={} x2={} x_head={}",
+            !arrow.wraps_around_successor(),
+            "after Move children too the inbound column is a gap, so the route must stay short, x1={} x2={} x_head={}",
             arrow.x1,
             arrow.x2,
             arrow.x_head
         );
         assert!(
-            arrow.x2 + 0.5 >= arrow.x1,
-            "the drop must stay at the source stub or slide into a local gap, x1={} x2={}",
-            arrow.x1,
+            !x_hits_span(arrow.x2, child_left, child_right),
+            "vertical x2={} must miss #1005 occupied {child_left}..{child_right}",
             arrow.x2
+        );
+        assert!(
+            !x_hits_span(arrow.x2, live_left, live_right),
+            "vertical x2={} must miss #1013 occupied {live_left}..{live_right}",
+            arrow.x2
+        );
+        assert!(
+            (arrow.x2 - (succ.x - 12.0)).abs() < 2.5,
+            "the drop must sit in the gap next to the successor, not past #1005/#1013, x2={} succ.x={}",
+            arrow.x2,
+            succ.x
         );
         assert!(
             arrow.x2 > 80.0,
             "must not detour to the chart left edge, x2={}",
             arrow.x2
-        );
-        assert!(
-            arrow.x2 + 0.5 >= pred.x + pred.width + 10.0,
-            "the loop must drop at or past the source end, x2={} pred_end={}",
-            arrow.x2,
-            pred.x + pred.width
         );
     }
 
@@ -5107,15 +5131,15 @@ mod tests {
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         let (left, right) = bar_occupied_x(mid, false);
         assert!(
-            arrow.wraps_around_successor(),
-            "must keep a local loop, x1={} x2={} x_head={}",
-            arrow.x1,
+            !x_hits_span(arrow.x2, left, right),
+            "vertical x2={} must miss #1005 occupied {left}..{right}, pred_end={}",
             arrow.x2,
-            arrow.x_head
+            pred.x + pred.width
         );
         assert!(
-            !x_hits_span(arrow.x2, left, right),
-            "wrap drop x2={} must miss #1005 occupied {left}..{right}, pred_end={}",
+            (arrow.x2 - (bars.iter().find(|bar| bar.id == 1012).unwrap().x - 12.0)).abs() < 2.5
+                || arrow.x2 + 0.5 >= pred.x + pred.width + 10.0,
+            "must use the successor gap or a wrap past the source, x2={} pred_end={}",
             arrow.x2,
             pred.x + pred.width
         );
@@ -5176,6 +5200,22 @@ mod tests {
             marker: false,
             open_ended: false,
         };
+        let blocker = BarLayout {
+            id: 5,
+            kind: GanttBarKind::Scheduled,
+            x: 40.0,
+            width: 90.0,
+            y: ROW_HEIGHT * 2.5,
+            summary: false,
+            milestone: false,
+            label: "block".into(),
+            title: "Block".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
         let succ = BarLayout {
             id: 4,
             kind: GanttBarKind::Scheduled,
@@ -5197,8 +5237,13 @@ mod tests {
             timeline_width: 800.0,
             ..Default::default()
         };
-        let arrows =
-            gantt.layout_dependency_arrows(&[pred.clone(), mid1.clone(), mid2.clone(), succ]);
+        let arrows = gantt.layout_dependency_arrows(&[
+            pred.clone(),
+            mid1.clone(),
+            mid2.clone(),
+            blocker.clone(),
+            succ,
+        ]);
         assert_eq!(arrows.len(), 1);
         let stub = pred.x + pred.width + 12.0;
         let (left1, right1) = bar_occupied_x(&mid1, false);
@@ -5284,17 +5329,18 @@ mod tests {
         let succ = bars.iter().find(|bar| bar.id == 1012).unwrap();
         assert!(pred.x + pred.width > succ.x + 12.0);
         assert_later_source_inbounds_from_left(arrow, pred, succ, gantt.timeline_width);
+        let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        let (child_left, child_right) = bar_occupied_x(child, false);
+        let (live_left, live_right) = bar_occupied_x(go_live, false);
         assert!(
-            arrow.wraps_around_successor(),
-            "target-starts-before-source-ends must loop at the source stub, x1={} x2={} x_head={}",
-            arrow.x1,
-            arrow.x2,
-            arrow.x_head
+            !x_hits_span(arrow.x2, child_left, child_right),
+            "vertical x2={} must miss #1005 occupied {child_left}..{child_right}",
+            arrow.x2
         );
         assert!(
-            (arrow.x2 - arrow.x1).abs() < 1.5,
-            "the drop must stay a few px past the source end, x1={} x2={}",
-            arrow.x1,
+            !x_hits_span(arrow.x2, live_left, live_right),
+            "vertical x2={} must miss #1013 occupied {live_left}..{live_right}",
             arrow.x2
         );
         assert!(

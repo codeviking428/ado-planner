@@ -1205,6 +1205,16 @@ impl PlannerView {
         self.state.form.is_some() || self.form_loading.is_some()
     }
 
+    fn set_bar_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
+        if self.state.gantt.bar_hovered_id != id {
+            self.state.gantt.bar_hovered_id = id;
+            cx.notify();
+        }
+        if id.is_some() {
+            self.set_hovered(id, cx);
+        }
+    }
+
     fn set_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
         let linking = self
             .state
@@ -1220,7 +1230,10 @@ impl PlannerView {
             return;
         }
         if id.is_none() {
-            if self.state.gantt.hovered_id.is_some() || self.state.gantt.hovered_link.is_some() {
+            if self.state.gantt.hovered_id.is_some()
+                || self.state.gantt.bar_hovered_id.is_some()
+                || self.state.gantt.hovered_link.is_some()
+            {
                 self.state.gantt.clear_hover();
                 cx.notify();
             }
@@ -2054,7 +2067,10 @@ impl PlannerView {
             cx.notify();
             return;
         }
-        if self.state.gantt.hovered_id.is_some() || self.state.gantt.hovered_link.is_some() {
+        if self.state.gantt.hovered_id.is_some()
+            || self.state.gantt.bar_hovered_id.is_some()
+            || self.state.gantt.hovered_link.is_some()
+        {
             self.state.gantt.clear_hover();
             cx.notify();
         }
@@ -4814,7 +4830,7 @@ impl PlannerView {
                 .children(self.bar_inner_resize_grips(bar, dragging, cx))
                 .children(self.bar_summary_edge_affordances(bar, dragging, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    this.set_hovered(if *hovered { Some(id) } else { None }, cx);
+                    this.set_bar_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
                 .when((marker || no_fields) && !self.details_overlay(), |el| {
                     let tip = if no_fields {
@@ -4826,7 +4842,7 @@ impl PlannerView {
                 })
                 .on_mouse_move(
                     cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                        this.set_hovered(Some(id), cx);
+                        this.set_bar_hovered(Some(id), cx);
                         // The bar captures the pointer on mouse-down. External titles
                         // occlude the timeline, so the captured bar must keep the drag.
                         this.on_bar_drag_move(event, window, cx);
@@ -4963,7 +4979,7 @@ impl PlannerView {
             return Vec::new();
         }
         let id = bar.id;
-        let hovered = self.state.gantt.hovered_id == Some(id);
+        let hovered = self.state.gantt.bar_hovered_id == Some(id);
         let show_handles = hovered && !dragging;
         let linking = self
             .state
@@ -4996,7 +5012,7 @@ impl PlannerView {
                 .cursor(CursorStyle::ResizeLeftRight)
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
-                        this.set_hovered(Some(id), cx);
+                        this.set_bar_hovered(Some(id), cx);
                     }
                 }))
                 .on_mouse_move(
@@ -5079,7 +5095,7 @@ impl PlannerView {
                 .tooltip(move |window, cx| Tooltip::new(DATES_ROLLUP_TIP).build(window, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
-                        this.set_hovered(Some(id), cx);
+                        this.set_bar_hovered(Some(id), cx);
                     }
                 }))
                 .on_mouse_move(
@@ -5128,7 +5144,7 @@ impl PlannerView {
         if unscheduled || bar.kind == ado_core::GanttBarKind::NoFields || bar.marker || linking {
             return None;
         }
-        let hovered = self.state.gantt.hovered_id == Some(id);
+        let hovered = self.state.gantt.bar_hovered_id == Some(id);
         let selected = self.state.gantt.selected_id == Some(id);
         let show_dot = hovered && !dragging;
         let can_resize = bar.can_resize();
@@ -5162,7 +5178,7 @@ impl PlannerView {
                     .cursor_pointer()
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
-                            this.set_hovered(Some(id), cx);
+                            this.set_bar_hovered(Some(id), cx);
                         }
                     }))
                     .on_mouse_move(

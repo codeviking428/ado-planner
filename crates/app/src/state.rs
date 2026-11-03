@@ -3118,6 +3118,7 @@ impl PlannerState {
         if children.is_empty() {
             return;
         }
+        let title = self.item_title(parent_id);
         for toast in &mut self.toasts.items {
             let Some(UndoAction::RestoreDates {
                 id,
@@ -3146,6 +3147,8 @@ impl PlannerState {
                 });
             }
             toast.undo = Some(UndoAction::RestoreDatesBatch { items });
+            toast.message =
+                named_dates_with_children(toast.message.clone(), &title, children.len());
             break;
         }
     }
@@ -3221,12 +3224,17 @@ impl PlannerState {
                     return "Moved dates".into();
                 };
                 let live = self.nodes.iter().find(|node| node.id == first.id);
-                dates_undo_message(
+                let message = dates_undo_message(
                     &self.item_title(first.id),
                     parse_iso_date(first.start_date.as_deref()),
                     parse_iso_date(first.target_date.as_deref()),
                     live.and_then(|node| parse_iso_date(node.start_date.as_deref())),
                     live.and_then(|node| parse_iso_date(node.target_date.as_deref())),
+                );
+                named_dates_with_children(
+                    message,
+                    &self.item_title(first.id),
+                    items.len().saturating_sub(1),
                 )
             }
             UndoAction::RestoreFields { id, fields } => {
@@ -3284,12 +3292,17 @@ impl PlannerState {
                 let Some(first) = items.first() else {
                     return "Moved dates".into();
                 };
-                dates_changed_message(
+                let message = dates_changed_message(
                     &self.item_title(first.id),
                     parse_iso_date(first.before_start.as_deref()),
                     parse_iso_date(first.before_target.as_deref()),
                     parse_iso_date(first.after_start.as_deref()),
                     parse_iso_date(first.after_target.as_deref()),
+                );
+                named_dates_with_children(
+                    message,
+                    &self.item_title(first.id),
+                    items.len().saturating_sub(1),
                 )
             }
             HistoryEntry::Link {
@@ -3353,12 +3366,17 @@ impl PlannerState {
                 let Some(first) = items.first() else {
                     return "Moved dates".into();
                 };
-                dates_undo_message(
+                let message = dates_undo_message(
                     &self.item_title(first.id),
                     parse_iso_date(first.before_start.as_deref()),
                     parse_iso_date(first.before_target.as_deref()),
                     parse_iso_date(first.after_start.as_deref()),
                     parse_iso_date(first.after_target.as_deref()),
+                );
+                named_dates_with_children(
+                    message,
+                    &self.item_title(first.id),
+                    items.len().saturating_sub(1),
                 )
             }
             other => self.history_action_message(other),
@@ -3393,6 +3411,19 @@ pub(crate) fn dates_moved_message(
     target: Option<Date>,
 ) -> String {
     dates_range_message("Moved", title, start, target)
+}
+
+fn named_dates_with_children(message: String, title: &str, extra_count: usize) -> String {
+    if extra_count == 0 {
+        return message;
+    }
+    let quoted = quote_name(title);
+    let kids = if extra_count == 1 {
+        "and 1 child".to_string()
+    } else {
+        format!("and {extra_count} children")
+    };
+    message.replacen(&quoted, &format!("{quoted} {kids}"), 1)
 }
 
 fn dates_resized_message(title: &str, start: Option<Date>, target: Option<Date>) -> String {
@@ -3974,6 +4005,16 @@ mod toast_copy_tests {
             message.starts_with("Moved \"Cart\" to"),
             "move toasts must quote the item then the range, got {message}"
         );
+        let with_kids = super::named_dates_with_children(message.clone(), "Cart", 2);
+        assert!(
+            with_kids.starts_with("Moved \"Cart\" and 2 children to"),
+            "Move children too must mention the children, got {with_kids}"
+        );
+        let with_one = super::named_dates_with_children(message.clone(), "Cart", 1);
+        assert!(
+            with_one.starts_with("Moved \"Cart\" and 1 child to"),
+            "a single child must stay singular, got {with_one}"
+        );
         assert!(
             message.contains('\u{00a0}'),
             "the range must use a non-breaking space so '18' cannot wrap alone, got {message}"
@@ -4243,6 +4284,17 @@ mod toast_copy_tests {
             }),
         );
         let _ = state.shift_descendants_now(1, 3);
+        let toast = state.toasts.items.last().expect("move toast");
+        assert!(
+            toast.message.contains("child"),
+            "Move children too must mention the children, got {}",
+            toast.message
+        );
+        assert!(
+            toast.message.contains("Work Item 0"),
+            "the parent title must stay in the toast, got {}",
+            toast.message
+        );
         assert_eq!(
             state.history.undo.len(),
             1,
