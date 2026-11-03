@@ -5221,10 +5221,10 @@ fn start_handle_dot_is_part_of_the_resize_hit_zone(cx: &mut gpui_kit::TestAppCon
     });
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
-    // Pink start dot sits on the left edge; a click just outside the painted
-    // bar must still begin ResizeStart, not select an incoming link.
+    // Inner start grip sits on the painted left edge and resizes. The
+    // connector circle lives fully outside the bar and starts a link.
     let mid_y = bar.origin.y + bar.size.height / 2.0;
-    let grip = point(bar.origin.x - px(4.), mid_y);
+    let grip = point(bar.origin.x + px(3.), mid_y);
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {

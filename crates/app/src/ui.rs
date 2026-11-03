@@ -5204,22 +5204,16 @@ impl PlannerView {
         let hovered = self.state.gantt.bar_hovered_id == Some(id);
         let selected = self.state.gantt.selected_id == Some(id);
         let show_dot = hovered && !dragging;
-        let can_resize = bar.can_resize();
         let (local_left, local_right) = self.painted_timeline_edges(bar);
-        // Start hit covers the left edge so a click just outside still
-        // resizes; the visible circle sits a few px inside so it does not
-        // bury the incoming ▶. End hit stays just past the bar. The
-        // painted bar (and inner grip) resizes; the visible end dot starts
-        // a link so dragging it onto another bar creates a dependency.
-        let start_x = local_left - 4.0;
-        let end_x = local_right + 2.0;
+        // Inner 8px grips resize both ends. These circles sit fully outside
+        // the bar (monday.com connectors) and always start a link.
+        let start_x = local_left - LINK_HANDLE_HIT - 2.0;
+        let end_x = local_right + 4.0;
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
-        let layout = bar.clone();
-        let handles = [("link-start", start_x, true), ("link-end", end_x, false)].map(
-            |(handle_id, handle_x, at_start)| {
+        let handles =
+            [("link-start", start_x), ("link-end", end_x)].map(|(handle_id, handle_x)| {
                 let selector = format!("gantt-link-handle-{id}-{handle_id}");
                 let origin = handle_x + LINK_HANDLE_HIT / 2.0;
-                let layout = layout.clone();
                 div()
                     .id((handle_id, id as u64))
                     .debug_selector(move || selector.clone())
@@ -5253,25 +5247,15 @@ impl PlannerView {
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             let x: f32 = event.position.x.into();
-                            let painted = this.painted_bar_for(id, &layout);
                             this.bar_press_shift = event.modifiers.shift;
-                            let kind = if (can_resize || layout.open_ended) && at_start {
-                                GestureKind::ResizeStart
-                            } else if can_resize && !at_start && x <= painted.right {
-                                GestureKind::ResizeEnd
-                            } else if x >= painted.left && x <= painted.right {
-                                this.begin_classified_bar_gesture(id, &layout, x, window, cx);
-                                return;
-                            } else {
-                                GestureKind::Link
-                            };
-                            let origin = if kind == GestureKind::Link {
-                                origin
-                            } else {
-                                let _ = this.classify_bar_hit(id, &layout, x);
-                                this.pointer_layout_x(x, Some(id))
-                            };
-                            this.continue_or_begin_bar_gesture(id, kind, origin, x, window, cx);
+                            this.continue_or_begin_bar_gesture(
+                                id,
+                                GestureKind::Link,
+                                origin,
+                                x,
+                                window,
+                                cx,
+                            );
                         }),
                     )
                     .on_mouse_up(
@@ -5296,14 +5280,13 @@ impl PlannerView {
                                         })
                                         .size(px(LINK_HANDLE))
                                         .rounded_full()
-                                        .bg(cx.theme().danger)
+                                        .bg(cx.theme().background)
                                         .border_2()
-                                        .border_color(cx.theme().background),
+                                        .border_color(cx.theme().primary),
                                 )
                             }),
                     )
-            },
-        );
+            });
         Some(
             div()
                 .absolute()
@@ -5404,8 +5387,15 @@ impl PlannerView {
         let estimated = title_width.max(24.0);
         let right_x = bar_right + label_gap;
         let left_x = bar.x - estimated - 6.0;
-        let prefer_left = right_x + estimated > timeline_w - 4.0 && left_x >= 0.0;
-        let mut label_x = if prefer_left { left_x } else { right_x };
+        // Keep outside titles on the right of the bar. Flipping to the left
+        // after a right-edge resize (#1014) is the jump the review caught.
+        let mut label_x = right_x;
+        if label_x >= timeline_w - 8.0 {
+            label_x = (bar_right + 4.0).min(timeline_w - 24.0);
+            if label_x < bar_right {
+                label_x = bar_right.min(timeline_w - 8.0);
+            }
+        }
         if label_x >= timeline_w || label_x + 8.0 < 0.0 {
             return None;
         }
@@ -8925,6 +8915,38 @@ mod bar_label_tests {
         assert!(
             max_w + 0.1 >= "Cart".chars().count() as f32 * 6.5,
             "Year Cart must keep a full-width outside label, not clip to a letter, max_w={max_w}"
+        );
+    }
+
+    #[test]
+    fn outside_label_stays_on_the_right_after_a_right_edge_grow() {
+        let bar = BarLayout {
+            id: 1014,
+            kind: GanttBarKind::Scheduled,
+            x: 620.0,
+            width: 140.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Backlog grooming".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        assert!(
+            !PlannerView::bar_title_fits_inside(&bar),
+            "precondition: #1014 title is wider than the bar"
+        );
+        let (label_x, _) =
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, None).expect("outside label");
+        assert!(
+            label_x >= bar.x + bar.width - 1.0,
+            "a right-edge resize must not flip the title to the left of the bar, label_x={label_x} bar={}..{}",
+            bar.x,
+            bar.x + bar.width
         );
     }
 }

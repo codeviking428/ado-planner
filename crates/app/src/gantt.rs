@@ -512,15 +512,20 @@ pub struct DependencyArrow {
 impl DependencyArrow {
     const WRAP_STUB: f32 = 12.0;
 
-    /// Wrap-around routing ends to the right of the successor; the last run
-    /// into the bar must stay a short inbound stub instead of crossing it.
+    /// Wrap-around routing drops at the source stub, then runs on the
+    /// successor row into a short inbound. Used for overlap/backward FS so
+    /// the path does not detour left of the source start.
     pub fn wraps_around_successor(&self) -> bool {
-        !self.inbound_right && self.x2 > self.x_head + Self::WRAP_STUB
+        self.x2 > self.x_head + Self::WRAP_STUB
     }
 
     pub fn stub_start(&self) -> f32 {
         if self.wraps_around_successor() {
-            self.x_head - Self::WRAP_STUB
+            if self.inbound_right {
+                self.x_head + Self::WRAP_STUB
+            } else {
+                self.x_head - Self::WRAP_STUB
+            }
         } else {
             self.x2
         }
@@ -870,7 +875,7 @@ impl GanttView {
         let width = self.timeline_width.max(1.0);
         if x < 24.0 {
             self.scroll_x += x - width * 0.2;
-        } else if x > width - 48.0 {
+        } else if x > width - TODAY_MARGIN_PX {
             self.scroll_x += x - width * 0.35;
         }
     }
@@ -967,14 +972,43 @@ impl GanttView {
     }
 
     /// Toolbar Day/Week/Month/… click. After Today, re-align so a Year park
-    /// is not amplified into a clipped Month column.
+    /// is not amplified into a clipped Month column. Otherwise hold the
+    /// left-edge date (Month→Year→Month). Pull an on-screen Today back in
+    /// on Day/Week/Month steps (Month→Week, Week→Day) and when the camera
+    /// origin is still Today (pointer-zoom then Month).
     pub fn set_scale_from_toolbar(&mut self, scale: GanttScale, today: Date) {
         if self.keep_today {
             self.set_scale_at(scale, 0.0);
             self.go_today(today);
             return;
         }
+        let width = self.timeline_width.max(1.0);
+        let today_visible = (0.0..=width).contains(&self.x_for_date(today));
+        let from = self.scale;
         self.set_scale_at(scale, 0.0);
+        if !today_visible || from == scale {
+            return;
+        }
+        let day_week_month =
+            |s: GanttScale| matches!(s, GanttScale::Day | GanttScale::Week | GanttScale::Month);
+        let fine_step = day_week_month(from) && day_week_month(scale);
+        let today_is_origin = self.origin == today;
+        if fine_step || (today_is_origin && day_week_month(scale)) {
+            self.nudge_today_off_clip(today);
+        }
+    }
+
+    /// Pull Today in from the clip so the Today pill and the nearby month
+    /// tick stay readable after a scale-up (Month→Week, Week→Day).
+    fn nudge_today_off_clip(&mut self, today: Date) {
+        let width = self.timeline_width.max(1.0);
+        let x = self.x_for_date(today);
+        let margin = TODAY_MARGIN_PX.max(TODAY_PILL_W + HEADER_EDGE_PAD);
+        if x < margin {
+            self.scroll_x += x - margin;
+        } else if x > width - margin {
+            self.scroll_x += x - (width - margin);
+        }
     }
 
     /// Undo the Year/Quarter gutter park, run `f`, then park again. Keeps
@@ -1027,7 +1061,22 @@ impl GanttView {
         let leftover = full + x;
         let min = (full * 0.4).max(40.0);
         if leftover < min {
-            self.scroll_x += x;
+            let mut delta = x;
+            let width = self.timeline_width.max(1.0);
+            let today = jiff::Zoned::now().date();
+            let today_x = self.x_for_date(today);
+            if (0.0..=width).contains(&today_x) {
+                // scroll_x += delta (delta < 0) moves Today right. Do not
+                // snap the leftover column so far that Today/Nov clip.
+                let max_right = (width - TODAY_MARGIN_PX).max(TODAY_MARGIN_PX);
+                let room = (max_right - today_x).max(0.0);
+                if -delta > room {
+                    delta = -room;
+                }
+            }
+            if delta < -0.5 {
+                self.scroll_x += delta;
+            }
         }
     }
 
@@ -1343,6 +1392,11 @@ impl GanttView {
                     && !display.milestone
                     && live.as_ref().is_none_or(|gesture| !gesture.had_target);
                 let open_ended = start_only;
+                let label = if let Some(gesture) = live {
+                    format_date_range(Some(gesture.live_start), Some(gesture.live_target))
+                } else {
+                    dates_column_text(node, nodes, hint.as_ref())
+                };
                 if start_only && live.is_none() && x + width <= 0.0 {
                     // Fully left of the clip: pin a hittable sliver at x = 0.
                     // Peeking bars (`x < 0` but `x + width > 0`) keep real
@@ -1361,7 +1415,7 @@ impl GanttView {
                     y: self.row_y(offset),
                     summary: row.has_children,
                     milestone: display.milestone,
-                    label: dates_column_text(node, nodes, hint.as_ref()),
+                    label,
                     title: node.title.clone(),
                     color: parse_type_color(ado_core::color_for_type(&node.work_item_type)),
                     progress: child_completion(nodes, node.id)
@@ -1997,22 +2051,26 @@ impl GanttView {
                 // Gutter pills live at the left edge. Attach to their right
                 // so the inbound is not a cramped stub on top of "No dates".
                 let succ_gutter = bar_is_gutter(bar);
-                let x_head = if succ_gutter {
-                    bar.x + bar.width
+                let succ_right = if bar.milestone || bar.marker {
+                    bar.x + MILESTONE_SIZE
                 } else {
-                    bar.x
+                    bar.x + bar.width
                 };
-                let inbound_right = succ_gutter;
-                // Forward FS: inbound from the left of the successor.
-                // When the target starts before the source ends, prefer a
-                // short inbound if that column already sits in a gap
-                // (misses intervening bar bodies). Otherwise loop at the
-                // source stub and slide the drop into a local gap — never
-                // to the chart left edge around intervening rows or gutter
-                // pills.
-                let wrap_around = !succ_gutter && pred_end > bar.x + STUB;
+                let pred_left = pred.x;
                 let x_out = pred_end + STUB;
-                let mut x_in = if inbound_right {
+                // Inbound at succ.x-12 that sits left of the source start is
+                // the long left detour (#1003→#1012 after a left-dot resize,
+                // or a new #1003→#1013). Exit right, drop, enter the target
+                // from the right instead.
+                let detour_left = !succ_gutter && bar.x - STUB < pred_left - 0.5;
+                let mut inbound_right = succ_gutter || detour_left;
+                let mut x_head = if inbound_right { succ_right } else { bar.x };
+                let wrap_around = !succ_gutter && (detour_left || pred_end > bar.x + STUB);
+                let mut x_in = if detour_left {
+                    // Drop at the source stub, then enter the target. A drop
+                    // at succ.x-12 is left of the source start.
+                    x_out
+                } else if inbound_right {
                     x_head + STUB
                 } else {
                     x_head - STUB
@@ -2034,12 +2092,8 @@ impl GanttView {
                 // body only at those zooms.
                 let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
                 if wrap_around {
-                    // Backward FS: always loop at the source stub. A short
-                    // inbound at succ.x-12 is a gap, but routing there draws
-                    // a long left run on the predecessor gutter (the detour
-                    // after a left-dot resize of #1012). Keep the wrap drop
-                    // next to the source; the inbound stub stays at the head.
                     x_in = clear_wrap_drop_x(x_out, &intervening, false, x_head);
+                    x_in = x_in.max(pred_left + STUB);
                 } else if !inbound_right && !intervening.is_empty() {
                     let x_vert =
                         clear_vertical_x(x_in, &intervening, bar.x, true, x_head, include_labels);
@@ -2047,6 +2101,13 @@ impl GanttView {
                         x_in = x_vert;
                     }
                     x_in = clamp_inbound_stub(x_in, x_head, true, &intervening, include_labels);
+                }
+                if !succ_gutter && x_in < pred_left {
+                    // Dodging shoved the vertical left of the source; drop
+                    // at the source stub and enter the target from the right.
+                    inbound_right = true;
+                    x_head = succ_right;
+                    x_in = x_out.max(pred_left + STUB);
                 }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
                 // Stay in the predecessor row's gutter so the outgoing
@@ -2058,7 +2119,7 @@ impl GanttView {
                 } else {
                     pred.y + 1.0
                 };
-                if !succ_gutter && !wrap_around {
+                if !succ_gutter && !inbound_right && !wrap_around {
                     let clear = gutter_clear_x(bars);
                     if x_in < clear && x_head > clear + 4.0 {
                         x_in = clear;
@@ -2091,7 +2152,11 @@ impl GanttView {
                 let lane_shift = rank as f32 * LANE_SEP;
                 if out[index].wraps_around_successor() {
                     // Keep the drop on the source stub; only fan the heads.
-                    out[index].x_head -= shift;
+                    if out[index].inbound_right {
+                        out[index].x_head += shift;
+                    } else {
+                        out[index].x_head -= shift;
+                    }
                 } else if out[index].inbound_right {
                     out[index].x_head += shift;
                     out[index].x2 += shift;
@@ -2674,44 +2739,34 @@ mod tests {
         }
     }
 
-    fn assert_later_source_inbounds_from_left(
+    fn assert_exits_right_without_left_detour(
         arrow: &DependencyArrow,
         pred: &BarLayout,
         succ: &BarLayout,
         timeline_width: f32,
     ) {
+        assert_arrow_stays_on_screen(arrow, timeline_width);
+        let pred_end = bar_end(pred);
+        let succ_right = bar_end(succ);
         assert!(
-            !arrow.inbound_right,
-            "source.start > target.start must inbound from the left (▶)"
+            (arrow.x1 - (pred_end + 12.0).clamp(10.0, (timeline_width - 10.0).max(24.0))).abs()
+                < 2.0
+                || arrow.x1 + 0.5 >= pred_end,
+            "must exit to the right of the source, x1={} pred_end={pred_end}",
+            arrow.x1
         );
         assert!(
-            (arrow.x_head - succ.x).abs() < 3.0,
-            "arrowhead must sit on the target's left edge, x_head={} succ.x={}",
+            arrow.x2 + 0.5 >= pred.x,
+            "the vertical must not detour left of the source start, x2={} pred.x={}",
+            arrow.x2,
+            pred.x
+        );
+        assert!(
+            (arrow.x_head - succ.x).abs() < 12.0 || (arrow.x_head - succ_right).abs() < 12.0,
+            "must enter a target edge, x_head={} succ={}..{succ_right}",
             arrow.x_head,
             succ.x
         );
-        let expected_out = bar_end(pred) + 12.0;
-        let clip_right = (timeline_width - 10.0).max(24.0);
-        let expected_x1 = expected_out.clamp(10.0, clip_right);
-        assert!(
-            (arrow.x1 - expected_x1).abs() < 1.5,
-            "outgoing stub must leave the source end, x1={} expected={expected_x1} pred_end={}",
-            arrow.x1,
-            bar_end(pred)
-        );
-        let short_stub = (arrow.x2 - (arrow.x_head - 12.0)).abs() < 2.5;
-        let wrap_drop = arrow.wraps_around_successor()
-            && (arrow.x1 - expected_x1).abs() < 1.5
-            && arrow.x2 + 0.5 >= arrow.x1;
-        assert!(
-            short_stub || wrap_drop,
-            "later source must use a short inbound or a wrap drop, x1={} x2={} x_head={} wrap={}",
-            arrow.x1,
-            arrow.x2,
-            arrow.x_head,
-            arrow.wraps_around_successor()
-        );
-        assert_arrow_stays_on_screen(arrow, timeline_width);
     }
 
     #[test]
@@ -4431,25 +4486,7 @@ mod tests {
         for arrow in &arrows {
             let pred = bars.iter().find(|bar| bar.id == arrow.from_id).unwrap();
             if pred.x > succ.x + 1.0 {
-                assert!(
-                    !arrow.inbound_right,
-                    "source after the target start must inbound from the left, inbound_right={}",
-                    arrow.inbound_right
-                );
-                assert!(
-                    arrow.x_head <= succ.x + 1.0,
-                    "backward inbound must sit on or left of the successor start (fan may offset), x_head={} succ.x={}",
-                    arrow.x_head,
-                    succ.x
-                );
-                let expected_x1 =
-                    (bar_end(pred) + 12.0).clamp(10.0, (gantt.timeline_width - 10.0).max(24.0));
-                assert!(
-                    (arrow.x1 - expected_x1).abs() < 1.5,
-                    "outgoing stub must leave the source end, x1={} expected={expected_x1}",
-                    arrow.x1
-                );
-                assert_arrow_stays_on_screen(arrow, gantt.timeline_width);
+                assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
             } else {
                 assert!(
                     (arrow.x_head - succ.x).abs() < 3.0,
@@ -5236,7 +5273,7 @@ mod tests {
         let pred = bars.iter().find(|bar| bar.id == 1).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 3).unwrap();
         let mid = bars.iter().find(|bar| bar.id == 2).unwrap();
-        assert_later_source_inbounds_from_left(&arrows[0], pred, succ, gantt.timeline_width);
+        assert_exits_right_without_left_detour(&arrows[0], pred, succ, gantt.timeline_width);
         let (left, right) = (mid.x - HANDLE_WIDTH, bar_label_right(mid));
         assert!(
             arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
@@ -5293,18 +5330,11 @@ mod tests {
             pred.x > succ.x + 1.0,
             "fixture must place the moved parent after the successor start"
         );
-        assert_later_source_inbounds_from_left(arrow, pred, succ, gantt.timeline_width);
+        assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
         let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
         let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
         let (child_left, child_right) = bar_occupied_x(child, false);
         let (live_left, live_right) = bar_occupied_x(go_live, false);
-        assert!(
-            arrow.wraps_around_successor(),
-            "after Move children too the wrap must stay at the source stub, x1={} x2={} x_head={}",
-            arrow.x1,
-            arrow.x2,
-            arrow.x_head
-        );
         assert!(
             !x_hits_span(arrow.x2, child_left, child_right),
             "vertical x2={} must miss #1005 occupied {child_left}..{child_right}",
@@ -5313,24 +5343,6 @@ mod tests {
         assert!(
             !x_hits_span(arrow.x2, live_left, live_right),
             "vertical x2={} must miss #1013 occupied {live_left}..{live_right}",
-            arrow.x2
-        );
-        assert!(
-            (arrow.stub_start() - (succ.x - 12.0)).abs() < 2.5,
-            "inbound must sit just before the target start, stub={} x_head={} succ.x={}",
-            arrow.stub_start(),
-            arrow.x_head,
-            succ.x
-        );
-        assert!(
-            (arrow.x2 - arrow.x1).abs() < 120.0,
-            "the wrap drop must stay next to the source, not a chart-width loop, x1={} x2={}",
-            arrow.x1,
-            arrow.x2
-        );
-        assert!(
-            arrow.x2 > 80.0,
-            "must not detour to the chart left edge, x2={}",
             arrow.x2
         );
     }
@@ -5652,32 +5664,56 @@ mod tests {
             pred.x + pred.width,
             succ.x
         );
-        assert_later_source_inbounds_from_left(arrow, pred, succ, gantt.timeline_width);
-        assert!(
-            arrow.wraps_around_successor(),
-            "must loop at the source instead of a long left run, x1={} x2={} x_head={}",
-            arrow.x1,
-            arrow.x2,
-            arrow.x_head
-        );
-        assert!(
-            (arrow.x2 - arrow.x1).abs() < 120.0,
-            "the wrap drop must stay next to the source stub, x1={} x2={}",
-            arrow.x1,
-            arrow.x2
-        );
-        assert!(
-            arrow.x2 > 80.0 && arrow.x2 > succ.x,
-            "must not detour to the chart left / gutter, x2={} succ.x={}",
-            arrow.x2,
-            succ.x
-        );
-        assert!(
-            (arrow.stub_start() - (succ.x - 12.0)).abs() < 2.5,
-            "inbound must sit just before the target start, stub={} x_head={}",
-            arrow.stub_start(),
-            arrow.x_head
-        );
+        assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
+    }
+
+    #[test]
+    fn new_forward_link_to_go_live_does_not_detour_left_of_the_source() {
+        let mut pred = node(1003, Some(1002));
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-07-06T00:00:00Z".into());
+        pred.target_date = Some("2026-07-20T00:00:00Z".into());
+        let mut child = node(1005, Some(1003));
+        child.title = "Cart UI".into();
+        child.start_date = Some("2026-07-21T00:00:00Z".into());
+        child.target_date = None;
+        let mut unscheduled = node(1014, Some(1002));
+        unscheduled.title = "Backlog grooming".into();
+        unscheduled.start_date = None;
+        unscheduled.target_date = None;
+        let mut go_live = node(1013, Some(1001));
+        go_live.title = "Go-live milestone".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        go_live.predecessors = vec![1003];
+        let mut spike = node(1012, None);
+        spike.title = "Unparented spike".into();
+        spike.start_date = Some("2026-07-21T00:00:00Z".into());
+        spike.target_date = Some("2026-08-04T00:00:00Z".into());
+        let nodes = vec![
+            node(1001, None),
+            node(1002, Some(1001)),
+            pred,
+            child,
+            unscheduled,
+            go_live,
+            spike,
+        ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("#1003→#1013");
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
     }
 
     #[test]
@@ -5727,7 +5763,7 @@ mod tests {
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 1012).unwrap();
         assert!(pred.x + pred.width > succ.x + 12.0);
-        assert_later_source_inbounds_from_left(arrow, pred, succ, gantt.timeline_width);
+        assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
         let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
         let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
         let (child_left, child_right) = bar_occupied_x(child, false);
@@ -5741,17 +5777,6 @@ mod tests {
             !x_hits_span(arrow.x2, live_left, live_right),
             "vertical x2={} must miss #1013 occupied {live_left}..{live_right}",
             arrow.x2
-        );
-        assert!(
-            arrow.x2 > 80.0,
-            "must not run down the chart left edge, x2={}",
-            arrow.x2
-        );
-        assert!(
-            (arrow.stub_start() - (arrow.x_head - 12.0)).abs() < 2.5,
-            "inbound must sit just before the target start, stub={} x_head={}",
-            arrow.stub_start(),
-            arrow.x_head
         );
     }
 
@@ -5867,12 +5892,14 @@ mod tests {
             pred.x > succ.x + 1.0,
             "fixture must place the predecessor start after the successor start"
         );
-        assert_later_source_inbounds_from_left(&arrows[0], pred, succ, gantt.timeline_width);
+        assert_exits_right_without_left_detour(&arrows[0], pred, succ, gantt.timeline_width);
         assert!(
-            arrows[0].stub_start() < arrows[0].x_head - 8.0,
-            "the inbound stub must sit left of the head so ▶ reaches the bar, stub={} x_head={}",
+            arrows[0].inbound_right && arrows[0].stub_start() > arrows[0].x_head + 8.0
+                || !arrows[0].inbound_right && arrows[0].stub_start() < arrows[0].x_head - 8.0,
+            "the inbound stub must sit outside the bar so the arrowhead reaches an edge, stub={} x_head={} inbound_right={}",
             arrows[0].stub_start(),
-            arrows[0].x_head
+            arrows[0].x_head,
+            arrows[0].inbound_right
         );
     }
 
@@ -5945,7 +5972,7 @@ mod tests {
             pred_bar.x,
             succ_bar.x
         );
-        assert_later_source_inbounds_from_left(
+        assert_exits_right_without_left_detour(
             &arrows[0],
             pred_bar,
             succ_bar,
@@ -5985,7 +6012,7 @@ mod tests {
             pred_bar.x > succ_bar.x + 1.0,
             "fixture must place start-only #1005 after #1012's start"
         );
-        assert_later_source_inbounds_from_left(
+        assert_exits_right_without_left_detour(
             &arrows[0],
             pred_bar,
             succ_bar,
@@ -6168,6 +6195,41 @@ mod tests {
         assert!(
             tip.contains("Unassigned"),
             "missing assignee must say Unassigned, got {tip:?}"
+        );
+    }
+
+    #[test]
+    fn live_resize_updates_the_bar_hover_tooltip_dates() {
+        let mut item = node(1, None);
+        item.title = "Cart".into();
+        item.start_date = Some("2026-07-06T00:00:00Z".into());
+        item.target_date = Some("2026-08-14T00:00:00Z".into());
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+        gantt
+            .begin_gesture(
+                &bars[0],
+                GestureKind::ResizeEnd,
+                bars[0].x + bars[0].width,
+                &[item.clone()],
+                &[],
+            )
+            .expect("resize");
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        gantt.update_gesture(bars[0].x + bars[0].width + ppd * 7.0);
+        let live = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+        let tip = bar_hover_tooltip(&live[0], std::slice::from_ref(&item));
+        assert!(
+            tip.contains("Aug 21") || tip.contains("Aug 20"),
+            "live resize must show the new Target Date in the tooltip, got {tip:?}"
+        );
+        assert!(
+            !tip.contains("Aug 14"),
+            "tooltip must not keep the pre-drag Target Date, got {tip:?}"
         );
     }
 
@@ -6957,10 +7019,75 @@ mod tests {
             "toolbar scale after pointer zoom must not re-enter Today-follow"
         );
         let after = gantt.x_for_date(today);
-        let aligned = gantt.timeline_width.max(1.0) * TODAY_ALIGN;
         assert!(
-            (after - aligned).abs() > 2.0,
-            "pointer zoom then Month must not jump back to Today, after={after} aligned={aligned}"
+            after >= 0.0 && after <= gantt.timeline_width,
+            "pointer zoom then Month must keep Today on-screen, after={after}"
+        );
+    }
+
+    #[test]
+    fn month_to_week_keeps_today_and_november_on_screen() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 9, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let today_x = gantt.x_for_date(today);
+        assert!(
+            today_x > gantt.timeline_width * 0.7,
+            "precondition: Today must sit near the Month right edge, x={today_x}"
+        );
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar(GanttScale::Week, today);
+        });
+        let week_x = gantt.x_for_date(today);
+        assert!(
+            week_x >= TODAY_MARGIN_PX - 1.0
+                && week_x <= gantt.timeline_width - TODAY_MARGIN_PX + 1.0,
+            "Month→Week must keep Today off the clip, x={week_x}"
+        );
+        let nov1 = Date::new(2026, 11, 1).unwrap();
+        let nov_x = gantt.x_for_date(nov1);
+        assert!(
+            nov_x >= 0.0 && nov_x <= gantt.timeline_width,
+            "Month→Week must keep Nov on-screen, x={nov_x}"
+        );
+        let labels = gantt.header_tick_labels(gantt.timeline_width);
+        assert!(
+            labels.iter().any(|(_, label)| label.contains("Nov")),
+            "Week header must still name Nov, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn week_to_day_keeps_today_as_the_anchor() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 9, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar(GanttScale::Week, today);
+        });
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar(GanttScale::Day, today);
+        });
+        assert_eq!(gantt.scale, GanttScale::Day);
+        let day_x = gantt.x_for_date(today);
+        assert!(
+            day_x >= 0.0 && day_x <= gantt.timeline_width,
+            "Week→Day must keep Today on-screen, x={day_x}"
+        );
+        let left = gantt.date_for_x(0.0);
+        assert!(
+            left >= Date::new(2026, 10, 15).unwrap(),
+            "Week→Day must not jump to early October, left={left}"
         );
     }
 
