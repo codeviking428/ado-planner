@@ -44,6 +44,13 @@ pub const PARALLEL_VERT_MIN: f32 = 16.0;
 pub const OVERFLOW_BADGE: f32 = 22.0;
 /// Gap after the link-handle hit box before the overflow badge.
 pub const OVERFLOW_BADGE_GAP: f32 = 4.0;
+/// Handles + `!` + slack in front of an outside title, matching the painted
+/// Year/Quarter chip (overflow-inclusive so Persist cart → Go-live clears
+/// the `!` as well as the letters).
+pub const OUTSIDE_LABEL_GAP: f32 =
+    LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0;
+/// Outside title chip height, matching `render_gantt_bar_label`.
+pub const OUTSIDE_LABEL_H: f32 = 16.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
@@ -78,6 +85,12 @@ pub const TODAY_PILL_W: f32 = 44.0;
 pub const TODAY_PILL_GAP: f32 = 6.0;
 /// Keep year/month majors off the Today pill; Year "2027" must not crowd it.
 const HEADER_TODAY_LABEL_GAP: f32 = 72.0;
+
+/// Hover text on a finish-to-start dependency.
+pub fn dependency_link_tooltip(from_title: &str, to_title: &str) -> String {
+    format!("{from_title} → {to_title}, finish-to-start")
+}
+
 const MAJOR_LABEL_ESTIMATE: f32 = 84.0;
 const TICK_MIN_GAP: f32 = 18.0;
 /// Keep edge tick/year labels off the clip.
@@ -2399,11 +2412,16 @@ impl GanttView {
 /// Horizontal run in the padding below (or above) the predecessor bar so
 /// a 2px stroke stays in that row gap instead of riding the next row
 /// (Persist cart → Go-live along Cart UI) or through an open-ended cue
-/// (Cart UI → spike).
+/// (Cart UI → spike). When the source title sits outside the bar, keep the
+/// run off that chip (live measure was ~3px under "Persist cart").
 fn arrow_lane_y(pred: &BarLayout, succ: &BarLayout) -> f32 {
     const STROKE: f32 = 2.0;
     if succ.y > pred.y {
-        let below_bar = pred.y + pred.paint_top() + pred.paint_h() + STROKE;
+        let mut below_bar = pred.y + pred.paint_top() + pred.paint_h() + STROKE;
+        if !bar_title_is_inside(pred) {
+            let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
+            below_bar = below_bar.max(label_top + OUTSIDE_LABEL_H + PARALLEL_LANE_MIN);
+        }
         let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
         below_bar.min(in_row)
     } else {
@@ -2739,16 +2757,25 @@ fn bar_outside_title_span(bar: &BarLayout) -> Option<(f32, f32)> {
     if title_w < 4.0 {
         return None;
     }
-    let right = bar_label_right(bar);
-    let left = right - title_w;
-    Some((left, right))
+    let painted_w = if bar.milestone || bar.marker {
+        MILESTONE_SIZE
+    } else {
+        bar.width.max(8.0)
+    };
+    let gap = if bar.milestone || bar.marker {
+        6.0
+    } else {
+        OUTSIDE_LABEL_GAP
+    };
+    let left = bar.x + painted_w + gap;
+    Some((left, left + title_w))
 }
 
 /// The outgoing vertical at `x1` must miss the source's own outside title
 /// (Persist cart → Go-live through "Persist cart"). Intervening-only dodge
 /// never sees the source row. Slide a shared-source group together so the
 /// fan (Persist cart → spike vs Persist cart → Go-live) is not collapsed
-/// onto `right + 8`.
+/// onto `right + PARALLEL_VERT_MIN`.
 fn dodge_outgoing_off_source_labels(
     arrows: &mut [DependencyArrow],
     bars: &[BarLayout],
@@ -2767,17 +2794,25 @@ fn dodge_outgoing_off_source_labels(
         let Some((left, right)) = bar_outside_title_span(pred) else {
             continue;
         };
-        if !indexes
-            .iter()
-            .any(|&index| x_hits_span(arrows[index].x1, left, right))
-        {
+        // Slide when the stub sits on the chip, or when a long horizontal
+        // would run under it toward a successor that is past the title.
+        // Adjacent FS links (successor still under the chip) stay on the
+        // 12px stub so routing does not wrap to the label edge.
+        if !indexes.iter().any(|&index| {
+            let arrow = &arrows[index];
+            x_hits_span(arrow.x1, left, right)
+                || (x_spans_overlap(
+                    (arrow.x1.min(arrow.x2), arrow.x1.max(arrow.x2)),
+                    (left, right),
+                ) && arrow.x_head > right + PARALLEL_VERT_MIN)
+        }) {
             continue;
         }
         let min_x1 = indexes
             .iter()
             .map(|&index| arrows[index].x1)
             .fold(f32::MAX, f32::min);
-        let target = (right + 8.0).clamp(clip_left, clip_right);
+        let target = (right + PARALLEL_VERT_MIN).clamp(clip_left, clip_right);
         let shift = (target - min_x1).max(0.0);
         if shift < 0.5 {
             continue;
@@ -5399,6 +5434,30 @@ mod tests {
             "Go-live arrowhead must sit on the diamond, x_head={} diamond={}",
             live.x_head,
             go_live.x
+        );
+        if let Some((left, right)) = bar_outside_title_span(pred) {
+            assert!(
+                live.x1 >= right + PARALLEL_VERT_MIN - 1.0
+                    || live.x1.max(live.x2) < left
+                    || live.lane_y
+                        >= pred.y
+                            + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0)
+                            + OUTSIDE_LABEL_H
+                            + PARALLEL_LANE_MIN
+                            - 1.0,
+                "Persist cart → Go-live must clear the source title, x1={} label={left}..{right} lane={} pred.y={}",
+                live.x1,
+                live.lane_y,
+                pred.y
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_hover_tooltip_names_both_ends() {
+        assert_eq!(
+            dependency_link_tooltip("Persist cart", "Go-live milestone"),
+            "Persist cart → Go-live milestone, finish-to-start"
         );
     }
 

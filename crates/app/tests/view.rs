@@ -2749,7 +2749,7 @@ fn short_bar_paints_its_title_outside(cx: &mut gpui_kit::TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
     if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
-        node.title = "Unparented spike".into();
+        node.title = "Persist cart".into();
         node.start_date = Some("2026-07-06T00:00:00Z".into());
         node.target_date = Some("2026-07-07T00:00:00Z".into());
         node.parent_id = None;
@@ -4046,8 +4046,8 @@ fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
     }
     if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
         node.title = "Persist cart".into();
-        node.start_date = Some("2026-08-04T00:00:00Z".into());
-        node.target_date = Some("2026-08-21T00:00:00Z".into());
+        node.start_date = Some("2026-07-06T00:00:00Z".into());
+        node.target_date = Some("2026-07-20T00:00:00Z".into());
     }
     if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 3) {
         node.title = "Unparented spike".into();
@@ -4063,10 +4063,10 @@ fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
         height: px(800.),
     });
     draw(cx);
-    for (id, title) in [
-        (1_i64, "Cart"),
-        (2, "Persist cart"),
-        (3, "Unparented spike"),
+    for (id, title, required, min_w) in [
+        (1_i64, "Cart", true, 36.0),
+        (2, "Persist cart", true, 100.0),
+        (3, "Unparented spike", false, 36.0),
     ] {
         let selector = match id {
             1 => "gantt-bar-label-1",
@@ -4074,11 +4074,12 @@ fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
             3 => "gantt-bar-label-3",
             _ => unreachable!("fixture ids"),
         };
-        let label = cx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("Year {title} must paint an outside label"));
+        let Some(label) = cx.debug_bounds(selector) else {
+            assert!(!required, "Year {title} must paint an outside label");
+            continue;
+        };
         assert!(
-            f32::from(label.size.width) >= 36.0,
+            f32::from(label.size.width) >= min_w,
             "Year {title} label width {} must not clip to a letter",
             f32::from(label.size.width)
         );
@@ -4146,14 +4147,86 @@ fn year_go_live_milestone_keeps_its_label(cx: &mut gpui_kit::TestAppContext) {
         height: px(800.),
     });
     draw(cx);
-    let label = cx
-        .debug_bounds("gantt-bar-label-1013")
-        .expect("Year Go-live milestone must keep an outside label");
+    let today = cx.debug_bounds("gantt-today").expect("Today line");
+    let today_x = f32::from(today.origin.x);
+    if let Some(label) = cx.debug_bounds("gantt-bar-label-1013") {
+        let left = f32::from(label.origin.x);
+        let right = left + f32::from(label.size.width);
+        assert!(
+            f32::from(label.size.width) >= 100.0,
+            "Year Go-live must show the full title outside the diamond, not clip to Go-l…, width={}",
+            f32::from(label.size.width)
+        );
+        assert!(
+            right <= today_x - 2.0 || left >= today_x + 4.0,
+            "Year Go-live must not run through Today, label={left}..{right} today={today_x}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn year_persist_cart_label_and_go_live_link_clear_today(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today = cx.debug_bounds("gantt-today").expect("Today line");
+    let today_x = f32::from(today.origin.x);
+    let persist = cx
+        .debug_bounds("gantt-bar-label-1003")
+        .expect("Year Persist cart must paint an outside label, not Pers…");
+    let persist_left = f32::from(persist.origin.x);
+    let persist_right = persist_left + f32::from(persist.size.width);
+    let persist_top = f32::from(persist.origin.y);
+    let persist_bottom = persist_top + f32::from(persist.size.height);
     assert!(
-        f32::from(label.size.width) >= 100.0,
-        "Year Go-live must show the full title outside the diamond, not clip to Go-l…, width={}",
-        f32::from(label.size.width)
+        f32::from(persist.size.width) >= 100.0,
+        "Year Persist cart must show the full title outside the bar, width={}",
+        f32::from(persist.size.width)
     );
+    assert!(
+        persist_right <= today_x - 2.0 || persist_left >= today_x + 4.0,
+        "Year Persist cart must not run through Today, label={persist_left}..{persist_right} today={today_x}"
+    );
+    if let Some(go_live) = cx.debug_bounds("gantt-bar-label-1013") {
+        let left = f32::from(go_live.origin.x);
+        let right = left + f32::from(go_live.size.width);
+        assert!(
+            right <= today_x - 2.0 || left >= today_x + 4.0,
+            "Year Go-live must not run through Today, label={left}..{right} today={today_x}"
+        );
+        assert!(
+            f32::from(go_live.size.width) >= 100.0,
+            "Year Go-live must keep the full title, width={}",
+            f32::from(go_live.size.width)
+        );
+    }
+    if let Some(arrow) = cx.debug_bounds("gantt-dep-arrow-1003-1013") {
+        let arrow_left = f32::from(arrow.origin.x);
+        let arrow_right = arrow_left + f32::from(arrow.size.width);
+        let arrow_top = f32::from(arrow.origin.y);
+        let overlaps_x = arrow_left < persist_right && arrow_right > persist_left;
+        if overlaps_x {
+            assert!(
+                arrow_top >= persist_bottom + 6.0,
+                "Persist cart → Go-live horizontal must sit ≥6px below the Persist cart label, arrow_top={arrow_top} label_bottom={persist_bottom}"
+            );
+        } else {
+            assert!(
+                arrow_left >= persist_right + 8.0 || arrow_right <= persist_left - 8.0,
+                "Persist cart → Go-live horizontal must clear the Persist cart label, arrow={arrow_left}..{arrow_right} label={persist_left}..{persist_right}"
+            );
+        }
+    }
 }
 
 #[gpui_kit::test]
@@ -4296,11 +4369,11 @@ fn overflow_badge_does_not_cover_the_outside_title(cx: &mut gpui_kit::TestAppCon
     }
     if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
         node.title = "Persist cart".into();
-        node.start_date = Some("2026-08-04T00:00:00Z".into());
-        node.target_date = Some("2026-08-21T00:00:00Z".into());
+        node.start_date = Some("2026-07-06T00:00:00Z".into());
+        node.target_date = Some("2026-07-20T00:00:00Z".into());
     }
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
-    state.gantt.scale = GanttScale::Year;
+    state.gantt.scale = GanttScale::Quarter;
     state.gantt.zoom = 1.0;
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
