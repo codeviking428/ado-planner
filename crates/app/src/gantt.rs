@@ -1735,11 +1735,7 @@ impl GanttView {
                     if (x_vert - x_in).abs() > 0.5 {
                         x_in = x_vert;
                     }
-                    if backward {
-                        x_in = x_in.max(x_head + STUB);
-                    } else {
-                        x_in = x_in.min(x_head - STUB);
-                    }
+                    x_in = clamp_inbound_stub(x_in, x_head, inbound_left, &intervening);
                 }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
                 // Stay in the predecessor row's gutter so the outgoing
@@ -1943,6 +1939,33 @@ fn clear_vertical_x(
         return around;
     }
     pref.max(x_head + 4.0)
+}
+
+/// Keep a 12px inbound stub when it stays in the clear lane; otherwise keep
+/// the already-cleared `x_in` so the vertical does not recross a bar.
+fn clamp_inbound_stub(
+    x_in: f32,
+    x_head: f32,
+    inbound_left: bool,
+    intervening: &[&BarLayout],
+) -> f32 {
+    const STUB: f32 = 12.0;
+    let clamped = if inbound_left {
+        x_in.min(x_head - STUB)
+    } else {
+        x_in.max(x_head + STUB)
+    };
+    if (clamped - x_in).abs() < 0.5 {
+        return clamped;
+    }
+    if intervening.iter().any(|bar| {
+        let (left, right) = bar_occupied_x(bar);
+        x_hits_span(clamped, left, right)
+    }) {
+        x_in
+    } else {
+        clamped
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4320,6 +4343,78 @@ mod tests {
             arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
             "the inbound vertical must still skip the intervening row, x2={} mid={left}..{right}",
             arrows[0].x2
+        );
+    }
+
+    #[test]
+    fn stub_clamp_does_not_recross_an_intervening_bar() {
+        let pred = BarLayout {
+            id: 1,
+            kind: GanttBarKind::Scheduled,
+            x: 20.0,
+            width: 40.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "pred".into(),
+            title: "Pred".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let mid = BarLayout {
+            id: 2,
+            kind: GanttBarKind::Scheduled,
+            x: 100.0,
+            width: 90.0,
+            y: ROW_HEIGHT,
+            summary: false,
+            milestone: false,
+            label: "mid".into(),
+            title: "MMMMMMMMMMMMMMMM".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let succ = BarLayout {
+            id: 3,
+            kind: GanttBarKind::Scheduled,
+            x: 200.0,
+            width: 80.0,
+            y: ROW_HEIGHT * 2.0,
+            summary: false,
+            milestone: false,
+            label: "succ".into(),
+            title: "Succ".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: vec![1],
+            marker: false,
+            open_ended: false,
+        };
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let arrows = gantt.layout_dependency_arrows(&[pred, mid.clone(), succ.clone()]);
+        assert_eq!(arrows.len(), 1);
+        let (left, right) = bar_occupied_x(&mid);
+        assert!(
+            arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
+            "forcing a 12px stub must not recross the intervening bar, x2={} mid={left}..{right} x_head={}",
+            arrows[0].x2,
+            arrows[0].x_head
+        );
+        assert!(
+            (arrows[0].x_head - succ.x).abs() < 3.0,
+            "the head must still sit on the successor start, x_head={} succ.x={}",
+            arrows[0].x_head,
+            succ.x
         );
     }
 
