@@ -1246,11 +1246,9 @@ impl GanttView {
                 let (start, target) = if let Some(gesture) = live {
                     (gesture.live_start, gesture.live_target)
                 } else if display.kind == GanttBarKind::NoFields {
-                    let width = if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
-                        MILESTONE_SIZE
-                    } else {
-                        NO_FIELDS_HINT_W
-                    };
+                    // Keep "No dates" readable on Year/Quarter. A 16px box
+                    // collapses the label to "…".
+                    let width = NO_FIELDS_HINT_W;
                     return Some(BarLayout {
                         id: node.id,
                         kind: display.kind,
@@ -1621,6 +1619,8 @@ impl GanttView {
     /// Skip a major label that would sit on the Today flag (Day zoom).
     /// Pin the in-view leftover month to x = 0; keep the next month on its
     /// own segment instead of sliding "Nov 2026" over October days.
+    /// Dodge runs after sticky so a leftover "Nov 2026" at x = 0 cannot
+    /// sit on the Today pill in Week view.
     pub fn header_major_labels_except(
         &self,
         width: f32,
@@ -1630,24 +1630,12 @@ impl GanttView {
             .timeline_ticks(width)
             .into_iter()
             .filter(|tick| tick.major)
-            .map(|tick| {
-                let mut x = tick.x.max(0.0);
-                if let Some(today) = hide_x {
-                    let pill_left = (today + TODAY_PILL_GAP).max(4.0);
-                    let pill_right = pill_left + TODAY_PILL_W;
-                    let text_w = MAJOR_LABEL_ESTIMATE.max(header_label_px(&tick.major_label));
-                    if x < pill_right + HEADER_TODAY_LABEL_GAP && x + text_w > pill_left {
-                        // Year paints Today on the tick row, so a sticky year
-                        // at x = 0 can stay. Other scales shift off the pill.
-                        if !(matches!(self.scale, GanttScale::Year) && x < HEADER_LEFT_PAD) {
-                            x = pill_right + HEADER_TODAY_LABEL_GAP;
-                        }
-                    }
-                }
-                (x, tick.major_label)
-            })
+            .map(|tick| (tick.x.max(0.0), tick.major_label))
             .collect();
-        let labels = Self::sticky_header_labels(ticks, false, 72.0);
+        let mut labels = Self::sticky_header_labels(ticks, false, 72.0);
+        if let Some(today) = hide_x {
+            labels = dodge_majors_off_today_pill(labels, today, width, self.scale);
+        }
         Self::fit_labels_to_width(labels, width)
     }
 
@@ -1949,6 +1937,15 @@ impl GanttView {
                 } else {
                     pred.x + pred.width
                 };
+                // Gutter pills live at the left edge. Attach to their right
+                // so the inbound is not a cramped stub on top of "No dates".
+                let succ_gutter = bar_is_gutter(bar);
+                let x_head = if succ_gutter {
+                    bar.x + bar.width
+                } else {
+                    bar.x
+                };
+                let inbound_right = succ_gutter;
                 // Forward FS: inbound from the left of the successor.
                 // When the target starts before the source ends, prefer a
                 // short inbound if that column already sits in a gap
@@ -1956,10 +1953,13 @@ impl GanttView {
                 // source stub and slide the drop into a local gap — never
                 // to the chart left edge around intervening rows or gutter
                 // pills.
-                let wrap_around = pred_end > bar.x + STUB;
-                let x_head = bar.x;
+                let wrap_around = !succ_gutter && pred_end > bar.x + STUB;
                 let x_out = pred_end + STUB;
-                let mut x_in = x_head - STUB;
+                let mut x_in = if inbound_right {
+                    x_head + STUB
+                } else {
+                    x_head - STUB
+                };
                 let lo = pred.y.min(bar.y);
                 let hi = pred.y.max(bar.y);
                 let intervening: Vec<&BarLayout> = bars
@@ -1969,9 +1969,6 @@ impl GanttView {
                             && mid.id != bar.id
                             && mid.y > lo + 1.0
                             && mid.y < hi - 1.0
-                            && mid.kind != GanttBarKind::Unscheduled
-                            && mid.kind != GanttBarKind::NoFields
-                            && !mid.marker
                     })
                     .collect();
                 // Year/Quarter bars are slivers; their titles still paint at
@@ -1985,7 +1982,7 @@ impl GanttView {
                     // intervening span (skip labels so a title to the
                     // right of a short marker does not shove the drop).
                     x_in = clear_wrap_drop_x(x_out, &intervening, false, x_head);
-                } else if !intervening.is_empty() && !wrap_around {
+                } else if !inbound_right && !intervening.is_empty() && !wrap_around {
                     let x_vert =
                         clear_vertical_x(x_in, &intervening, bar.x, true, x_head, include_labels);
                     if (x_vert - x_in).abs() > 0.5 {
@@ -2003,6 +2000,12 @@ impl GanttView {
                 } else {
                     pred.y + 1.0
                 };
+                if !succ_gutter {
+                    let clear = gutter_clear_x(bars);
+                    if x_in < clear && x_head > clear + 4.0 {
+                        x_in = clear;
+                    }
+                }
                 out.push(DependencyArrow {
                     from_id: *pred_id,
                     to_id: bar.id,
@@ -2012,7 +2015,7 @@ impl GanttView {
                     y2,
                     x_head,
                     lane_y,
-                    inbound_right: false,
+                    inbound_right,
                 });
             }
         }
@@ -2047,18 +2050,26 @@ impl GanttView {
             }
         }
         let clip_right = (self.timeline_width - 10.0).max(24.0);
+        let clip_left = gutter_clear_x(bars);
         for arrow in &mut out {
-            clip_arrow_to_timeline(arrow, 10.0, clip_right);
+            clip_arrow_to_timeline(arrow, clip_left, clip_right);
         }
         out
     }
 }
 
 fn clip_arrow_to_timeline(arrow: &mut DependencyArrow, left: f32, right: f32) {
-    let clamp = |x: f32| x.clamp(left, right);
-    arrow.x_head = clamp(arrow.x_head);
-    arrow.x1 = clamp(arrow.x1);
-    arrow.x2 = clamp(arrow.x2);
+    let clamp_span = |x: f32| x.clamp(left, right);
+    // Keep the head on the successor. Pulling it to `left` parks ▶ on the
+    // chart edge and on top of gutter "No dates" pills.
+    arrow.x_head = arrow.x_head.clamp(0.0, right);
+    if arrow.x_head > left + 1.0 {
+        arrow.x1 = clamp_span(arrow.x1);
+        arrow.x2 = clamp_span(arrow.x2);
+    } else {
+        arrow.x1 = arrow.x1.clamp(0.0, right);
+        arrow.x2 = arrow.x2.clamp(0.0, right);
+    }
     const MIN_STUB: f32 = 10.0;
     // Only expand a collapsed inbound stub. Do not shrink wrap-around elbows.
     if arrow.inbound_right {
@@ -2070,8 +2081,13 @@ fn clip_arrow_to_timeline(arrow: &mut DependencyArrow, left: f32, right: f32) {
             arrow.x2 = right;
         }
     } else if (arrow.x_head - arrow.x2).abs() < MIN_STUB {
-        arrow.x2 = (arrow.x_head - MIN_STUB).max(left);
-        if arrow.x_head < left + MIN_STUB {
+        let floor = if arrow.x_head > left + MIN_STUB {
+            left
+        } else {
+            0.0
+        };
+        arrow.x2 = (arrow.x_head - MIN_STUB).max(floor);
+        if arrow.x_head < left + MIN_STUB && arrow.x_head > left + 1.0 {
             arrow.x_head = (left + MIN_STUB).min(right);
             arrow.x2 = left;
         }
@@ -2084,6 +2100,87 @@ fn parse_type_color(hex: &str) -> u32 {
 
 pub(crate) fn header_label_px(label: &str) -> f32 {
     (label.chars().count() as f32 * 7.0 + 8.0).max(14.0)
+}
+
+/// Painted x of the "Today" pill, matching the timeline header.
+pub(crate) fn today_pill_left(today_x: f32, width: f32) -> f32 {
+    if today_x + TODAY_PILL_GAP + TODAY_PILL_W > width - 4.0 {
+        (today_x - TODAY_PILL_W - 4.0).max(4.0)
+    } else {
+        (today_x + TODAY_PILL_GAP).max(4.0)
+    }
+}
+
+fn dodge_majors_off_today_pill(
+    labels: Vec<(f32, String)>,
+    today_x: f32,
+    width: f32,
+    scale: GanttScale,
+) -> Vec<(f32, String)> {
+    let pill_left = today_pill_left(today_x, width);
+    let pill_right = pill_left + TODAY_PILL_W;
+    labels
+        .into_iter()
+        .map(|(mut x, label)| {
+            let text_w = MAJOR_LABEL_ESTIMATE.max(header_label_px(&label));
+            if x < pill_right + HEADER_TODAY_LABEL_GAP && x + text_w > pill_left {
+                // Year leftover at x = 0 can stay when Today is in the middle.
+                if !(matches!(scale, GanttScale::Year)
+                    && x < HEADER_LEFT_PAD
+                    && x + text_w <= pill_left + 1.0)
+                {
+                    x = pill_right + HEADER_TODAY_LABEL_GAP;
+                }
+            }
+            (x, label)
+        })
+        .collect()
+}
+
+fn bar_is_gutter(bar: &BarLayout) -> bool {
+    bar.marker || bar.kind == GanttBarKind::Unscheduled || bar.kind == GanttBarKind::NoFields
+}
+
+/// Right edge arrows must stay clear of, so wrap verticals miss gutter pills.
+fn gutter_clear_x(bars: &[BarLayout]) -> f32 {
+    let right = bars
+        .iter()
+        .filter(|bar| bar_is_gutter(bar))
+        .map(|bar| bar.x + bar.width)
+        .fold(0.0_f32, f32::max);
+    if right <= 0.0 {
+        10.0
+    } else {
+        (right + 8.0).max(UNSCHEDULED_GUTTER_RIGHT)
+    }
+}
+
+/// Hover copy for a Gantt bar: title, dates, assignee.
+pub fn bar_hover_tooltip(bar: &BarLayout, nodes: &[WorkItemNode]) -> String {
+    let assignee = nodes
+        .iter()
+        .find(|node| node.id == bar.id)
+        .and_then(|node| node.assigned_to.as_ref())
+        .map(|identity| identity.display_name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Unassigned");
+    let dates = if bar.kind == GanttBarKind::NoFields {
+        "No dates"
+    } else if bar.marker || bar.kind == GanttBarKind::Unscheduled {
+        "Unscheduled"
+    } else if bar.label.is_empty() {
+        "No dates"
+    } else {
+        bar.label.as_str()
+    };
+    format!("{} · {} · {assignee}", bar.title, dates)
+}
+
+/// True when the timeline has no dated bars — only gutter pills, or nothing.
+pub fn timeline_is_empty_of_scheduled(bars: &[BarLayout]) -> bool {
+    !bars
+        .iter()
+        .any(|bar| bar.kind == GanttBarKind::Scheduled && !bar.marker)
 }
 
 /// Child start before the parent, or child target after the parent.
@@ -2169,6 +2266,9 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
 
 /// Body, and optionally an external title, so a vertical drop misses the row.
 fn bar_occupied_x(bar: &BarLayout, include_label: bool) -> (f32, f32) {
+    if bar_is_gutter(bar) {
+        return (bar.x - 2.0, bar.x + bar.width + 4.0);
+    }
     let left = if bar.milestone || bar.marker {
         bar.x - 2.0
     } else {
@@ -4789,26 +4889,38 @@ mod tests {
     #[test]
     fn week_header_shifts_the_month_off_the_today_pill() {
         let today = Date::new(2026, 11, 2).unwrap();
-        let gantt = GanttView {
-            origin: today,
-            scale: GanttScale::Week,
-            zoom: 1.0,
-            timeline_width: 800.0,
-            ..Default::default()
-        };
-        let today_x = gantt.today_x(today);
-        let majors = gantt.header_major_labels_except(800.0, Some(today_x));
-        assert!(
-            majors.iter().any(|(_, label)| label.contains("Nov")),
-            "Week zoom must keep the Nov month label, got {majors:?}"
-        );
-        assert!(
-            majors
-                .iter()
-                .filter(|(_, label)| label.contains("Nov"))
-                .all(|(x, _)| (x - today_x).abs() >= 14.0 || *x <= 1.0),
-            "Week month label must not sit on the Today flag: {majors:?} today_x={today_x}"
-        );
+        let centered_days =
+            ((800.0 * TODAY_ALIGN) / GanttScale::Week.pixels_per_day(1.0)).round() as i32;
+        for (origin, scroll_x) in [
+            (today, 0.0),
+            (today.saturating_sub(centered_days.days()), 0.0),
+            (Date::new(2026, 11, 1).unwrap(), 0.0),
+        ] {
+            let gantt = GanttView {
+                origin,
+                scroll_x,
+                scale: GanttScale::Week,
+                zoom: 1.0,
+                timeline_width: 800.0,
+                ..Default::default()
+            };
+            let today_x = gantt.today_x(today);
+            let majors = gantt.header_major_labels_except(800.0, Some(today_x));
+            assert!(
+                majors.iter().any(|(_, label)| label.contains("Nov")),
+                "Week zoom must keep the Nov month label, origin={origin} got {majors:?}"
+            );
+            let pill_left = today_pill_left(today_x, 800.0);
+            let pill_right = pill_left + TODAY_PILL_W;
+            for (x, label) in &majors {
+                let text_w = header_label_px(label);
+                let overlaps = *x < pill_right && *x + text_w > pill_left;
+                assert!(
+                    !overlaps,
+                    "Week label {label:?} at {x} (w={text_w}) must not overlap Today {pill_left}..{pill_right}, origin={origin} majors={majors:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5293,6 +5405,85 @@ mod tests {
     }
 
     #[test]
+    fn wrap_vertical_misses_gutter_no_dates_pills() {
+        let pred = BarLayout {
+            id: 1,
+            kind: GanttBarKind::Scheduled,
+            x: 300.0,
+            width: 80.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "pred".into(),
+            title: "Pred".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let pill = BarLayout {
+            id: 2,
+            kind: GanttBarKind::NoFields,
+            x: UNSCHEDULED_GUTTER_X,
+            width: NO_FIELDS_HINT_W,
+            y: ROW_HEIGHT,
+            summary: false,
+            milestone: false,
+            label: "No dates".into(),
+            title: "No fields".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let succ = BarLayout {
+            id: 3,
+            kind: GanttBarKind::Scheduled,
+            x: 80.0,
+            width: 80.0,
+            y: ROW_HEIGHT * 2.0,
+            summary: false,
+            milestone: false,
+            label: "succ".into(),
+            title: "Succ".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: vec![1],
+            marker: false,
+            open_ended: false,
+        };
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let arrows = gantt.layout_dependency_arrows(&[pred, pill.clone(), succ.clone()]);
+        assert_eq!(arrows.len(), 1);
+        let (left, right) = bar_occupied_x(&pill, false);
+        assert!(
+            !x_hits_span(arrows[0].x1, left, right) && !x_hits_span(arrows[0].x2, left, right),
+            "connector x1={} x2={} must miss the No dates pill {left}..{right}",
+            arrows[0].x1,
+            arrows[0].x2
+        );
+        assert!(
+            arrows[0].x2 >= gutter_clear_x(&[pill.clone(), succ.clone()]) - 0.5
+                || arrows[0].x_head > 80.0,
+            "inbound must not sit on the left edge, x2={} x_head={}",
+            arrows[0].x2,
+            arrows[0].x_head
+        );
+        assert!(
+            arrows[0].inbound_right || arrows[0].x_head >= 70.0,
+            "arrowhead must not park on the gutter, inbound_right={} x_head={}",
+            arrows[0].inbound_right,
+            arrows[0].x_head
+        );
+    }
+
+    #[test]
     fn backward_link_loops_locally_not_to_the_chart_left() {
         let mut pred = node(1003, Some(1002));
         pred.title = "Persist cart".into();
@@ -5732,19 +5923,73 @@ mod tests {
         item.target_date = None;
         item.has_date_fields = false;
         item.work_item_type = "Product Backlog Item".into();
+        for scale in [GanttScale::Month, GanttScale::Year, GanttScale::Quarter] {
+            let gantt = GanttView {
+                origin: Date::new(2026, 7, 1).unwrap(),
+                scale,
+                ..Default::default()
+            };
+            let rows = gantt.flatten(std::slice::from_ref(&item));
+            let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+            assert_eq!(bars.len(), 1);
+            assert_eq!(bars[0].kind, GanttBarKind::NoFields);
+            assert!(
+                (bars[0].x - UNSCHEDULED_GUTTER_X).abs() < 0.1,
+                "PBI rows without date fields must still show a gutter hint, x={}",
+                bars[0].x
+            );
+            assert!(
+                (bars[0].width - NO_FIELDS_HINT_W).abs() < 0.1,
+                "{scale:?} No dates pill must stay wide enough to paint the words, width={}",
+                bars[0].width
+            );
+        }
+    }
+
+    #[test]
+    fn bar_hover_tooltip_lists_name_dates_and_assignee() {
+        let mut item = node(1, None);
+        item.title = "Cart".into();
+        item.assigned_to = Some(ado_core::IdentityValue {
+            display_name: "Ada Lovelace".into(),
+            unique_name: "ada@contoso.com".into(),
+            id: None,
+        });
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
             ..Default::default()
         };
         let rows = gantt.flatten(std::slice::from_ref(&item));
         let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
-        assert_eq!(bars.len(), 1);
-        assert_eq!(bars[0].kind, GanttBarKind::NoFields);
+        let tip = bar_hover_tooltip(&bars[0], std::slice::from_ref(&item));
         assert!(
-            (bars[0].x - UNSCHEDULED_GUTTER_X).abs() < 0.1,
-            "PBI rows without date fields must still show a gutter hint, x={}",
-            bars[0].x
+            tip.contains("Cart") && tip.contains("Ada Lovelace") && tip.contains('→'),
+            "bar tooltip must show name, dates, and assignee, got {tip:?}"
         );
+        item.assigned_to = None;
+        let tip = bar_hover_tooltip(&bars[0], std::slice::from_ref(&item));
+        assert!(
+            tip.contains("Unassigned"),
+            "missing assignee must say Unassigned, got {tip:?}"
+        );
+    }
+
+    #[test]
+    fn unscheduled_bars_count_as_an_empty_timeline() {
+        let mut dated = node(1, None);
+        dated.start_date = None;
+        dated.target_date = None;
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(std::slice::from_ref(&dated));
+        let bars = gantt.layout_bars(std::slice::from_ref(&dated), &rows, &[], 720.0);
+        assert!(timeline_is_empty_of_scheduled(&bars));
+        let scheduled = node(2, None);
+        let rows = gantt.flatten(std::slice::from_ref(&scheduled));
+        let bars = gantt.layout_bars(std::slice::from_ref(&scheduled), &rows, &[], 720.0);
+        assert!(!timeline_is_empty_of_scheduled(&bars));
     }
 
     #[test]

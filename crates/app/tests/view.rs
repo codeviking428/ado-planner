@@ -103,6 +103,10 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
         "at least one Gantt bar should be painted"
     );
     assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "a scheduled backlog must not show the empty-timeline hint"
+    );
+    assert!(
         cx.debug_bounds("gantt-sync-status").is_some(),
         "the toolbar must show a subtle save/sync status"
     );
@@ -817,8 +821,8 @@ fn unscheduled_only_grid_paints_today_markers(cx: &mut gpui_kit::TestAppContext)
         "unscheduled rows must still paint a Today marker so a new row is not blank"
     );
     assert!(
-        cx.debug_bounds("unscheduled-empty-hint").is_none(),
-        "placeholder bars replace the empty-timeline drop hint"
+        cx.debug_bounds("unscheduled-empty-hint").is_some(),
+        "an all-unscheduled grid must still hint that the timeline is empty"
     );
 }
 
@@ -896,6 +900,10 @@ fn context_menu_opens_at_the_click_not_the_window_origin(cx: &mut gpui_kit::Test
         cx.debug_bounds("gantt-menu-Add child").is_some(),
         "right-click must offer Add child"
     );
+    assert!(
+        cx.debug_bounds("gantt-menu-Rename").is_some(),
+        "right-click must offer Rename so F2 is not the only edit path"
+    );
 }
 
 #[gpui_kit::test]
@@ -923,6 +931,29 @@ fn context_menu_closes_after_an_action_is_chosen(cx: &mut gpui_kit::TestAppConte
             "choosing Add child must close the context menu"
         );
     });
+}
+
+#[gpui_kit::test]
+fn context_menu_rename_starts_inline_edit(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.context_menu = Some(ContextTarget {
+        id: 1,
+        from_bar: false,
+        x: 320.0,
+        y: 280.0,
+        link: None,
+    });
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let rename = cx.debug_bounds("gantt-menu-Rename").expect("Rename");
+    cx.simulate_mouse_down(rename.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_some(),
+        "Rename must start an inline title edit"
+    );
 }
 
 #[gpui_kit::test]
@@ -3528,6 +3559,49 @@ fn year_today_label_does_not_overlap_month_ticks(cx: &mut gpui_kit::TestAppConte
         today_bottom <= tick_top + 1.0,
         "Year Today at {today_top}..{today_bottom} must sit on the year row, not on month ticks at {tick_top}"
     );
+}
+
+#[gpui_kit::test]
+fn week_header_nov_does_not_overlap_today(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 11, 2).unwrap();
+    state.gantt.scale = GanttScale::Week;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today = cx
+        .debug_bounds("gantt-today-label")
+        .expect("Week Today label");
+    let today_left = f32::from(today.origin.x);
+    let today_right = today_left + f32::from(today.size.width);
+    let selectors = [
+        "gantt-major-0",
+        "gantt-major-1",
+        "gantt-major-2",
+        "gantt-major-3",
+        "gantt-major-4",
+        "gantt-major-5",
+    ];
+    let mut found = 0;
+    for selector in selectors {
+        let Some(major) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        found += 1;
+        let major_left = f32::from(major.origin.x);
+        let major_right = major_left + f32::from(major.size.width);
+        assert!(
+            major_right <= today_left + 1.0 || major_left >= today_right - 1.0,
+            "{selector} at {major_left}..{major_right} must not overlap Today {today_left}..{today_right}"
+        );
+    }
+    assert!(found > 0, "Week view must paint a month major label");
 }
 
 #[gpui_kit::test]
@@ -6692,7 +6766,7 @@ fn delete_confirm_warns_about_children(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn double_click_title_starts_inline_rename(cx: &mut gpui_kit::TestAppContext) {
+fn double_click_title_opens_details(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let state = idle_state(&dir);
@@ -6709,16 +6783,21 @@ fn double_click_title_starts_inline_rename(cx: &mut gpui_kit::TestAppContext) {
     });
     draw(cx);
     assert!(
-        cx.debug_bounds("gantt-inline-title").is_some(),
-        "double-click on a title must start inline rename, matching the tooltip"
+        cx.debug_bounds("gantt-inline-title").is_none(),
+        "double-click on a title must open details, not inline rename"
     );
     view.update(cx, |view, _| {
         assert!(
-            view.state.form.is_none(),
-            "double-click on a title must not open details"
+            view.form_is_loading() || view.state.form.is_some(),
+            "double-click on a title must open details"
         );
         assert_eq!(view.state.gantt.selected_id, Some(1));
     });
+    assert!(
+        cx.debug_bounds("work-item-form-loading").is_some()
+            || cx.debug_bounds("work-item-form").is_some(),
+        "double-click on a title must show the details dialog"
+    );
 }
 
 #[gpui_kit::test]

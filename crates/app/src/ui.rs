@@ -45,11 +45,12 @@ use crate::form::ado_edit_url_on;
 use crate::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH,
     DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
-    LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS,
-    NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W,
+    LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W,
+    NUDGE_IDLE_MS, NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W,
     SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H,
-    TODAY_PILL_GAP, TODAY_PILL_W, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT,
-    bar_title_is_inside, header_label_px, parent_date_overflow, parent_overflow_tip,
+    TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside,
+    header_label_px, parent_date_overflow, parent_overflow_tip, timeline_is_empty_of_scheduled,
+    today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -576,7 +577,8 @@ impl PlannerView {
         self.begin_inline(InlineEdit::Title(id), title, window, cx);
     }
 
-    /// Title click: single-click selects, double-click starts inline rename.
+    /// Title click: single-click selects, double-click opens details.
+    /// Rename with F2 or the context-menu action.
     pub fn activate_title(
         &mut self,
         id: i64,
@@ -586,7 +588,7 @@ impl PlannerView {
     ) {
         self.state.gantt.select_row(id);
         if click_count >= 2 {
-            self.open_inline_title(id, window, cx);
+            self.open_form(id, cx);
             return;
         }
         if self.inline_edit.is_none() {
@@ -3643,7 +3645,7 @@ impl PlannerView {
                 .into_any_element();
         }
         let title_owned = title.to_string();
-        let tip = format!("{title_owned} · Double-click or F2 to rename");
+        let tip = format!("{title_owned} · Double-click to open · F2 or Rename to edit");
         let form_open = self.details_overlay();
         div()
             .id(("title", id as u64))
@@ -4112,15 +4114,11 @@ impl PlannerView {
         // at y=22; putting Today there overlaps "Nov".
         let today_label_top = 2.0;
         let today_label_x = if today_on_screen {
-            if today_x + TODAY_PILL_GAP + TODAY_PILL_W > width - 4.0 {
-                (today_x - TODAY_PILL_W - 4.0).max(4.0)
-            } else {
-                (today_x + TODAY_PILL_GAP).max(4.0)
-            }
+            today_pill_left(today_x, width)
         } else {
             f32::MAX
         };
-        let major_painted: Vec<(f32, f32, String)> = {
+        let major_painted: Vec<(f32, f32, String, usize)> = {
             let filtered: Vec<(f32, String)> = major_labels
                 .into_iter()
                 .filter(|(x, _)| *x < width)
@@ -4128,14 +4126,21 @@ impl PlannerView {
             filtered
                 .iter()
                 .enumerate()
-                .map(|(index, (x, label))| {
+                .filter_map(|(index, (x, label))| {
                     let next = filtered.get(index + 1).map(|(nx, _)| *nx).unwrap_or(width);
+                    let natural = header_label_px(label);
                     let cap = if *x < today_label_x && today_label_x < next {
                         (today_label_x - 8.0).max(*x)
                     } else {
                         next
                     };
-                    (*x, (cap - *x).max(header_label_px(label)), label.clone())
+                    // Do not force the full glyph width over the Today pill.
+                    let w = if *x < today_label_x && cap <= today_label_x {
+                        cap - *x
+                    } else {
+                        (cap - *x).max(natural)
+                    };
+                    (w > 4.0).then_some((*x, w, label.clone(), index))
                 })
                 .collect()
         };
@@ -4423,14 +4428,17 @@ impl PlannerView {
                         })
                     })
                     .when(
-                        bars.is_empty()
+                        timeline_is_empty_of_scheduled(bars)
                             && !self.state.nodes.is_empty()
                             && !self.state.filters_hide_work_items(),
                         |el| {
                         el.child(
                             div()
                                 .absolute()
-                                .inset_0()
+                                .left(px(NO_FIELDS_HINT_W + 36.0))
+                                .right_0()
+                                .top(px(TIMELINE_HEADER_H))
+                                .bottom_0()
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -4467,8 +4475,11 @@ impl PlannerView {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
-                    .children(major_painted.into_iter().map(|(x, w, label)| {
+                    .children(major_painted.into_iter().map(|(x, w, label, index)| {
+                        let selector = format!("gantt-major-{index}");
                         div()
+                            .id(("gantt-major", index as u64))
+                            .debug_selector(move || selector)
                             .absolute()
                             .left(px(x))
                             .top(px(2.))
@@ -4843,12 +4854,8 @@ impl PlannerView {
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.set_bar_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
-                .when((marker || no_fields) && !self.details_overlay(), |el| {
-                    let tip = if no_fields {
-                        format!("{} · No Start/Target on type", bar.title)
-                    } else {
-                        format!("{} · Unscheduled — drag to set dates", bar.title)
-                    };
+                .when(!self.details_overlay(), |el| {
+                    let tip = bar_hover_tooltip(bar, &self.state.nodes);
                     el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 })
                 .on_mouse_move(
@@ -5827,6 +5834,10 @@ impl PlannerView {
                 }))
             })
             .child(self.menu_item("Open", cx, move |this, cx| this.open_form(id, cx)))
+            .child(self.menu_item("Rename", cx, move |this, _cx| {
+                this.state.gantt.select_row(id);
+                this.pending_inline_title = Some(id);
+            }))
             .child(self.menu_item("Add child", cx, move |this, cx| {
                 this.state.gantt.select_row(id);
                 this.spawn_state(cx, move |mut state| async move {
