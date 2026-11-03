@@ -2616,11 +2616,15 @@ impl PlannerState {
                 linked,
             } => {
                 let should_link = if is_undo { !*linked } else { *linked };
-                if should_link {
+                let result = if should_link {
                     self.add_dependency(*successor_id, *predecessor_id).await
                 } else {
                     self.remove_dependency(*successor_id, *predecessor_id).await
+                };
+                if is_undo && result.is_ok() {
+                    self.clear_selection_after_link_undo();
                 }
+                result
             }
             HistoryEntry::Created { id, .. } => {
                 if is_undo {
@@ -2681,11 +2685,23 @@ impl PlannerState {
             UndoAction::RemoveLink {
                 successor_id,
                 predecessor_id,
-            } => self.remove_dependency(*successor_id, *predecessor_id).await,
+            } => {
+                let result = self.remove_dependency(*successor_id, *predecessor_id).await;
+                if result.is_ok() {
+                    self.clear_selection_after_link_undo();
+                }
+                result
+            }
             UndoAction::RestoreLink {
                 successor_id,
                 predecessor_id,
-            } => self.add_dependency(*successor_id, *predecessor_id).await,
+            } => {
+                let result = self.add_dependency(*successor_id, *predecessor_id).await;
+                if result.is_ok() {
+                    self.clear_selection_after_link_undo();
+                }
+                result
+            }
             UndoAction::DeleteCreated { id, .. } => self.delete_item(*id).await,
             UndoAction::RestoreFields { id, fields } => self.restore_fields(*id, fields).await,
             UndoAction::StackUndo | UndoAction::StackRedo => Ok(()),
@@ -2806,9 +2822,20 @@ impl PlannerState {
         }
         self.discard_history_for_undo(action);
         self.persist_hierarchy_cache();
+        if matches!(
+            action,
+            UndoAction::RemoveLink { .. } | UndoAction::RestoreLink { .. }
+        ) {
+            self.clear_selection_after_link_undo();
+        }
         if let Some(msg) = working.toasts.last_error_message() {
             self.toasts.push(ToastKind::Error, msg.to_string());
         }
+    }
+
+    fn clear_selection_after_link_undo(&mut self) {
+        self.gantt.selected_id = None;
+        self.gantt.selected_link = None;
     }
 
     fn discard_history_for_undo(&mut self, action: &UndoAction) {
@@ -4362,6 +4389,8 @@ mod toast_copy_tests {
             None,
         );
         state.nodes = super::fake_hierarchy(3);
+        state.gantt.selected_id = Some(1);
+        state.gantt.selected_link = Some((2, 1));
         state.history.push(HistoryEntry::Link {
             successor_id: 2,
             predecessor_id: 1,
@@ -4375,6 +4404,11 @@ mod toast_copy_tests {
                 predecessor_id: 1,
             },
         );
+        assert_eq!(
+            state.gantt.selected_id, None,
+            "toast Undo of a link must clear the row highlight"
+        );
+        assert_eq!(state.gantt.selected_link, None);
         assert!(
             state.history.undo.is_empty(),
             "toast Undo must consume the link entry"

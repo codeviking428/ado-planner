@@ -2336,13 +2336,12 @@ impl GanttView {
                     if x_in < clear && x_head > clear + 4.0 {
                         x_in = clear;
                     }
-                    // A long inbound on the successor row (Month Persist cart
-                    // → Go-live under Cart UI) is worse than dropping through
-                    // an open-ended dashed tail. Enter the diamond from the
-                    // left — but not if that stub recrosses a solid bar.
+                    // A short inbound through an intervening bar (Cart UI
+                    // body or its dashed tail) is worse than a longer run
+                    // on the successor row. Drop before that bar starts.
                     if x_head - x_in > MAX_FORWARD_INBOUND {
                         let stub = x_head - STUB;
-                        if !stub_recrosses_solid_intervening(stub, &intervening) {
+                        if !stub_recrosses_intervening(stub, &intervening, clip_right) {
                             x_in = stub;
                         }
                     }
@@ -2463,6 +2462,8 @@ impl GanttView {
         nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
         // Nudging off Cart UI can land on Cart UI → spike; re-spread.
         separate_parallel_verticals(&mut out, clip_left, clip_right);
+        // Spreading can shove a Year inbound back onto Cart UI's sliver.
+        nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
         dodge_outgoing_off_source_labels(
             &mut out, bars, clip_left, clip_right, timeline_w, today_x,
         );
@@ -2773,23 +2774,24 @@ fn dodge_forward_inbounds_off_intervening(
         if next > arrow.x_head + DependencyArrow::WRAP_STUB {
             continue;
         }
-        // Never park a long inbound on the successor row after clip —
-        // that is the Persist cart → Go-live run under Cart UI / spike.
-        // Solid-body recross is handled before clip; this pass only
-        // nudges short inbounds off a cue the stub still sits on.
-        if arrow.x_head - next > MAX_FORWARD_INBOUND {
+        // Keep a long successor-row inbound when the current stub still
+        // sits inside an intervening bar (Cart UI body + dashed tail).
+        // Skipping those slides is what parked Persist cart → Go-live
+        // through Cart UI at x≈705.
+        let already_clear = blocked
+            .iter()
+            .all(|(left, right)| !x_hits_span(arrow.x2, *left, *right));
+        if already_clear && arrow.x_head - next > MAX_FORWARD_INBOUND {
             continue;
         }
         arrow.x2 = next;
     }
 }
 
-/// Slide a forward inbound out of an intervening solid body. Prefer the
-/// gap just past the marker when that still enters the successor from the
-/// left (Year Cart UI at x=30, Go-live at x=59). Fall back to the left of
-/// the body when the diamond sits inside the marker. Dashed cues and
-/// outside titles are ignored — Year/Quarter chips would shove the drop
-/// tens of days away.
+/// Slide a forward inbound out of an intervening painted bar (body or
+/// open-ended dashed tail). Prefer a gap just past the bar when that still
+/// enters the successor from the left; otherwise drop before the bar
+/// starts. Outside titles stay ignored so Year/Quarter chips do not shove.
 fn nudge_forward_inbounds_off_solid_bodies(
     arrows: &mut [DependencyArrow],
     bars: &[BarLayout],
@@ -2817,18 +2819,28 @@ fn nudge_forward_inbounds_off_solid_bodies(
             .collect();
         let mut x = arrow.x2;
         for mid in &intervening {
-            let (left, right) = bar_occupied_x(mid, false, None, None);
+            // Body + open-ended cue (the painted Cart UI bar), not Year
+            // outside titles — those would shove the drop tens of days.
+            let (left, right) = bar_occupied_x(mid, false, Some(clip_right), None);
             if !x_hits_span(x, left, right) {
                 continue;
             }
-            // Occupancy already pads the painted body by 4px; sit just
-            // past that so Year Persist cart → Go-live can keep 8px of
-            // air before the Persist cart letters (label at bar_end+30).
-            let past = (right + 2.0).min(clip_right);
-            if past < arrow.x_head - 2.0 {
-                x = past;
+            let (body_left, body_right) = bar_occupied_x(mid, false, None, None);
+            let before = (left - 8.0).max(clip_left);
+            // Occupancy already pads the body by 4px; +2 sits in the Year
+            // sliver gap without walking onto Persist cart's outside chip.
+            let past_body = (body_right + 2.0).min(clip_right);
+            if !x_hits_span(before, left, right) {
+                // Room left of the painted bar (Month Cart UI at x≈611).
+                x = before;
+            } else if past_body < arrow.x_head - 2.0
+                && !x_hits_span(past_body, body_left, body_right)
+            {
+                // Year sliver: the unscheduled gutter clip sits on the body,
+                // but Go-live is just past it — use that gap.
+                x = past_body;
             } else {
-                x = (left - 8.0).max(clip_left);
+                x = before;
             }
         }
         arrow.x2 = x;
@@ -3417,22 +3429,29 @@ pub fn today_line_segments(y0: f32, y1: f32, skips: &[(f32, f32)]) -> Vec<(f32, 
 }
 
 /// ‹ / › chip when a dated bar sits fully past the timeline clip.
+/// Milestones keep the on-bar ◆ so a Day-view Go-live cue still reads
+/// as a diamond, not a plain title.
 pub(crate) fn offscreen_edge_chip(
     bar: &BarLayout,
     timeline_w: f32,
 ) -> Option<(f32, f32, String, &'static str)> {
     let edge = bar_offscreen_edge(bar, timeline_w)?;
     const GLYPH_W: f32 = 16.0;
+    const DIAMOND_W: f32 = 16.0;
     let title_w = bar_title_paint_px(&bar.title).min(180.0);
-    let chip_w = GLYPH_W + 8.0 + title_w;
+    let diamond_w = if bar.milestone { DIAMOND_W } else { 0.0 };
+    let chip_w = GLYPH_W + diamond_w + 8.0 + title_w;
+    let label = match (edge, bar.milestone) {
+        (OffscreenEdge::Left, true) => format!("‹ ◆ {}", bar.title),
+        (OffscreenEdge::Right, true) => format!("◆ {} ›", bar.title),
+        (OffscreenEdge::Left, false) => format!("‹ {}", bar.title),
+        (OffscreenEdge::Right, false) => format!("{} ›", bar.title),
+    };
     match edge {
-        OffscreenEdge::Left => Some((2.0, chip_w, format!("‹ {}", bar.title), "left")),
-        OffscreenEdge::Right => Some((
-            (timeline_w - chip_w - 2.0).max(2.0),
-            chip_w,
-            format!("{} ›", bar.title),
-            "right",
-        )),
+        OffscreenEdge::Left => Some((2.0, chip_w, label, "left")),
+        OffscreenEdge::Right => {
+            Some(((timeline_w - chip_w - 2.0).max(2.0), chip_w, label, "right"))
+        }
     }
 }
 
@@ -3516,22 +3535,12 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
     }
 }
 
-fn is_open_ended_cue(bar: &BarLayout) -> bool {
-    bar.open_ended && !bar.milestone && !bar.marker
-}
-
-/// A 12px inbound stub at the successor start must not land inside a
-/// solid intervening body. Open-ended dashed tails are allowed: entering
-/// the diamond from the left beats a long successor-row run that only
-/// exists to miss Cart UI's cue.
-fn stub_recrosses_solid_intervening(stub: f32, intervening: &[&BarLayout]) -> bool {
+/// A short inbound stub must not land inside an intervening painted bar
+/// (solid body or open-ended dashed tail). Outside titles stay ignored
+/// so Year/Quarter chips do not shove the drop tens of days away.
+fn stub_recrosses_intervening(stub: f32, intervening: &[&BarLayout], clip_right: f32) -> bool {
     intervening.iter().any(|mid| {
-        if is_open_ended_cue(mid) {
-            return false;
-        }
-        // Body only: outside titles and dashed cues must not block a short
-        // inbound into the diamond (spike's chip, Cart UI's tail).
-        let (left, right) = bar_occupied_x(mid, false, None, None);
+        let (left, right) = bar_occupied_x(mid, false, Some(clip_right), None);
         x_hits_span(stub, left, right)
     })
 }
@@ -3981,6 +3990,28 @@ mod tests {
             !arrow.inbound_right,
             "dated FS links must not enter from the right, x_head={} succ_right={succ_right}",
             arrow.x_head
+        );
+    }
+
+    fn assert_inbound_drops_before_intervening_bar(
+        arrow: &DependencyArrow,
+        bar: &BarLayout,
+        clip_right: f32,
+    ) {
+        let (left, right) = bar_occupied_x(bar, false, Some(clip_right), None);
+        assert!(
+            !x_hits_span(arrow.x2, left, right),
+            "inbound vertical must miss {}'s painted bar, x2={} occupied={left}..{right} bar.x={}",
+            bar.title,
+            arrow.x2,
+            bar.x
+        );
+        assert!(
+            arrow.x2 < bar.x || arrow.x2 > right,
+            "drop before {} starts or after its painted span, x2={} bar.x={}",
+            bar.title,
+            arrow.x2,
+            bar.x
         );
     }
 
@@ -4769,12 +4800,12 @@ mod tests {
             offscreen_edge_chip(&go_live, 512.0).expect("Go-live past the clip must show a cue");
         assert_eq!(side, "right");
         assert!(
-            label.contains("Go-live milestone") && label.contains('›'),
-            "Day off-screen cue must show the title, not a bare ›, got {label:?}"
+            label.contains("Go-live milestone") && label.contains('›') && label.contains('◆'),
+            "Day off-screen milestone cue must show the diamond and title, not a bare ›, got {label:?}"
         );
         assert!(
-            w >= 16.0 + 8.0 + bar_title_paint_px("Go-live milestone").min(180.0) - 0.5,
-            "cue must be wide enough for the title, w={w} x={x}"
+            w >= 16.0 + 16.0 + 8.0 + bar_title_paint_px("Go-live milestone").min(180.0) - 0.5,
+            "cue must be wide enough for the diamond and title, w={w} x={x}"
         );
         let left = BarLayout {
             x: -200.0,
@@ -4784,8 +4815,10 @@ mod tests {
             offscreen_edge_chip(&left, 512.0).expect("left-edge cue");
         assert_eq!(left_side, "left");
         assert!(
-            left_label.contains("Go-live milestone") && left_label.contains('‹'),
-            "left-edge cue must include the title, got {left_label:?}"
+            left_label.contains("Go-live milestone")
+                && left_label.contains('‹')
+                && left_label.contains('◆'),
+            "left-edge milestone cue must include the diamond and title, got {left_label:?}"
         );
     }
 
@@ -6380,21 +6413,9 @@ mod tests {
             cart_spike.lane_y
         );
         let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
-        let (occ_left, occ_right) = bar_occupied_x(cart, false, None, None);
-        let head_on_timeline = persist_live.x_head <= timeline_width;
-        let short_inbound =
-            (persist_live.x_head - persist_live.x2).abs() <= MAX_FORWARD_INBOUND + 0.5;
-        assert!(
-            !head_on_timeline
-                || short_inbound
-                || persist_live.x2 < occ_left - 0.5
-                || persist_live.x2 > occ_right + 0.5,
-            "{scale:?}: Persist cart → Go-live inbound must enter the diamond from the left or miss Cart UI's solid body, x2={} occupied={occ_left}..{occ_right} cart={}..{} x_head={}",
-            persist_live.x2,
-            cart.x,
-            cart.x + cart.width,
-            persist_live.x_head
-        );
+        if persist_live.x_head <= timeline_width {
+            assert_inbound_drops_before_intervening_bar(persist_live, cart, timeline_width);
+        }
         let cue_bottom = cart.y + cart.paint_top() + cart.paint_h();
         assert!(
             persist_live.lane_y < cart.y || persist_live.lane_y >= cart.y + ROW_HEIGHT,
@@ -7182,12 +7203,8 @@ mod tests {
                 live.x1
             );
         }
-        assert!(
-            (live.x_head - live.x2).abs() <= MAX_FORWARD_INBOUND + 0.5,
-            "Month Persist cart → Go-live must enter the diamond from the left, not run along the milestone row, x2={} x_head={}",
-            live.x2,
-            live.x_head
-        );
+        let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        assert_inbound_drops_before_intervening_bar(&live, cart_ui, gantt.timeline_width);
         assert!(
             !live.wraps_around_successor(),
             "forward Persist cart → Go-live must not wrap along the Go-live row"
@@ -7255,13 +7272,64 @@ mod tests {
             cart_spike.x2
         );
         if persist_live.x_head <= gantt.timeline_width {
-            assert!(
-                (persist_live.x_head - persist_live.x2).abs() <= MAX_FORWARD_INBOUND + 0.5,
-                "runtime Persist cart → Go-live must enter the diamond from the left, x2={} x_head={}",
-                persist_live.x2,
-                persist_live.x_head
+            let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
+            assert_inbound_drops_before_intervening_bar(
+                persist_live,
+                cart_ui,
+                gantt.timeline_width,
             );
         }
+    }
+
+    #[test]
+    fn runtime_persist_go_live_inbound_drops_before_cart_ui() {
+        let mut nodes = mock_fixture_nodes();
+        if let Some(go_live) = nodes.iter_mut().find(|node| node.id == 1013) {
+            go_live.predecessors.clear();
+        }
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 1200.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert!(
+            gantt
+                .layout_dependency_arrows(&bars)
+                .iter()
+                .all(|arrow| !(arrow.from_id == 1003 && arrow.to_id == 1013)),
+            "precondition: Persist cart → Go-live is created at runtime"
+        );
+        if let Some(go_live) = nodes.iter_mut().find(|node| node.id == 1013) {
+            go_live.predecessors = vec![1003];
+        }
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let live = gantt
+            .layout_dependency_arrows(&bars)
+            .into_iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("runtime Persist cart → Go-live");
+        let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        assert!(
+            cart_ui.open_ended,
+            "fixture: Cart UI is the intervening start-only bar"
+        );
+        assert_inbound_drops_before_intervening_bar(&live, cart_ui, gantt.timeline_width);
+        assert!(
+            live.x2 < cart_ui.x,
+            "second vertical must drop before Cart UI starts, x2={} cart.x={}..{}",
+            live.x2,
+            cart_ui.x,
+            cart_ui.x + cart_ui.width
+        );
+        assert!(
+            !live.wraps_around_successor(),
+            "forward Persist cart → Go-live must not wrap along the Go-live row"
+        );
     }
 
     #[test]
@@ -8632,12 +8700,7 @@ mod tests {
             "forward milestone links must enter the start, not the right tip"
         );
         let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
-        assert!(
-            (arrow.x_head - arrow.x2).abs() <= MAX_FORWARD_INBOUND + 0.5,
-            "forward Persist cart → Go-live must enter the diamond from the left, not run along the milestone row, x2={} x_head={}",
-            arrow.x2,
-            arrow.x_head
-        );
+        assert_inbound_drops_before_intervening_bar(arrow, cart, gantt.timeline_width);
         assert!(
             !arrow.wraps_around_successor(),
             "forward Persist cart → Go-live must not wrap along the Go-live row"
@@ -8685,12 +8748,8 @@ mod tests {
             .iter()
             .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
             .expect("#1003→#1013");
-        assert!(
-            (arrow.x_head - arrow.x2).abs() <= MAX_FORWARD_INBOUND + 0.5,
-            "Day-view Persist cart → Go-live must enter the diamond from the left, x2={} x_head={}",
-            arrow.x2,
-            arrow.x_head
-        );
+        let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        assert_inbound_drops_before_intervening_bar(arrow, cart, gantt.timeline_width);
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 1013).unwrap();
         assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);

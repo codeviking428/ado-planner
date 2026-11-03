@@ -1478,6 +1478,24 @@ async fn undo_and_redo_restore_dates_and_links() {
 }
 
 #[tokio::test]
+async fn undoing_a_link_clears_row_selection() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.gantt.selected_id = Some(1003);
+    state.gantt.selected_link = Some((1005, 1003));
+    state
+        .add_dependency(1005, 1003)
+        .await
+        .expect("link 1003 → 1005");
+    assert_eq!(state.gantt.selected_id, Some(1003));
+    state.undo().await.expect("undo add link");
+    assert_eq!(
+        state.gantt.selected_id, None,
+        "Ctrl+Z of a link must clear the row highlight"
+    );
+    assert_eq!(state.gantt.selected_link, None);
+}
+
+#[tokio::test]
 async fn toast_restore_link_action_puts_the_predecessor_back() {
     let (_mock, mut state, _dir) = signed_in().await;
     state

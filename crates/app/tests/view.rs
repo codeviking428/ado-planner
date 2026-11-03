@@ -1229,12 +1229,10 @@ fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext)
     );
     view.update(cx, |view, _| {
         let rows = view.state.gantt.flatten(&view.state.nodes);
-        let bars = view.state.gantt.layout_bars(
-            &view.state.nodes,
-            &rows,
-            &view.state.iterations,
-            720.0,
-        );
+        let bars =
+            view.state
+                .gantt
+                .layout_bars(&view.state.nodes, &rows, &view.state.iterations, 720.0);
         let live = view
             .state
             .gantt
@@ -1246,14 +1244,11 @@ fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext)
             return;
         }
         let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
-        let core_left = cart.x;
-        let core_right = cart.x + cart.width.max(8.0);
-        let short = (live.x_head - live.x2).abs() <= 20.5;
         assert!(
-            short || live.x2 < core_left - 0.5 || live.x2 > core_right + 0.5,
-            "painted Persist cart → Go-live inbound x2={} must enter the diamond from the left or miss Cart UI {core_left}..{core_right} x_head={}",
+            live.x2 < cart.x,
+            "painted Persist cart → Go-live inbound x2={} must drop before Cart UI starts at {}",
             live.x2,
-            live.x_head
+            cart.x
         );
     });
 }
@@ -1286,19 +1281,13 @@ fn mock_fixture_month_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppCo
         dx >= 12.0,
         "Month mock fixture: Persist cart → Go-live inv at {persist_x} must sit ≥12px from Cart UI → spike at {spike_x} (dx={dx})"
     );
-    let live_bar = cx
-        .debug_bounds("gantt-bar-1013")
-        .expect("Go-live diamond (Month)");
-    let live_left = f32::from(live_bar.origin.x);
-    let short_inbound = (persist_x - live_left).abs() <= 24.0;
     let cart = cx
         .debug_bounds("gantt-bar-1005")
         .expect("Cart UI bar (Month)");
     let cart_left = f32::from(cart.origin.x);
-    let cart_right = cart_left + f32::from(cart.size.width);
     assert!(
-        short_inbound || persist_x < cart_left - 1.0 || persist_x > cart_right + 1.0,
-        "Month painted Persist cart → Go-live inbound at {persist_x} must enter the diamond from the left or miss Cart UI {cart_left}..{cart_right}"
+        persist_x < cart_left - 1.0,
+        "Month painted Persist cart → Go-live inbound at {persist_x} must drop before Cart UI at {cart_left}"
     );
 }
 
@@ -5020,8 +5009,8 @@ fn day_offscreen_milestone_cue_includes_the_title(cx: &mut gpui_kit::TestAppCont
         .debug_bounds("gantt-bar-edge-right-1013")
         .expect("Day off-screen Go-live must show a right-edge cue");
     assert!(
-        f32::from(cue.size.width) >= 48.0,
-        "Day off-screen Go-live cue must include the title, not a bare ›, width={}",
+        f32::from(cue.size.width) >= 64.0,
+        "Day off-screen Go-live cue must include the diamond and title, not a bare ›, width={}",
         f32::from(cue.size.width)
     );
 }
@@ -5088,11 +5077,12 @@ fn month_persist_go_live_link_clears_the_painted_label(cx: &mut gpui_kit::TestAp
                 live.x1
             );
         }
+        let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
         assert!(
-            (live.x_head - live.x2).abs() <= 20.5,
-            "Month Persist cart → Go-live must enter the diamond from the left, x2={} x_head={}",
+            live.x2 < cart_ui.x,
+            "Month Persist cart → Go-live inbound must drop before Cart UI, x2={} cart.x={}",
             live.x2,
-            live.x_head
+            cart_ui.x
         );
         assert!(
             !live.wraps_around_successor(),
