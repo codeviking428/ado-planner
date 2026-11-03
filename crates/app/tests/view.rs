@@ -13,7 +13,7 @@ use ado_planner::ui::PlannerView;
 use ado_planner::ui::{
     date_field_text, dates_from_range_picker, dates_from_range_picker_in_years,
     format_picker_dates, looks_like_pat, pending_range_typed, range_picker_is_complete,
-    typed_dates_error,
+    typed_dates_error, typed_dates_error_in,
 };
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use gpui_kit::component::calendar::Date as PickerDate;
@@ -489,17 +489,25 @@ fn typed_unparseable_dates_do_not_clear_the_range() {
     assert!(typed_dates_error("Jul 22 -> zz").is_some());
     assert!(typed_dates_error("").is_none());
     let hint = typed_dates_error("not a date").expect("parse hint");
-    let today = jiff::Zoned::now().date();
-    let near = today.saturating_add(6.days());
-    let today_s = ado_core::compact_date(today);
-    let near_s = ado_core::compact_date(near);
     assert!(
-        hint.contains(&today_s) && hint.contains(&near_s),
-        "parse-hint examples must use dates near today ({today_s} → {near_s}), got {hint}"
+        hint.contains("Jan 6") && hint.contains("Jan 12"),
+        "parse-hint without item dates must use a fixed example, got {hint}"
     );
+    let today = jiff::Zoned::now().date();
+    let today_s = ado_core::compact_date(today);
     assert!(
-        !hint.contains("Jul 22"),
-        "parse-hint must not keep the stale July examples, got {hint}"
+        !hint.contains(&today_s),
+        "parse-hint must not use today's date, got {hint}"
+    );
+    let item_hint = typed_dates_error_in(
+        "foo",
+        Some(Date::new(2026, 7, 6).unwrap()),
+        Some(Date::new(2026, 7, 20).unwrap()),
+    )
+    .expect("item parse hint");
+    assert!(
+        item_hint.contains("Jul 6") && item_hint.contains("Jul 20"),
+        "parse-hint must reuse the item's own dates, got {item_hint}"
     );
     let cleared = dates_from_range_picker(calendar, "", seed).expect("empty typed is a clear");
     assert_eq!(
@@ -3103,13 +3111,22 @@ fn dates_cell_stays_one_line_with_a_conflict_marker(cx: &mut gpui_kit::TestAppCo
     draw(cx);
     let cell = cx.debug_bounds("gantt-dates-cell").expect("dates cell");
     assert!(
-        cx.debug_bounds("gantt-parent-overflow").is_some(),
+        cx.debug_bounds("gantt-dates-overflow").is_some(),
         "a child past its parent dates must show the conflict marker"
     );
     assert!(
         f32::from(cell.size.height) <= ROW_HEIGHT + 1.0,
         "the Dates column must not wrap to two lines, height={}",
         f32::from(cell.size.height)
+    );
+    let mark = cx
+        .debug_bounds("gantt-dates-overflow")
+        .expect("overflow marker");
+    let cell_right = f32::from(cell.origin.x) + f32::from(cell.size.width);
+    let mark_right = f32::from(mark.origin.x) + f32::from(mark.size.width);
+    assert!(
+        mark_right <= cell_right - 2.0,
+        "the amber ! must sit inside the Dates column, not clipped at the edge, mark_right={mark_right} cell_right={cell_right}"
     );
 }
 
@@ -5247,9 +5264,17 @@ fn invalid_typed_dates_keep_the_grid_picker_open(cx: &mut gpui_kit::TestAppConte
     };
     view.update(cx, |view, cx| {
         view.handle_key(&enter, cx);
+        let hint = view
+            .inline_dates_error_text()
+            .expect("garbage dates must show an inline error");
         assert!(
-            view.inline_dates_error_text().is_some(),
-            "garbage dates must show an inline error"
+            hint.contains("Jul 6") && hint.contains("Jul 20"),
+            "foo parse hint must use the item's own dates, got {hint}"
+        );
+        let today_s = ado_core::compact_date(jiff::Zoned::now().date());
+        assert!(
+            !hint.contains(&today_s),
+            "foo parse hint must not use today, got {hint}"
         );
         let node = view
             .state

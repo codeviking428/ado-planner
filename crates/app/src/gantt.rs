@@ -1811,15 +1811,15 @@ impl GanttView {
                     pred.x + pred.width
                 };
                 // Forward FS: inbound from the left of the successor.
-                // When the source starts after the target, wrap around: stub
-                // out of the source end, drop to the gap above the target,
-                // run left past the target start, inbound from the left (▶).
-                // Never attach to the successor's right — that sat the line
-                // on an intervening bar and pointed the head the wrong way.
+                // Prefer a short elbow (12px inbound) even when the source
+                // starts after the target — a wrap drop at the source end
+                // draws a long vertical through intervening rows (Go-live
+                // after Move children too). Wrap only if that inbound still
+                // hits a row body. Never attach to the successor's right.
                 let wrap_around = pred.x > bar.x + 1.0;
                 let x_head = bar.x;
                 let x_out = pred_end + STUB;
-                let mut x_in = if wrap_around { x_out } else { x_head - STUB };
+                let mut x_in = x_head - STUB;
                 let lo = pred.y.min(bar.y);
                 let hi = pred.y.max(bar.y);
                 let intervening: Vec<&BarLayout> = bars
@@ -1831,21 +1831,26 @@ impl GanttView {
                             && mid.y < hi - 1.0
                     })
                     .collect();
-                // Wrap-around already skips intervening bodies via the gap
-                // above the target; do not slide x2 onto another bar's end.
-                if !intervening.is_empty() && !wrap_around {
-                    // Year/Quarter bars are slivers; their titles still paint at
-                    // full glyph width and would shove the inbound vertical
-                    // tens of days away (stray line at x≈532). Occupy the
-                    // body only at those zooms.
-                    let include_labels =
-                        !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
+                // Year/Quarter bars are slivers; their titles still paint at
+                // full glyph width and would shove the inbound vertical
+                // tens of days away (stray line at x≈532). Occupy the
+                // body only at those zooms.
+                let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
+                if !intervening.is_empty() {
                     let x_vert =
                         clear_vertical_x(x_in, &intervening, bar.x, true, x_head, include_labels);
                     if (x_vert - x_in).abs() > 0.5 {
                         x_in = x_vert;
                     }
                     x_in = clamp_inbound_stub(x_in, x_head, true, &intervening, include_labels);
+                    if wrap_around
+                        && intervening.iter().any(|mid| {
+                            let (left, right) = bar_occupied_x(mid, include_labels);
+                            x_hits_span(x_in, left, right)
+                        })
+                    {
+                        x_in = x_out;
+                    }
                 }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
                 // Stay in the predecessor row's gutter so the outgoing
@@ -2310,7 +2315,7 @@ mod tests {
         }
     }
 
-    fn assert_wraps_to_target_left(
+    fn assert_later_source_inbounds_from_left(
         arrow: &DependencyArrow,
         pred: &BarLayout,
         succ: &BarLayout,
@@ -2319,10 +2324,6 @@ mod tests {
         assert!(
             !arrow.inbound_right,
             "source.start > target.start must inbound from the left (▶)"
-        );
-        assert!(
-            arrow.wraps_around_successor(),
-            "must stub out of the source, drop to the gap above the target, then run left"
         );
         assert!(
             (arrow.x_head - succ.x).abs() < 3.0,
@@ -2339,11 +2340,15 @@ mod tests {
             arrow.x1,
             bar_end(pred)
         );
+        let short_stub = (arrow.x2 - (arrow.x_head - 12.0)).abs() < 2.5;
+        let wrap_drop = arrow.wraps_around_successor() && (arrow.x2 - arrow.x1).abs() < 1.5;
         assert!(
-            (arrow.x2 - arrow.x1).abs() < 1.5,
-            "wrap drop must stay at the source stub, not an intervening bar, x2={} x1={}",
+            short_stub || wrap_drop,
+            "later source must use a short inbound or a wrap drop, x1={} x2={} x_head={} wrap={}",
+            arrow.x1,
             arrow.x2,
-            arrow.x1
+            arrow.x_head,
+            arrow.wraps_around_successor()
         );
         assert_arrow_stays_on_screen(arrow, timeline_width);
     }
@@ -3935,10 +3940,9 @@ mod tests {
             let pred = bars.iter().find(|bar| bar.id == arrow.from_id).unwrap();
             if pred.x > succ.x + 1.0 {
                 assert!(
-                    !arrow.inbound_right && arrow.wraps_around_successor(),
-                    "source after the target start must wrap to the left, inbound_right={} wrap={}",
-                    arrow.inbound_right,
-                    arrow.wraps_around_successor()
+                    !arrow.inbound_right,
+                    "source after the target start must inbound from the left, inbound_right={}",
+                    arrow.inbound_right
                 );
                 assert!(
                     arrow.x_head <= succ.x + 1.0,
@@ -4724,12 +4728,83 @@ mod tests {
         let pred = bars.iter().find(|bar| bar.id == 1).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 3).unwrap();
         let mid = bars.iter().find(|bar| bar.id == 2).unwrap();
-        assert_wraps_to_target_left(&arrows[0], pred, succ, gantt.timeline_width);
+        assert_later_source_inbounds_from_left(&arrows[0], pred, succ, gantt.timeline_width);
         let (left, right) = (mid.x - HANDLE_WIDTH, bar_label_right(mid));
         assert!(
             arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
             "the wrap drop must not sit on the intervening row, x2={} mid={left}..{right}",
             arrows[0].x2
+        );
+    }
+
+    #[test]
+    fn moved_parent_link_uses_a_short_elbow_not_a_go_live_drop() {
+        // Mock tree after dragging Persist cart later and "Move children too":
+        // children shift with the parent; Go-live (not a child) stays put.
+        let mut epic = node(1001, None);
+        epic.title = "Checkout rewrite".into();
+        epic.start_date = Some("2026-07-01T00:00:00Z".into());
+        epic.target_date = Some("2026-09-30T00:00:00Z".into());
+        let mut cart = node(1002, Some(1001));
+        cart.title = "Cart".into();
+        cart.start_date = Some("2026-07-06T00:00:00Z".into());
+        cart.target_date = Some("2026-08-14T00:00:00Z".into());
+        let mut pred = node(1003, Some(1002));
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-08-04T00:00:00Z".into());
+        pred.target_date = Some("2026-08-21T00:00:00Z".into());
+        let mut child = node(1005, Some(1003));
+        child.title = "Cart UI".into();
+        child.start_date = Some("2026-08-19T00:00:00Z".into());
+        child.target_date = None;
+        let mut go_live = node(1013, Some(1001));
+        go_live.title = "Go-live milestone".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        let mut succ = node(1012, None);
+        succ.title = "Unparented spike".into();
+        succ.start_date = Some("2026-07-21T00:00:00Z".into());
+        succ.target_date = Some("2026-08-04T00:00:00Z".into());
+        succ.predecessors = vec![1003];
+        let nodes = vec![epic, cart, pred, child, go_live, succ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+            .expect("#1003→#1012");
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1012).unwrap();
+        let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        assert!(
+            pred.x > succ.x + 1.0,
+            "fixture must place the moved parent after the successor start"
+        );
+        assert_later_source_inbounds_from_left(arrow, pred, succ, gantt.timeline_width);
+        assert!(
+            !arrow.wraps_around_successor(),
+            "moved-parent links must be a short elbow, not a wrap drop at the source end, x1={} x2={} x_head={}",
+            arrow.x1,
+            arrow.x2,
+            arrow.x_head
+        );
+        let (left, right) = bar_occupied_x(go_live, true);
+        assert!(
+            arrow.x2 < left - 1.0 || arrow.x2 > right + 1.0,
+            "the inbound vertical must not run through Go-live, x2={} go-live={left}..{right}",
+            arrow.x2
+        );
+        assert!(
+            (arrow.x2 - arrow.x1).abs() > ROW_HEIGHT,
+            "the long run must be the horizontal at the predecessor gutter, not a vertical through Go-live, x1={} x2={}",
+            arrow.x1,
+            arrow.x2
         );
     }
 
@@ -4832,7 +4907,7 @@ mod tests {
             pred.x > succ.x + 1.0,
             "fixture must place the predecessor start after the successor start"
         );
-        assert_wraps_to_target_left(&arrows[0], pred, succ, gantt.timeline_width);
+        assert_later_source_inbounds_from_left(&arrows[0], pred, succ, gantt.timeline_width);
         assert!(
             arrows[0].stub_start() < arrows[0].x_head - 8.0,
             "the inbound stub must sit left of the head so ▶ reaches the bar, stub={} x_head={}",
@@ -4910,7 +4985,12 @@ mod tests {
             pred_bar.x,
             succ_bar.x
         );
-        assert_wraps_to_target_left(&arrows[0], pred_bar, succ_bar, gantt.timeline_width);
+        assert_later_source_inbounds_from_left(
+            &arrows[0],
+            pred_bar,
+            succ_bar,
+            gantt.timeline_width,
+        );
     }
 
     #[test]
@@ -4945,7 +5025,12 @@ mod tests {
             pred_bar.x > succ_bar.x + 1.0,
             "fixture must place start-only #1005 after #1012's start"
         );
-        assert_wraps_to_target_left(&arrows[0], pred_bar, succ_bar, gantt.timeline_width);
+        assert_later_source_inbounds_from_left(
+            &arrows[0],
+            pred_bar,
+            succ_bar,
+            gantt.timeline_width,
+        );
         let parent_end = bar_end(parent_bar);
         assert!(
             (arrows[0].x1

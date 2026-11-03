@@ -629,12 +629,34 @@ impl PlannerView {
         self.inline_input.update(cx, |input, cx| {
             input.replace_all(text, window, cx);
         });
-        self.inline_dates_error = typed_dates_error(text);
+        self.inline_dates_error = self.typed_dates_error_for_current(text);
         cx.notify();
     }
 
     pub fn inline_dates_error_text(&self) -> Option<String> {
         self.inline_dates_error.clone()
+    }
+
+    fn dates_example_for(&self, id: i64) -> (Option<jiff::civil::Date>, Option<jiff::civil::Date>) {
+        let Some(node) = self.state.nodes.iter().find(|node| node.id == id) else {
+            return (None, None);
+        };
+        (
+            parse_iso_date(node.start_date.as_deref()),
+            parse_iso_date(node.target_date.as_deref()),
+        )
+    }
+
+    fn typed_dates_error_for_item(&self, typed: &str, id: i64) -> Option<String> {
+        let (start, target) = self.dates_example_for(id);
+        typed_dates_error_in(typed, start, target)
+    }
+
+    fn typed_dates_error_for_current(&self, typed: &str) -> Option<String> {
+        match self.inline_edit {
+            Some(edit) => self.typed_dates_error_for_item(typed, edit.item_id()),
+            None => typed_dates_error(typed),
+        }
     }
 
     pub fn form_input_value(&self, field: &str, cx: &App) -> Option<String> {
@@ -829,7 +851,7 @@ impl PlannerView {
                 && matches!(event, InputEvent::Change)
             {
                 let value = input.read(cx).value().to_string();
-                this.inline_dates_error = typed_dates_error(&value);
+                this.inline_dates_error = this.typed_dates_error_for_current(&value);
                 cx.notify();
             }
             if matches!(event, InputEvent::PressEnter { .. }) && this.inline_edit.is_some() {
@@ -1374,7 +1396,7 @@ impl PlannerView {
         self.inline_enter_guard = true;
         let value = self.inline_input.read(cx).value().to_string();
         if let InlineEdit::Dates(id) = edit {
-            if let Some(err) = typed_dates_error(&value) {
+            if let Some(err) = self.typed_dates_error_for_item(&value, id) {
                 self.inline_dates_error = Some(err);
                 cx.notify();
                 return;
@@ -3205,6 +3227,8 @@ impl PlannerView {
                             div()
                                 .w(px(DATES_COL_WIDTH))
                                 .flex_shrink_0()
+                                .pl_1()
+                                .pr(px(8.))
                                 .text_xs()
                                 .text_color(header_fg)
                                 .child("Dates"),
@@ -3660,7 +3684,8 @@ impl PlannerView {
             .w(px(DATES_COL_WIDTH))
             .h(px(ROW_HEIGHT))
             .items_center()
-            .overflow_hidden()
+            .pl_1()
+            .pr(px(8.))
             .gap_1()
             .text_xs()
             .when(unscheduled, |el| el.text_color(muted))
@@ -3670,6 +3695,7 @@ impl PlannerView {
                 div()
                     .flex_1()
                     .min_w(px(0.))
+                    .overflow_hidden()
                     .truncate()
                     .child(display.clone()),
             )
@@ -3680,8 +3706,12 @@ impl PlannerView {
                 el.child(
                     div()
                         .id(("dates-overflow", id as u64))
-                        .debug_selector(|| "gantt-parent-overflow".into())
+                        .debug_selector(|| "gantt-dates-overflow".into())
                         .flex_shrink_0()
+                        .w(px(10.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .occlude()
                         .tooltip(move |window, cx| {
                             Tooltip::new(overflow_tip.clone()).build(window, cx)
@@ -6461,7 +6491,7 @@ impl PlannerView {
             .get(ado_core::START_DATE_FIELD)
             .or_else(|| self.form_inputs.get(ado_core::TARGET_DATE_FIELD))
             .map(|input| input.read(cx).value().to_string())?;
-        typed_dates_error(&typed)
+        self.typed_dates_error_for_item(&typed, form_id)
     }
 
     fn form_has_unsaved_edits(&self, cx: &App) -> bool {
@@ -8019,18 +8049,35 @@ fn parse_typed_date_range(
     }
 }
 
-fn dates_parse_hint() -> String {
-    let start = jiff::Zoned::now().date();
-    let target = start.saturating_add(6.days());
-    let a = compact_date(start);
-    let b = compact_date(target);
+fn dates_parse_hint(start: Option<jiff::civil::Date>, target: Option<jiff::civil::Date>) -> String {
+    let (a, b) = match (start, target) {
+        (Some(start), Some(target)) => (compact_date(start), compact_date(target)),
+        (Some(start), None) => {
+            let target = start.saturating_add(6.days());
+            (compact_date(start), compact_date(target))
+        }
+        (None, Some(target)) => {
+            let start = target.saturating_sub(6.days());
+            (compact_date(start), compact_date(target))
+        }
+        (None, None) => ("Jan 6".into(), "Jan 12".into()),
+    };
     format!("Could not parse. Use {a} → {b} or a start date.")
 }
 
 /// `None` when the Dates field is empty or a recognised range.
 pub fn typed_dates_error(typed: &str) -> Option<String> {
+    typed_dates_error_in(typed, None, None)
+}
+
+/// Parse-hint examples prefer the item's own dates; otherwise a fixed range.
+pub fn typed_dates_error_in(
+    typed: &str,
+    start: Option<jiff::civil::Date>,
+    target: Option<jiff::civil::Date>,
+) -> Option<String> {
     match parse_typed_date_range(typed, None, None) {
-        TypedDateRange::Invalid => Some(dates_parse_hint()),
+        TypedDateRange::Invalid => Some(dates_parse_hint(start, target)),
         TypedDateRange::Empty | TypedDateRange::Parsed(_, _) => None,
     }
 }
