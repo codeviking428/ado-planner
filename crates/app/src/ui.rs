@@ -8546,12 +8546,23 @@ fn ink_for_luminance(lum: f32) -> gpui_kit::Hsla {
     }
 }
 
+/// Solid fills (not canvas washes). Feature/Epic/Bug darkened 22% still sit
+/// at lum 0.50–0.55 and look light; the wash cutoff would pick white and
+/// the title would disappear. Only use white on actually dark solids.
+fn ink_for_solid_fill(lum: f32) -> gpui_kit::Hsla {
+    if lum > 0.40 {
+        gpui_kit::hsla(0., 0., 0., 1.)
+    } else {
+        gpui_kit::hsla(0., 0., 1., 1.)
+    }
+}
+
 fn inner_bar_label_color_darkened(color: u32, darken: f32) -> gpui_kit::Hsla {
     let scale = (1.0 - darken).clamp(0.0, 1.0);
     let r = ((color >> 16) & 0xff) as f32 / 255.0 * scale;
     let g = ((color >> 8) & 0xff) as f32 / 255.0 * scale;
     let b = (color & 0xff) as f32 / 255.0 * scale;
-    ink_for_luminance(srgb_luminance(r, g, b))
+    ink_for_solid_fill(srgb_luminance(r, g, b))
 }
 
 fn painted_bar_title_color(
@@ -9146,7 +9157,13 @@ mod bar_label_tests {
 
     #[test]
     fn green_and_orange_bars_use_dark_ink() {
-        for (name, color) in [("User Story", 0xa6e3a1), ("Task", 0xfab387)] {
+        for (name, color) in [
+            ("User Story", 0xa6e3a1),
+            ("Task", 0xfab387),
+            ("Feature", 0x89b4fa),
+            ("Epic", 0xcba6f7),
+            ("Bug", 0xf38ba8),
+        ] {
             let ink = inner_bar_label_color_darkened(color, 0.0);
             assert!(
                 ink.l < 0.2,
@@ -9191,6 +9208,17 @@ mod bar_label_tests {
         assert!(
             painted_bar_title_color(&spike, canvas).l < 0.2,
             "Week/Day Unparented spike must not paint white on orange"
+        );
+        let feature = BarLayout {
+            id: 1002,
+            title: "Cart".into(),
+            color: 0x89b4fa,
+            progress: Some(0.4),
+            ..spike.clone()
+        };
+        assert!(
+            painted_bar_title_color(&feature, canvas).l < 0.2,
+            "in-progress Feature must keep dark ink on the darkened fill"
         );
         let cart_ui = BarLayout {
             open_ended: true,
