@@ -2201,6 +2201,9 @@ impl GanttView {
         const LANE_SEP: f32 = PARALLEL_LANE_MIN;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
         let timeline_w = self.timeline_width.max(1.0);
+        let today = jiff::Zoned::now().date();
+        let today_px = self.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
         let mut out = Vec::new();
         for bar in bars {
             for pred_id in &bar.predecessors {
@@ -2271,6 +2274,7 @@ impl GanttView {
                         x_head,
                         pred_left + STUB,
                         clip_right,
+                        today_x,
                     );
                     x_in = x_in.max(pred_left + STUB);
                 } else if !inbound_right && !intervening.is_empty() {
@@ -2282,6 +2286,7 @@ impl GanttView {
                         x_head,
                         include_labels,
                         Some(clip_right),
+                        today_x,
                     );
                     if (x_vert - x_in).abs() > 0.5 {
                         x_in = x_vert;
@@ -2293,6 +2298,7 @@ impl GanttView {
                         &intervening,
                         include_labels,
                         Some(clip_right),
+                        today_x,
                     );
                 }
                 if !succ_gutter && x_in < pred_left {
@@ -2302,7 +2308,8 @@ impl GanttView {
                     // stub sits inside an intervening bar or its open-ended cue.
                     let fallback = x_out.max(pred_left + STUB);
                     let hits_intervening = intervening.iter().any(|mid| {
-                        let (left, right) = bar_occupied_x(mid, include_labels, Some(clip_right));
+                        let (left, right) =
+                            bar_occupied_x(mid, include_labels, Some(clip_right), today_x);
                         x_hits_span(fallback, left, right)
                     });
                     if !hits_intervening {
@@ -2422,9 +2429,6 @@ impl GanttView {
         // MIN_STUB / clip can park a dodged inbound back onto an intervening
         // open-ended cue (Persist cart → Go-live on Cart UI at Month 512).
         let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
-        let today = jiff::Zoned::now().date();
-        let today_px = self.x_for_date(today);
-        let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
         dodge_outgoing_off_source_labels(
             &mut out, bars, clip_left, clip_right, timeline_w, today_x,
         );
@@ -2434,6 +2438,7 @@ impl GanttView {
             include_labels,
             clip_left,
             clip_right,
+            today_x,
         );
         separate_parallel_verticals(&mut out, clip_left, clip_right);
         separate_shared_source_outgoing(&mut out, clip_left, clip_right);
@@ -2688,6 +2693,7 @@ fn dodge_forward_inbounds_off_intervening(
     include_labels: bool,
     clip_left: f32,
     clip_right: f32,
+    today_x: Option<f32>,
 ) {
     let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
     for arrow in arrows.iter_mut() {
@@ -2713,7 +2719,7 @@ fn dodge_forward_inbounds_off_intervening(
         }
         let blocked: Vec<(f32, f32)> = intervening
             .iter()
-            .map(|bar| bar_occupied_x(bar, include_labels, Some(clip_right)))
+            .map(|bar| bar_occupied_x(bar, include_labels, Some(clip_right), today_x))
             .collect();
         let slide_left = |x: f32| -> f32 {
             let mut x = x.clamp(clip_left, clip_right);
@@ -3246,7 +3252,10 @@ pub fn bar_outside_label_frame(
         let clamped = left_x.max(2.0);
         let misses_today = today_x
             .is_none_or(|today| clamped >= today + 8.0 || clamped + estimated <= today - 8.0);
-        if misses_today && clamped + estimated > 8.0 {
+        // A clamp to x=2 can cover the sliver (Year Cart next to Today).
+        // Only flip left when the chip also sits beside the bar.
+        let misses_bar = clamped + estimated <= bar.x + 0.1;
+        if misses_today && misses_bar && clamped + estimated > 8.0 {
             return Some((clamped, estimated));
         }
     }
@@ -3368,30 +3377,45 @@ fn stub_recrosses_solid_intervening(stub: f32, intervening: &[&BarLayout]) -> bo
         }
         // Body only: outside titles and dashed cues must not block a short
         // inbound into the diamond (spike's chip, Cart UI's tail).
-        let (left, right) = bar_occupied_x(mid, false, None);
+        let (left, right) = bar_occupied_x(mid, false, None, None);
         x_hits_span(stub, left, right)
     })
 }
 
 /// Body, and optionally an external title, so a vertical drop misses the row.
 /// Open-ended start-only bars paint a dashed cue to the clip, so routing
-/// must treat that tail as occupied or the elbow runs through it.
-fn bar_occupied_x(bar: &BarLayout, include_label: bool, cue_right: Option<f32>) -> (f32, f32) {
+/// must treat that tail as occupied or the elbow runs through it. Label
+/// occupancy uses the painted chip (`bar_outside_label_frame`) so a
+/// Today/clip flip to the left is occupied on the letters, not a phantom
+/// span to the right of the bar.
+fn bar_occupied_x(
+    bar: &BarLayout,
+    include_label: bool,
+    cue_right: Option<f32>,
+    today_x: Option<f32>,
+) -> (f32, f32) {
     if bar_is_gutter(bar) {
         return (bar.x - 2.0, bar.x + bar.width + 4.0);
     }
-    let left = if bar.milestone || bar.marker {
+    let mut left = if bar.milestone || bar.marker {
         bar.x - 2.0
     } else {
         bar.x - HANDLE_WIDTH
     };
-    let mut right = if include_label {
-        bar_label_right(bar)
-    } else if bar.milestone || bar.marker {
+    let mut right = if bar.milestone || bar.marker {
         bar.x + MILESTONE_SIZE + 4.0
     } else {
         bar.x + bar.width.max(8.0) + 4.0
     };
+    if include_label {
+        let timeline_w = cue_right.unwrap_or(10_000.0).max(1.0);
+        if let Some((x, w)) = bar_outside_label_frame(bar, timeline_w, true, today_x, false) {
+            left = left.min(x);
+            right = right.max(x + w);
+        } else {
+            right = right.max(bar_label_right(bar));
+        }
+    }
     if let Some(clip) = cue_right
         && bar.open_ended
         && !bar.milestone
@@ -3408,6 +3432,7 @@ fn x_hits_span(x: f32, left: f32, right: f32) -> bool {
 
 /// Keep an inbound vertical in a gap that misses intervening bars and labels,
 /// without flipping to the other side of `x_head`.
+#[allow(clippy::too_many_arguments)]
 fn clear_vertical_x(
     pref: f32,
     intervening: &[&BarLayout],
@@ -3416,10 +3441,11 @@ fn clear_vertical_x(
     x_head: f32,
     include_labels: bool,
     cue_right: Option<f32>,
+    today_x: Option<f32>,
 ) -> f32 {
     let blocked: Vec<(f32, f32)> = intervening
         .iter()
-        .map(|bar| bar_occupied_x(bar, include_labels, cue_right))
+        .map(|bar| bar_occupied_x(bar, include_labels, cue_right, today_x))
         .collect();
     if blocked
         .iter()
@@ -3511,10 +3537,11 @@ fn clear_wrap_drop_x(
     x_head: f32,
     pred_min_x: f32,
     clip_right: f32,
+    today_x: Option<f32>,
 ) -> f32 {
     let blocked: Vec<(f32, f32)> = intervening
         .iter()
-        .map(|bar| bar_occupied_x(bar, include_labels, Some(clip_right)))
+        .map(|bar| bar_occupied_x(bar, include_labels, Some(clip_right), today_x))
         .collect();
     let min_x = pred_min_x.max(x_head + DependencyArrow::WRAP_STUB + 1.0);
     let mut x = pref;
@@ -3561,6 +3588,7 @@ fn clamp_inbound_stub(
     intervening: &[&BarLayout],
     include_labels: bool,
     cue_right: Option<f32>,
+    today_x: Option<f32>,
 ) -> f32 {
     const STUB: f32 = 12.0;
     let clamped = if inbound_left {
@@ -3572,7 +3600,7 @@ fn clamp_inbound_stub(
         return clamped;
     }
     if intervening.iter().any(|bar| {
-        let (left, right) = bar_occupied_x(bar, include_labels, cue_right);
+        let (left, right) = bar_occupied_x(bar, include_labels, cue_right, today_x);
         x_hits_span(clamped, left, right)
     }) {
         x_in
@@ -6180,7 +6208,7 @@ mod tests {
             cart_spike.lane_y
         );
         let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
-        let (occ_left, occ_right) = bar_occupied_x(cart, false, None);
+        let (occ_left, occ_right) = bar_occupied_x(cart, false, None, None);
         let head_on_timeline = persist_live.x_head <= timeline_width;
         let short_inbound =
             (persist_live.x_head - persist_live.x2).abs() <= MAX_FORWARD_INBOUND + 0.5;
@@ -6506,6 +6534,65 @@ mod tests {
             "fixture: Today must flip the chip left of the bar, paint_x={paint_x} bar.x={}",
             bar.x
         );
+        let (occ_left, occ_right) = bar_occupied_x(&bar, true, Some(800.0), Some(today_x));
+        assert!(
+            occ_left <= paint_x + 0.5 && occ_right + 0.5 >= paint_x + paint_w,
+            "intervening occupancy must cover the flipped letters, occ={occ_left}..{occ_right} paint={paint_x}..{}",
+            paint_x + paint_w
+        );
+        let phantom_right = bar_label_right(&bar);
+        assert!(
+            !x_hits_span(phantom_right - 8.0, occ_left, occ_right),
+            "occupancy must not keep a phantom right-side chip after a Today flip, phantom={phantom_right} occ={occ_left}..{occ_right}"
+        );
+        assert!(
+            x_hits_span(paint_x + 8.0, occ_left, occ_right),
+            "occupancy must hit the left-side letters, paint_x={paint_x} occ={occ_left}..{occ_right}"
+        );
+    }
+
+    #[test]
+    fn today_dodge_does_not_cover_the_bar() {
+        let bar = BarLayout {
+            id: 1002,
+            kind: GanttBarKind::Scheduled,
+            x: 40.0,
+            width: 24.0,
+            y: 40.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let estimated = bar_title_paint_px(&bar.title);
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let today_x = right_x + 20.0;
+        assert!(
+            today_x - right_x < estimated,
+            "precondition: full Cart title cannot fit before Today"
+        );
+        let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
+        assert!(
+            left_x.max(2.0) + estimated > bar.x,
+            "precondition: a clamp-to-2 chip would cover the sliver"
+        );
+        let (x, w) = bar_outside_label_frame(&bar, 800.0, true, Some(today_x), false)
+            .expect("Year Cart must keep a full outside title");
+        assert!(
+            w + 0.1 >= estimated,
+            "must keep the full title, not Ca…, max_w={w} estimated={estimated}"
+        );
+        assert!(
+            x + w <= bar.x + 0.1 || x + 0.5 >= bar.x + bar.width.max(8.0),
+            "Today dodge must not paint over the bar, label={x}..{} bar.x={}",
+            x + w,
+            bar.x
+        );
     }
 
     #[test]
@@ -6550,7 +6637,10 @@ mod tests {
             );
             if let Some(today) = today_x {
                 let room_before_today = today - 8.0;
-                let can_sit_left_of_today = estimated + 10.0 <= room_before_today
+                let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
+                let left_misses_bar = left_x.max(2.0) + estimated <= bar.x + 0.1;
+                let can_sit_left_of_today = (estimated + 10.0 <= room_before_today
+                    && left_misses_bar)
                     || x + estimated <= room_before_today + 0.5;
                 if can_sit_left_of_today && x < today {
                     assert!(
@@ -7585,8 +7675,9 @@ mod tests {
         assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
         let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
         let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
-        let (child_left, child_right) = bar_occupied_x(child, false, Some(gantt.timeline_width));
-        let (live_left, live_right) = bar_occupied_x(go_live, false, None);
+        let (child_left, child_right) =
+            bar_occupied_x(child, false, Some(gantt.timeline_width), None);
+        let (live_left, live_right) = bar_occupied_x(go_live, false, None, None);
         assert!(
             !x_hits_span(arrow.x2, child_left, child_right),
             "vertical x2={} must miss #1005 including its open-ended cue {child_left}..{child_right}",
@@ -7629,7 +7720,7 @@ mod tests {
             .expect("#1003→#1012");
         let mid = bars.iter().find(|bar| bar.id == 1005).unwrap();
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
-        let (left, right) = bar_occupied_x(mid, false, None);
+        let (left, right) = bar_occupied_x(mid, false, None, None);
         assert!(
             !x_hits_span(arrow.x2, left, right),
             "vertical x2={} must miss #1005 occupied {left}..{right}, pred_end={}",
@@ -7746,8 +7837,8 @@ mod tests {
         ]);
         assert_eq!(arrows.len(), 1);
         let stub = pred.x + pred.width + 12.0;
-        let (left1, right1) = bar_occupied_x(&mid1, false, None);
-        let (left2, right2) = bar_occupied_x(&mid2, false, None);
+        let (left1, right1) = bar_occupied_x(&mid1, false, None, None);
+        let (left2, right2) = bar_occupied_x(&mid2, false, None, None);
         assert!(
             x_hits_span(stub, left1, right1),
             "precondition: source stub {stub} must sit on mid1 {left1}..{right1}"
@@ -7839,7 +7930,7 @@ mod tests {
         let arrows = gantt.layout_dependency_arrows(&[pred.clone(), mid.clone(), succ]);
         assert_eq!(arrows.len(), 1);
         let stub = pred.x + pred.width + 12.0;
-        let (cue_left, cue_right) = bar_occupied_x(&mid, false, Some(gantt.timeline_width));
+        let (cue_left, cue_right) = bar_occupied_x(&mid, false, Some(gantt.timeline_width), None);
         assert!(
             x_hits_span(stub, cue_left, cue_right),
             "precondition: source stub {stub} sits in the open-ended cue {cue_left}..{cue_right}"
@@ -7920,7 +8011,7 @@ mod tests {
         };
         let arrows = gantt.layout_dependency_arrows(&[pred, pill.clone(), succ.clone()]);
         assert_eq!(arrows.len(), 1);
-        let (left, right) = bar_occupied_x(&pill, false, None);
+        let (left, right) = bar_occupied_x(&pill, false, None, None);
         assert!(
             !x_hits_span(arrows[0].x1, left, right) && !x_hits_span(arrows[0].x2, left, right),
             "connector x1={} x2={} must miss the No dates pill {left}..{right}",
@@ -8012,7 +8103,7 @@ mod tests {
             arrow.x_head
         );
         let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
-        let (cue_left, cue_right) = bar_occupied_x(child, false, Some(gantt.timeline_width));
+        let (cue_left, cue_right) = bar_occupied_x(child, false, Some(gantt.timeline_width), None);
         assert!(
             !x_hits_span(arrow.x2, cue_left, cue_right),
             "wrap vertical x2={} must miss Cart UI's open-ended cue {cue_left}..{cue_right}",
@@ -8278,8 +8369,8 @@ mod tests {
         assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
         let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
         let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
-        let (child_left, child_right) = bar_occupied_x(child, false, None);
-        let (live_left, live_right) = bar_occupied_x(go_live, false, None);
+        let (child_left, child_right) = bar_occupied_x(child, false, None, None);
+        let (live_left, live_right) = bar_occupied_x(go_live, false, None, None);
         assert!(
             !x_hits_span(arrow.x2, child_left, child_right),
             "vertical x2={} must miss #1005 occupied {child_left}..{child_right}",
@@ -8349,7 +8440,7 @@ mod tests {
         };
         let arrows = gantt.layout_dependency_arrows(&[pred, mid.clone(), succ.clone()]);
         assert_eq!(arrows.len(), 1);
-        let (left, right) = bar_occupied_x(&mid, true, None);
+        let (left, right) = bar_occupied_x(&mid, true, None, None);
         assert!(
             arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
             "forcing a 12px stub must not recross the intervening bar, x2={} mid={left}..{right} x_head={}",
