@@ -48,8 +48,8 @@ use crate::gantt::{
     LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS,
     NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W,
     SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H,
-    TODAY_PILL_GAP, TODAY_PILL_W, TREE_INDENT, TYPE_COL_WIDTH, bar_title_is_inside,
-    header_label_px, parent_date_overflow, parent_overflow_tip,
+    TODAY_PILL_GAP, TODAY_PILL_W, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT,
+    bar_title_is_inside, header_label_px, parent_date_overflow, parent_overflow_tip,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -162,7 +162,7 @@ pub struct PlannerView {
     /// must not auto-schedule.
     schedule_origin_x: Option<f32>,
     /// Window-x where an unscheduled gutter-pill press began. A release with
-    /// no movement must not PATCH dates to the date under the gutter.
+    /// no movement, or still in the gutter, must not PATCH dates.
     pill_press_window_x: Option<f32>,
     /// Window-x where a dated bar press began. A flick (mouse-up with no
     /// mouse-move) applies this delta so the release still commits.
@@ -4868,7 +4868,7 @@ impl PlannerView {
                             let _ = this.classify_bar_hit(id, &layout, x);
                             // Live dates start at Today. Origin is Today on the
                             // date axis so a drag follows the cursor x. A
-                            // no-move release is cancelled from pill_press_window_x
+                            // no-move or still-in-gutter release is cancelled
                             // instead of PATCHing the gutter as a date.
                             this.pill_press_window_x = Some(x);
                             this.bar_press_window_x = Some(x);
@@ -6827,13 +6827,17 @@ impl PlannerView {
         if self.state.gantt.gesture.is_none() {
             return;
         }
-        let unscheduled_no_move = self.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+        let unscheduled = self.state.gantt.gesture.as_ref().is_some_and(|gesture| {
             gesture.kind == GestureKind::Move && !gesture.had_start && !gesture.had_target
-        }) && self
-            .pill_press_window_x
-            .is_some_and(|origin| (window_x - origin).abs() < 6.0);
+        });
+        let unscheduled_no_move = unscheduled
+            && self
+                .pill_press_window_x
+                .is_some_and(|origin| (window_x - origin).abs() < 6.0);
+        let still_in_gutter =
+            unscheduled && self.timeline_local_x(window_x) < UNSCHEDULED_GUTTER_RIGHT;
         self.pill_press_window_x = None;
-        if unscheduled_no_move {
+        if unscheduled_no_move || still_in_gutter {
             self.bar_press_window_x = None;
             self.state.cancel_gesture();
             self.saw_pressed_drag = false;

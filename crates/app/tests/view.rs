@@ -4,7 +4,8 @@ use ado_core::{IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH,
-    MIN_TIMELINE_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, insert_index_for_child,
+    MIN_TIMELINE_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
+    insert_index_for_child,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -2078,6 +2079,83 @@ fn unscheduled_pill_click_without_drag_does_not_schedule(cx: &mut gpui_kit::Test
         assert!(
             view.state.history.undo.is_empty(),
             "a no-move pill click must not record a date change"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn unscheduled_pill_micro_drag_in_gutter_does_not_schedule(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = None;
+        node.target_date = None;
+        node.title = "Backlog grooming".into();
+        node.iteration_path = "Shop\\FY26\\Sprint 12".into();
+    }
+    state.iterations = vec![ado_core::IterationNode {
+        path: "Shop\\FY26\\Sprint 12".into(),
+        name: "Sprint 12".into(),
+        start_date: Some("2026-08-10T00:00:00Z".into()),
+        finish_date: Some("2026-08-21T00:00:00Z".into()),
+        children: Vec::new(),
+    }];
+    let today = jiff::Zoned::now().date();
+    state.gantt.go_today(today);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let pill = cx
+        .debug_bounds("gantt-bar-2")
+        .expect("unscheduled gutter pill");
+    let timeline = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let sloppy = point(
+        px(f32::from(timeline.origin.x) + UNSCHEDULED_GUTTER_RIGHT - 4.0),
+        pill.center().y,
+    );
+    let press = pill.center();
+    assert!(
+        (f32::from(sloppy.x) - f32::from(press.x)).abs() >= 6.0,
+        "precondition: the sloppy release must travel past the 6px no-move cancel"
+    );
+    cx.simulate_mouse_down(press, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(sloppy, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(sloppy, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "a gutter micro-drag must finish the gesture"
+        );
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .expect("pill item");
+        assert_eq!(
+            node.start_date, None,
+            "releasing still in the gutter must not PATCH Start, got {:?}",
+            node.start_date
+        );
+        assert_eq!(
+            node.target_date, None,
+            "releasing still in the gutter must not PATCH Target, got {:?}",
+            node.target_date
+        );
+        assert!(
+            view.last_committed_start_for_test().is_none(),
+            "a gutter micro-drag must not record a committed start"
+        );
+        assert!(
+            view.state.history.undo.is_empty(),
+            "a gutter micro-drag must not record a date change"
         );
     });
 }

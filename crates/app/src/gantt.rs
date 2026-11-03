@@ -49,6 +49,9 @@ pub const LEAF_BAR_H: f32 = 28.0;
 pub const DATES_COL_WIDTH: f32 = 140.0;
 /// Left gutter for unscheduled / no-field pills so they do not stack on Today.
 pub const UNSCHEDULED_GUTTER_X: f32 = 10.0;
+/// Right edge of that gutter (pill plus a few px of slack). A drop still
+/// left of this has not chosen a date yet.
+pub const UNSCHEDULED_GUTTER_RIGHT: f32 = UNSCHEDULED_GUTTER_X + MILESTONE_SIZE + 6.0;
 pub const NO_FIELDS_HINT_W: f32 = 88.0;
 pub const DETAILS_PILL_WIDTH: f32 = 36.0;
 pub const ID_COL_WIDTH: f32 = 64.0;
@@ -919,7 +922,7 @@ impl GanttView {
         if !matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
             return;
         }
-        let gutter_right = UNSCHEDULED_GUTTER_X + MILESTONE_SIZE + 6.0;
+        let gutter_right = UNSCHEDULED_GUTTER_RIGHT;
         let month_start = GanttScale::Month.floor_date(self.date_for_x(gutter_right));
         let x = self.x_for_date(month_start);
         if (x - gutter_right).abs() < 1.0 {
@@ -933,7 +936,7 @@ impl GanttView {
     /// do not sit on dated bars.
     pub fn snap_cramped_leading_column(&mut self) {
         if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
-            let gutter_right = UNSCHEDULED_GUTTER_X + MILESTONE_SIZE + 6.0;
+            let gutter_right = UNSCHEDULED_GUTTER_RIGHT;
             // Park the first on-screen month after the unscheduled gutter.
             // Using date_for_x(0) (then stepping forward if that month is
             // already off the left) so a second snap is a no-op instead of
@@ -957,8 +960,11 @@ impl GanttView {
         if x >= -0.5 {
             return;
         }
-        let leftover = -x;
+        // Visible remainder of the leftover column, not how far the period
+        // start is off-screen. A week that starts far left still shows a
+        // sliver at x=0 even when `-x` is larger than the snap threshold.
         let full = self.period_width(start).max(1.0);
+        let leftover = full + x;
         let min = (full * 0.4).max(40.0);
         if leftover < min {
             self.scroll_x += x;
@@ -1400,6 +1406,17 @@ impl GanttView {
         let snap_unscheduled = self.gesture.as_ref().is_some_and(|gesture| {
             gesture.kind == GestureKind::Move && !gesture.had_start && !gesture.had_target
         });
+        if snap_unscheduled && (0.0..UNSCHEDULED_GUTTER_RIGHT).contains(&x) {
+            // Still in the gutter strip: keep Today. date_for_x there is the
+            // timeline origin, not a chosen day. Negative x is a real date
+            // off the left edge, not the gutter.
+            if let Some(gesture) = &mut self.gesture {
+                gesture.live_x = x;
+                gesture.live_start = gesture.start;
+                gesture.live_target = gesture.target;
+            }
+            return;
+        }
         let snapped = snap_unscheduled.then(|| self.date_for_x(x));
         let Some(gesture) = &mut self.gesture else {
             return;
@@ -2215,7 +2232,9 @@ fn clear_vertical_x(
 }
 
 /// Slide a wrap-around drop just past intervening bars so the long vertical
-/// runs in a gap, without sending the loop to the chart left edge.
+/// runs in a gap, without sending the loop to the chart left edge. Re-test
+/// each candidate against every occupied span: sliding past the source stub
+/// can still land inside a later overlapping bar.
 fn clear_wrap_drop_x(
     pref: f32,
     intervening: &[&BarLayout],
@@ -2226,23 +2245,24 @@ fn clear_wrap_drop_x(
         .iter()
         .map(|bar| bar_occupied_x(bar, include_labels))
         .collect();
-    if blocked
-        .iter()
-        .all(|(left, right)| !x_hits_span(pref, *left, *right))
-    {
-        return pref;
+    let min_x = x_head + DependencyArrow::WRAP_STUB + 1.0;
+    let mut x = pref;
+    for _ in 0..=blocked.len() {
+        let hit_right = blocked
+            .iter()
+            .filter(|(left, right)| x_hits_span(x, *left, *right))
+            .map(|(_, right)| *right)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if hit_right == f32::NEG_INFINITY {
+            return x;
+        }
+        let cand = hit_right + 6.0;
+        if cand <= x || cand <= x_head + DependencyArrow::WRAP_STUB {
+            return pref.max(min_x);
+        }
+        x = cand;
     }
-    let hit_right = blocked
-        .iter()
-        .filter(|(left, right)| x_hits_span(pref, *left, *right))
-        .map(|(_, right)| *right)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let cand = hit_right + 6.0;
-    if cand > x_head + DependencyArrow::WRAP_STUB {
-        cand
-    } else {
-        pref.max(x_head + DependencyArrow::WRAP_STUB + 1.0)
-    }
+    x
 }
 
 /// Keep a 12px inbound stub when it stays in the clear lane; otherwise keep
@@ -3449,6 +3469,42 @@ mod tests {
         assert!(
             gantt.finish_gesture().is_none(),
             "a release with no movement must not commit dates"
+        );
+    }
+
+    #[test]
+    fn unscheduled_gutter_micro_drag_does_not_commit_origin_dates() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        item.iteration_path.clear();
+        let origin = Date::new(2026, 7, 1).unwrap();
+        let mut gantt = GanttView {
+            origin,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&[item.clone()]);
+        let bars = gantt.layout_bars(&[item.clone()], &rows, &[], 720.0);
+        let bar = bars[0].clone();
+        let today = jiff::Zoned::now().date();
+        let today_x = gantt.x_for_date(today);
+        gantt
+            .begin_gesture(&bar, GestureKind::Move, today_x, &[item], &[])
+            .expect("move");
+        gantt.update_gesture(UNSCHEDULED_GUTTER_X + 8.0);
+        let gesture = gantt.gesture.clone().expect("live");
+        assert_eq!(
+            gesture.live_start, today,
+            "a gutter x must keep Today, not snap to the origin date {}",
+            gesture.live_start
+        );
+        assert_ne!(
+            gesture.live_start, origin,
+            "micro-dragging in the gutter must not adopt the timeline origin"
+        );
+        assert!(
+            gantt.finish_gesture().is_none(),
+            "releasing still in the gutter must not commit dates"
         );
     }
 
@@ -5023,6 +5079,116 @@ mod tests {
     }
 
     #[test]
+    fn wrap_drop_slides_past_later_intervening_bars() {
+        let pred = BarLayout {
+            id: 1,
+            kind: GanttBarKind::Scheduled,
+            x: 300.0,
+            width: 80.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "pred".into(),
+            title: "Pred".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let mid1 = BarLayout {
+            id: 2,
+            kind: GanttBarKind::Scheduled,
+            x: 360.0,
+            width: 50.0,
+            y: ROW_HEIGHT,
+            summary: false,
+            milestone: false,
+            label: "mid1".into(),
+            title: "Mid1".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let mid2 = BarLayout {
+            id: 3,
+            kind: GanttBarKind::Scheduled,
+            x: 418.0,
+            width: 60.0,
+            y: ROW_HEIGHT * 2.0,
+            summary: false,
+            milestone: false,
+            label: "mid2".into(),
+            title: "Mid2".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let succ = BarLayout {
+            id: 4,
+            kind: GanttBarKind::Scheduled,
+            x: 80.0,
+            width: 80.0,
+            y: ROW_HEIGHT * 3.0,
+            summary: false,
+            milestone: false,
+            label: "succ".into(),
+            title: "Succ".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: vec![1],
+            marker: false,
+            open_ended: false,
+        };
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let arrows =
+            gantt.layout_dependency_arrows(&[pred.clone(), mid1.clone(), mid2.clone(), succ]);
+        assert_eq!(arrows.len(), 1);
+        let stub = pred.x + pred.width + 12.0;
+        let (left1, right1) = bar_occupied_x(&mid1, false);
+        let (left2, right2) = bar_occupied_x(&mid2, false);
+        assert!(
+            x_hits_span(stub, left1, right1),
+            "precondition: source stub {stub} must sit on mid1 {left1}..{right1}"
+        );
+        let naive = right1 + 6.0;
+        assert!(
+            x_hits_span(naive, left2, right2),
+            "precondition: one-step slide {naive} must still hit mid2 {left2}..{right2}"
+        );
+        assert!(
+            arrows[0].wraps_around_successor(),
+            "must keep a local loop, x1={} x2={} x_head={}",
+            arrows[0].x1,
+            arrows[0].x2,
+            arrows[0].x_head
+        );
+        assert!(
+            !x_hits_span(arrows[0].x2, left1, right1),
+            "wrap drop x2={} must miss mid1 {left1}..{right1}",
+            arrows[0].x2
+        );
+        assert!(
+            !x_hits_span(arrows[0].x2, left2, right2),
+            "wrap drop x2={} must miss the later intervening bar {left2}..{right2}",
+            arrows[0].x2
+        );
+        assert!(
+            arrows[0].x2 > 80.0,
+            "must not detour to the chart left edge, x2={}",
+            arrows[0].x2
+        );
+    }
+
+    #[test]
     fn backward_link_loops_locally_not_to_the_chart_left() {
         let mut pred = node(1003, Some(1002));
         pred.title = "Persist cart".into();
@@ -5896,6 +6062,40 @@ mod tests {
             "#1012 must paint inside the Week viewport, x={} width={}",
             bar.x,
             bar.width
+        );
+    }
+
+    #[test]
+    fn week_snaps_when_the_visible_remainder_is_a_sliver() {
+        let origin = Date::new(2026, 6, 29).unwrap();
+        let mut gantt = GanttView {
+            origin,
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            scroll_x: 120.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let start = gantt.scale.floor_date(gantt.date_for_x(0.0));
+        let x = gantt.x_for_date(start);
+        let full = gantt.period_width(start).max(1.0);
+        let min = (full * 0.4).max(40.0);
+        assert!(x < -0.5, "precondition: period start is off-screen, x={x}");
+        assert!(
+            -x >= min,
+            "precondition: off-screen amount is not a small leftover, -x={} min={min}",
+            -x
+        );
+        assert!(
+            full + x < min,
+            "precondition: visible remainder is a sliver, remainder={} min={min}",
+            full + x
+        );
+        gantt.snap_cramped_leading_column();
+        let after = gantt.x_for_date(start);
+        assert!(
+            after.abs() < 0.5,
+            "must align the week start to the left edge, x={after}"
         );
     }
 
