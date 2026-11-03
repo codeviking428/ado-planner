@@ -5011,6 +5011,15 @@ fn toast_undo_and_scale_switch_clear_hover_dots(cx: &mut gpui_kit::TestAppContex
         height: px(800.),
     });
     draw(cx);
+    view.update(cx, |view, cx| {
+        view.state.gantt.hovered_id = Some(2);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-end").is_some(),
+        "hover must paint the pink end dot"
+    );
     let undo = cx.debug_bounds("toast-undo").expect("Undo");
     cx.simulate_click(undo.center(), Modifiers::default());
     draw(cx);
@@ -5019,8 +5028,16 @@ fn toast_undo_and_scale_switch_clear_hover_dots(cx: &mut gpui_kit::TestAppContex
             view.state.gantt.hovered_id, None,
             "toast Undo must clear hover dots"
         );
-        view.state.gantt.hovered_id = Some(2);
     });
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-end").is_none(),
+        "toast Undo must hide the pink end dot even if the bar stays selected"
+    );
+    view.update(cx, |view, cx| {
+        view.state.gantt.hovered_id = Some(2);
+        cx.notify();
+    });
+    draw(cx);
     let year = cx.debug_bounds("gantt-scale-Year").expect("Year");
     cx.simulate_click(year.center(), Modifiers::default());
     draw(cx);
@@ -5030,6 +5047,43 @@ fn toast_undo_and_scale_switch_clear_hover_dots(cx: &mut gpui_kit::TestAppContex
             "switching views must clear hover dots"
         );
     });
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-end").is_none(),
+        "a scale switch must hide the pink end dot"
+    );
+}
+
+#[gpui_kit::test]
+fn mouse_leave_clears_hover_dots_while_locked(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.hovered_id = Some(2);
+    state.gantt.selected_id = Some(2);
+    state.gantt.hover_locked = true;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-end").is_some(),
+        "a locked hover must still paint the pink end dot"
+    );
+    let nav = cx.debug_bounds("gantt-nav").expect("nav");
+    cx.simulate_mouse_move(nav.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_id, None,
+            "leaving the canvas must clear hover even after a click locked it"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-end").is_none(),
+        "mouse leave must hide the pink end dot"
+    );
 }
 
 #[gpui_kit::test]
@@ -5061,6 +5115,75 @@ fn year_to_month_keeps_the_scroll_anchor(cx: &mut gpui_kit::TestAppContext) {
         assert!(
             after < Date::new(2027, 1, 1).unwrap(),
             "must not jump to Jul 2027, got {after}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn toast_undo_clears_saving_status(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.set_busy_for_test(true);
+        assert_eq!(view.sync_status_for_test(), "Saving…");
+        view.complete_undo_io_for_test(cx);
+        assert_eq!(
+            view.sync_status_for_test(),
+            "Synced",
+            "Saving… must not linger in the header after Undo"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn flick_drag_without_mouse_move_still_commits(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("bar");
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    // Press in the body, past the 18px start handle that would resize.
+    let start = bar.center();
+    let drop = point(start.x + px(ppd * 4.0), start.y);
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("mouse-down must arm a bar gesture before the flick release");
+        assert_eq!(gesture.kind, GestureKind::Move);
+        assert_eq!(
+            gesture.live_start,
+            Date::new(2026, 7, 6).unwrap(),
+            "flick press must start on the bar's origin date"
+        );
+    });
+    cx.simulate_mouse_up(drop, MouseButton::Left, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "a flick must commit on mouse-up"
+        );
+        assert_eq!(
+            view.last_committed_start_for_test(),
+            Some(Date::new(2026, 7, 10).unwrap()),
+            "a 4-day flick with no mouse-move must still move the bar, got {:?}",
+            view.last_committed_start_for_test()
         );
     });
 }

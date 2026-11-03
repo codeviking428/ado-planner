@@ -146,12 +146,26 @@ impl GanttScale {
         match self {
             Self::Day => date.day().to_string(),
             Self::Week => format!("{} {}", month_abbrev(date), date.day()),
-            Self::Month => month_abbrev(date).to_string(),
+            Self::Month | Self::Year => month_abbrev(date).to_string(),
             Self::Quarter => {
                 let q = ((date.month() as i32 - 1) / 3) + 1;
                 format!("Q{q}")
             }
-            Self::Year => String::new(),
+        }
+    }
+
+    /// Grid/header step. Year walks months so labels are not a single cramped year.
+    fn tick_floor(self, date: Date) -> Date {
+        match self {
+            Self::Year => Date::new(date.year(), date.month(), 1).unwrap_or(date),
+            other => other.floor_date(date),
+        }
+    }
+
+    fn tick_next(self, date: Date) -> Date {
+        match self {
+            Self::Year => date.saturating_add(1.month()),
+            other => other.next_date(date),
         }
     }
 
@@ -899,9 +913,42 @@ impl GanttView {
         }
     }
 
+    /// Reverse [`snap_cramped_leading_column`]'s Year/Quarter gutter park so
+    /// Month→Year→Month keeps the left-edge date.
+    pub fn unsnap_year_gutter(&mut self) {
+        if !matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
+            return;
+        }
+        let gutter_right = UNSCHEDULED_GUTTER_X + MILESTONE_SIZE + 6.0;
+        let month_start = GanttScale::Month.floor_date(self.date_for_x(gutter_right));
+        let x = self.x_for_date(month_start);
+        if (x - gutter_right).abs() < 1.0 {
+            self.scroll_x += gutter_right;
+        }
+    }
+
     /// If the leftover column at x=0 is a sliver, align the period start to
-    /// the left edge so Week/Day first columns stay readable.
+    /// the left edge so Week/Day first columns stay readable. Year/Quarter
+    /// also park the first month after the unscheduled gutter so diamonds
+    /// do not sit on dated bars.
     pub fn snap_cramped_leading_column(&mut self) {
+        if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
+            let gutter_right = UNSCHEDULED_GUTTER_X + MILESTONE_SIZE + 6.0;
+            // Park the first on-screen month after the unscheduled gutter.
+            // Using date_for_x(0) (then stepping forward if that month is
+            // already off the left) so a second snap is a no-op instead of
+            // walking one month further left.
+            let mut month_start = GanttScale::Month.floor_date(self.date_for_x(0.0));
+            let mut x = self.x_for_date(month_start);
+            if x < 0.0 {
+                month_start = month_start.saturating_add(1.month());
+                x = self.x_for_date(month_start);
+            }
+            if x < gutter_right {
+                self.scroll_x += x - gutter_right;
+            }
+            return;
+        }
         if !matches!(self.scale, GanttScale::Week | GanttScale::Day) {
             return;
         }
@@ -1172,11 +1219,16 @@ impl GanttView {
                 let (start, target) = if let Some(gesture) = live {
                     (gesture.live_start, gesture.live_target)
                 } else if display.kind == GanttBarKind::NoFields {
+                    let width = if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
+                        MILESTONE_SIZE
+                    } else {
+                        NO_FIELDS_HINT_W
+                    };
                     return Some(BarLayout {
                         id: node.id,
                         kind: display.kind,
                         x: UNSCHEDULED_GUTTER_X,
-                        width: NO_FIELDS_HINT_W,
+                        width,
                         y: self.row_y(offset),
                         summary: row.has_children,
                         milestone: false,
@@ -1486,7 +1538,7 @@ impl GanttView {
         }
         let left = self.date_for_x(-ppd);
         let right = self.date_for_x(width + ppd.max(1.0));
-        let mut date = self.scale.floor_date(left);
+        let mut date = self.scale.tick_floor(left);
         let mut ticks = Vec::new();
         let mut last_major = String::new();
         let mut guard = 0;
@@ -1508,7 +1560,7 @@ impl GanttView {
                 major,
                 weekend: is_weekend(date),
             });
-            let next = self.scale.next_date(date);
+            let next = self.scale.tick_next(date);
             if next <= date {
                 break;
             }
@@ -1567,7 +1619,7 @@ impl GanttView {
         self.header_tick_labels_except(width, None)
     }
 
-    /// Skip empty Year ticks. Shift the Day number off the Today line so "2"
+    /// Year ticks are months. Shift the Day number off the Today line so "2"
     /// stays readable instead of hiding it.
     pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 22.0;
@@ -1610,6 +1662,14 @@ impl GanttView {
             && *x < HEADER_LEFT_PAD
         {
             *x = HEADER_LEFT_PAD;
+        }
+        // Pinning the leftover month to the left pad can sit it on the
+        // first in-view tick; drop the leftover so Year "Jul" stays.
+        if labels.len() >= 2 {
+            let need = header_label_px(&labels[0].1).max(TICK_MIN_GAP);
+            if labels[1].0 - labels[0].0 < need {
+                labels.remove(0);
+            }
         }
         while let Some((x, label)) = labels.last() {
             let w = header_label_px(label);
@@ -1982,7 +2042,7 @@ fn parse_type_color(hex: &str) -> u32 {
     u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0x89b4fa)
 }
 
-fn header_label_px(label: &str) -> f32 {
+pub(crate) fn header_label_px(label: &str) -> f32 {
     (label.chars().count() as f32 * 7.0 + 8.0).max(14.0)
 }
 
@@ -4292,10 +4352,14 @@ mod tests {
             .collect();
         let widths: Vec<f32> = xs.windows(2).map(|pair| pair[1] - pair[0]).collect();
         assert!(widths.len() >= 2, "need at least two year columns: {xs:?}");
-        let first = widths[0];
+        // The leftover year at the left edge can be a sliver; complete
+        // years (January→January) stay equal width.
+        let full: Vec<f32> = widths.iter().copied().skip(1).collect();
+        let first_full = full[0];
         assert!(
-            widths.iter().all(|width| (width - first).abs() < 3.0),
-            "year columns must be equal width, got {widths:?}"
+            full.iter().all(|width| (width - first_full).abs() < 3.0),
+            "complete year columns must be equal width, got leftover={} full={full:?}",
+            widths[0]
         );
     }
 
@@ -5832,6 +5896,94 @@ mod tests {
             "#1012 must paint inside the Week viewport, x={} width={}",
             bar.x,
             bar.width
+        );
+    }
+
+    #[test]
+    fn year_ticks_are_months_and_not_cramped() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.snap_cramped_leading_column();
+        let labels = gantt.header_tick_labels(800.0);
+        assert!(
+            labels.iter().any(|(_, label)| *label == "Jul"),
+            "Year view must show month labels, got {labels:?}"
+        );
+        for pair in labels.windows(2) {
+            let (x0, l0) = &pair[0];
+            let (x1, l1) = &pair[1];
+            let need = header_label_px(l0);
+            assert!(
+                x1 - x0 >= need - 0.5,
+                "Year ticks {l0:?}@{x0} and {l1:?}@{x1} are cramped (need {need})"
+            );
+        }
+    }
+
+    #[test]
+    fn year_snap_keeps_unscheduled_pills_off_dated_bars() {
+        let mut scheduled = node(1, None);
+        scheduled.start_date = Some("2026-07-06T00:00:00Z".into());
+        scheduled.target_date = Some("2026-07-20T00:00:00Z".into());
+        let mut open = node(2, None);
+        open.start_date = None;
+        open.target_date = None;
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.snap_cramped_leading_column();
+        let nodes = vec![scheduled, open];
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let pill = bars.iter().find(|bar| bar.id == 2).expect("gutter pill");
+        let dated = bars.iter().find(|bar| bar.id == 1).expect("dated bar");
+        assert!(pill.marker);
+        assert!(
+            dated.x >= pill.x + pill.width + 1.0,
+            "Year unscheduled diamond must not sit on a dated bar, pill={}..{} bar x={}",
+            pill.x,
+            pill.x + pill.width,
+            dated.x
+        );
+        let scroll_after = gantt.scroll_x;
+        gantt.snap_cramped_leading_column();
+        assert!(
+            (gantt.scroll_x - scroll_after).abs() < 0.5,
+            "Year gutter snap must be idempotent, first={scroll_after} second={}",
+            gantt.scroll_x
+        );
+    }
+
+    #[test]
+    fn flick_move_applies_release_x_without_prior_updates() {
+        let nodes = vec![node(1, None)];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let origin = bars[0].x + 12.0;
+        gantt
+            .begin_gesture(&bars[0], GestureKind::Move, origin, &nodes, &[])
+            .expect("move");
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        gantt.update_gesture(origin + ppd * 4.0);
+        let finished = gantt.finish_gesture().expect("flick must commit");
+        assert_eq!(
+            finished.1,
+            Date::new(2026, 7, 10).unwrap(),
+            "a 4-day flick with no intermediate updates must still move the bar"
         );
     }
 }

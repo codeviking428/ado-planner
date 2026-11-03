@@ -49,7 +49,7 @@ use crate::gantt::{
     NudgeAxis, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W,
     SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H,
     TODAY_PILL_GAP, TODAY_PILL_W, TREE_INDENT, TYPE_COL_WIDTH, bar_title_is_inside,
-    parent_date_overflow, parent_overflow_tip,
+    header_label_px, parent_date_overflow, parent_overflow_tip,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -139,6 +139,8 @@ pub struct PlannerView {
     io_busy: bool,
     saving_shown_at: Option<Instant>,
     saving_hold_gen: u64,
+    /// Undo/Redo should not leave the 400ms Saving… hold in the header.
+    skip_saving_hold: bool,
     date_save_busy: HashSet<i64>,
     date_save_queue: VecDeque<PendingDateSave>,
     pending_team: Option<String>,
@@ -162,6 +164,9 @@ pub struct PlannerView {
     /// Window-x where an unscheduled gutter-pill press began. A release with
     /// no movement must not PATCH dates to the date under the gutter.
     pill_press_window_x: Option<f32>,
+    /// Window-x where a dated bar press began. A flick (mouse-up with no
+    /// mouse-move) applies this delta so the release still commits.
+    bar_press_window_x: Option<f32>,
     /// Live window-x while dragging to schedule an unscheduled row.
     schedule_live_x: Option<f32>,
     /// Nested hover count so moving onto Undo does not unpause expiry.
@@ -187,6 +192,9 @@ pub struct PlannerView {
     painted_bar_bounds: Rc<RefCell<HashMap<i64, PaintedBar>>>,
     /// Last bar mouse-down classification (window x vs painted bounds).
     last_bar_hit: Option<BarHitDebug>,
+    /// Start date of the last committed date gesture. Persist without a
+    /// mock may revert the node; tests still see that the flick committed.
+    last_committed_start_for_test: Option<jiff::civil::Date>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -406,6 +414,7 @@ impl PlannerView {
             io_busy: false,
             saving_shown_at: None,
             saving_hold_gen: 0,
+            skip_saving_hold: false,
             date_save_busy: HashSet::new(),
             date_save_queue: VecDeque::new(),
             pending_team: None,
@@ -423,6 +432,7 @@ impl PlannerView {
             saw_pressed_drag: false,
             schedule_origin_x: None,
             pill_press_window_x: None,
+            bar_press_window_x: None,
             schedule_live_x: None,
             toast_hover_depth: 0,
             toast_pointer: false,
@@ -434,6 +444,7 @@ impl PlannerView {
             timeline_body_origin_x: Rc::new(Cell::new(None)),
             painted_bar_bounds: Rc::new(RefCell::new(HashMap::new())),
             last_bar_hit: None,
+            last_committed_start_for_test: None,
             _subscriptions: vec![keystrokes],
         };
         this.scope_query.update(cx, |input, cx| {
@@ -905,7 +916,7 @@ impl PlannerView {
             let _ = this.update(cx, |this, cx| {
                 this.io_busy = false;
                 if saving {
-                    this.arm_saving_status(cx);
+                    this.finish_or_hold_saving_status(cx);
                 }
                 match outcome {
                     Ok((working, result)) => {
@@ -1184,6 +1195,7 @@ impl PlannerView {
         self.state.gantt.schedule_drag = None;
         self.schedule_origin_x = None;
         self.pill_press_window_x = None;
+        self.bar_press_window_x = None;
         self.schedule_live_x = None;
         self.state.gantt.clear_hover();
         self.dates_anchor = None;
@@ -1207,10 +1219,14 @@ impl PlannerView {
             }
             return;
         }
-        if self.state.gantt.hover_locked {
-            if id.is_none() {
-                return;
+        if id.is_none() {
+            if self.state.gantt.hovered_id.is_some() || self.state.gantt.hovered_link.is_some() {
+                self.state.gantt.clear_hover();
+                cx.notify();
             }
+            return;
+        }
+        if self.state.gantt.hover_locked {
             self.state.gantt.hover_locked = false;
         }
         if self.state.gantt.hovered_id != id {
@@ -1652,6 +1668,7 @@ impl PlannerView {
                                 .flex_shrink_0()
                                 .child(Button::new(("copy-toast", id)).label("Copy").on_click(
                                     cx.listener(move |this, _, _, cx| {
+                                        this.state.gantt.clear_hover();
                                         this.state.copy_toast(id);
                                         if let Some(text) = this.state.copied.clone() {
                                             this.write_clipboard(cx, text);
@@ -1742,6 +1759,7 @@ impl PlannerView {
                             .flex_shrink_0()
                             .child(Button::new(("dismiss-toast", id)).label("×").on_click(
                                 cx.listener(move |this, _, _, cx| {
+                                    this.state.gantt.clear_hover();
                                     this.state.toasts.dismiss(id);
                                     this.clamp_toast_hover();
                                     cx.notify();
@@ -1777,9 +1795,11 @@ impl PlannerView {
         self.toast_pointer = true;
         self.state.cancel_gesture();
         self.state.gantt.schedule_drag = None;
+        self.state.gantt.clear_hover();
         self.saw_pressed_drag = false;
         self.schedule_origin_x = None;
         self.pill_press_window_x = None;
+        self.bar_press_window_x = None;
         self.schedule_live_x = None;
     }
 
@@ -1912,7 +1932,8 @@ impl PlannerView {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
                 this.io_busy = false;
-                this.arm_saving_status(cx);
+                this.skip_saving_hold = true;
+                this.finish_or_hold_saving_status(cx);
                 this.toast_undo_inflight = false;
                 match outcome {
                     Ok((working, Ok(()))) => {
@@ -1944,6 +1965,7 @@ impl PlannerView {
         if self.history_hotkey_is_duplicate(true) || self.state.history.undo.is_empty() {
             return;
         }
+        self.state.gantt.clear_hover();
         self.state.gantt.context_menu = None;
         let pending = self.state.undo_date_stack_now();
         if !pending.is_empty() {
@@ -1955,6 +1977,7 @@ impl PlannerView {
             self.request_repaint(None, cx);
             return;
         }
+        self.skip_saving_hold = true;
         self.spawn_state(cx, |mut state| async move {
             let result = state.undo().await;
             (state, result)
@@ -1965,6 +1988,7 @@ impl PlannerView {
         if self.history_hotkey_is_duplicate(false) || self.state.history.redo.is_empty() {
             return;
         }
+        self.state.gantt.clear_hover();
         let pending = self.state.redo_date_stack_now();
         if !pending.is_empty() {
             self.queue_form_dates_from_draft();
@@ -1975,6 +1999,7 @@ impl PlannerView {
             self.request_repaint(None, cx);
             return;
         }
+        self.skip_saving_hold = true;
         self.spawn_state(cx, |mut state| async move {
             let result = state.redo().await;
             (state, result)
@@ -2901,6 +2926,7 @@ impl PlannerView {
                             .label("+ Add item")
                             .tooltip("Add a child work item under the selected row.")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.gantt.clear_hover();
                                 this.spawn_state(cx, |mut state| async move {
                                     let result = state.add_item().await;
                                     (state, result)
@@ -2985,6 +3011,12 @@ impl PlannerView {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.dismiss_overlays();
                                         this.animate_gantt(cx, |gantt| {
+                                            if !matches!(
+                                                scale,
+                                                GanttScale::Year | GanttScale::Quarter
+                                            ) {
+                                                gantt.unsnap_year_gutter();
+                                            }
                                             gantt.set_scale_at(scale, 0.0);
                                             gantt.snap_cramped_leading_column();
                                         });
@@ -3138,6 +3170,19 @@ impl PlannerView {
             }
         })
         .detach();
+    }
+
+    fn finish_or_hold_saving_status(&mut self, cx: &mut Context<Self>) {
+        if self.skip_saving_hold {
+            self.skip_saving_hold = false;
+            self.saving_hold_gen += 1;
+            if !self.io_saving() {
+                self.saving_shown_at = None;
+                cx.notify();
+            }
+            return;
+        }
+        self.arm_saving_status(cx);
     }
 
     fn sync_status_text(&self) -> String {
@@ -4065,7 +4110,7 @@ impl PlannerView {
                     } else {
                         next
                     };
-                    (*x, (cap - *x).max(24.0), label.clone())
+                    (*x, (cap - *x).max(header_label_px(label)), label.clone())
                 })
                 .collect()
         };
@@ -4410,22 +4455,33 @@ impl PlannerView {
                             .text_color(muted_fg)
                             .child(label)
                     }))
-                    .children(tick_labels.into_iter().enumerate().filter(|(_, (x, _))| *x > -40.0 && *x < width).map(|(index, (x, label))| {
-                        let selector = format!("gantt-tick-{index}");
-                        let max_w = (width - x).max(1.0);
-                        div()
-                            .id(("gantt-tick", index as u64))
-                            .debug_selector(move || selector)
-                            .absolute()
-                            .left(px(x))
-                            .top(px(22.))
-                            .max_w(px(max_w))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_xs()
-                            .text_color(header_fg)
-                            .child(label)
-                    })),
+                    .children({
+                        let ticks: Vec<(f32, String)> = tick_labels
+                            .into_iter()
+                            .filter(|(x, _)| *x > -40.0 && *x < width)
+                            .collect();
+                        ticks
+                            .iter()
+                            .enumerate()
+                            .map(|(index, (x, label))| {
+                                let selector = format!("gantt-tick-{index}");
+                                let next = ticks.get(index + 1).map(|(nx, _)| *nx).unwrap_or(width);
+                                let max_w = (next - *x).max(header_label_px(label));
+                                div()
+                                    .id(("gantt-tick", index as u64))
+                                    .debug_selector(move || selector)
+                                    .absolute()
+                                    .left(px(*x))
+                                    .top(px(22.))
+                                    .max_w(px(max_w))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .text_color(header_fg)
+                                    .child(label.clone())
+                            })
+                            .collect::<Vec<_>>()
+                    }),
             )
             .when(today_on_screen, |el| {
                 el.child(
@@ -4652,6 +4708,7 @@ impl PlannerView {
                                             id,
                                             GestureKind::Link,
                                             open_ended_link_origin,
+                                            open_ended_link_origin,
                                             window,
                                             cx,
                                         );
@@ -4814,6 +4871,7 @@ impl PlannerView {
                             // no-move release is cancelled from pill_press_window_x
                             // instead of PATCHing the gutter as a date.
                             this.pill_press_window_x = Some(x);
+                            this.bar_press_window_x = Some(x);
                             let today_x = this.state.gantt.x_for_date(jiff::Zoned::now().date());
                             let _ = this.state.begin_bar_gesture(id, GestureKind::Move, today_x);
                             cx.notify();
@@ -4908,8 +4966,7 @@ impl PlannerView {
         }
         let id = bar.id;
         let hovered = self.state.gantt.hovered_id == Some(id);
-        let selected = self.state.gantt.selected_id == Some(id);
-        let show_handles = (hovered || selected) && !dragging;
+        let show_handles = hovered && !dragging;
         let linking = self
             .state
             .gantt
@@ -4966,7 +5023,7 @@ impl PlannerView {
                             GestureKind::ResizeEnd
                         };
                         let origin = this.pointer_layout_x(x, Some(id));
-                        this.continue_or_begin_bar_gesture(id, kind, origin, window, cx);
+                        this.continue_or_begin_bar_gesture(id, kind, origin, x, window, cx);
                     }),
                 )
                 .on_mouse_up(
@@ -5075,7 +5132,7 @@ impl PlannerView {
         }
         let hovered = self.state.gantt.hovered_id == Some(id);
         let selected = self.state.gantt.selected_id == Some(id);
-        let show_dot = (hovered || selected) && !dragging;
+        let show_dot = hovered && !dragging;
         let can_resize = bar.can_resize();
         let (local_left, local_right) = self.painted_timeline_edges(bar);
         // Start hit covers the left edge so a click just outside still
@@ -5102,7 +5159,7 @@ impl PlannerView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .when(show_dot || dragging, |el| el.occlude())
+                    .when(show_dot || selected || dragging, |el| el.occlude())
                     .bg(gpui_kit::hsla(0., 0., 0., 0.01))
                     .cursor_pointer()
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -5142,7 +5199,7 @@ impl PlannerView {
                                 let _ = this.classify_bar_hit(id, &layout, x);
                                 this.pointer_layout_x(x, Some(id))
                             };
-                            this.continue_or_begin_bar_gesture(id, kind, origin, window, cx);
+                            this.continue_or_begin_bar_gesture(id, kind, origin, x, window, cx);
                         }),
                     )
                     .on_mouse_up(
@@ -5162,6 +5219,9 @@ impl PlannerView {
                             .when(show_dot, |el| {
                                 el.child(
                                     div()
+                                        .debug_selector(move || {
+                                            format!("gantt-link-dot-{id}-{handle_id}")
+                                        })
                                         .size(px(LINK_HANDLE))
                                         .rounded_full()
                                         .bg(cx.theme().danger)
@@ -6748,9 +6808,10 @@ impl PlannerView {
             cx.notify();
             return;
         }
-        // Mouse-up was missed (handle unmounted mid-drag). Commit the
-        // last live dates — do not apply this move's x, which is the
-        // post-release pointer (Aug 8 preview must not become Sep 1).
+        // Mouse-up was missed (handle unmounted mid-drag). A flick never
+        // saw a pressed move, so apply this x; after a real drag keep the
+        // last live preview (Aug 8 must not become Sep 1).
+        self.apply_flick_release_x(x);
         self.saw_pressed_drag = true;
         self.commit_gesture(window, cx);
     }
@@ -6773,6 +6834,7 @@ impl PlannerView {
             .is_some_and(|origin| (window_x - origin).abs() < 6.0);
         self.pill_press_window_x = None;
         if unscheduled_no_move {
+            self.bar_press_window_x = None;
             self.state.cancel_gesture();
             self.saw_pressed_drag = false;
             self.request_repaint(Some(window), cx);
@@ -6787,11 +6849,43 @@ impl PlannerView {
         if linking {
             self.arm_link_target_from_pointer(window_x, window_y);
         }
-        // Date gestures keep the live preview from the last drag move. Mapping
-        // mouse-up through the grown bar can snap back to origin and drop the
-        // commit (Aug 8 preview stays until the next move writes Sep 1).
+        // A fast flick has no mouse-move (or only a same-x press move), so
+        // live dates still match the origin. Apply the release x. After a
+        // real drag, keep the last live preview — remapping mouse-up through
+        // a grown bar can snap back to origin (Aug 8 must not become Sep 1).
+        self.apply_flick_release_x(window_x);
+        self.bar_press_window_x = None;
         self.saw_pressed_drag = true;
         self.commit_gesture(window, cx);
+    }
+
+    fn unmoved_date_gesture(&self) -> bool {
+        self.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+            gesture.kind != GestureKind::Link
+                && gesture.live_start == gesture.start
+                && gesture.live_target == gesture.target
+        })
+    }
+
+    /// Map a flick's release window-x onto the live dates. Prefer the
+    /// press→release window delta so we do not remap through a painted bar.
+    fn apply_flick_release_x(&mut self, window_x: f32) {
+        if !self.unmoved_date_gesture() {
+            return;
+        }
+        let id = self.state.gantt.gesture.as_ref().map(|gesture| gesture.id);
+        let origin_x = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .map(|gesture| gesture.origin_x);
+        let press_x = self.bar_press_window_x.or(self.pill_press_window_x);
+        let local_x = match (origin_x, press_x) {
+            (Some(origin_x), Some(press_x)) => origin_x + (window_x - press_x),
+            _ => self.pointer_layout_x(window_x, id),
+        };
+        self.state.update_bar_gesture(local_x);
     }
 
     fn arm_link_target_from_pointer(&mut self, window_x: f32, window_y: f32) {
@@ -6931,6 +7025,7 @@ impl PlannerView {
             return;
         }
         let origin = self.pointer_layout_x(window_x, Some(id));
+        self.bar_press_window_x = Some(window_x);
         let _ = self.state.begin_bar_gesture(id, kind, origin);
         cx.notify();
     }
@@ -6981,6 +7076,7 @@ impl PlannerView {
         id: i64,
         kind: GestureKind,
         origin: f32,
+        window_x: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6999,12 +7095,16 @@ impl PlannerView {
         self.state.gantt.select_row(id);
         self.focus_planner(window, cx);
         self.dismiss_overlays();
+        if kind != GestureKind::Link {
+            self.bar_press_window_x = Some(window_x);
+        }
         let _ = self.state.begin_bar_gesture(id, kind, origin);
         cx.notify();
     }
 
     fn commit_gesture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.saw_pressed_drag = false;
+        self.bar_press_window_x = None;
         if self.state.gantt.gesture.is_none() {
             return;
         }
@@ -7034,6 +7134,7 @@ impl PlannerView {
         self.state.gantt.clear_hover();
         self.state.gantt.hover_locked = true;
         if let Some(pending) = self.state.commit_date_gesture_now() {
+            self.last_committed_start_for_test = pending.start;
             self.enqueue_date_save(cx, pending);
         }
         self.request_repaint(Some(window), cx);
@@ -7126,7 +7227,13 @@ impl PlannerView {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
                 this.date_save_busy.remove(&id);
-                this.arm_saving_status(cx);
+                if matches!(
+                    role,
+                    DateSaveRole::Undo | DateSaveRole::Restore | DateSaveRole::Redo
+                ) {
+                    this.skip_saving_hold = true;
+                }
+                this.finish_or_hold_saving_status(cx);
                 if let Ok((working, result)) = outcome {
                     let still_after = this.state.nodes.iter().any(|node| {
                         node.id == id
@@ -7449,6 +7556,13 @@ impl PlannerView {
         }
     }
 
+    pub fn complete_undo_io_for_test(&mut self, cx: &mut Context<Self>) {
+        self.io_busy = false;
+        self.date_save_busy.clear();
+        self.skip_saving_hold = true;
+        self.finish_or_hold_saving_status(cx);
+    }
+
     pub fn sync_status_for_test(&self) -> String {
         self.sync_status_text()
     }
@@ -7475,6 +7589,10 @@ impl PlannerView {
 
     pub fn toast_undo_inflight_for_test(&self) -> bool {
         self.toast_undo_inflight
+    }
+
+    pub fn last_committed_start_for_test(&self) -> Option<jiff::civil::Date> {
+        self.last_committed_start_for_test
     }
 
     pub fn last_bar_hit_for_test(&self) -> Option<BarHitDebug> {
@@ -7804,6 +7922,7 @@ impl PlannerView {
     }
 
     fn scroll_or_select(&mut self, rows: i32, cx: &mut Context<Self>) {
+        self.state.gantt.clear_hover();
         self.cancel_camera_anim();
         let before = self.state.gantt.scroll_y;
         let count = self.state.visible_rows().len();
@@ -8280,12 +8399,14 @@ impl Render for PlannerView {
                         return;
                     }
                 }
-                this.state.gantt.clear_hover();
+                let x: f32 = event.position.x.into();
+                let y: f32 = event.position.y.into();
                 this.state.gantt.hover_locked = true;
                 if this.state.gantt.gesture.is_some() {
-                    let x: f32 = event.position.x.into();
-                    let y: f32 = event.position.y.into();
+                    this.state.gantt.clear_hover();
                     this.release_bar_gesture(x, y, window, cx);
+                } else if !this.state.gantt.pointer_in_rows(x, y) {
+                    this.clear_canvas_hover(cx);
                 }
                 if this.state.gantt.splitter_drag.take().is_some() {
                     this.state.persist_tree_width();
