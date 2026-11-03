@@ -4565,11 +4565,11 @@ impl PlannerView {
                             .map(|(index, (x, label))| {
                                 let selector = format!("gantt-tick-{index}");
                                 let next = ticks.get(index + 1).map(|(nx, _)| *nx).unwrap_or(width);
-                                // Year/Quarter ticks sit on the row below Today.
+                                // Month/Year/Quarter ticks sit on the row below Today.
                                 // Capping their width to the pill hid "Nov".
                                 let cap = if matches!(
                                     self.state.gantt.scale,
-                                    GanttScale::Year | GanttScale::Quarter
+                                    GanttScale::Year | GanttScale::Quarter | GanttScale::Month
                                 ) {
                                     next
                                 } else if *x < today_label_x && today_label_x < next {
@@ -4625,7 +4625,7 @@ impl PlannerView {
                                 GestureKind::ResizeStart => (bar.x + 12.0).max(4.0),
                                 _ => bar.x.max(4.0),
                             };
-                            let y = (TIMELINE_HEADER_H + bar.y - 24.0).max(2.0);
+                            let y = TIMELINE_HEADER_H + bar.y + ROW_HEIGHT + 2.0;
                             (x, y)
                         }
                         None => (gesture.live_x.max(4.0), 4.0),
@@ -5030,7 +5030,7 @@ impl PlannerView {
                     .debug_selector(|| "gantt-bar-tooltip".into())
                     .absolute()
                     .left(px(bar.x))
-                    .top(px(bar_top - 36.0))
+                    .top(px(bar_top + bar_h + 4.0))
                     .px_2()
                     .py_1()
                     .rounded_md()
@@ -5589,7 +5589,6 @@ impl PlannerView {
                 .text_size(px(20.))
                 .line_height(px(20.))
                 .font_weight(gpui_kit::FontWeight::BOLD)
-                .occlude()
                 .child("!")
                 .child(
                     Button::new(("overflow-tip", id as u64))
@@ -5600,8 +5599,10 @@ impl PlannerView {
                         .inset_0()
                         .w_full()
                         .h_full()
+                        .occlude()
                         .tooltip(overflow_tip)
-                        .tooltip_placement(Placement::Top),
+                        .tooltip_placement(Placement::Top)
+                        .tooltip_show_delay(Duration::ZERO),
                 )
                 .into_any_element(),
         )
@@ -5630,7 +5631,7 @@ impl PlannerView {
         let overflow = parent_date_overflow(&self.state.nodes, id);
         let (label_x, max_w) =
             Self::bar_external_label_frame(bar, timeline_w, true, Some(today_x), overflow)?;
-        if cramped && max_w < 56.0 {
+        if cramped && !bar.milestone && max_w < 56.0 {
             return None;
         }
         let label = bar.title.clone();

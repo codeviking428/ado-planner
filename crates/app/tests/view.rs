@@ -1222,8 +1222,15 @@ fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext)
     let spike_x = f32::from(spike.origin.x) + f32::from(spike.size.width) / 2.0;
     let dx = (persist_x - spike_x).abs();
     assert!(
-        dx >= 8.0,
-        "rendered Persist cart → Go-live inv at {persist_x} must sit ≥8px from Cart UI → spike at {spike_x} (dx={dx})"
+        dx >= 12.0,
+        "rendered Persist cart → Go-live inv at {persist_x} must sit ≥12px from Cart UI → spike at {spike_x} (dx={dx})"
+    );
+    let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI bar");
+    let cart_left = f32::from(cart.origin.x);
+    let cart_right = cart_left + f32::from(cart.size.width);
+    assert!(
+        persist_x < cart_left - 1.0 || persist_x > cart_right + 1.0,
+        "painted Persist cart → Go-live inbound at {persist_x} must not cut through Cart UI {cart_left}..{cart_right}"
     );
 }
 
@@ -1252,8 +1259,17 @@ fn mock_fixture_month_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppCo
     let spike_x = f32::from(spike.origin.x) + f32::from(spike.size.width) / 2.0;
     let dx = (persist_x - spike_x).abs();
     assert!(
-        dx >= 8.0,
-        "Month mock fixture: Persist cart → Go-live inv at {persist_x} must sit ≥8px from Cart UI → spike at {spike_x} (dx={dx})"
+        dx >= 12.0,
+        "Month mock fixture: Persist cart → Go-live inv at {persist_x} must sit ≥12px from Cart UI → spike at {spike_x} (dx={dx})"
+    );
+    let cart = cx
+        .debug_bounds("gantt-bar-1005")
+        .expect("Cart UI bar (Month)");
+    let cart_left = f32::from(cart.origin.x);
+    let cart_right = cart_left + f32::from(cart.size.width);
+    assert!(
+        persist_x < cart_left - 1.0 || persist_x > cart_right + 1.0,
+        "Month painted Persist cart → Go-live inbound at {persist_x} must not cut through Cart UI {cart_left}..{cart_right}"
     );
 }
 
@@ -3919,6 +3935,31 @@ fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn year_go_live_milestone_keeps_its_label(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let label = cx
+        .debug_bounds("gantt-bar-label-1013")
+        .expect("Year Go-live milestone must keep an outside label");
+    assert!(
+        f32::from(label.size.width) >= 24.0,
+        "Year Go-live label width {} must not be hidden as cramped",
+        f32::from(label.size.width)
+    );
+}
+
+#[gpui_kit::test]
 fn dates_cell_stays_one_line_with_a_conflict_marker(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -5791,7 +5832,26 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("gantt-bar-tooltip").is_some(),
         "the live bar tooltip must paint after a resize while the cursor stays on the bar"
     );
+    let tip = cx
+        .debug_bounds("gantt-bar-tooltip")
+        .expect("pinned tooltip");
     let bar_after = cx.debug_bounds("gantt-bar-2").expect("leaf bar after drop");
+    let tip_top = f32::from(tip.origin.y);
+    let bar_bottom = f32::from(bar_after.origin.y) + f32::from(bar_after.size.height);
+    assert!(
+        tip_top + 1.0 >= bar_bottom,
+        "pinned move/resize tooltip must sit below the bar, tip_top={tip_top} bar_bottom={bar_bottom}"
+    );
+    if let Some(parent) = cx.debug_bounds("gantt-bar-1") {
+        let parent_top = f32::from(parent.origin.y);
+        let parent_bottom = parent_top + f32::from(parent.size.height);
+        let tip_bottom = tip_top + f32::from(tip.size.height);
+        let overlaps_parent = tip_top < parent_bottom && tip_bottom > parent_top;
+        assert!(
+            !overlaps_parent,
+            "pinned tooltip must not cover the neighbouring parent title, tip={tip_top}..{tip_bottom} parent={parent_top}..{parent_bottom}"
+        );
+    }
     cx.simulate_mouse_move(bar_after.center(), None, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {

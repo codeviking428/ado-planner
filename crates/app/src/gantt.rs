@@ -846,9 +846,12 @@ impl GanttView {
                     self.scale.range_title(start)
                 }
             }
-            GanttScale::Day | GanttScale::Week => compact_date_span(start, end),
+            GanttScale::Day | GanttScale::Week => {
+                let (start, end) = self.painted_tick_range();
+                compact_date_span(start, end)
+            }
             GanttScale::Quarter => {
-                let (start, end) = self.painted_quarter_range();
+                let (start, end) = self.painted_tick_range();
                 let left = quarter_title(start);
                 let right = quarter_title(end);
                 if left == right {
@@ -908,10 +911,11 @@ impl GanttView {
         (start, end)
     }
 
-    /// First and last painted Quarter columns, matching `header_tick_labels`
-    /// (48px gap, leftover dropped when cramped). `viewport_axis_start_date`
-    /// uses `TICK_MIN_GAP` and would title a leftover Q2 the axis did not paint.
-    fn painted_quarter_range(&self) -> (Date, Date) {
+    /// First and last painted tick dates, matching `header_tick_labels`
+    /// (leftover dropped when cramped). `viewport_axis_start_date` /
+    /// `date_for_x(width-1)` can name a leftover Jun 29 or a Jul 29 pixel
+    /// the Day grid never painted.
+    fn painted_tick_range(&self) -> (Date, Date) {
         let width = self.timeline_width.max(1.0);
         let labels = self.header_tick_labels(width);
         let ticks = self.timeline_ticks(width);
@@ -1868,8 +1872,8 @@ impl GanttView {
     /// other month from the first painted tick so leftover Jul yields
     /// Jul, Sep, Nov, Jan, Mar — not calendar-odd names that skip Jan.
     /// Day/Week still shift the in-month number off the Today line so "2"
-    /// stays readable. Year/Quarter ticks keep their column x (different
-    /// row from the pill) so a Today dodge cannot stack them and drop Nov.
+    /// stays readable. Month/Year/Quarter ticks keep their column x
+    /// (different row from the pill) so a Today dodge cannot crowd Nov.
     pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 22.0;
         const SHIFT: f32 = 16.0;
@@ -1885,7 +1889,10 @@ impl GanttView {
             })
             .collect();
         if let Some(today) = hide_x
-            && !matches!(self.scale, GanttScale::Year | GanttScale::Quarter)
+            && !matches!(
+                self.scale,
+                GanttScale::Year | GanttScale::Quarter | GanttScale::Month
+            )
             && let Some(index) = ticks
                 .iter()
                 .enumerate()
@@ -2358,6 +2365,17 @@ impl GanttView {
         // Clip first: two long verticals can both clamp to the same
         // `clip_right` (1–3px stack at the chart edge). Separate after.
         separate_parallel_verticals(&mut out, clip_left, clip_right);
+        // MIN_STUB / clip can park a dodged inbound back onto an intervening
+        // open-ended cue (Persist cart → Go-live on Cart UI at Month 512).
+        let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
+        dodge_forward_inbounds_off_intervening(
+            &mut out,
+            bars,
+            include_labels,
+            clip_left,
+            clip_right,
+        );
+        separate_parallel_verticals(&mut out, clip_left, clip_right);
         out
     }
 }
@@ -2578,6 +2596,68 @@ fn separate_parallel_verticals(arrows: &mut [DependencyArrow], clip_left: f32, c
         }
         if !moved {
             break;
+        }
+    }
+}
+
+/// Slide a forward inbound (and its outgoing stub) left of intervening bars
+/// after clip. Clip+MIN_STUB can otherwise drop Persist cart → Go-live through
+/// the Cart UI cue at x≈clip.
+fn dodge_forward_inbounds_off_intervening(
+    arrows: &mut [DependencyArrow],
+    bars: &[BarLayout],
+    include_labels: bool,
+    clip_left: f32,
+    clip_right: f32,
+) {
+    let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
+    for arrow in arrows.iter_mut() {
+        if arrow.wraps_around_successor() {
+            continue;
+        }
+        let Some(pred) = by_id.get(&arrow.from_id) else {
+            continue;
+        };
+        let Some(succ) = by_id.get(&arrow.to_id) else {
+            continue;
+        };
+        let lo = pred.y.min(succ.y);
+        let hi = pred.y.max(succ.y);
+        let intervening: Vec<&BarLayout> = bars
+            .iter()
+            .filter(|mid| {
+                mid.id != pred.id && mid.id != succ.id && mid.y > lo + 1.0 && mid.y < hi - 1.0
+            })
+            .collect();
+        if intervening.is_empty() {
+            continue;
+        }
+        let blocked: Vec<(f32, f32)> = intervening
+            .iter()
+            .map(|bar| bar_occupied_x(bar, include_labels, Some(clip_right)))
+            .collect();
+        let slide_left = |x: f32| -> f32 {
+            let mut x = x.clamp(clip_left, clip_right);
+            for _ in 0..=blocked.len() {
+                let hit_left = blocked
+                    .iter()
+                    .filter(|(left, right)| x_hits_span(x, *left, *right))
+                    .map(|(left, _)| *left)
+                    .fold(f32::INFINITY, f32::min);
+                if hit_left == f32::INFINITY {
+                    return x;
+                }
+                let cand = (hit_left - 8.0).max(clip_left);
+                if cand >= x - 0.5 {
+                    return x;
+                }
+                x = cand;
+            }
+            x
+        };
+        let next = slide_left(arrow.x2);
+        if next <= arrow.x_head + DependencyArrow::WRAP_STUB {
+            arrow.x2 = next;
         }
     }
 }
@@ -5104,6 +5184,41 @@ mod tests {
     }
 
     #[test]
+    fn clipped_edge_verticals_stay_sixteen_apart() {
+        let a = DependencyArrow {
+            from_id: 1003,
+            to_id: 1013,
+            x1: 200.0,
+            y1: 20.0,
+            x2: 600.0,
+            y2: 180.0,
+            x_head: 603.0,
+            lane_y: 39.0,
+            inbound_right: false,
+        };
+        let b = DependencyArrow {
+            from_id: 1005,
+            to_id: 1012,
+            x1: 603.0,
+            y1: 60.0,
+            x2: 603.0,
+            y2: 220.0,
+            x_head: 480.0,
+            lane_y: 79.0,
+            inbound_right: false,
+        };
+        let mut arrows = vec![a, b];
+        separate_parallel_verticals(&mut arrows, 0.0, 603.0);
+        let dx = closest_vertical_gap(&arrows[0], &arrows[1]);
+        assert!(
+            dx >= PARALLEL_VERT_MIN,
+            "clip-edge 600/603 stack must separate, dx={dx} persist x2={} spike x2={}",
+            arrows[0].x2,
+            arrows[1].x2
+        );
+    }
+
+    #[test]
     fn parallel_verticals_one_px_apart_are_pushed_to_ten() {
         let a = DependencyArrow {
             from_id: 1003,
@@ -5351,8 +5466,8 @@ mod tests {
             .expect("Cart UI → spike");
         let dx = closest_vertical_gap(persist_live, cart_spike);
         assert!(
-            dx >= 8.0,
-            "{:?}: Persist cart → Go-live vertical must sit ≥8px from Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={} lanes={},{}",
+            dx >= PARALLEL_VERT_MIN,
+            "{:?}: Persist cart → Go-live vertical must sit ≥{PARALLEL_VERT_MIN}px from Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={} lanes={},{}",
             scale,
             persist_live.x1,
             persist_live.x2,
@@ -5362,6 +5477,16 @@ mod tests {
             cart_spike.lane_y
         );
         let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let clip_right = (timeline_width - 10.0).max(24.0);
+        let include_labels = !matches!(scale, GanttScale::Year | GanttScale::Quarter);
+        let (occ_left, occ_right) = bar_occupied_x(cart, include_labels, Some(clip_right));
+        assert!(
+            persist_live.x2 < occ_left - 0.5 || persist_live.x2 > occ_right + 0.5,
+            "{scale:?}: Persist cart → Go-live inbound must not cut through Cart UI, x2={} occupied={occ_left}..{occ_right} cart={}..{}",
+            persist_live.x2,
+            cart.x,
+            cart.x + cart.width
+        );
         let cue_bottom = cart.y + cart.paint_top() + cart.paint_h();
         assert!(
             persist_live.lane_y < cart.y || persist_live.lane_y >= cart.y + ROW_HEIGHT,
@@ -5429,8 +5554,8 @@ mod tests {
             .expect("Cart UI → spike");
         let dx = closest_vertical_gap(persist_live, cart_spike);
         assert!(
-            dx >= 8.0,
-            "a newly created Persist cart → Go-live must sit ≥8px off Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={}",
+            dx >= PARALLEL_VERT_MIN,
+            "a newly created Persist cart → Go-live must sit ≥{PARALLEL_VERT_MIN}px off Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={}",
             persist_live.x1,
             persist_live.x2,
             cart_spike.x1,
@@ -5898,15 +6023,50 @@ mod tests {
             ..Default::default()
         };
         let title = gantt.viewport_range_title();
-        let end = gantt.date_for_x(799.0);
+        let ticks = gantt.header_tick_labels(800.0);
+        let first = ticks.first().and_then(|(x, label)| {
+            gantt
+                .timeline_ticks(800.0)
+                .into_iter()
+                .filter(|tick| tick.label == *label)
+                .min_by(|a, b| {
+                    (a.x.max(0.0) - *x)
+                        .abs()
+                        .partial_cmp(&(b.x.max(0.0) - *x).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|tick| tick.date)
+        });
+        let last = ticks.last().and_then(|(x, label)| {
+            gantt
+                .timeline_ticks(800.0)
+                .into_iter()
+                .filter(|tick| tick.label == *label)
+                .min_by(|a, b| {
+                    (a.x.max(0.0) - *x)
+                        .abs()
+                        .partial_cmp(&(b.x.max(0.0) - *x).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|tick| tick.date)
+        });
+        let first = first.expect("painted Day start");
+        let last = last.expect("painted Day end");
         assert!(
-            title.starts_with("Oct 24")
+            title.starts_with(&compact_date(first))
                 && title.contains('–')
-                && title.contains(&compact_date(end)),
-            "Day toolbar must show the visible span, got {title:?} end={end}"
+                && title.contains(&compact_date(last)),
+            "Day toolbar must match painted ticks {first}–{last}, got {title:?}"
         );
+        let pixel_end = gantt.date_for_x(799.0);
+        if pixel_end != last {
+            assert!(
+                !title.contains(&compact_date(pixel_end)),
+                "Day toolbar must not name the last pixel ({pixel_end}) when the grid ends on {last}, got {title:?}"
+            );
+        }
         assert!(
-            !title.eq("Oct 24"),
+            !title.eq(&compact_date(first)),
             "a single date must not stand in for the whole Day axis"
         );
     }
@@ -7810,6 +7970,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn month_today_label_does_not_crowd_nov() {
+        let today = Date::new(2026, 11, 2).unwrap();
+        let gantt = GanttView {
+            origin: today.saturating_sub(40.days()),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let today_x = gantt.today_x(today);
+        let ticks = gantt.header_tick_labels_except(800.0, Some(today_x));
+        let Some(nov) = ticks.iter().find(|(_, label)| label == "Nov") else {
+            panic!("Month ticks must keep Nov, got {ticks:?}");
+        };
+        let nov_x = gantt.x_for_date(Date::new(2026, 11, 1).unwrap());
+        assert!(
+            (nov.0 - nov_x).abs() < 2.0,
+            "Month Nov must stay on its column, not dodge Today, nov={} column={nov_x} today={today_x} ticks={ticks:?}",
+            nov.0
+        );
     }
 
     #[test]
