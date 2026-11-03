@@ -1764,7 +1764,12 @@ impl GanttView {
             .collect();
         let mut labels = Self::sticky_header_labels(ticks, false, 72.0);
         if let Some(today) = hide_x {
-            labels = dodge_majors_off_today_pill(labels, today, width, self.scale);
+            let mut pill = today_pill_left(today, width);
+            if matches!(self.scale, GanttScale::Year) {
+                let ticks = self.header_tick_labels_except(width, Some(today));
+                pill = nudge_today_off_ticks(pill, &ticks, width);
+            }
+            labels = dodge_majors_off_today_pill(labels, pill, self.scale);
         }
         Self::fit_labels_to_width(labels, width)
     }
@@ -2484,27 +2489,39 @@ pub(crate) fn today_pill_left(today_x: f32, width: f32) -> f32 {
 }
 
 /// Year ticks stay put; slide the Today pill so it does not sit on "Nov".
+/// Recompute the right edge after each slide so Dec/Jan just past that
+/// original edge are not skipped. Cap at a few hops so a 44px pill does
+/// not march along every remaining month to the chart edge.
 pub(crate) fn nudge_today_off_ticks(pill_x: f32, ticks: &[(f32, String)], width: f32) -> f32 {
     let mut x = pill_x;
-    let pill_right = x + TODAY_PILL_W;
-    for (tick_x, label) in ticks {
-        let tick_w = header_label_px(label);
-        let tick_right = *tick_x + tick_w;
-        if tick_right < x - 2.0 || *tick_x > pill_right + 2.0 {
-            continue;
+    let max_x = (width - TODAY_PILL_W - 4.0).max(4.0);
+    for _ in 0..3 {
+        let pill_right = x + TODAY_PILL_W;
+        let mut hit_right = None;
+        for (tick_x, label) in ticks {
+            let tick_right = *tick_x + header_label_px(label);
+            if tick_right < x - 2.0 || *tick_x > pill_right + 2.0 {
+                continue;
+            }
+            hit_right = Some(hit_right.unwrap_or(f32::NEG_INFINITY).max(tick_right));
         }
-        x = (tick_right + TODAY_PILL_GAP).min(width - TODAY_PILL_W - 4.0);
+        let Some(tick_right) = hit_right else {
+            break;
+        };
+        let next = (tick_right + TODAY_PILL_GAP).min(max_x);
+        if next <= x + 0.5 {
+            break;
+        }
+        x = next;
     }
     x.max(4.0)
 }
 
 fn dodge_majors_off_today_pill(
     labels: Vec<(f32, String)>,
-    today_x: f32,
-    width: f32,
+    pill_left: f32,
     scale: GanttScale,
 ) -> Vec<(f32, String)> {
-    let pill_left = today_pill_left(today_x, width);
     let pill_right = pill_left + TODAY_PILL_W;
     labels
         .into_iter()
@@ -7393,7 +7410,12 @@ mod tests {
                 ..Default::default()
             };
             let today_x = gantt.today_x(today);
-            let pill_left = (today_x + TODAY_PILL_GAP).max(4.0);
+            let ticks = gantt.header_tick_labels_except(timeline_width, Some(today_x));
+            let pill_left = nudge_today_off_ticks(
+                today_pill_left(today_x, timeline_width),
+                &ticks,
+                timeline_width,
+            );
             let pill_right = pill_left + TODAY_PILL_W;
             let majors = gantt.header_major_labels_except(timeline_width, Some(today_x));
             let twenty_seven = majors.iter().find(|(_, label)| label == "2027");
@@ -7402,16 +7424,12 @@ mod tests {
                 "Year view must still show 2027 instead of letting Today hide it, origin={origin} majors={majors:?}"
             );
             for (x, label) in &majors {
+                let text_w = MAJOR_LABEL_ESTIMATE.max(header_label_px(label));
+                let overlaps = *x < pill_right && *x + text_w > pill_left;
                 assert!(
-                    *x + 1.0 <= pill_right || *x >= pill_right + HEADER_TODAY_LABEL_GAP - 0.1,
-                    "Year label {label:?} at {x} must clear the Today pill ending at {pill_right}"
+                    !overlaps,
+                    "Year label {label:?} at {x} (w={text_w}) must not sit on Today {pill_left}..{pill_right}, origin={origin}"
                 );
-                if label == "2027" {
-                    assert!(
-                        *x >= pill_right + HEADER_TODAY_LABEL_GAP - 0.1,
-                        "2027 must sit to the right of Today, got {x} pill_right={pill_right}"
-                    );
-                }
             }
         }
     }
@@ -7435,15 +7453,44 @@ mod tests {
             );
             let pill = today_pill_left(today_x, 800.0);
             let nudged = nudge_today_off_ticks(pill, &ticks, 800.0);
-            if let Some((nov_x, _)) = ticks.iter().find(|(_, label)| label == "Nov") {
-                let nov_right = *nov_x + header_label_px("Nov");
-                assert!(
-                    nudged >= nov_right + TODAY_PILL_GAP - 0.5
-                        || nudged + TODAY_PILL_W <= *nov_x + 0.5,
-                    "Today pill at {nudged} must clear Nov at {nov_x}..{nov_right}"
-                );
+            for name in ["Nov", "Dec", "Jan"] {
+                if let Some((tick_x, label)) = ticks.iter().find(|(_, label)| label == name) {
+                    let tick_right = *tick_x + header_label_px(label);
+                    let overlaps =
+                        tick_right >= nudged - 0.5 && *tick_x <= nudged + TODAY_PILL_W + 0.5;
+                    assert!(
+                        !overlaps,
+                        "Today pill at {nudged}..{} must clear {name} at {tick_x}..{tick_right}, zoom={zoom}",
+                        nudged + TODAY_PILL_W
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn nudge_today_clears_dec_after_sliding_past_nov() {
+        let nov = 100.0;
+        // Just past the original pill's right edge (90+44) so a stale
+        // `pill_right` would skip Dec after the Nov slide.
+        let dec = 140.0;
+        let ticks = vec![(nov, "Nov".to_string()), (dec, "Dec".to_string())];
+        let pill = 90.0;
+        let nudged = nudge_today_off_ticks(pill, &ticks, 800.0);
+        let nov_right = nov + header_label_px("Nov");
+        let dec_right = dec + header_label_px("Dec");
+        assert!(
+            nudged >= dec_right + TODAY_PILL_GAP - 0.5,
+            "after clearing Nov ({nov_right}) the pill must also clear Dec ({dec_right}), got {nudged}"
+        );
+        assert!(
+            nudged + TODAY_PILL_W <= 800.0,
+            "the nudged pill must stay on the header"
+        );
+        assert!(
+            nudged < pill + 120.0,
+            "the pill must stay near Today, not march to the chart edge, got {nudged}"
+        );
     }
 
     #[test]
