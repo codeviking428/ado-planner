@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,28 @@ impl PendingDateSave {
         if self.cascade.is_empty() && !dropped.cascade.is_empty() {
             self.cascade = dropped.cascade;
         }
+    }
+}
+
+/// Drop superseded same-id saves, parking each dropped cascade on the
+/// **nearest later** save for that id. A later Shift-drag keeps its own
+/// children; a trailing non-Shift inherits the most recent kids.
+pub fn coalesce_superseded_date_saves(queue: &mut VecDeque<PendingDateSave>) {
+    let mut index = 0;
+    while index < queue.len() {
+        let id = queue[index].id;
+        let has_later = queue.iter().skip(index + 1).any(|pending| pending.id == id);
+        if !has_later {
+            index += 1;
+            continue;
+        }
+        let dropped = queue.remove(index).expect("queued save");
+        let later = queue
+            .iter_mut()
+            .skip(index)
+            .find(|pending| pending.id == id)
+            .expect("has_later same-id save");
+        later.adopt_cascade_from_superseded(dropped);
     }
 }
 
@@ -3079,6 +3101,12 @@ impl PlannerState {
         self.restore_cascade_saves(&matching);
     }
 
+    /// A queued persist no longer matches live dates (or the node is gone).
+    /// Restore Shift-drag children still sitting at that persist's dates.
+    pub fn discard_stale_date_save(&mut self, pending: &PendingDateSave) {
+        self.restore_matching_commit_cascade(pending);
+    }
+
     fn push_dates_moved_toast(
         &mut self,
         id: i64,
@@ -4775,63 +4803,212 @@ mod toast_copy_tests {
         assert_eq!(parent.start_date.as_deref(), Some("2026-07-06T00:00:00Z"));
     }
 
+    fn commit_save(
+        after_start: &str,
+        after_target: &str,
+        kid_start: Option<&str>,
+    ) -> super::PendingDateSave {
+        super::PendingDateSave {
+            id: 1,
+            start: None,
+            target: None,
+            after_start: Some(after_start.into()),
+            after_target: Some(after_target.into()),
+            previous: super::fake_hierarchy(1).remove(0),
+            role: super::DateSaveRole::Commit,
+            rev: 1,
+            cascade: kid_start
+                .map(|start| {
+                    vec![super::PendingDateSave {
+                        id: 2,
+                        start: None,
+                        target: None,
+                        after_start: Some(start.into()),
+                        after_target: Some(after_target.into()),
+                        previous: super::fake_hierarchy(1).remove(0),
+                        role: super::DateSaveRole::Cascade,
+                        rev: 1,
+                        cascade: Vec::new(),
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
     #[test]
     fn later_shift_keeps_its_cascade_when_an_earlier_save_is_superseded() {
-        let mut first = super::PendingDateSave {
-            id: 1,
-            start: None,
-            target: None,
-            after_start: Some("2026-07-09T00:00:00Z".into()),
-            after_target: Some("2026-07-23T00:00:00Z".into()),
-            previous: super::fake_hierarchy(1).remove(0),
-            role: super::DateSaveRole::Commit,
-            rev: 1,
-            cascade: vec![super::PendingDateSave {
-                id: 2,
-                start: None,
-                target: None,
-                after_start: Some("2026-07-09T00:00:00Z".into()),
-                after_target: Some("2026-07-23T00:00:00Z".into()),
-                previous: super::fake_hierarchy(1).remove(0),
-                role: super::DateSaveRole::Cascade,
-                rev: 1,
-                cascade: Vec::new(),
-            }],
-        };
-        let mut second = super::PendingDateSave {
-            id: 1,
-            start: None,
-            target: None,
-            after_start: Some("2026-07-12T00:00:00Z".into()),
-            after_target: Some("2026-07-26T00:00:00Z".into()),
-            previous: super::fake_hierarchy(1).remove(0),
-            role: super::DateSaveRole::Commit,
-            rev: 1,
-            cascade: vec![super::PendingDateSave {
-                id: 2,
-                start: None,
-                target: None,
-                after_start: Some("2026-07-12T00:00:00Z".into()),
-                after_target: Some("2026-07-26T00:00:00Z".into()),
-                previous: super::fake_hierarchy(1).remove(0),
-                role: super::DateSaveRole::Cascade,
-                rev: 1,
-                cascade: Vec::new(),
-            }],
-        };
+        let first = commit_save(
+            "2026-07-09T00:00:00Z",
+            "2026-07-23T00:00:00Z",
+            Some("2026-07-09T00:00:00Z"),
+        );
+        let mut second = commit_save(
+            "2026-07-12T00:00:00Z",
+            "2026-07-26T00:00:00Z",
+            Some("2026-07-12T00:00:00Z"),
+        );
         second.adopt_cascade_from_superseded(first.clone());
         assert_eq!(
             second.cascade[0].after_start.as_deref(),
             Some("2026-07-12T00:00:00Z"),
             "a later Shift-drag must keep its own children"
         );
-        first.cascade.clear();
-        let mut non_shift = first.clone();
+        let mut non_shift = commit_save("2026-07-15T00:00:00Z", "2026-07-29T00:00:00Z", None);
         non_shift.adopt_cascade_from_superseded(second);
         assert_eq!(
             non_shift.cascade[0].after_start.as_deref(),
             Some("2026-07-12T00:00:00Z"),
             "a later non-Shift parent persist must still persist the Shift-drag children"
+        );
+    }
+
+    #[test]
+    fn coalescing_two_shifts_then_a_nudge_keeps_the_latest_children() {
+        let mut queue = std::collections::VecDeque::from([
+            commit_save(
+                "2026-07-09T00:00:00Z",
+                "2026-07-23T00:00:00Z",
+                Some("2026-07-09T00:00:00Z"),
+            ),
+            commit_save(
+                "2026-07-12T00:00:00Z",
+                "2026-07-26T00:00:00Z",
+                Some("2026-07-12T00:00:00Z"),
+            ),
+            commit_save("2026-07-15T00:00:00Z", "2026-07-29T00:00:00Z", None),
+        ]);
+        super::coalesce_superseded_date_saves(&mut queue);
+        assert_eq!(queue.len(), 1, "only the trailing persist should remain");
+        assert_eq!(
+            queue[0].after_start.as_deref(),
+            Some("2026-07-15T00:00:00Z")
+        );
+        assert_eq!(
+            queue[0].cascade[0].after_start.as_deref(),
+            Some("2026-07-12T00:00:00Z"),
+            "the newest Shift-drag children must survive coalescing onto a later non-Shift"
+        );
+    }
+
+    #[test]
+    fn discarding_a_stale_queued_save_restores_matching_children() {
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-stale-drain")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        let child_before = state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .unwrap()
+            .clone();
+        let start = Date::new(2026, 7, 9).unwrap();
+        let target = Date::new(2026, 7, 23).unwrap();
+        let _ = state.apply_optimistic_partial(1, Some(start), Some(target));
+        let mut pending = super::PendingDateSave {
+            id: 1,
+            start: Some(start),
+            target: Some(target),
+            after_start: Some("2026-07-09T00:00:00Z".into()),
+            after_target: Some("2026-07-23T00:00:00Z".into()),
+            previous: super::fake_hierarchy(1).remove(0),
+            role: super::DateSaveRole::Commit,
+            rev: 1,
+            cascade: Vec::new(),
+        };
+        pending.cascade = state.shift_children_with_committed_move(&pending);
+        let later_start = Date::new(2026, 7, 12).unwrap();
+        let later_target = Date::new(2026, 7, 26).unwrap();
+        let _ = state.apply_optimistic_partial(1, Some(later_start), Some(later_target));
+        assert_ne!(
+            state
+                .nodes
+                .iter()
+                .find(|node| node.id == 1)
+                .unwrap()
+                .start_date,
+            pending.after_start,
+            "parent dates must no longer match the queued persist"
+        );
+        state.discard_stale_date_save(&pending);
+        let child = state.nodes.iter().find(|node| node.id == 2).unwrap();
+        assert_eq!(
+            child.start_date, child_before.start_date,
+            "dropping a mismatched queued persist must restore Shift-drag children still at those dates"
+        );
+        assert_eq!(
+            state
+                .nodes
+                .iter()
+                .find(|node| node.id == 1)
+                .unwrap()
+                .start_date
+                .as_deref(),
+            Some("2026-07-12T00:00:00Z"),
+            "the later local parent dates must stay"
+        );
+    }
+
+    #[test]
+    fn discarding_a_stale_queued_save_keeps_a_later_shift() {
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-stale-later-shift")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        let start = Date::new(2026, 7, 9).unwrap();
+        let target = Date::new(2026, 7, 23).unwrap();
+        let _ = state.apply_optimistic_partial(1, Some(start), Some(target));
+        let mut first = super::PendingDateSave {
+            id: 1,
+            start: Some(start),
+            target: Some(target),
+            after_start: Some("2026-07-09T00:00:00Z".into()),
+            after_target: Some("2026-07-23T00:00:00Z".into()),
+            previous: super::fake_hierarchy(1).remove(0),
+            role: super::DateSaveRole::Commit,
+            rev: 1,
+            cascade: Vec::new(),
+        };
+        first.cascade = state.shift_children_with_committed_move(&first);
+        let later_start = Date::new(2026, 7, 12).unwrap();
+        let later_target = Date::new(2026, 7, 26).unwrap();
+        let _ = state.apply_optimistic_partial(1, Some(later_start), Some(later_target));
+        let mut second = super::PendingDateSave {
+            id: 1,
+            start: Some(later_start),
+            target: Some(later_target),
+            after_start: Some("2026-07-12T00:00:00Z".into()),
+            after_target: Some("2026-07-26T00:00:00Z".into()),
+            previous: super::fake_hierarchy(1).remove(0),
+            role: super::DateSaveRole::Commit,
+            rev: 1,
+            cascade: Vec::new(),
+        };
+        second.cascade = state.shift_children_with_committed_move(&second);
+        let later_child = state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .unwrap()
+            .start_date
+            .clone();
+        state.discard_stale_date_save(&first);
+        let child = state.nodes.iter().find(|node| node.id == 2).unwrap();
+        assert_eq!(
+            child.start_date, later_child,
+            "dropping an earlier persist must not restore over a later Shift-drag"
         );
     }
 }

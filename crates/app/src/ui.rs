@@ -54,7 +54,8 @@ use crate::gantt::{
 };
 use crate::paths::AppPaths;
 use crate::state::{
-    DateSaveRole, PendingDateSave, PlannerState, undone_message as undone_toast_message,
+    DateSaveRole, PendingDateSave, PlannerState, coalesce_superseded_date_saves,
+    undone_message as undone_toast_message,
 };
 use crate::toasts::{HistoryEntry, ToastExtra, ToastKind, UndoAction};
 
@@ -7418,6 +7419,7 @@ impl PlannerView {
     }
 
     fn drain_date_saves(&mut self, cx: &mut Context<Self>) {
+        coalesce_superseded_date_saves(&mut self.date_save_queue);
         let mut index = 0;
         while index < self.date_save_queue.len() {
             let id = self.date_save_queue[index].id;
@@ -7425,28 +7427,13 @@ impl PlannerView {
                 index += 1;
                 continue;
             }
-            let has_later = self
-                .date_save_queue
-                .iter()
-                .skip(index + 1)
-                .any(|pending| pending.id == id);
-            if has_later {
-                let dropped = self.date_save_queue.remove(index).expect("queued save");
-                if let Some(later) = self
-                    .date_save_queue
-                    .iter_mut()
-                    .rev()
-                    .find(|pending| pending.id == id)
-                {
-                    later.adopt_cascade_from_superseded(dropped);
-                }
-                continue;
-            }
             let mut pending = self.date_save_queue.remove(index).expect("queued save");
             let Some(live) = self.state.nodes.iter().find(|node| node.id == pending.id) else {
+                self.state.discard_stale_date_save(&pending);
                 continue;
             };
             if live.start_date != pending.after_start || live.target_date != pending.after_target {
+                self.state.discard_stale_date_save(&pending);
                 continue;
             }
             pending.rev = live.rev;
