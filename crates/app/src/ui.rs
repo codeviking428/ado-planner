@@ -45,11 +45,11 @@ use crate::form::ado_edit_url_on;
 use crate::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH,
     DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
-    LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W,
-    NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP, PLACEHOLDER_BAR_H, ROW_HEIGHT,
-    SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H,
-    SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT,
-    bar_hover_tooltip, bar_title_is_inside, header_label_px, nudge_today_off_ticks,
+    LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH,
+    NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
+    PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT,
+    SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH,
+    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, header_label_px,
     parent_date_overflow, parent_overflow_tip, timeline_is_empty_of_scheduled, today_pill_left,
 };
 use crate::paths::AppPaths;
@@ -4138,12 +4138,7 @@ impl PlannerView {
         // at y=22; putting Today there overlaps "Nov".
         let today_label_top = 2.0;
         let today_label_x = if today_on_screen {
-            let pill = today_pill_left(today_x, width);
-            if matches!(self.state.gantt.scale, GanttScale::Year) {
-                nudge_today_off_ticks(pill, &tick_labels, width)
-            } else {
-                pill
-            }
+            today_pill_left(today_x, width)
         } else {
             f32::MAX
         };
@@ -5241,16 +5236,11 @@ impl PlannerView {
         let selected = self.state.gantt.selected_id == Some(id);
         let show_dot = hovered && !dragging;
         let (local_left, local_right) = self.painted_timeline_edges(bar);
-        // Inner 8px grips resize both ends. These circles sit fully outside
-        // the bar (monday.com connectors) and always start a link. Skip past
-        // the overflow ! so the badge wins hits and the end grip stays free.
+        // Inner 8px grips resize both ends. The connector sits just outside
+        // the bar; the overflow ! is painted past this hit box so it does
+        // not cover the handle.
         let start_x = local_left - LINK_HANDLE_HIT - 2.0;
-        let overflow_pad = if parent_date_overflow(&self.state.nodes, id) {
-            OVERFLOW_BADGE + OVERFLOW_BADGE_GAP + 6.0
-        } else {
-            6.0
-        };
-        let end_x = local_right + overflow_pad;
+        let end_x = local_right + LINK_HANDLE_GAP;
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
         let handles =
             [("link-start", start_x), ("link-end", end_x)].map(|(handle_id, handle_x)| {
@@ -5486,12 +5476,13 @@ impl PlannerView {
             bar.width.max(8.0)
         };
         let warn = cx.theme().warning;
+        let badge_left = bar.x + painted_w + LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP;
         Some(
             div()
                 .id(("gantt-overflow", id as u64))
                 .debug_selector(|| "gantt-parent-overflow".into())
                 .absolute()
-                .left(px(bar.x + painted_w + OVERFLOW_BADGE_GAP))
+                .left(px(badge_left))
                 .top(px(bar.y + ((ROW_HEIGHT - OVERFLOW_BADGE) / 2.0).max(0.0)))
                 .w(px(OVERFLOW_BADGE))
                 .h(px(OVERFLOW_BADGE))

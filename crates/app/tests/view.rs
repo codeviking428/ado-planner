@@ -4,8 +4,8 @@ use ado_core::{IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
-    MIN_TIMELINE_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
-    bar_hover_tooltip, insert_index_for_child,
+    LINK_HANDLE_HIT, MIN_TIMELINE_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
+    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, insert_index_for_child,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -53,6 +53,100 @@ fn draw(cx: &mut VisualTestContext) {
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
+}
+
+/// `e2e/fixtures/work-items.json` plus the live Persist cart → Go-live link.
+fn mock_fixture_nodes() -> Vec<WorkItemNode> {
+    fn item(
+        id: i64,
+        parent: Option<i64>,
+        ty: &str,
+        title: &str,
+        start: Option<&str>,
+        target: Option<&str>,
+    ) -> WorkItemNode {
+        WorkItemNode {
+            id,
+            rev: 1,
+            title: title.into(),
+            work_item_type: ty.into(),
+            state: "Active".into(),
+            assigned_to: None,
+            parent_id: parent,
+            area_path: "Shop\\Platform".into(),
+            iteration_path: "Shop\\FY26".into(),
+            start_date: start.map(str::to_string),
+            target_date: target.map(str::to_string),
+            has_date_fields: true,
+            predecessors: Vec::new(),
+            fields: serde_json::Map::new(),
+        }
+    }
+    let persist = item(
+        1003,
+        Some(1002),
+        "User Story",
+        "Persist cart",
+        Some("2026-07-06T00:00:00Z"),
+        Some("2026-07-20T00:00:00Z"),
+    );
+    let cart_ui = item(
+        1005,
+        Some(1003),
+        "Task",
+        "Cart UI",
+        Some("2026-07-21T00:00:00Z"),
+        None,
+    );
+    let mut spike = item(
+        1012,
+        None,
+        "Task",
+        "Unparented spike",
+        Some("2026-07-21T00:00:00Z"),
+        Some("2026-08-04T00:00:00Z"),
+    );
+    spike.predecessors = vec![1005];
+    let mut go_live = item(
+        1013,
+        Some(1001),
+        "Feature",
+        "Go-live milestone",
+        None,
+        Some("2026-08-15T00:00:00Z"),
+    );
+    go_live.predecessors = vec![1003];
+    vec![
+        item(
+            1001,
+            None,
+            "Epic",
+            "Checkout rewrite",
+            Some("2026-07-01T00:00:00Z"),
+            Some("2026-09-30T00:00:00Z"),
+        ),
+        item(
+            1002,
+            Some(1001),
+            "Feature",
+            "Cart",
+            Some("2026-07-06T00:00:00Z"),
+            Some("2026-08-14T00:00:00Z"),
+        ),
+        persist,
+        cart_ui,
+        spike,
+        go_live,
+        item(1014, Some(1002), "Task", "Backlog grooming", None, None),
+        item(
+            1020,
+            None,
+            "Epic",
+            "Growth experiments",
+            Some("2026-08-01T00:00:00Z"),
+            Some("2026-09-15T00:00:00Z"),
+        ),
+    ]
 }
 
 /// Visible end-dot / outer handle pixel starts a link.
@@ -1078,6 +1172,54 @@ fn painted_dependency_arrow_joins_predecessor_to_successor(cx: &mut gpui_kit::Te
     assert!(
         cx.debug_bounds("gantt-dep-arrow-1-2").is_some(),
         "dependency arrows must paint once System.LinkTypes.Dependency predecessors are loaded"
+    );
+}
+
+#[gpui_kit::test]
+fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    if let Some(go_live) = state.nodes.iter_mut().find(|node| node.id == 1013) {
+        go_live.predecessors.clear();
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Week;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-dep-inv-1005-1012").is_some(),
+        "Cart UI → spike must paint before the new Persist cart → Go-live link"
+    );
+    assert!(
+        cx.debug_bounds("gantt-dep-inv-1003-1013").is_none(),
+        "Persist cart → Go-live is created next"
+    );
+    view.update(cx, |view, cx| {
+        if let Some(go_live) = view.state.nodes.iter_mut().find(|node| node.id == 1013) {
+            go_live.predecessors = vec![1003];
+        }
+        cx.notify();
+    });
+    draw(cx);
+    let persist = cx
+        .debug_bounds("gantt-dep-inv-1003-1013")
+        .expect("painted Persist cart → Go-live inbound");
+    let spike = cx
+        .debug_bounds("gantt-dep-inv-1005-1012")
+        .expect("painted Cart UI → spike inbound");
+    let persist_x = f32::from(persist.origin.x) + f32::from(persist.size.width) / 2.0;
+    let spike_x = f32::from(spike.origin.x) + f32::from(spike.size.width) / 2.0;
+    let dx = (persist_x - spike_x).abs();
+    assert!(
+        dx >= 6.0,
+        "rendered Persist cart → Go-live inv at {persist_x} must sit ≥6px from Cart UI → spike at {spike_x} (dx={dx})"
     );
 }
 
@@ -3553,6 +3695,7 @@ fn year_today_label_does_not_overlap_month_ticks(cx: &mut gpui_kit::TestAppConte
     let today = cx
         .debug_bounds("gantt-today-label")
         .expect("Year Today label");
+    let today_line = cx.debug_bounds("gantt-today").expect("Year Today line");
     let tick = cx.debug_bounds("gantt-tick-0").expect("Year month tick");
     let today_top = f32::from(today.origin.y);
     let today_bottom = today_top + f32::from(today.size.height);
@@ -3560,6 +3703,16 @@ fn year_today_label_does_not_overlap_month_ticks(cx: &mut gpui_kit::TestAppConte
     assert!(
         today_bottom <= tick_top + 1.0,
         "Year Today at {today_top}..{today_bottom} must sit on the year row, not on month ticks at {tick_top}"
+    );
+    let line_x = f32::from(today_line.origin.x);
+    let line_right = line_x + f32::from(today_line.size.width);
+    let pill_x = f32::from(today.origin.x);
+    let pill_right = pill_x + f32::from(today.size.width);
+    let attached_right = pill_x >= line_right - 1.0 && pill_x <= line_right + TODAY_PILL_GAP + 8.0;
+    let attached_left = pill_right <= line_x + 1.0 && line_x - pill_right <= 8.0;
+    assert!(
+        attached_right || attached_left,
+        "Year Today pill at {pill_x}..{pill_right} must stay on the line at {line_x}..{line_right}, not slide onto year labels"
     );
     let mut tick_count = 0;
     for selector in [
@@ -3628,6 +3781,58 @@ fn week_header_nov_does_not_overlap_today(cx: &mut gpui_kit::TestAppContext) {
         );
     }
     assert!(found > 0, "Week view must paint a month major label");
+}
+
+#[gpui_kit::test]
+fn quarter_q_labels_are_not_jammed_at_the_left(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Quarter;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    let left = f32::from(timeline.origin.x);
+    let mut xs = Vec::new();
+    for selector in [
+        "gantt-tick-0",
+        "gantt-tick-1",
+        "gantt-tick-2",
+        "gantt-tick-3",
+        "gantt-tick-4",
+        "gantt-tick-5",
+        "gantt-tick-6",
+        "gantt-tick-7",
+    ] {
+        let Some(tick) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        xs.push(f32::from(tick.origin.x));
+    }
+    assert!(
+        xs.len() >= 2,
+        "Quarter view must paint more than one Q label, got {}",
+        xs.len()
+    );
+    for pair in xs.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= 40.0,
+            "Quarter ticks at {} and {} are jammed together",
+            pair[0],
+            pair[1]
+        );
+    }
+    let left_cluster = xs.iter().filter(|x| **x < left + 40.0).count();
+    assert!(
+        left_cluster <= 1,
+        "at most one Quarter label may sit at the left edge, xs={xs:?} left={left}"
+    );
 }
 
 #[gpui_kit::test]
@@ -3753,11 +3958,30 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
         .debug_bounds("gantt-parent-overflow")
         .expect("the overflow ! must still paint");
     let bar = cx.debug_bounds("gantt-bar-2").expect("overflow bar");
+    let handle = cx
+        .debug_bounds("gantt-link-handle-2-link-end")
+        .expect("overflow bar must still expose a link handle");
     let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
     let badge_left = f32::from(badge.origin.x);
+    let handle_left = f32::from(handle.origin.x);
+    let handle_right = handle_left + f32::from(handle.size.width);
     assert!(
         badge_left >= bar_right - 0.5,
         "the ! must sit past the bar end so the grip stays hittable, badge_left={badge_left} bar_right={bar_right}"
+    );
+    assert!(
+        handle_left >= bar_right - 0.5,
+        "the link handle must sit just outside the bar, handle_left={handle_left} bar_right={bar_right}"
+    );
+    assert!(
+        badge_left >= handle_right - 0.5,
+        "the ! must sit clear of the link handle, badge_left={badge_left} handle={handle_left}..{handle_right}"
+    );
+    assert!(
+        (handle_right - handle_left - LINK_HANDLE_HIT).abs() < 1.0,
+        "link handle hit box must stay {}px, got {}",
+        LINK_HANDLE_HIT,
+        handle_right - handle_left
     );
     assert!(
         f32::from(badge.size.width) >= 20.0 && f32::from(badge.size.height) >= 20.0,

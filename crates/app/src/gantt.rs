@@ -32,13 +32,15 @@ pub const TREE_INDENT: f32 = 20.0;
 /// circle is not mistaken for an edge handle.
 pub const LINK_HANDLE: f32 = 8.0;
 pub const LINK_HANDLE_HIT: f32 = 16.0;
+/// Gap between the painted bar end and the outside link handle.
+pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// Parallel dependency lanes stay at least this far apart (stroke is 2px).
 pub const PARALLEL_LANE_MIN: f32 = 10.0;
 /// Parent-overflow `!` on the bar. The circle is larger than the glyph so a
 /// 20px font still reads as a true 14px bang instead of a 10px mark.
 pub const OVERFLOW_BADGE: f32 = 22.0;
-/// Gap between the painted bar end and the overflow badge.
-pub const OVERFLOW_BADGE_GAP: f32 = 2.0;
+/// Gap after the link-handle hit box before the overflow badge.
+pub const OVERFLOW_BADGE_GAP: f32 = 4.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
@@ -1764,11 +1766,7 @@ impl GanttView {
             .collect();
         let mut labels = Self::sticky_header_labels(ticks, false, 72.0);
         if let Some(today) = hide_x {
-            let mut pill = today_pill_left(today, width);
-            if matches!(self.scale, GanttScale::Year) {
-                let ticks = self.header_tick_labels_except(width, Some(today));
-                pill = nudge_today_off_ticks(pill, &ticks, width);
-            }
+            let pill = today_pill_left(today, width);
             labels = dodge_majors_off_today_pill(labels, pill, self.scale);
         }
         Self::fit_labels_to_width(labels, width)
@@ -1780,9 +1778,10 @@ impl GanttView {
         self.header_tick_labels_except(width, None)
     }
 
-    /// Year ticks are months on the row *below* the Today pill. Keep "Nov"
-    /// visible; hiding it left Today covering the month. Day/Week still
-    /// shift the in-month number off the Today line so "2" stays readable.
+    /// Year ticks are months on the row *below* the Today pill. Show every
+    /// other month so names do not jam. Day/Week still shift the in-month
+    /// number off the Today line so "2" stays readable. Year/Quarter dodge
+    /// labels around the pill instead of sliding the pill off the Today line.
     pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         const HIDE_PAD: f32 = 22.0;
         const SHIFT: f32 = 16.0;
@@ -1790,16 +1789,29 @@ impl GanttView {
             .timeline_ticks(width)
             .into_iter()
             .filter_map(|tick| {
-                if tick.label.is_empty() {
+                let skip_even_month = matches!(self.scale, GanttScale::Year)
+                    && !matches!(
+                        tick.label.as_str(),
+                        "Jan" | "Mar" | "May" | "Jul" | "Sep" | "Nov"
+                    );
+                if tick.label.is_empty() || skip_even_month {
                     None
                 } else {
                     Some((tick.x, tick.label))
                 }
             })
             .collect();
-        if let Some(today) = hide_x
-            && !matches!(self.scale, GanttScale::Year | GanttScale::Quarter)
-            && let Some(index) = ticks
+        if let Some(today) = hide_x {
+            if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
+                let pill_left = today_pill_left(today, width);
+                let pill_right = pill_left + TODAY_PILL_W;
+                for (x, label) in ticks.iter_mut() {
+                    let right = *x + header_label_px(label);
+                    if right >= pill_left - 2.0 && *x <= pill_right + 2.0 {
+                        *x = pill_right + TODAY_PILL_GAP;
+                    }
+                }
+            } else if let Some(index) = ticks
                 .iter()
                 .enumerate()
                 .filter(|(_, (x, _))| (x - today).abs() < HIDE_PAD)
@@ -1810,21 +1822,19 @@ impl GanttView {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(index, _)| index)
-        {
-            ticks[index].0 = today + SHIFT;
+            {
+                ticks[index].0 = today + SHIFT;
+            }
         }
-        // Year month names sit on the row below Today. Keep "Nov" even when
-        // the Today pill is nearby; the pill is nudged instead of dropping
-        // the tick.
-        let min_gap = if matches!(self.scale, GanttScale::Year) {
-            10.0
+        let min_gap = if matches!(self.scale, GanttScale::Quarter) {
+            48.0
         } else {
             TICK_MIN_GAP
         };
         let labels = Self::space_header_labels(
             Self::sticky_header_labels(ticks, false, min_gap),
             min_gap,
-            !matches!(self.scale, GanttScale::Year),
+            true,
         );
         Self::fit_labels_to_width(labels, width)
     }
@@ -2346,82 +2356,144 @@ fn separate_parallel_lanes(arrows: &mut [DependencyArrow]) {
     }
 }
 
-fn vertical_spans(arrow: &DependencyArrow) -> [(f32, f32, f32); 2] {
-    let v2_end = if arrow.wraps_around_successor() {
-        arrow.gutter_y()
-    } else {
-        arrow.y2
-    };
+/// Full polyline Y, not per-segment. After lane_y split, inbound verticals
+/// can miss a segment-overlap check while still occupying the same X corridor.
+fn arrow_y_span(arrow: &DependencyArrow) -> (f32, f32) {
+    let mut lo = arrow.y1.min(arrow.y2).min(arrow.lane_y);
+    let mut hi = arrow.y1.max(arrow.y2).max(arrow.lane_y);
+    if arrow.wraps_around_successor() {
+        lo = lo.min(arrow.gutter_y());
+        hi = hi.max(arrow.gutter_y());
+    }
+    (lo, hi)
+}
+
+fn y_spans_overlap(a: (f32, f32), b: (f32, f32)) -> bool {
+    a.0 <= b.1 + 8.0 && b.0 <= a.1 + 8.0
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VertKind {
+    Outgoing,
+    Inbound,
+}
+
+fn movable_verticals(arrow: &DependencyArrow) -> [(VertKind, f32); 2] {
     [
-        (
-            arrow.x1,
-            arrow.y1.min(arrow.lane_y),
-            arrow.y1.max(arrow.lane_y),
-        ),
-        (arrow.x2, arrow.lane_y.min(v2_end), arrow.lane_y.max(v2_end)),
+        (VertKind::Outgoing, arrow.x1),
+        (VertKind::Inbound, arrow.x2),
     ]
 }
 
-fn y_ranges_overlap(a: (f32, f32, f32), b: (f32, f32, f32)) -> bool {
-    a.1 <= b.2 + 8.0 && b.1 <= a.2 + 8.0
+fn wrap_floor(arrow: &DependencyArrow) -> f32 {
+    arrow.x_head + DependencyArrow::WRAP_STUB + 1.0
 }
 
-fn shift_vertical_x(arrow: &mut DependencyArrow, outgoing: bool, delta: f32) {
-    if outgoing {
-        arrow.x1 += delta;
-        return;
+/// Shift one vertical. Wrap x1/x2 stay coupled so the drop does not split
+/// from the source stub. Do not clamp inbound to `x_head - 4` — that undoes
+/// a right-edge push and restacks two clipped verticals.
+fn shift_vertical(
+    arrow: &mut DependencyArrow,
+    kind: VertKind,
+    delta: f32,
+    clip_left: f32,
+    clip_right: f32,
+) -> bool {
+    let wrap = arrow.wraps_around_successor();
+    let cur = match kind {
+        VertKind::Outgoing => arrow.x1,
+        VertKind::Inbound => arrow.x2,
+    };
+    let next = (cur + delta).clamp(clip_left, clip_right);
+    if (next - cur).abs() < 0.5 {
+        return false;
     }
-    let next = arrow.x2 + delta;
-    if !arrow.inbound_right && !arrow.wraps_around_successor() {
-        arrow.x2 = next.min(arrow.x_head - 4.0);
-    } else {
-        arrow.x2 = next;
+    if wrap && next <= wrap_floor(arrow) {
+        return false;
     }
+    let applied = next - cur;
+    match kind {
+        VertKind::Outgoing => arrow.x1 = next,
+        VertKind::Inbound => arrow.x2 = next,
+    }
+    if wrap {
+        match kind {
+            VertKind::Outgoing => {
+                arrow.x2 = (arrow.x2 + applied).clamp(clip_left, clip_right);
+            }
+            VertKind::Inbound => {
+                arrow.x1 = (arrow.x1 + applied).clamp(clip_left, clip_right);
+            }
+        }
+    }
+    true
 }
 
 /// Keep long inbound/wrap verticals from stacking 1–3px apart (Persist cart
-/// → Go-live vs Cart UI → spike at x≈601).
+/// → Go-live vs Cart UI → spike at x≈601). Uses the whole arrow Y span so
+/// a newly created link is offset against existing ones even when their
+/// inbound segments no longer overlap after lane_y split.
 fn separate_parallel_verticals(arrows: &mut [DependencyArrow], clip_left: f32, clip_right: f32) {
     if arrows.len() < 2 {
         return;
     }
-    for _ in 0..arrows.len() * 4 {
+    for _ in 0..arrows.len() * 6 {
         let mut moved = false;
         for i in 0..arrows.len() {
             for j in i + 1..arrows.len() {
-                let segs_i = vertical_spans(&arrows[i]);
-                let segs_j = vertical_spans(&arrows[j]);
-                for (si, seg_i) in segs_i.iter().enumerate() {
-                    for (sj, seg_j) in segs_j.iter().enumerate() {
-                        if !y_ranges_overlap(*seg_i, *seg_j) {
-                            continue;
-                        }
-                        let dx = seg_j.0 - seg_i.0;
+                if !y_spans_overlap(arrow_y_span(&arrows[i]), arrow_y_span(&arrows[j])) {
+                    continue;
+                }
+                let verts_i = movable_verticals(&arrows[i]);
+                let verts_j = movable_verticals(&arrows[j]);
+                let frozen_i = arrows[i]
+                    .wraps_around_successor()
+                    .then(|| arrows[i].stub_start());
+                let frozen_j = arrows[j]
+                    .wraps_around_successor()
+                    .then(|| arrows[j].stub_start());
+                for (ki, xi) in verts_i {
+                    for (kj, xj) in verts_j {
+                        let dx = xj - xi;
                         if dx.abs() >= PARALLEL_LANE_MIN {
                             continue;
                         }
                         let push = (PARALLEL_LANE_MIN - dx.abs()).max(1.0);
-                        let (right, right_out, left, left_out) = if seg_j.0 >= seg_i.0 {
-                            (j, sj == 0, i, si == 0)
+                        let (right, right_k, left, left_k) = if xj >= xi {
+                            (j, kj, i, ki)
                         } else {
-                            (i, si == 0, j, sj == 0)
+                            (i, ki, j, kj)
                         };
-                        let right_x = if right_out {
-                            arrows[right].x1
-                        } else {
-                            arrows[right].x2
-                        };
-                        if right_x + push <= clip_right {
-                            shift_vertical_x(&mut arrows[right], right_out, push);
+                        if shift_vertical(&mut arrows[right], right_k, push, clip_left, clip_right)
+                            || shift_vertical(
+                                &mut arrows[left],
+                                left_k,
+                                -push,
+                                clip_left,
+                                clip_right,
+                            )
+                        {
                             moved = true;
-                        } else {
-                            let left_x = if left_out {
-                                arrows[left].x1
-                            } else {
-                                arrows[left].x2
-                            };
-                            if left_x - push >= clip_left {
-                                shift_vertical_x(&mut arrows[left], left_out, -push);
+                        }
+                    }
+                    if let Some(frozen) = frozen_j {
+                        let dx = frozen - xi;
+                        if dx.abs() < PARALLEL_LANE_MIN {
+                            let push = (PARALLEL_LANE_MIN - dx.abs()).max(1.0);
+                            let delta = if xi >= frozen { push } else { -push };
+                            if shift_vertical(&mut arrows[i], ki, delta, clip_left, clip_right) {
+                                moved = true;
+                            }
+                        }
+                    }
+                }
+                if let Some(frozen) = frozen_i {
+                    for (kj, xj) in verts_j {
+                        let dx = xj - frozen;
+                        if dx.abs() < PARALLEL_LANE_MIN {
+                            let push = (PARALLEL_LANE_MIN - dx.abs()).max(1.0);
+                            let delta = if xj >= frozen { push } else { -push };
+                            if shift_vertical(&mut arrows[j], kj, delta, clip_left, clip_right) {
                                 moved = true;
                             }
                         }
@@ -2486,35 +2558,6 @@ pub(crate) fn today_pill_left(today_x: f32, width: f32) -> f32 {
     } else {
         (today_x + TODAY_PILL_GAP).max(4.0)
     }
-}
-
-/// Year ticks stay put; slide the Today pill so it does not sit on "Nov".
-/// Recompute the right edge after each slide so Dec/Jan just past that
-/// original edge are not skipped. Cap at a few hops so a 44px pill does
-/// not march along every remaining month to the chart edge.
-pub(crate) fn nudge_today_off_ticks(pill_x: f32, ticks: &[(f32, String)], width: f32) -> f32 {
-    let mut x = pill_x;
-    let max_x = (width - TODAY_PILL_W - 4.0).max(4.0);
-    for _ in 0..3 {
-        let pill_right = x + TODAY_PILL_W;
-        let mut hit_right = None;
-        for (tick_x, label) in ticks {
-            let tick_right = *tick_x + header_label_px(label);
-            if tick_right < x - 2.0 || *tick_x > pill_right + 2.0 {
-                continue;
-            }
-            hit_right = Some(hit_right.unwrap_or(f32::NEG_INFINITY).max(tick_right));
-        }
-        let Some(tick_right) = hit_right else {
-            break;
-        };
-        let next = (tick_right + TODAY_PILL_GAP).min(max_x);
-        if next <= x + 0.5 {
-            break;
-        }
-        x = next;
-    }
-    x.max(4.0)
 }
 
 fn dodge_majors_off_today_pill(
@@ -4951,13 +4994,13 @@ mod tests {
     }
 
     fn overlapping_vertical_gap(a: &DependencyArrow, b: &DependencyArrow) -> Option<f32> {
+        if !y_spans_overlap(arrow_y_span(a), arrow_y_span(b)) {
+            return None;
+        }
         let mut min_dx = f32::MAX;
-        for seg_a in vertical_spans(a) {
-            for seg_b in vertical_spans(b) {
-                if !y_ranges_overlap(seg_a, seg_b) {
-                    continue;
-                }
-                min_dx = min_dx.min((seg_a.0 - seg_b.0).abs());
+        for xa in [a.x1, a.x2] {
+            for xb in [b.x1, b.x2] {
+                min_dx = min_dx.min((xa - xb).abs());
             }
         }
         (min_dx < f32::MAX).then_some(min_dx)
@@ -5110,12 +5153,12 @@ mod tests {
         ]
     }
 
-    fn assert_mock_fixture_parallel_verticals(scale: GanttScale) {
+    fn assert_mock_fixture_parallel_verticals(scale: GanttScale, timeline_width: f32) {
         let nodes = mock_fixture_nodes();
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
             scale,
-            timeline_width: 800.0,
+            timeline_width,
             ..Default::default()
         };
         let rows = gantt.flatten(&nodes);
@@ -5154,8 +5197,71 @@ mod tests {
 
     #[test]
     fn mock_fixture_parallel_verticals_are_at_least_six_apart() {
-        assert_mock_fixture_parallel_verticals(GanttScale::Month);
-        assert_mock_fixture_parallel_verticals(GanttScale::Week);
+        for width in [512.0, 800.0, 1200.0] {
+            assert_mock_fixture_parallel_verticals(GanttScale::Month, width);
+            assert_mock_fixture_parallel_verticals(GanttScale::Week, width);
+        }
+    }
+
+    #[test]
+    fn newly_created_link_offsets_against_existing_verticals() {
+        let mut nodes = mock_fixture_nodes();
+        if let Some(go_live) = nodes.iter_mut().find(|node| node.id == 1013) {
+            go_live.predecessors.clear();
+        }
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Week,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let before = gantt.layout_dependency_arrows(&bars);
+        assert!(
+            before
+                .iter()
+                .any(|arrow| arrow.from_id == 1005 && arrow.to_id == 1012),
+            "Cart UI → spike must already exist"
+        );
+        assert!(
+            before
+                .iter()
+                .all(|arrow| !(arrow.from_id == 1003 && arrow.to_id == 1013)),
+            "Persist cart → Go-live is the newly created link"
+        );
+        if let Some(go_live) = nodes.iter_mut().find(|node| node.id == 1013) {
+            go_live.predecessors = vec![1003];
+        }
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let persist_live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("newly created Persist cart → Go-live");
+        let cart_spike = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1005 && arrow.to_id == 1012)
+            .expect("Cart UI → spike");
+        let dx = overlapping_vertical_gap(persist_live, cart_spike).unwrap_or_else(|| {
+            [
+                (persist_live.x1 - cart_spike.x1).abs(),
+                (persist_live.x1 - cart_spike.x2).abs(),
+                (persist_live.x2 - cart_spike.x1).abs(),
+                (persist_live.x2 - cart_spike.x2).abs(),
+            ]
+            .into_iter()
+            .fold(f32::MAX, f32::min)
+        });
+        assert!(
+            dx >= 6.0,
+            "a newly created Persist cart → Go-live must sit ≥6px off Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={}",
+            persist_live.x1,
+            persist_live.x2,
+            cart_spike.x1,
+            cart_spike.x2
+        );
     }
 
     #[test]
@@ -7410,12 +7516,7 @@ mod tests {
                 ..Default::default()
             };
             let today_x = gantt.today_x(today);
-            let ticks = gantt.header_tick_labels_except(timeline_width, Some(today_x));
-            let pill_left = nudge_today_off_ticks(
-                today_pill_left(today_x, timeline_width),
-                &ticks,
-                timeline_width,
-            );
+            let pill_left = today_pill_left(today_x, timeline_width);
             let pill_right = pill_left + TODAY_PILL_W;
             let majors = gantt.header_major_labels_except(timeline_width, Some(today_x));
             let twenty_seven = majors.iter().find(|(_, label)| label == "2027");
@@ -7451,17 +7552,24 @@ mod tests {
                 ticks.iter().any(|(_, label)| label == "Nov"),
                 "Year ticks at zoom {zoom} must keep Nov next to Today, got {ticks:?}"
             );
+            for (_, label) in &ticks {
+                assert!(
+                    matches!(
+                        label.as_str(),
+                        "Jan" | "Mar" | "May" | "Jul" | "Sep" | "Nov"
+                    ),
+                    "Year ticks skip even months, got {ticks:?}"
+                );
+            }
             let pill = today_pill_left(today_x, 800.0);
-            let nudged = nudge_today_off_ticks(pill, &ticks, 800.0);
-            for name in ["Nov", "Dec", "Jan"] {
+            for name in ["Nov", "Jan"] {
                 if let Some((tick_x, label)) = ticks.iter().find(|(_, label)| label == name) {
                     let tick_right = *tick_x + header_label_px(label);
-                    let overlaps =
-                        tick_right >= nudged - 0.5 && *tick_x <= nudged + TODAY_PILL_W + 0.5;
+                    let overlaps = tick_right >= pill - 0.5 && *tick_x <= pill + TODAY_PILL_W + 0.5;
                     assert!(
                         !overlaps,
-                        "Today pill at {nudged}..{} must clear {name} at {tick_x}..{tick_right}, zoom={zoom}",
-                        nudged + TODAY_PILL_W
+                        "Today pill at {pill}..{} must clear {name} at {tick_x}..{tick_right}, zoom={zoom}",
+                        pill + TODAY_PILL_W
                     );
                 }
             }
@@ -7469,28 +7577,43 @@ mod tests {
     }
 
     #[test]
-    fn nudge_today_clears_dec_after_sliding_past_nov() {
-        let nov = 100.0;
-        // Just past the original pill's right edge (90+44) so a stale
-        // `pill_right` would skip Dec after the Nov slide.
-        let dec = 140.0;
-        let ticks = vec![(nov, "Nov".to_string()), (dec, "Dec".to_string())];
-        let pill = 90.0;
-        let nudged = nudge_today_off_ticks(pill, &ticks, 800.0);
-        let nov_right = nov + header_label_px("Nov");
-        let dec_right = dec + header_label_px("Dec");
-        assert!(
-            nudged >= dec_right + TODAY_PILL_GAP - 0.5,
-            "after clearing Nov ({nov_right}) the pill must also clear Dec ({dec_right}), got {nudged}"
-        );
-        assert!(
-            nudged + TODAY_PILL_W <= 800.0,
-            "the nudged pill must stay on the header"
-        );
-        assert!(
-            nudged < pill + 120.0,
-            "the pill must stay near Today, not march to the chart edge, got {nudged}"
-        );
+    fn quarter_q2_q3_are_not_jammed_at_the_left() {
+        let today = Date::new(2026, 11, 2).unwrap();
+        for (origin, zoom, width) in [
+            (Date::new(2026, 1, 1).unwrap(), 1.0, 800.0),
+            (today.saturating_sub(40.days()), 1.0, 800.0),
+            (Date::new(2026, 7, 1).unwrap(), 0.4, 512.0),
+        ] {
+            let gantt = GanttView {
+                origin,
+                scale: GanttScale::Quarter,
+                zoom,
+                timeline_width: width,
+                ..Default::default()
+            };
+            let today_x = gantt.today_x(today);
+            let ticks = gantt.header_tick_labels_except(width, Some(today_x));
+            let qs: Vec<(f32, &str)> = ticks
+                .iter()
+                .filter(|(_, label)| label.starts_with('Q'))
+                .map(|(x, label)| (*x, label.as_str()))
+                .collect();
+            for pair in qs.windows(2) {
+                assert!(
+                    pair[1].0 - pair[0].0 >= 48.0 - 0.5,
+                    "Quarter {0}@{1} and {2}@{3} must not jam (origin={origin} zoom={zoom}): {ticks:?}",
+                    pair[0].1,
+                    pair[0].0,
+                    pair[1].1,
+                    pair[1].0
+                );
+            }
+            let left_cluster = qs.iter().filter(|(x, _)| *x < 40.0).count();
+            assert!(
+                left_cluster <= 1,
+                "at most one quarter label may sit at the left edge, got {qs:?} origin={origin}"
+            );
+        }
     }
 
     #[test]
