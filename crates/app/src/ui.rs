@@ -1223,15 +1223,9 @@ impl PlannerView {
     }
 
     fn set_bar_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
-        // After a drop the bar remounts and GPUI fires hover-leave. Keep a
-        // pinned tooltip; do not treat that remount as the pointer leaving.
         if id.is_none() {
-            if self.state.gantt.pin_bar_tooltip.is_some()
-                && (self.state.gantt.hover_locked || self.state.gantt.pin_ignore_leave)
-            {
-                return;
-            }
             self.state.gantt.pin_bar_tooltip = None;
+            self.state.gantt.pin_ignore_leave = false;
             if self.state.gantt.hover_locked {
                 self.state.gantt.hover_locked = false;
                 cx.notify();
@@ -2012,11 +2006,12 @@ impl PlannerView {
     }
 
     fn undo_last(&mut self, cx: &mut Context<Self>) {
-        if self.history_hotkey_is_duplicate(true) || self.state.history.undo.is_empty() {
-            return;
-        }
         self.state.gantt.clear_hover();
         self.state.gantt.context_menu = None;
+        if self.history_hotkey_is_duplicate(true) || self.state.history.undo.is_empty() {
+            cx.notify();
+            return;
+        }
         let pending = self.state.undo_date_stack_now();
         if !pending.is_empty() {
             self.queue_form_dates_from_draft();
@@ -2035,10 +2030,11 @@ impl PlannerView {
     }
 
     fn redo_last(&mut self, cx: &mut Context<Self>) {
+        self.state.gantt.clear_hover();
         if self.history_hotkey_is_duplicate(false) || self.state.history.redo.is_empty() {
+            cx.notify();
             return;
         }
-        self.state.gantt.clear_hover();
         let pending = self.state.redo_date_stack_now();
         if !pending.is_empty() {
             self.queue_form_dates_from_draft();
@@ -2109,6 +2105,7 @@ impl PlannerView {
         if self.state.gantt.hovered_id.is_some()
             || self.state.gantt.bar_hovered_id.is_some()
             || self.state.gantt.hovered_link.is_some()
+            || self.state.gantt.pin_bar_tooltip.is_some()
         {
             self.state.gantt.clear_hover();
             cx.notify();
@@ -5004,18 +5001,18 @@ impl PlannerView {
             } else {
                 bar.width.max(8.0)
             };
-            const BADGE: f32 = 16.0;
+            const BADGE: f32 = 14.0;
             let overflow_tip = overflow_tip.clone();
             let warn = cx.theme().warning;
-            // Outside the bar's overflow clip so Month slivers still show a
-            // 16px badge, and left of the end grip so resize keeps the edge.
+            // Past the painted end so Month slivers stay unclipped, the
+            // 8px end grip keeps hits, and the glyph is a readable 14px.
             items.push(
                 div()
                     .id(("gantt-overflow", id as u64))
                     .debug_selector(|| "gantt-parent-overflow".into())
                     .absolute()
-                    .left(px((bar.x + painted_w - grip_w - BADGE).max(bar.x)))
-                    .top(px(bar_top - 4.0))
+                    .left(px(bar.x + painted_w + 2.0))
+                    .top(px(bar_top + ((bar_h - BADGE) / 2.0).max(0.0)))
                     .size(px(BADGE))
                     .rounded_full()
                     .flex()
@@ -5023,7 +5020,7 @@ impl PlannerView {
                     .justify_center()
                     .bg(warn)
                     .text_color(cx.theme().background)
-                    .text_sm()
+                    .text_xs()
                     .font_weight(gpui_kit::FontWeight::BOLD)
                     .occlude()
                     .tooltip(move |window, cx| Tooltip::new(overflow_tip.clone()).build(window, cx))
@@ -5445,7 +5442,9 @@ impl PlannerView {
         let right_x = bar_right + label_gap;
         let left_x = bar.x - estimated - 6.0;
         // Keep outside titles on the right of the bar. Flipping to the left
-        // after a right-edge resize (#1014) is the jump the review caught.
+        // after a right-edge resize (#1014) is the jump the review caught;
+        // hide a fragment at the clip instead of clipping to a letter.
+        const MIN_OUTSIDE: f32 = 40.0;
         let mut label_x = right_x;
         if label_x >= timeline_w - 8.0 {
             label_x = (bar_right + 4.0).min(timeline_w - 24.0);
@@ -5456,7 +5455,10 @@ impl PlannerView {
         if label_x >= timeline_w || label_x + 8.0 < 0.0 {
             return None;
         }
-        let mut max_w = (timeline_w - label_x - 4.0).max(24.0);
+        let mut max_w = (timeline_w - label_x - 4.0).max(0.0);
+        if max_w < MIN_OUTSIDE {
+            return None;
+        }
         if let Some(today) = today_x {
             let label_right = label_x + estimated.min(max_w);
             if label_x < today && label_right > today - 4.0 {
@@ -7177,16 +7179,22 @@ impl PlannerView {
     fn clear_pinned_tooltip_if_pointer_left(
         &mut self,
         window_x: f32,
-        _window_y: f32,
+        window_y: f32,
         cx: &mut Context<Self>,
     ) {
         let Some(id) = self.state.gantt.pin_bar_tooltip else {
             return;
         };
         let Some(painted) = self.painted_bar_bounds.borrow().get(&id).copied() else {
+            self.state.gantt.pin_bar_tooltip = None;
+            self.state.gantt.pin_ignore_leave = false;
+            cx.notify();
             return;
         };
-        if window_x >= painted.left && window_x <= painted.right {
+        let on_bar = window_x >= painted.left
+            && window_x <= painted.right
+            && self.state.gantt.pointer_in_rows(window_x, window_y);
+        if on_bar {
             return;
         }
         self.state.gantt.pin_bar_tooltip = None;
@@ -7369,11 +7377,6 @@ impl PlannerView {
             if shift_children {
                 pending.cascade = self.state.shift_children_with_committed_move(&pending);
             }
-            // Pointer is still on the bar. Pin the tooltip so it appears
-            // without waiting for a new mouse-enter, but keep hover cleared
-            // so row highlight and link handles do not stick after a drop.
-            self.state.gantt.pin_bar_tooltip = Some(pending.id);
-            self.state.gantt.pin_ignore_leave = true;
             self.enqueue_date_save(cx, pending);
         }
         self.request_repaint(Some(window), cx);
@@ -9046,13 +9049,58 @@ mod bar_label_tests {
             !PlannerView::bar_title_fits_inside(&bar),
             "precondition: #1014 title is wider than the bar"
         );
-        let (label_x, _) =
-            PlannerView::bar_external_label_frame(&bar, 800.0, true, None).expect("outside label");
+        let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, None);
+        if let Some((label_x, max_w)) = frame {
+            assert!(
+                label_x >= bar.x + bar.width - 1.0,
+                "a right-edge resize must not flip the title to the left of the bar, label_x={label_x} bar={}..{}",
+                bar.x,
+                bar.x + bar.width
+            );
+            assert!(
+                max_w >= 40.0,
+                "an outside label must stay readable, not clip to a letter, max_w={max_w}"
+            );
+        }
+    }
+
+    #[test]
+    fn day_view_cart_ui_keeps_a_readable_title() {
+        let bar = BarLayout {
+            id: 1005,
+            kind: GanttBarKind::Scheduled,
+            x: 400.0,
+            width: 336.0,
+            y: 80.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Cart UI".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: true,
+        };
         assert!(
-            label_x >= bar.x + bar.width - 1.0,
-            "a right-edge resize must not flip the title to the left of the bar, label_x={label_x} bar={}..{}",
-            bar.x,
-            bar.x + bar.width
+            PlannerView::bar_title_fits_inside(&bar),
+            "a Day-view start-only Cart UI bar is wide enough for an inside title"
         );
+        assert!(
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, None).is_none(),
+            "must not float a fragment at the viewport edge when the title fits inside"
+        );
+        let at_clip = BarLayout {
+            x: 760.0,
+            width: 48.0,
+            ..bar
+        };
+        let frame = PlannerView::bar_external_label_frame(&at_clip, 800.0, true, None);
+        if let Some((label_x, max_w)) = frame {
+            assert!(
+                max_w >= 40.0,
+                "Day-view Cart UI must not crush to a letter at the clip, label_x={label_x} max_w={max_w}"
+            );
+        }
     }
 }

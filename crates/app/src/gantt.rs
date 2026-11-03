@@ -892,9 +892,8 @@ impl GanttView {
         self.hovered_id = None;
         self.bar_hovered_id = None;
         self.hovered_link = None;
-        if !self.pin_ignore_leave {
-            self.pin_bar_tooltip = None;
-        }
+        self.pin_bar_tooltip = None;
+        self.pin_ignore_leave = false;
     }
 
     pub fn pointer_in_canvas(&self, x: f32, y: f32) -> bool {
@@ -2100,22 +2099,45 @@ impl GanttView {
                 // tens of days away (stray line at x≈532). Occupy the
                 // body only at those zooms.
                 let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
+                let clip_right = self.timeline_width.max(1.0);
                 if wrap_around {
-                    x_in = clear_wrap_drop_x(x_out, &intervening, false, x_head);
+                    x_in = clear_wrap_drop_x(x_out, &intervening, false, x_head, clip_right);
                     x_in = x_in.max(pred_left + STUB);
                 } else if !inbound_right && !intervening.is_empty() {
-                    let x_vert =
-                        clear_vertical_x(x_in, &intervening, bar.x, true, x_head, include_labels);
+                    let x_vert = clear_vertical_x(
+                        x_in,
+                        &intervening,
+                        bar.x,
+                        true,
+                        x_head,
+                        include_labels,
+                        Some(clip_right),
+                    );
                     if (x_vert - x_in).abs() > 0.5 {
                         x_in = x_vert;
                     }
-                    x_in = clamp_inbound_stub(x_in, x_head, true, &intervening, include_labels);
+                    x_in = clamp_inbound_stub(
+                        x_in,
+                        x_head,
+                        true,
+                        &intervening,
+                        include_labels,
+                        Some(clip_right),
+                    );
                 }
                 if !succ_gutter && x_in < pred_left {
                     // Dodging shoved the vertical left of the source. Drop at
                     // the source stub and keep the head on the start instead
-                    // of overshooting to a right-edge inbound.
-                    x_in = x_out.max(pred_left + STUB);
+                    // of overshooting to a right-edge inbound — unless that
+                    // stub sits inside an intervening bar or its open-ended cue.
+                    let fallback = x_out.max(pred_left + STUB);
+                    let hits_intervening = intervening.iter().any(|mid| {
+                        let (left, right) = bar_occupied_x(mid, include_labels, Some(clip_right));
+                        x_hits_span(fallback, left, right)
+                    });
+                    if !hits_intervening {
+                        x_in = fallback;
+                    }
                 }
                 let same_row = (pred.y - bar.y).abs() < 1.0;
                 // Stay in the predecessor row's gutter so the outgoing
@@ -2375,7 +2397,6 @@ pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
         || bar.kind == GanttBarKind::NoFields
         || bar.milestone
         || bar.marker
-        || bar.open_ended
     {
         return false;
     }
@@ -2391,7 +2412,12 @@ pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
     } else {
         12.0
     };
-    let inner = (visible_w - grip * 2.0 - h_pad).max(0.0);
+    let cue = if bar.open_ended {
+        OPEN_ENDED_LINK_HIT + 4.0
+    } else {
+        0.0
+    };
+    let inner = (visible_w - grip * 2.0 - h_pad - cue).max(0.0);
     inner >= bar_title_px(&bar.title)
 }
 
@@ -2411,7 +2437,9 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
 }
 
 /// Body, and optionally an external title, so a vertical drop misses the row.
-fn bar_occupied_x(bar: &BarLayout, include_label: bool) -> (f32, f32) {
+/// Open-ended start-only bars paint a dashed cue to the clip, so routing
+/// must treat that tail as occupied or the elbow runs through it.
+fn bar_occupied_x(bar: &BarLayout, include_label: bool, cue_right: Option<f32>) -> (f32, f32) {
     if bar_is_gutter(bar) {
         return (bar.x - 2.0, bar.x + bar.width + 4.0);
     }
@@ -2420,13 +2448,20 @@ fn bar_occupied_x(bar: &BarLayout, include_label: bool) -> (f32, f32) {
     } else {
         bar.x - HANDLE_WIDTH
     };
-    let right = if include_label {
+    let mut right = if include_label {
         bar_label_right(bar)
     } else if bar.milestone || bar.marker {
         bar.x + MILESTONE_SIZE + 4.0
     } else {
         bar.x + bar.width.max(8.0) + 4.0
     };
+    if let Some(clip) = cue_right
+        && bar.open_ended
+        && !bar.milestone
+        && !bar.marker
+    {
+        right = right.max(clip);
+    }
     (left, right)
 }
 
@@ -2443,10 +2478,11 @@ fn clear_vertical_x(
     inbound_left: bool,
     x_head: f32,
     include_labels: bool,
+    cue_right: Option<f32>,
 ) -> f32 {
     let blocked: Vec<(f32, f32)> = intervening
         .iter()
-        .map(|bar| bar_occupied_x(bar, include_labels))
+        .map(|bar| bar_occupied_x(bar, include_labels, cue_right))
         .collect();
     if blocked
         .iter()
@@ -2470,19 +2506,34 @@ fn clear_vertical_x(
         let gap_right = succ_edge - 4.0;
         if gap_right - gap_left >= 4.0 {
             let cand = pref.clamp(gap_left, gap_right);
-            if on_side(cand) {
+            if on_side(cand)
+                && blocked
+                    .iter()
+                    .all(|(left, right)| !x_hits_span(cand, *left, *right))
+            {
                 return cand;
             }
         }
-        let intervening_left = blocked
-            .iter()
-            .map(|(left, _)| *left)
-            .fold(f32::INFINITY, f32::min);
-        let around = intervening_left - 8.0;
-        if on_side(around) {
-            return around;
+        // Slide left past each occupied span. Do not merge disjoint bars
+        // (a gutter pill plus an open-ended cue) into one blob that
+        // dumps the vertical at the chart edge.
+        let mut x = pref;
+        for _ in 0..=blocked.len() {
+            let hit_left = blocked
+                .iter()
+                .filter(|(left, right)| x_hits_span(x, *left, *right))
+                .map(|(left, _)| *left)
+                .fold(f32::INFINITY, f32::min);
+            if hit_left == f32::INFINITY {
+                return x;
+            }
+            let cand = hit_left - 8.0;
+            if cand >= x || !on_side(cand) {
+                return pref.min(x_head - 4.0);
+            }
+            x = cand;
         }
-        return pref.min(x_head - 4.0);
+        return x;
     }
     let intervening_left = blocked
         .iter()
@@ -2516,27 +2567,44 @@ fn clear_wrap_drop_x(
     intervening: &[&BarLayout],
     include_labels: bool,
     x_head: f32,
+    clip_right: f32,
 ) -> f32 {
     let blocked: Vec<(f32, f32)> = intervening
         .iter()
-        .map(|bar| bar_occupied_x(bar, include_labels))
+        .map(|bar| bar_occupied_x(bar, include_labels, None))
         .collect();
     let min_x = x_head + DependencyArrow::WRAP_STUB + 1.0;
     let mut x = pref;
     for _ in 0..=blocked.len() {
-        let hit_right = blocked
+        let hits: Vec<&(f32, f32)> = blocked
             .iter()
             .filter(|(left, right)| x_hits_span(x, *left, *right))
-            .map(|(_, right)| *right)
-            .fold(f32::NEG_INFINITY, f32::max);
-        if hit_right == f32::NEG_INFINITY {
+            .collect();
+        if hits.is_empty() {
             return x;
         }
-        let cand = hit_right + 6.0;
-        if cand <= x || cand <= x_head + DependencyArrow::WRAP_STUB {
-            return pref.max(min_x);
+        let hit_right = hits
+            .iter()
+            .map(|(_, right)| *right)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let hit_left = hits
+            .iter()
+            .map(|(left, _)| *left)
+            .fold(f32::INFINITY, f32::min);
+        let cand_right = hit_right + 6.0;
+        if cand_right > x
+            && cand_right > x_head + DependencyArrow::WRAP_STUB
+            && cand_right <= clip_right
+        {
+            x = cand_right;
+            continue;
         }
-        x = cand;
+        let cand_left = hit_left - 8.0;
+        if cand_left >= min_x && cand_left < x {
+            x = cand_left;
+            continue;
+        }
+        return pref.max(min_x);
     }
     x
 }
@@ -2549,6 +2617,7 @@ fn clamp_inbound_stub(
     inbound_left: bool,
     intervening: &[&BarLayout],
     include_labels: bool,
+    cue_right: Option<f32>,
 ) -> f32 {
     const STUB: f32 = 12.0;
     let clamped = if inbound_left {
@@ -2560,7 +2629,7 @@ fn clamp_inbound_stub(
         return clamped;
     }
     if intervening.iter().any(|bar| {
-        let (left, right) = bar_occupied_x(bar, include_labels);
+        let (left, right) = bar_occupied_x(bar, include_labels, cue_right);
         x_hits_span(clamped, left, right)
     }) {
         x_in
@@ -5342,8 +5411,8 @@ mod tests {
         assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
         let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
         let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
-        let (child_left, child_right) = bar_occupied_x(child, false);
-        let (live_left, live_right) = bar_occupied_x(go_live, false);
+        let (child_left, child_right) = bar_occupied_x(child, false, None);
+        let (live_left, live_right) = bar_occupied_x(go_live, false, None);
         assert!(
             !x_hits_span(arrow.x2, child_left, child_right),
             "vertical x2={} must miss #1005 occupied {child_left}..{child_right}",
@@ -5386,7 +5455,7 @@ mod tests {
             .expect("#1003→#1012");
         let mid = bars.iter().find(|bar| bar.id == 1005).unwrap();
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
-        let (left, right) = bar_occupied_x(mid, false);
+        let (left, right) = bar_occupied_x(mid, false, None);
         assert!(
             !x_hits_span(arrow.x2, left, right),
             "vertical x2={} must miss #1005 occupied {left}..{right}, pred_end={}",
@@ -5503,8 +5572,8 @@ mod tests {
         ]);
         assert_eq!(arrows.len(), 1);
         let stub = pred.x + pred.width + 12.0;
-        let (left1, right1) = bar_occupied_x(&mid1, false);
-        let (left2, right2) = bar_occupied_x(&mid2, false);
+        let (left1, right1) = bar_occupied_x(&mid1, false, None);
+        let (left2, right2) = bar_occupied_x(&mid2, false, None);
         assert!(
             x_hits_span(stub, left1, right1),
             "precondition: source stub {stub} must sit on mid1 {left1}..{right1}"
@@ -5595,7 +5664,7 @@ mod tests {
         };
         let arrows = gantt.layout_dependency_arrows(&[pred, pill.clone(), succ.clone()]);
         assert_eq!(arrows.len(), 1);
-        let (left, right) = bar_occupied_x(&pill, false);
+        let (left, right) = bar_occupied_x(&pill, false, None);
         assert!(
             !x_hits_span(arrows[0].x1, left, right) && !x_hits_span(arrows[0].x2, left, right),
             "connector x1={} x2={} must miss the No dates pill {left}..{right}",
@@ -5745,6 +5814,66 @@ mod tests {
             !arrow.inbound_right,
             "forward milestone links must enter the start, not the right tip"
         );
+        let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let (cart_left, cart_right) = bar_occupied_x(cart, true, Some(gantt.timeline_width));
+        assert!(
+            !x_hits_span(arrow.x2, cart_left, cart_right),
+            "the inbound vertical must skip Cart UI including its open-ended cue, x2={} cart={cart_left}..{cart_right}",
+            arrow.x2
+        );
+        assert!(
+            arrow.lane_y < cart.y || arrow.lane_y >= cart.y + ROW_HEIGHT,
+            "the horizontal lane must stay in a row gap, not through Cart UI, lane {} cart {}",
+            arrow.lane_y,
+            cart.y
+        );
+    }
+
+    #[test]
+    fn day_view_link_to_go_live_skips_the_cart_ui_cue() {
+        let mut pred = node(1003, Some(1002));
+        pred.title = "Persist cart".into();
+        pred.start_date = Some("2026-07-06T00:00:00Z".into());
+        pred.target_date = Some("2026-07-20T00:00:00Z".into());
+        let mut child = node(1005, Some(1003));
+        child.title = "Cart UI".into();
+        child.start_date = Some("2026-07-21T00:00:00Z".into());
+        child.target_date = None;
+        let mut go_live = node(1013, Some(1001));
+        go_live.title = "Go-live milestone".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        go_live.predecessors = vec![1003];
+        let nodes = vec![
+            node(1001, None),
+            node(1002, Some(1001)),
+            pred,
+            child,
+            go_live,
+        ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Day,
+            timeline_width: 2400.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("#1003→#1013");
+        let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let (cart_left, cart_right) = bar_occupied_x(cart, true, Some(gantt.timeline_width));
+        assert!(
+            !x_hits_span(arrow.x2, cart_left, cart_right),
+            "Day-view elbow must not drop through Cart UI, x2={} cart={cart_left}..{cart_right}",
+            arrow.x2
+        );
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
     }
 
     #[test]
@@ -5883,8 +6012,8 @@ mod tests {
         assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
         let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
         let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
-        let (child_left, child_right) = bar_occupied_x(child, false);
-        let (live_left, live_right) = bar_occupied_x(go_live, false);
+        let (child_left, child_right) = bar_occupied_x(child, false, None);
+        let (live_left, live_right) = bar_occupied_x(go_live, false, None);
         assert!(
             !x_hits_span(arrow.x2, child_left, child_right),
             "vertical x2={} must miss #1005 occupied {child_left}..{child_right}",
@@ -5954,7 +6083,7 @@ mod tests {
         };
         let arrows = gantt.layout_dependency_arrows(&[pred, mid.clone(), succ.clone()]);
         assert_eq!(arrows.len(), 1);
-        let (left, right) = bar_occupied_x(&mid, true);
+        let (left, right) = bar_occupied_x(&mid, true, None);
         assert!(
             arrows[0].x2 < left - 1.0 || arrows[0].x2 > right + 1.0,
             "forcing a 12px stub must not recross the intervening bar, x2={} mid={left}..{right} x_head={}",
@@ -6313,6 +6442,22 @@ mod tests {
             tip.contains("Unassigned"),
             "missing assignee must say Unassigned, got {tip:?}"
         );
+    }
+
+    #[test]
+    fn clear_hover_drops_a_pinned_bar_tooltip() {
+        let mut gantt = GanttView {
+            pin_bar_tooltip: Some(2),
+            pin_ignore_leave: true,
+            hovered_id: Some(2),
+            bar_hovered_id: Some(2),
+            ..Default::default()
+        };
+        gantt.clear_hover();
+        assert_eq!(gantt.pin_bar_tooltip, None);
+        assert!(!gantt.pin_ignore_leave);
+        assert_eq!(gantt.hovered_id, None);
+        assert_eq!(gantt.bar_hovered_id, None);
     }
 
     #[test]

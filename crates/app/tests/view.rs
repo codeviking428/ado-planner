@@ -3754,13 +3754,18 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
     draw(cx);
     let badge = cx
         .debug_bounds("gantt-parent-overflow")
-        .expect("the overflow ! must still paint on the bar");
+        .expect("the overflow ! must still paint");
     let bar = cx.debug_bounds("gantt-bar-2").expect("overflow bar");
     let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
-    let badge_right = f32::from(badge.origin.x) + f32::from(badge.size.width);
+    let badge_left = f32::from(badge.origin.x);
     assert!(
-        badge_right <= bar_right - HANDLE_WIDTH + 1.0,
-        "the ! must sit left of the {HANDLE_WIDTH}px end grip, badge_right={badge_right} bar_right={bar_right}"
+        badge_left >= bar_right - 0.5,
+        "the ! must sit past the bar end so the grip stays hittable, badge_left={badge_left} bar_right={bar_right}"
+    );
+    assert!(
+        f32::from(badge.size.width) >= 14.0 && f32::from(badge.size.height) >= 14.0,
+        "the bar ! must be a readable 14px badge, got {:?}",
+        badge.size
     );
     assert!(
         bar_right < 1280.0,
@@ -5182,33 +5187,89 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
             "mouse-up must end the resize gesture"
         );
         assert_eq!(
-            view.state.gantt.pin_bar_tooltip,
-            Some(2),
-            "drop must pin the bar tooltip"
+            view.state.gantt.pin_bar_tooltip, None,
+            "mouse-up must clear the bar tooltip instead of pinning it"
         );
     });
     assert!(
         cx.debug_bounds("gantt-drag-preview").is_none(),
         "the preview chip must clear when the resize ends, without waiting for another mouse-move"
     );
-    let tip = cx.debug_bounds("gantt-bar-tooltip");
     assert!(
-        tip.is_some(),
-        "the bar tooltip must appear after a drop without waiting for another mouse-move, bounds={tip:?}"
-    );
-    let bar_after = cx.debug_bounds("gantt-bar-2").expect("resized bar");
-    let tip = cx
-        .debug_bounds("gantt-bar-tooltip")
-        .expect("pinned tooltip");
-    assert!(
-        f32::from(tip.origin.y) + f32::from(tip.size.height) <= f32::from(bar_after.origin.y) + 2.0,
-        "the pinned tooltip must sit above the bar, not over the right label, tip={tip:?} bar={bar_after:?}"
+        cx.debug_bounds("gantt-bar-tooltip").is_none(),
+        "mouse-up must not leave a pinned tooltip on the bar"
     );
     cx.simulate_mouse_move(point(px(8.), px(8.)), None, Modifiers::default());
     draw(cx);
     assert!(
         cx.debug_bounds("gantt-bar-tooltip").is_none(),
-        "leaving the bar must clear the pinned tooltip"
+        "leaving the bar must keep the tooltip cleared"
+    );
+}
+
+#[gpui_kit::test]
+fn drop_undo_and_pointer_leave_clear_the_bar_tooltip(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let grip = point(
+        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(grip.x + px(ppd * 3.0), grip.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    cx.simulate_mouse_up(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "mouse-up after a drop must clear the tooltip"
+        );
+        view.state.gantt.pin_bar_tooltip = Some(2);
+        view.state.gantt.pin_ignore_leave = true;
+    });
+    let undo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&undo, cx);
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "undo must clear a stale bar tooltip"
+        );
+        view.state.gantt.pin_bar_tooltip = Some(2);
+        view.state.gantt.pin_ignore_leave = true;
+    });
+    draw(cx);
+    cx.simulate_mouse_move(point(px(8.), px(8.)), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "pointer leave must clear a stale bar tooltip"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-bar-tooltip").is_none(),
+        "a stale tooltip must not stay painted over empty space"
     );
 }
 
