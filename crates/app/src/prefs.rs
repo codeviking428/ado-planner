@@ -10,6 +10,12 @@ pub struct AppPrefs {
     pub planner: PlannerPrefs,
     #[serde(default = "default_flavor")]
     pub flavor: Flavor,
+    #[serde(default = "default_tree_width")]
+    pub tree_width: i32,
+}
+
+fn default_tree_width() -> i32 {
+    crate::gantt::DEFAULT_TREE_WIDTH as i32
 }
 
 impl Default for AppPrefs {
@@ -26,6 +32,7 @@ impl Default for AppPrefs {
                 root_types: None,
             },
             flavor: default_flavor(),
+            tree_width: default_tree_width(),
         }
     }
 }
@@ -42,6 +49,7 @@ impl AppPrefs {
             return Self {
                 planner,
                 flavor: default_flavor(),
+                tree_width: default_tree_width(),
             };
         }
         Self::default()
@@ -85,5 +93,20 @@ mod tests {
         assert!(raw.contains("\"rootTypes\": null") || raw.contains("\"rootTypes\":null"));
         let loaded = AppPrefs::load(&path);
         assert_eq!(loaded.planner.root_types, Some(None));
+    }
+
+    #[test]
+    fn tree_width_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        let prefs = AppPrefs {
+            tree_width: 820,
+            ..AppPrefs::default()
+        };
+        prefs.save(&path);
+        let loaded = AppPrefs::load(&path);
+        assert_eq!(loaded.tree_width, 820);
+        let missing = AppPrefs::load(&dir.path().join("missing.json"));
+        assert_eq!(missing.tree_width, default_tree_width());
     }
 }

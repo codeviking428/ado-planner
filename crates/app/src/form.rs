@@ -62,7 +62,7 @@ impl FormDraft {
     }
 
     pub fn title(&self) -> String {
-        format!("#{} {}", self.model.id, self.model.work_item_type)
+        format!("#{}", self.model.id)
     }
 
     pub fn item_title(&self) -> String {

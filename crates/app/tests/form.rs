@@ -23,6 +23,30 @@ async fn signed_in() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
 }
 
 #[tokio::test]
+async fn opening_and_cancelling_the_form_does_not_write() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let patches = mock.patch_count();
+    let writes = mock.mutating_writes();
+    state.open_form(1003).await.expect("open");
+    assert!(state.form.is_some(), "details must load");
+    assert_eq!(
+        mock.patch_count(),
+        patches,
+        "opening details must not PATCH"
+    );
+    assert_eq!(
+        mock.mutating_writes(),
+        writes,
+        "opening details must not POST/PATCH/DELETE a work item, got {:?}",
+        mock.mutating_writes()
+    );
+    state.close_form();
+    assert!(state.form.is_none());
+    assert_eq!(mock.patch_count(), patches);
+    assert_eq!(mock.mutating_writes(), writes);
+}
+
+#[tokio::test]
 async fn open_and_save_work_item_form() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.open_form(1003).await.expect("open");
@@ -334,5 +358,9 @@ fn gpui_form_title_renders(cx: &mut gpui_kit::TestAppContext) {
     };
     let draft = FormDraft::from_model(model);
     assert!(draft.title().contains("#1003"));
-    assert!(draft.title().contains("User Story"));
+    assert!(
+        !draft.title().contains("User Story"),
+        "the header id must not repeat the type already shown on the badge, got {}",
+        draft.title()
+    );
 }

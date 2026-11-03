@@ -27,6 +27,7 @@ struct AppState {
     fixtures: Fixtures,
     patches: StdMutex<Vec<String>>,
     last_patch_content_type: StdMutex<Option<String>>,
+    writes: StdMutex<Vec<(String, String)>>,
 }
 
 pub struct AdoMock {
@@ -54,6 +55,22 @@ impl AdoMock {
 
     pub fn patch_count(&self) -> usize {
         self.state.patches.lock().expect("patches").len()
+    }
+
+    /// PATCH anywhere, or POST that creates a work item. WIQL/batch POSTs are reads.
+    pub fn mutating_writes(&self) -> Vec<(String, String)> {
+        self.state
+            .writes
+            .lock()
+            .expect("writes")
+            .iter()
+            .filter(|(method, path)| {
+                method == "PATCH"
+                    || (method == "POST" && path.contains("/workitems/$"))
+                    || method == "DELETE"
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn last_patch_content_type(&self) -> Option<String> {
@@ -96,6 +113,7 @@ pub async fn start() -> AdoMock {
         fixtures,
         patches: StdMutex::new(Vec::new()),
         last_patch_content_type: StdMutex::new(None),
+        writes: StdMutex::new(Vec::new()),
     });
     let app = Router::new()
         .fallback(any(handle))
@@ -153,6 +171,16 @@ async fn route(
     path: &str,
     req: Request<Body>,
 ) -> Result<Response, String> {
+    if *method == Method::PATCH
+        || *method == Method::DELETE
+        || (*method == Method::POST && path.contains("/workitems/$"))
+    {
+        state
+            .writes
+            .lock()
+            .expect("writes")
+            .push((method.to_string(), path.to_string()));
+    }
     let fixtures = &state.fixtures;
     if path.ends_with("/_apis/connectionData") {
         return Ok(json_response(

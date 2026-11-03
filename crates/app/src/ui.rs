@@ -845,12 +845,31 @@ impl PlannerView {
         F: FnOnce(PlannerState) -> Fut + Send + 'static,
         Fut: Future<Output = (PlannerState, Result<(), AppError>)> + Send + 'static,
     {
+        self.spawn_io(cx, true, work)
+    }
+
+    /// Fetch-only I/O (open details). Must not flip the pill to Saving….
+    fn spawn_load<F, Fut>(&mut self, cx: &mut Context<Self>, work: F) -> bool
+    where
+        F: FnOnce(PlannerState) -> Fut + Send + 'static,
+        Fut: Future<Output = (PlannerState, Result<(), AppError>)> + Send + 'static,
+    {
+        self.spawn_io(cx, false, work)
+    }
+
+    fn spawn_io<F, Fut>(&mut self, cx: &mut Context<Self>, saving: bool, work: F) -> bool
+    where
+        F: FnOnce(PlannerState) -> Fut + Send + 'static,
+        Fut: Future<Output = (PlannerState, Result<(), AppError>)> + Send + 'static,
+    {
         if self.io_busy {
             return false;
         }
         self.io_busy = true;
         self.state.gantt.context_menu = None;
-        self.arm_saving_status(cx);
+        if saving {
+            self.arm_saving_status(cx);
+        }
         let runtime = self.state.runtime.clone();
         let mut working = self.state.clone();
         working.gantt.context_menu = None;
@@ -859,7 +878,9 @@ impl PlannerView {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
                 this.io_busy = false;
-                this.arm_saving_status(cx);
+                if saving {
+                    this.arm_saving_status(cx);
+                }
                 match outcome {
                     Ok((working, result)) => {
                         let shown_at = this.loading_shown_at;
@@ -2689,6 +2710,7 @@ impl PlannerView {
                                     if event.click_count >= 2 {
                                         this.state.gantt.reset_tree_width();
                                         this.state.gantt.splitter_drag = None;
+                                        this.state.persist_tree_width();
                                     } else {
                                         let x: f32 = event.position.x.into();
                                         this.state.gantt.viewport_w =
@@ -3102,7 +3124,7 @@ impl PlannerView {
     }
 
     fn sync_status_text(&self) -> String {
-        if self.state.hierarchy_loading {
+        if self.state.hierarchy_loading || self.form_loading.is_some() {
             "Loading…".into()
         } else if self.io_saving() || self.saving_shown_at.is_some() {
             "Saving…".into()
@@ -3535,7 +3557,7 @@ impl PlannerView {
             .id(("title", id as u64))
             .debug_selector(move || format!("gantt-title-{id}"))
             .flex_1()
-            .min_w(px(120.))
+            .min_w(px(180.))
             .overflow_hidden()
             .child(
                 Button::new(("title-tip", id as u64))
@@ -4459,6 +4481,7 @@ impl PlannerView {
         let id = bar.id;
         let summary = bar.summary;
         let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
+        let no_fields = bar.kind == ado_core::GanttBarKind::NoFields;
         let milestone = bar.milestone;
         let marker = bar.marker;
         let open_ended = bar.open_ended;
@@ -4471,7 +4494,7 @@ impl PlannerView {
             MILESTONE_SIZE
         } else if summary {
             SUMMARY_BAR_H
-        } else if unscheduled {
+        } else if unscheduled || no_fields {
             PLACEHOLDER_BAR_H
         } else {
             LEAF_BAR_H
@@ -4491,7 +4514,7 @@ impl PlannerView {
         let layout_x = bar.x;
         let grip_w = bar.inner_grip_width();
         // on_prepaint reports the content box; hits use the visible border box.
-        let paint_border = if milestone || marker || unscheduled || open_ended {
+        let paint_border = if milestone || marker || unscheduled || no_fields || open_ended {
             0.0
         } else if selected {
             2.0
@@ -4561,7 +4584,7 @@ impl PlannerView {
                     el.bg(rgb(bar.color).opacity(0.55)).rounded_sm()
                 })
                 .when(
-                    !summary && !milestone && !marker && !unscheduled && !open_ended,
+                    !summary && !milestone && !marker && !unscheduled && !no_fields && !open_ended,
                     |el| {
                         el.bg(rgb(bar.color))
                             .when(hovered && !dragging, |el| el.opacity(0.92))
@@ -4605,6 +4628,21 @@ impl PlannerView {
                     el.bg(cx.theme().muted.opacity(0.28))
                         .border_2()
                         .border_color(cx.theme().muted_foreground)
+                })
+                .when(no_fields, |el| {
+                    el.bg(cx.theme().muted.opacity(0.16))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(muted_fg.opacity(0.55))
+                        .items_center()
+                        .px_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .truncate()
+                                .text_color(muted_fg)
+                                .child("No dates"),
+                        )
                 })
                 .text_color(if inside {
                     inner_label_fg
@@ -4687,6 +4725,14 @@ impl PlannerView {
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.set_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
+                .when((marker || no_fields) && !self.details_overlay(), |el| {
+                    let tip = if no_fields {
+                        format!("{} · No Start/Target on type", bar.title)
+                    } else {
+                        format!("{} · Unscheduled — drag to set dates", bar.title)
+                    };
+                    el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                })
                 .on_mouse_move(
                     cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
                         this.set_hovered(Some(id), cx);
@@ -4719,12 +4765,18 @@ impl PlannerView {
                             this.open_form(id, cx);
                             return;
                         }
+                        if no_fields {
+                            cx.notify();
+                            return;
+                        }
                         if unscheduled {
                             this.clear_toast_pointer_for_new_press();
                             this.dismiss_overlays();
                             let _ = this.classify_bar_hit(id, &layout, x);
-                            let local_x = this.pointer_layout_x(x, Some(id));
-                            let _ = this.state.begin_bar_gesture(id, GestureKind::Move, local_x);
+                            // Gutter pills are not on the date axis; start the
+                            // live bar at Today so a drag follows the pointer.
+                            let today_x = this.state.gantt.x_for_date(jiff::Zoned::now().date());
+                            let _ = this.state.begin_bar_gesture(id, GestureKind::Move, today_x);
                             cx.notify();
                             return;
                         }
@@ -4954,7 +5006,7 @@ impl PlannerView {
     ) -> Option<AnyElement> {
         let id = bar.id;
         let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
-        if unscheduled || bar.marker || dragging {
+        if unscheduled || bar.kind == ado_core::GanttBarKind::NoFields || bar.marker || dragging {
             return None;
         }
         let hovered = self.state.gantt.hovered_id == Some(id);
@@ -5093,9 +5145,14 @@ impl PlannerView {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let id = bar.id;
-        let show_link_handles = bar.kind != ado_core::GanttBarKind::Unscheduled && !bar.marker;
+        if bar.kind == ado_core::GanttBarKind::Unscheduled
+            || bar.kind == ado_core::GanttBarKind::NoFields
+            || bar.marker
+        {
+            return None;
+        }
         let timeline_w = self.state.gantt.timeline_width.max(1.0);
-        let (label_x, max_w) = Self::bar_external_label_frame(bar, timeline_w, show_link_handles)?;
+        let (label_x, max_w) = Self::bar_external_label_frame(bar, timeline_w, true)?;
         let label = bar.title.clone();
         Some(
             div()
@@ -6378,7 +6435,7 @@ impl PlannerView {
             .map(|node| node.title.clone())
             .unwrap_or_default();
         self.form_loading = Some((id, title));
-        if !self.spawn_state(cx, move |mut state| async move {
+        if !self.spawn_load(cx, move |mut state| async move {
             let result = state.open_form(id).await;
             (state, result)
         }) {
@@ -7284,6 +7341,10 @@ impl PlannerView {
         self.form_loading = Some((id, title.into()));
     }
 
+    pub fn set_form_loading_for_test_clear(&mut self) {
+        self.form_loading = None;
+    }
+
     pub fn pending_delete_id(&self) -> Option<i64> {
         self.pending_delete.as_ref().map(|(id, _)| *id)
     }
@@ -7485,12 +7546,14 @@ impl PlannerView {
                     self.schedule_nudge_flush(cx);
                 } else if event.keystroke.modifiers.control {
                     self.state.gantt.nudge_tree_width(delta as f32 * 16.0);
+                    self.state.persist_tree_width();
                     cx.notify();
                 } else if self.state.gantt.selected_id.is_some() {
                     let _ = self.state.nudge(NudgeAxis::Both, delta);
                     self.schedule_nudge_flush(cx);
                 } else {
                     self.state.gantt.nudge_tree_width(delta as f32 * 16.0);
+                    self.state.persist_tree_width();
                     cx.notify();
                 }
             }
@@ -8027,11 +8090,8 @@ impl Render for PlannerView {
         window.set_window_title(&self.window_title());
         if let Some(form_id) = self.state.form.as_ref().map(|form| form.model.id) {
             if self.form_title_focused_for != Some(form_id) {
-                if let Some(title) = self.form_inputs.get("System.Title").cloned() {
-                    Self::focus_input(&title, window, cx);
-                } else {
-                    window.focus(&self.form_focus, cx);
-                }
+                // Focus the dialog, not Title — auto-focus made accidental edits too easy.
+                window.focus(&self.form_focus, cx);
                 self.form_title_focused_for = Some(form_id);
             }
         } else {
@@ -8068,6 +8128,7 @@ impl Render for PlannerView {
                     this.commit_gesture(window, cx);
                 }
                 if this.state.gantt.splitter_drag.take().is_some() {
+                    this.state.persist_tree_width();
                     cx.notify();
                 }
                 if let Some(id) = this.state.gantt.schedule_drag.take() {

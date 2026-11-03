@@ -105,6 +105,13 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
     );
     view.update(cx, |view, _| {
         assert_eq!(view.sync_status_for_test(), "Synced");
+        view.set_form_loading_for_test(1, "Persist cart");
+        assert_eq!(
+            view.sync_status_for_test(),
+            "Loading…",
+            "opening details is a fetch, not a write"
+        );
+        view.set_form_loading_for_test_clear();
         view.set_busy_for_test(true);
         assert_eq!(view.sync_status_for_test(), "Saving…");
         view.set_busy_for_test(false);
@@ -1918,12 +1925,12 @@ fn placeholder_drop_on_august_keeps_august_dates(cx: &mut gpui_kit::TestAppConte
             bars.iter()
                 .find(|bar| bar.id == 2)
                 .is_some_and(|bar| bar.marker),
-            "unscheduled items must be a Today diamond, not a sprint ghost"
+            "unscheduled items must be a gutter pill, not a sprint ghost"
         );
     });
     let bar = cx
         .debug_bounds("gantt-bar-2")
-        .expect("unscheduled marker should paint at Today");
+        .expect("unscheduled gutter pill");
     cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
@@ -6403,7 +6410,7 @@ fn realistic_backlog_keeps_markers_badges_and_indent(cx: &mut gpui_kit::TestAppC
         );
         assert!(
             unscheduled.iter().all(|bar| bar.marker),
-            "unscheduled items must be Today markers, not ghost bars"
+            "unscheduled items must be gutter pills, not ghost bars"
         );
         let task = rows.iter().find(|row| row.id == 4).expect("task");
         let test_case = rows.iter().find(|row| row.id == 5).expect("test case");
@@ -6702,6 +6709,45 @@ fn pre_sign_in_window_title_does_not_leak_the_last_org(cx: &mut gpui_kit::TestAp
             view.window_title()
         );
     });
+}
+
+#[gpui_kit::test]
+fn opening_details_shows_loading_not_saving(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, _| {
+        view.set_form_loading_for_test(1, "Persist cart");
+        assert_eq!(
+            view.sync_status_for_test(),
+            "Loading…",
+            "opening the info dialog is a GET, so the pill must say Loading… not Saving…"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn default_name_column_is_wider_than_a_dozen_glyphs(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let title = cx.debug_bounds("gantt-title-1").expect("title cell");
+    assert!(
+        f32::from(title.size.width) >= 180.0,
+        "the Work item name column must be wider than 10–15 characters, got {}",
+        f32::from(title.size.width)
+    );
+    assert!(
+        cx.debug_bounds("gantt-splitter").is_some(),
+        "the tree splitter must still paint so the width can be dragged"
+    );
 }
 
 #[gpui_kit::test]

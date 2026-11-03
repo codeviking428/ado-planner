@@ -140,7 +140,10 @@ impl PlannerState {
             hierarchy_loading: false,
             team_settings_error: None,
             scope_locked: false,
-            gantt: GanttView::default(),
+            gantt: GanttView {
+                tree_width: prefs.tree_width as f32,
+                ..GanttView::default()
+            },
             form: None,
             toasts: Toasts::default(),
             history: EditHistory::default(),
@@ -164,6 +167,11 @@ impl PlannerState {
 
     pub fn persist_prefs(&self) {
         self.prefs.save(&self.paths.prefs_file());
+    }
+
+    pub fn persist_tree_width(&mut self) {
+        self.prefs.tree_width = self.gantt.tree_width.round() as i32;
+        self.persist_prefs();
     }
 
     pub fn initials(&self) -> String {

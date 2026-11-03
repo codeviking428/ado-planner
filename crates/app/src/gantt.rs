@@ -9,7 +9,7 @@ use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
 
 pub const ROW_HEIGHT: f32 = 40.0;
-pub const DEFAULT_TREE_WIDTH: f32 = 640.0;
+pub const DEFAULT_TREE_WIDTH: f32 = 760.0;
 pub const MIN_TREE_WIDTH: f32 = 240.0;
 pub const MIN_TIMELINE_WIDTH: f32 = 240.0;
 pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
@@ -47,6 +47,9 @@ pub const SUMMARY_BAR_H: f32 = 14.0;
 pub const PLACEHOLDER_BAR_H: f32 = 24.0;
 pub const LEAF_BAR_H: f32 = 28.0;
 pub const DATES_COL_WIDTH: f32 = 140.0;
+/// Left gutter for unscheduled / no-field pills so they do not stack on Today.
+pub const UNSCHEDULED_GUTTER_X: f32 = 10.0;
+pub const NO_FIELDS_HINT_W: f32 = 88.0;
 pub const DETAILS_PILL_WIDTH: f32 = 36.0;
 pub const ID_COL_WIDTH: f32 = 64.0;
 pub const TYPE_COL_WIDTH: f32 = 88.0;
@@ -329,7 +332,7 @@ pub struct BarLayout {
     pub color: u32,
     pub progress: Option<f32>,
     pub predecessors: Vec<i64>,
-    /// Diamond at Today for unscheduled items with no iteration/rollup span.
+    /// Gutter pill for unscheduled items (not a date on the axis).
     pub marker: bool,
     /// Start-only used to paint as a ▸ marker; kept for hit-test compat.
     pub open_ended: bool,
@@ -341,7 +344,7 @@ impl BarLayout {
             MILESTONE_SIZE
         } else if self.summary {
             SUMMARY_BAR_H
-        } else if self.kind == GanttBarKind::Unscheduled {
+        } else if self.kind == GanttBarKind::Unscheduled || self.kind == GanttBarKind::NoFields {
             PLACEHOLDER_BAR_H
         } else {
             LEAF_BAR_H
@@ -355,6 +358,7 @@ impl BarLayout {
     pub fn can_resize(&self) -> bool {
         !self.summary
             && self.kind != GanttBarKind::Unscheduled
+            && self.kind != GanttBarKind::NoFields
             && !self.milestone
             && !self.marker
             && !self.open_ended
@@ -1137,12 +1141,26 @@ impl GanttView {
                 let mut marker = false;
                 let (start, target) = if let Some(gesture) = live {
                     (gesture.live_start, gesture.live_target)
+                } else if display.kind == GanttBarKind::NoFields {
+                    return Some(BarLayout {
+                        id: node.id,
+                        kind: display.kind,
+                        x: UNSCHEDULED_GUTTER_X,
+                        width: NO_FIELDS_HINT_W,
+                        y: self.row_y(offset),
+                        summary: row.has_children,
+                        milestone: false,
+                        label: dates_column_text(node, nodes, hint.as_ref()),
+                        title: node.title.clone(),
+                        color: parse_type_color(ado_core::color_for_type(&node.work_item_type)),
+                        progress: None,
+                        predecessors: node.predecessors.clone(),
+                        marker: false,
+                        open_ended: false,
+                    });
                 } else if display.kind == GanttBarKind::Unscheduled {
-                    // Year/Quarter diamonds read as stray circles on the row.
-                    if matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
-                        return None;
-                    }
-                    // One treatment: a diamond at Today, never a fake iteration/rollup bar.
+                    // Gutter pill, not a fake iteration/rollup bar and not a
+                    // stack of diamonds on the Today line.
                     marker = true;
                     let today = jiff::Zoned::now().date();
                     (today, today)
@@ -1154,7 +1172,10 @@ impl GanttView {
                 let mut x = self.x_for_date(start);
                 let end = ado_core::to_gantt_inclusive_target(target);
                 let mut width = (self.x_for_date(end) - x).max(YEAR_MIN_BAR_WIDTH);
-                if display.milestone || marker {
+                if marker {
+                    width = MILESTONE_SIZE;
+                    x = UNSCHEDULED_GUTTER_X;
+                } else if display.milestone {
                     width = MILESTONE_SIZE;
                     x -= MILESTONE_SIZE / 2.0;
                 } else if display.kind == GanttBarKind::Unscheduled {
@@ -1961,7 +1982,12 @@ fn bar_title_px(title: &str) -> f32 {
 /// floats outside instead of truncating. Clipped-left bars keep the title in
 /// the on-screen fragment so it does not jump to the grid.
 pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
-    if bar.kind == GanttBarKind::Unscheduled || bar.milestone || bar.marker || bar.open_ended {
+    if bar.kind == GanttBarKind::Unscheduled
+        || bar.kind == GanttBarKind::NoFields
+        || bar.milestone
+        || bar.marker
+        || bar.open_ended
+    {
         return false;
     }
     let clip_pad = (-bar.x).max(0.0);
@@ -2990,7 +3016,7 @@ mod tests {
         assert_eq!(bars[0].kind, GanttBarKind::Unscheduled);
         assert!(
             bars[0].marker,
-            "unscheduled items are a Today diamond, not an iteration ghost bar"
+            "unscheduled items are a gutter pill, not an iteration ghost bar"
         );
         assert!((bars[0].width - MILESTONE_SIZE).abs() < 0.1);
     }
@@ -3223,6 +3249,11 @@ mod tests {
         assert_eq!(bars[0].kind, GanttBarKind::Unscheduled);
         assert!(bars[0].marker, "no iteration span must not look scheduled");
         assert!((bars[0].width - MILESTONE_SIZE).abs() < 0.1);
+        assert!(
+            (bars[0].x - UNSCHEDULED_GUTTER_X).abs() < 0.1,
+            "unscheduled pills must sit in the gutter, not on Today, x={}",
+            bars[0].x
+        );
     }
 
     #[test]
@@ -5015,7 +5046,7 @@ mod tests {
     }
 
     #[test]
-    fn year_view_omits_unscheduled_today_diamonds() {
+    fn year_view_unscheduled_is_a_gutter_pill() {
         let mut item = node(1, None);
         item.start_date = None;
         item.target_date = None;
@@ -5028,9 +5059,34 @@ mod tests {
         };
         let rows = gantt.flatten(std::slice::from_ref(&item));
         let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 1).expect("gutter pill");
+        assert!(bar.marker);
         assert!(
-            bars.iter().all(|bar| bar.id != 1),
-            "Year view must not paint a stray circle on an unscheduled row, got {bars:?}"
+            (bar.x - UNSCHEDULED_GUTTER_X).abs() < 0.1,
+            "Year view must keep the unscheduled pill in the gutter, not on Today, x={}",
+            bar.x
+        );
+    }
+
+    #[test]
+    fn no_date_fields_paints_a_gutter_hint() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        item.has_date_fields = false;
+        item.work_item_type = "Product Backlog Item".into();
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].kind, GanttBarKind::NoFields);
+        assert!(
+            (bars[0].x - UNSCHEDULED_GUTTER_X).abs() < 0.1,
+            "PBI rows without date fields must still show a gutter hint, x={}",
+            bars[0].x
         );
     }
 
