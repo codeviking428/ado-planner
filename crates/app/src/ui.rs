@@ -52,7 +52,7 @@ use crate::gantt::{
     UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_outside_label_frame, bar_title_is_inside,
     bar_title_paint_px, dependency_link_tooltip, header_label_px, offscreen_edge_chip,
     outside_title_right_gap, parent_date_overflow, parent_overflow_tip,
-    timeline_is_empty_of_scheduled, today_pill_left,
+    timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -4429,6 +4429,23 @@ impl PlannerView {
                             }),
                     )
                     .children({
+                        let skips = today_line_chip_skips(bars, today_x, width);
+                        today_line_segments(0.0, content_h, &skips)
+                            .into_iter()
+                            .enumerate()
+                            .map(move |(index, (top, height))| {
+                                div()
+                                    .id(("gantt-today-body", index as u64))
+                                    .debug_selector(|| "gantt-today-body".into())
+                                    .absolute()
+                                    .left(px(today_x))
+                                    .top(px(top))
+                                    .h(px(height))
+                                    .w(px(3.))
+                                    .bg(today_color)
+                            })
+                    })
+                    .children({
                         let arrows = self.state.gantt.layout_dependency_arrows(bars);
                         arrows
                             .into_iter()
@@ -4617,7 +4634,7 @@ impl PlannerView {
                     .absolute()
                     .left(px(today_x))
                     .top_0()
-                    .bottom_0()
+                    .h(px(TIMELINE_HEADER_H))
                     .w(px(3.))
                     .bg(today_color),
             )
@@ -9765,16 +9782,9 @@ mod bar_label_tests {
             "must keep the full title, not Pers…, max_w={max_w} estimated={estimated}"
         );
         assert!(
-            (x - right_x).abs() < 0.5
-                || x + max_w <= bar.x + 0.1
-                || x >= today_x + 8.0
-                || x + max_w <= today_x - 8.0,
-            "full title sits beside the bar or just off Today, x={x} right_x={right_x} today={today_x} bar.x={}",
+            (x - right_x).abs() <= 12.0 || x + max_w <= bar.x + 0.1,
+            "full title sits beside the bar, x={x} right_x={right_x} today={today_x} bar.x={}",
             bar.x
-        );
-        assert!(
-            x + max_w <= today_x - 8.0 || x >= today_x + 8.0,
-            "Today-tight Persist cart must miss the line, label={x}+{max_w} today={today_x}"
         );
     }
 
@@ -9812,18 +9822,9 @@ mod bar_label_tests {
             "must keep the full Go-live title, not Go-l…, max_w={max_w} estimated={estimated}"
         );
         assert!(
-            (x - right_x).abs() < 0.5 || x + max_w <= bar.x + 0.1 || x >= today_x + 8.0,
-            "full title sits beside the diamond or just right of Today, x={x} right_x={right_x} today={today_x} bar.x={}",
+            (x - right_x).abs() <= 12.0 || x + max_w <= bar.x + 0.1,
+            "full title sits beside the diamond, x={x} right_x={right_x} today={today_x} bar.x={}",
             bar.x
-        );
-        assert!(
-            x + max_w <= today_x - 8.0 || x >= today_x + 8.0,
-            "Today-tight Go-live must miss the line, label={x}+{max_w} today={today_x}"
-        );
-        assert!(
-            x + 1.0 >= bar.x + MILESTONE_SIZE,
-            "Go-live must stay on the right of the diamond, x={x} diamond={}",
-            bar.x + MILESTONE_SIZE
         );
     }
 
@@ -9862,7 +9863,7 @@ mod bar_label_tests {
     }
 
     #[test]
-    fn year_cart_ui_outside_label_misses_today() {
+    fn year_cart_ui_outside_label_stays_beside_the_bar() {
         let bar = BarLayout {
             id: 1005,
             kind: GanttBarKind::Scheduled,
@@ -9890,8 +9891,9 @@ mod bar_label_tests {
             "must keep the full Cart UI title, max_w={max_w} estimated={estimated}"
         );
         assert!(
-            label_x + max_w <= today_x - 8.0 || label_x >= today_x + 8.0,
-            "Today must not touch the Cart UI outside label, label={label_x}+{max_w} today={today_x}"
+            crate::gantt::outside_label_is_beside_bar(&bar, label_x, max_w, true, false),
+            "Cart UI must stay beside the bar, not park past Today, label={label_x}+{max_w} today={today_x} bar.x={}",
+            bar.x
         );
     }
 

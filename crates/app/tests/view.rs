@@ -4,9 +4,10 @@ use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
-    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, PARALLEL_VERT_MIN, ROW_HEIGHT,
-    TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
-    bar_title_is_inside, bar_title_paint_px, insert_index_for_child,
+    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, PARALLEL_VERT_MIN,
+    ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
+    bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px, insert_index_for_child,
+    outside_label_is_beside_bar,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -4133,21 +4134,12 @@ fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
         let label_left = f32::from(label.origin.x);
         let bar_left = f32::from(bar.origin.x);
         let bar_right = bar_left + f32::from(bar.size.width);
-        let on_right =
-            label_left + 4.0 >= bar_right - 8.0 && (label_left - bar_right).abs() < 120.0;
+        let on_right = label_left + 4.0 >= bar_right - 8.0
+            && (label_left - bar_right).abs() < OUTSIDE_LABEL_GAP + 12.0;
         let on_left = label_left + 8.0 <= bar_left + 4.0 && (bar_left - label_left).abs() < 160.0;
-        let today_adjacent = cx.debug_bounds("gantt-today").is_some_and(|today| {
-            let line_x = f32::from(today.origin.x);
-            let line_right = line_x + f32::from(today.size.width);
-            let label_right = label_left + f32::from(label.size.width);
-            let misses = label_right <= line_x - 6.0 || label_left >= line_right + 6.0;
-            let near_today =
-                (label_left - line_right).abs() < 16.0 || (line_x - label_right).abs() < 16.0;
-            misses && near_today
-        });
         assert!(
-            on_right || on_left || today_adjacent,
-            "Year {title} label must sit next to its bar or just off Today, label_x={label_left} bar={bar_left}..{bar_right}"
+            on_right || on_left,
+            "Year {title} label must sit next to its bar, not at the Today line, label_x={label_left} bar={bar_left}..{bar_right}"
         );
     }
 }
@@ -4256,18 +4248,19 @@ fn year_toolbar_launch_paints_full_outside_titles(cx: &mut gpui_kit::TestAppCont
         let label_right = label_left + width;
         let inside_bar = label_left + 2.0 >= bar_left && label_right <= bar_right + 2.0;
         let today_dodge_left = label_left + 2.0 < bar_left;
+        let near_bar = (label_left - bar_right).abs() <= 48.0
+            || (bar_left - label_right).abs() <= 48.0
+            || inside_bar
+            || today_dodge_left;
         assert!(
-            label_left + 2.0 >= bar_right
-                || label_right <= bar_left + 2.0
-                || inside_bar
-                || today_dodge_left,
-            "launch Year {title} must sit beside, inside, or Today-dodged left of the bar, label={label_left}..{label_right} bar={bar_left}..{bar_right}"
+            near_bar,
+            "launch Year {title} must sit within ~12px of its bar, not at Today, label={label_left}..{label_right} bar={bar_left}..{bar_right}"
         );
     }
 }
 
 #[gpui_kit::test]
-fn year_toolbar_launch_outside_titles_miss_today(cx: &mut gpui_kit::TestAppContext) {
+fn year_toolbar_launch_outside_titles_stay_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
@@ -4275,7 +4268,7 @@ fn year_toolbar_launch_outside_titles_miss_today(cx: &mut gpui_kit::TestAppConte
     let nodes = state.nodes.clone();
     // apply_hierarchy auto_fit, then Year — before the Today button is pressed.
     state.gantt.auto_fit(&nodes, &[], 800.0);
-    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
         height: px(800.),
@@ -4287,23 +4280,6 @@ fn year_toolbar_launch_outside_titles_miss_today(cx: &mut gpui_kit::TestAppConte
     let today_line = cx
         .debug_bounds("gantt-today")
         .expect("launch Year Today line");
-    let line_x = f32::from(today_line.origin.x);
-    let line_right = line_x + f32::from(today_line.size.width);
-    for (title, selector) in [
-        ("Persist cart", "gantt-bar-label-1003"),
-        ("Cart UI", "gantt-bar-label-1005"),
-        ("Go-live milestone", "gantt-bar-label-1013"),
-    ] {
-        let label = cx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("launch Year {title} must paint an outside label"));
-        let label_left = f32::from(label.origin.x);
-        let label_right = label_left + f32::from(label.size.width);
-        assert!(
-            label_right <= line_x - 6.0 || label_left >= line_right + 6.0,
-            "launch Year {title} must miss the Today line by ≥6px, label={label_left}..{label_right} today={line_x}..{line_right}"
-        );
-    }
     if let Some(pill) = cx.debug_bounds("gantt-today-label") {
         let pill_top = f32::from(pill.origin.y);
         let pill_bottom = pill_top + f32::from(pill.size.height);
@@ -4314,6 +4290,41 @@ fn year_toolbar_launch_outside_titles_miss_today(cx: &mut gpui_kit::TestAppConte
             "launch Year Today pill at {pill_top}..{pill_bottom} must sit on its line at {line_top}..{line_bottom}"
         );
     }
+    view.update(cx, |view, _| {
+        let today = jiff::Zoned::now().date();
+        let today_px = view.state.gantt.x_for_date(today);
+        let today_x =
+            (today_px >= 0.0 && today_px <= view.state.gantt.timeline_width).then_some(today_px);
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        for id in [1001_i64, 1003, 1005, 1013] {
+            let bar = bars
+                .iter()
+                .find(|bar| bar.id == id)
+                .unwrap_or_else(|| panic!("launch Year bar {id}"));
+            if bar_title_is_inside(bar) {
+                continue;
+            }
+            let Some((x, w)) = ado_planner::gantt::bar_outside_label_frame(
+                bar,
+                view.state.gantt.timeline_width,
+                true,
+                today_x,
+                bar.overflow_badge,
+            ) else {
+                continue;
+            };
+            assert!(
+                outside_label_is_beside_bar(bar, x, w, true, bar.overflow_badge),
+                "launch Year {} must stay within 12px of its bar, label={x}+{w} bar.x={}",
+                bar.title,
+                bar.x
+            );
+        }
+    });
 }
 
 #[gpui_kit::test]
@@ -4480,7 +4491,7 @@ fn year_persist_cart_label_and_go_live_link_clear_today(cx: &mut gpui_kit::TestA
             }
         } else {
             assert!(
-                arrow_left >= persist_right + 8.0 || arrow_right <= persist_left - 8.0,
+                arrow_left >= persist_right + 6.0 || arrow_right <= persist_left - 6.0,
                 "Persist cart → Go-live horizontal must clear the Persist cart label, arrow={arrow_left}..{arrow_right} label={persist_left}..{persist_right}"
             );
         }

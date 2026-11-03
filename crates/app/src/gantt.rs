@@ -97,6 +97,8 @@ pub const TODAY_PILL_GAP: f32 = 6.0;
 /// Keep outside-title chips off the Today line (line is 3px wide).
 /// 11px from the line's left edge is 8px past its right edge.
 const TODAY_LABEL_CLEARANCE: f32 = 11.0;
+/// Do not park a chip more than this far from its natural beside-bar slot.
+const MAX_LABEL_BAR_SHIFT: f32 = 12.0;
 /// Keep year/month majors off the Today pill; Year "2027" must not crowd it.
 const HEADER_TODAY_LABEL_GAP: f32 = 72.0;
 
@@ -2455,6 +2457,15 @@ impl GanttView {
         dodge_outgoing_off_source_labels(
             &mut out, bars, clip_left, clip_right, timeline_w, today_x,
         );
+        // Short inbound stubs (x_head-12) can land inside Cart UI's marker
+        // when Go-live sits just past it. Slide to the handle gap — not
+        // through the body, and not a long successor-row run.
+        nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
+        // Nudging off Cart UI can land on Cart UI → spike; re-spread.
+        separate_parallel_verticals(&mut out, clip_left, clip_right);
+        dodge_outgoing_off_source_labels(
+            &mut out, bars, clip_left, clip_right, timeline_w, today_x,
+        );
         // Shared-source Y fan can lift the new Persist cart → Go-live run
         // into the outside chip; put it back ≥6px below, still in-row.
         clamp_lanes_off_source_titles(&mut out, bars);
@@ -2773,6 +2784,57 @@ fn dodge_forward_inbounds_off_intervening(
     }
 }
 
+/// Slide a forward inbound out of an intervening solid body. Prefer the
+/// gap just past the marker when that still enters the successor from the
+/// left (Year Cart UI at x=30, Go-live at x=59). Fall back to the left of
+/// the body when the diamond sits inside the marker. Dashed cues and
+/// outside titles are ignored — Year/Quarter chips would shove the drop
+/// tens of days away.
+fn nudge_forward_inbounds_off_solid_bodies(
+    arrows: &mut [DependencyArrow],
+    bars: &[BarLayout],
+    clip_left: f32,
+    clip_right: f32,
+) {
+    let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
+    for arrow in arrows.iter_mut() {
+        if arrow.wraps_around_successor() || arrow.inbound_right {
+            continue;
+        }
+        let Some(pred) = by_id.get(&arrow.from_id) else {
+            continue;
+        };
+        let Some(succ) = by_id.get(&arrow.to_id) else {
+            continue;
+        };
+        let lo = pred.y.min(succ.y);
+        let hi = pred.y.max(succ.y);
+        let intervening: Vec<&BarLayout> = bars
+            .iter()
+            .filter(|mid| {
+                mid.id != pred.id && mid.id != succ.id && mid.y > lo + 1.0 && mid.y < hi - 1.0
+            })
+            .collect();
+        let mut x = arrow.x2;
+        for mid in &intervening {
+            let (left, right) = bar_occupied_x(mid, false, None, None);
+            if !x_hits_span(x, left, right) {
+                continue;
+            }
+            // Occupancy already pads the painted body by 4px; sit just
+            // past that so Year Persist cart → Go-live can keep 8px of
+            // air before the Persist cart letters (label at bar_end+30).
+            let past = (right + 2.0).min(clip_right);
+            if past < arrow.x_head - 2.0 {
+                x = past;
+            } else {
+                x = (left - 8.0).max(clip_left);
+            }
+        }
+        arrow.x2 = x;
+    }
+}
+
 /// Shared-source outgoing stubs (Persist cart → spike vs Persist cart →
 /// Go-live) can restack to 1–3px after clip even when lanes are apart.
 /// Spread `x1` by `PARALLEL_VERT_MIN` without touching inbound `x2`.
@@ -2901,12 +2963,11 @@ fn dodge_outgoing_off_source_labels(
         // successor sits under the chip (Year Persist cart → Go-live).
         // Leave (or pull back into) the handle gap instead.
         if desired > wrap_limit {
-            let gap_x = pred.x + painted_w + 12.0;
-            let clear_left = (left - SOURCE_LABEL_CLEARANCE).max(gap_x);
-            // Shared-source fan parks the stub 1–2px left of the chip
-            // (bar_end+28 vs letters at +30). Snap ≥6px off the letters.
-            if arrow.x1 > left - SOURCE_LABEL_CLEARANCE && arrow.x1 < right + SOURCE_LABEL_CLEARANCE
-            {
+            // Successor sits under the chip, so we cannot pass its right
+            // edge. Park ≥8px left of the letters — not on the chip edge
+            // and not a 6px stub that clips the glyph.
+            let clear_left = left - SOURCE_LABEL_CLEARANCE;
+            if arrow.x1 > clear_left && arrow.x1 < right + SOURCE_LABEL_CLEARANCE {
                 arrow.x1 = clear_left.clamp(clip_left, clip_right);
             }
             continue;
@@ -3211,8 +3272,9 @@ fn full_outside_title_fits(
 /// Overlay frame for a title that does not fit inside the bar. Always the
 /// full glyph width — never a 40px "Pers…" clip. Prefer the right of the
 /// bar; flip left when the full title cannot sit on the right (clip or
-/// Today) if the left side can hold it; otherwise park just beside Today
-/// rather than painting through the line.
+/// Today) if the left side can hold it. Never park far from the bar — if
+/// both sides miss, keep the natural right slot (the Today line gaps
+/// through the chip).
 pub fn bar_outside_label_frame(
     bar: &BarLayout,
     timeline_w: f32,
@@ -3261,68 +3323,97 @@ pub fn bar_outside_label_frame(
     if full_outside_title_fits(left_x, estimated, timeline_w, today_x) {
         return Some((left_x, estimated));
     }
-    // Last-resort right would paint through Today (launch Year Persist cart
-    // / Go-live / Cart UI). Prefer a left chip when that side is only
-    // slightly past x=0 so the dodge covers outside-placed titles too.
-    // A deeply negative left_x (Persist cart ~144px at bar.x=40) would
-    // clamp onto Today; those try a Today-adjacent slot instead.
+    // Last-resort right would paint through Today. Prefer a left chip
+    // beside the bar when that side is only slightly past x=0. A deeply
+    // negative left_x (Persist cart ~144px at bar.x=40) stays on the
+    // right of the bar — the Today line draws a gap through the chip.
     if today_blocks_right && !bar.milestone && !bar.marker {
         let clamped = left_x.max(2.0);
         let misses_today = today_x.is_none_or(|today| {
             clamped >= today + TODAY_LABEL_CLEARANCE
                 || clamped + estimated <= today - TODAY_LABEL_CLEARANCE
         });
-        // A clamp to x=2 can cover the sliver (Year Cart next to Today).
-        // Only flip left when the chip also sits beside the bar.
         let misses_bar = clamped + estimated <= bar.x + 0.1;
-        if misses_today && misses_bar && clamped + estimated > 8.0 {
+        let beside = (clamped - left_x).abs() <= MAX_LABEL_BAR_SHIFT;
+        if misses_today && misses_bar && beside && clamped + estimated > 8.0 {
             return Some((clamped, estimated));
-        }
-    }
-    if let Some(today) = today_x
-        && today_blocks_right
-    {
-        let after = today + TODAY_LABEL_CLEARANCE;
-        let before = today - TODAY_LABEL_CLEARANCE - estimated;
-        let closer_first = if (before - right_x).abs() <= (after - right_x).abs() {
-            [before, after]
-        } else {
-            [after, before]
-        };
-        for slot in closer_first {
-            if today_adjacent_slot_holds(slot, estimated, timeline_w, bar) {
-                return Some((slot, estimated));
-            }
         }
     }
     Some((right_x, estimated))
 }
 
-fn chip_covers_bar(chip_x: f32, estimated: f32, bar: &BarLayout) -> bool {
+/// True when an outside chip sits in the natural beside-bar slot, not
+/// parked tens of pixels away at the Today line.
+pub fn outside_label_is_beside_bar(
+    bar: &BarLayout,
+    label_x: f32,
+    label_w: f32,
+    show_link_handles: bool,
+    overflow_badge: bool,
+) -> bool {
     let painted_w = if bar.milestone || bar.marker {
         MILESTONE_SIZE
     } else {
         bar.width.max(8.0)
     };
-    chip_x < bar.x + painted_w && chip_x + estimated > bar.x
+    let bar_right = bar.x + painted_w;
+    let gap = outside_title_right_gap(
+        bar.milestone || bar.marker,
+        show_link_handles,
+        overflow_badge,
+    );
+    let right_x = bar_right + gap;
+    let left_x = bar.x - label_w.max(24.0) - OUTSIDE_TITLE_LEFT_GAP;
+    (label_x - right_x).abs() <= MAX_LABEL_BAR_SHIFT
+        || (label_x - left_x).abs() <= MAX_LABEL_BAR_SHIFT
 }
 
-fn today_adjacent_slot_holds(slot: f32, estimated: f32, timeline_w: f32, bar: &BarLayout) -> bool {
-    // Start on-screen; a few px of clip at the right edge is the same
-    // last-resort the milestone chip already uses at a tight clip.
-    if slot < 0.0 || slot >= timeline_w - 4.0 {
-        return false;
+/// Body-relative Y ranges where the Today line should break so it does
+/// not paint through an outside-title chip that stays beside its bar.
+pub fn today_line_chip_skips(bars: &[BarLayout], today_x: f32, timeline_w: f32) -> Vec<(f32, f32)> {
+    let line_right = today_x + 3.0;
+    let mut skips: Vec<(f32, f32)> = bars
+        .iter()
+        .filter_map(|bar| {
+            let (x, w) =
+                bar_outside_label_frame(bar, timeline_w, true, Some(today_x), bar.overflow_badge)?;
+            if x >= line_right || x + w <= today_x {
+                return None;
+            }
+            let top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0) - 2.0;
+            Some((top, top + OUTSIDE_LABEL_H + 4.0))
+        })
+        .collect();
+    skips.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged: Vec<(f32, f32)> = Vec::new();
+    for skip in skips {
+        match merged.last_mut() {
+            Some(prev) if skip.0 <= prev.1 + 1.0 => prev.1 = prev.1.max(skip.1),
+            _ => merged.push(skip),
+        }
     }
-    if slot + estimated.min(48.0) > timeline_w {
-        return false;
+    merged
+}
+
+/// Painted Today-line segments `(top, height)` in `y0..y1`, skipping `skips`.
+pub fn today_line_segments(y0: f32, y1: f32, skips: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let mut cursor = y0;
+    let mut out = Vec::new();
+    for &(skip_top, skip_bottom) in skips {
+        let top = skip_top.max(y0);
+        let bottom = skip_bottom.min(y1);
+        if top >= bottom {
+            continue;
+        }
+        if top > cursor + 1.0 {
+            out.push((cursor, top - cursor));
+        }
+        cursor = cursor.max(bottom);
     }
-    if chip_covers_bar(slot, estimated, bar) {
-        return false;
+    if y1 > cursor + 1.0 {
+        out.push((cursor, y1 - cursor));
     }
-    if (bar.milestone || bar.marker) && slot + 1.0 < bar.x + MILESTONE_SIZE {
-        return false;
-    }
-    true
+    out
 }
 
 /// ‹ / › chip when a dated bar sits fully past the timeline clip.
@@ -6440,8 +6531,8 @@ mod tests {
             live.x_head
         );
         assert!(
-            live.x1 < left - 0.5,
-            "when the successor sits under the title, keep the stub in the handle gap, x1={} label_left={left}",
+            live.x1 <= left - SOURCE_LABEL_CLEARANCE + 0.5,
+            "when the successor sits under the title, the stub must sit ≥8px left of the letters, x1={} label_left={left}",
             live.x1
         );
         assert!(
@@ -6500,6 +6591,24 @@ mod tests {
             live.lane_y,
             mid
         );
+        let today = jiff::Zoned::now().date();
+        let today_px = gantt.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+        let (body_left, body_right) = bar_occupied_x(cart_ui, false, None, None);
+        assert!(
+            !x_hits_span(live.x2, body_left, body_right),
+            "inbound vertical must miss Cart UI's bar, x2={} body={body_left}..{body_right}",
+            live.x2
+        );
+        if let Some((label_left, label_right)) =
+            bar_outside_title_span_clipped(cart_ui, gantt.timeline_width, today_x)
+        {
+            assert!(
+                !x_hits_span(live.x2, label_left, label_right),
+                "inbound vertical must miss Cart UI's beside-bar label, x2={} label={label_left}..{label_right}",
+                live.x2
+            );
+        }
         let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
         assert!(
             live.lane_y + 1.0 >= label_top + OUTSIDE_LABEL_H + 6.0,
@@ -6783,8 +6892,9 @@ mod tests {
             bar.x
         );
         assert!(
-            x + w <= today_x - TODAY_LABEL_CLEARANCE || x >= today_x + TODAY_LABEL_CLEARANCE,
-            "Today dodge must miss the line, label={x}+{w} today={today_x}"
+            outside_label_is_beside_bar(&bar, x, w, true, false),
+            "Today dodge must keep the chip beside the bar, not park at the line, label={x}+{w} today={today_x} bar.x={}",
+            bar.x
         );
     }
 
@@ -6828,13 +6938,169 @@ mod tests {
                 "launch Year {} must keep the full title, not Pers…/Go-l…, max_w={w} estimated={estimated} x={x}",
                 bar.title
             );
-            if let Some(today) = today_x {
+            assert!(
+                outside_label_is_beside_bar(bar, x, w, true, false),
+                "launch Year {} must stay within {MAX_LABEL_BAR_SHIFT}px of its bar, not park at Today, label={x}+{w} bar.x={}",
+                bar.title,
+                bar.x
+            );
+        }
+    }
+
+    #[test]
+    fn quarter_and_year_outside_titles_stay_beside_the_bar() {
+        let nodes = mock_fixture_nodes();
+        for scale in [GanttScale::Quarter, GanttScale::Year] {
+            let mut gantt = GanttView {
+                timeline_width: 800.0,
+                ..Default::default()
+            };
+            gantt.auto_fit(&nodes, &[], 800.0);
+            gantt.retarget_year_gutter(|gantt| {
+                gantt.set_scale_from_toolbar(scale, jiff::Zoned::now().date());
+            });
+            let rows = gantt.flatten(&nodes);
+            let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+            let today = jiff::Zoned::now().date();
+            let today_px = gantt.x_for_date(today);
+            let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+            for id in [1001_i64, 1003, 1005, 1013] {
+                let bar = bars
+                    .iter()
+                    .find(|bar| bar.id == id)
+                    .unwrap_or_else(|| panic!("fixture bar {id}"));
+                if bar_offscreen_edge(bar, gantt.timeline_width).is_some()
+                    || bar_title_is_inside(bar)
+                {
+                    continue;
+                }
+                let (x, w) =
+                    bar_outside_label_frame(bar, gantt.timeline_width, true, today_x, false)
+                        .unwrap_or_else(|| {
+                            panic!("{scale:?} {} must have a full outside frame", bar.title)
+                        });
                 assert!(
-                    x + w <= today - TODAY_LABEL_CLEARANCE || x >= today + TODAY_LABEL_CLEARANCE,
-                    "launch Year {} outside label must miss Today, label={x}+{w} today={today}",
-                    bar.title
+                    outside_label_is_beside_bar(bar, x, w, true, false),
+                    "{scale:?} {} must stay within {MAX_LABEL_BAR_SHIFT}px of its bar, label={x}+{w} bar.x={} today={today_x:?}",
+                    bar.title,
+                    bar.x
                 );
             }
+        }
+    }
+
+    #[test]
+    fn today_line_gaps_through_a_beside_bar_chip() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 40.0,
+            width: 24.0,
+            y: 80.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let estimated = bar_title_paint_px(&bar.title);
+        let today_x = right_x + 20.0;
+        assert!(
+            today_x - right_x < estimated,
+            "precondition: the natural right chip crosses Today"
+        );
+        let (x, w) = bar_outside_label_frame(&bar, 800.0, true, Some(today_x), false)
+            .expect("must keep a full Persist cart chip");
+        assert!(
+            outside_label_is_beside_bar(&bar, x, w, true, false),
+            "must stay beside the bar even when that slot crosses Today, label={x}+{w} today={today_x}"
+        );
+        assert!(
+            x < today_x && x + w > today_x,
+            "fixture: the beside-bar chip crosses the Today x, label={x}..{} today={today_x}",
+            x + w
+        );
+        let skips = today_line_chip_skips(std::slice::from_ref(&bar), today_x, 800.0);
+        assert!(
+            !skips.is_empty(),
+            "Today must skip the Persist cart chip y-range, skips={skips:?}"
+        );
+        let segments = today_line_segments(0.0, 400.0, &skips);
+        assert!(
+            segments.len() >= 2,
+            "Today must break around the chip, segments={segments:?} skips={skips:?}"
+        );
+        let chip_top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
+        let chip_bottom = chip_top + OUTSIDE_LABEL_H;
+        for (top, height) in &segments {
+            let bottom = top + height;
+            assert!(
+                bottom <= chip_top + 2.0 || *top >= chip_bottom - 2.0,
+                "a Today segment must not paint through the chip, segment={top}..{bottom} chip={chip_top}..{chip_bottom}"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_year_persist_go_live_misses_cart_ui_and_source_title() {
+        let nodes = mock_fixture_nodes();
+        let mut gantt = GanttView {
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.auto_fit(&nodes, &[], 800.0);
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar(GanttScale::Year, jiff::Zoned::now().date());
+        });
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("launch Year Persist cart → Go-live");
+        let today = jiff::Zoned::now().date();
+        let today_px = gantt.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+        if let Some((left, right)) =
+            bar_outside_title_span_clipped(pred, gantt.timeline_width, today_x)
+        {
+            assert!(
+                !x_hits_span(live.x1, left, right),
+                "outgoing vertical must miss the Persist cart title, x1={} label={left}..{right}",
+                live.x1
+            );
+            let past_right = live.x1 >= right + SOURCE_LABEL_CLEARANCE - 0.5;
+            let past_left = live.x1 <= left - SOURCE_LABEL_CLEARANCE + 0.5;
+            assert!(
+                past_right || past_left,
+                "outgoing stub must sit ≥8px off the Persist cart letters, x1={} label={left}..{right}",
+                live.x1
+            );
+        }
+        let (body_left, body_right) = bar_occupied_x(cart_ui, false, None, None);
+        assert!(
+            !x_hits_span(live.x2, body_left, body_right),
+            "inbound vertical must miss Cart UI's bar, x2={} body={body_left}..{body_right} cart.x={}",
+            live.x2,
+            cart_ui.x
+        );
+        if let Some((label_left, label_right)) =
+            bar_outside_title_span_clipped(cart_ui, gantt.timeline_width, today_x)
+        {
+            assert!(
+                !x_hits_span(live.x2, label_left, label_right),
+                "inbound vertical must miss Cart UI's beside-bar label, x2={} label={label_left}..{label_right}",
+                live.x2
+            );
         }
     }
 
