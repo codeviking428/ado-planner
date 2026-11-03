@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const TOAST_CAP: usize = 2;
-const SUCCESS_TTL: Duration = Duration::from_secs(10);
-const UNDO_TTL: Duration = Duration::from_secs(12);
-const WARNING_TTL: Duration = Duration::from_secs(10);
-const ERROR_TTL: Duration = Duration::from_secs(12);
+const SUCCESS_TTL: Duration = Duration::from_secs(5);
+const UNDO_TTL: Duration = Duration::from_secs(8);
+const WARNING_TTL: Duration = Duration::from_secs(5);
+const ERROR_TTL: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -353,6 +353,49 @@ mod tests {
         );
         assert_eq!(toasts.items[0].message, "Moved B");
         assert!(toasts.items[0].undo.is_some());
+    }
+
+    #[test]
+    fn success_toasts_expire_after_five_seconds() {
+        let mut toasts = Toasts::default();
+        toasts.push(ToastKind::Success, "Saved");
+        toasts.items[0].created_at = Instant::now() - Duration::from_millis(4_500);
+        toasts.expire();
+        assert_eq!(
+            toasts.items.len(),
+            1,
+            "a 4.5s success toast must still show"
+        );
+        toasts.items[0].created_at = Instant::now() - Duration::from_secs(5);
+        toasts.expire();
+        assert!(toasts.items.is_empty(), "success toasts dismiss at ~5s");
+    }
+
+    #[test]
+    fn undo_toasts_expire_after_eight_seconds() {
+        let mut toasts = Toasts::default();
+        toasts.push_undo(
+            "Cleared dates",
+            UndoAction::RestoreDates {
+                id: 1,
+                start_date: None,
+                target_date: None,
+                rev: 1,
+            },
+        );
+        toasts.items[0].created_at = Instant::now() - Duration::from_secs(7);
+        toasts.expire();
+        assert_eq!(
+            toasts.items.len(),
+            1,
+            "an undo toast with an action button stays through 7s"
+        );
+        toasts.items[0].created_at = Instant::now() - Duration::from_secs(8);
+        toasts.expire();
+        assert!(
+            toasts.items.is_empty(),
+            "undo toasts with an action dismiss at ~8s"
+        );
     }
 
     #[test]

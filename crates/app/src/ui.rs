@@ -5096,11 +5096,10 @@ impl PlannerView {
                                 .when(!at_start, |el| el.right(px(2.)))
                                 .top(px(3.))
                                 .bottom(px(3.))
-                                .w(px(3.))
+                                .w(px(4.))
                                 .rounded_full()
-                                .bg(cx.theme().background)
-                                .border_1()
-                                .border_color(cx.theme().primary),
+                                .bg(cx.theme().primary)
+                                .opacity(0.92),
                         )
                     })
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -5504,8 +5503,8 @@ impl PlannerView {
                 .justify_center()
                 .bg(warn)
                 .text_color(cx.theme().background)
-                .text_size(px(14.))
-                .line_height(gpui_kit::relative(1.))
+                .text_size(px(20.))
+                .line_height(px(20.))
                 .font_weight(gpui_kit::FontWeight::BOLD)
                 .occlude()
                 .tooltip(move |window, cx| Tooltip::new(overflow_tip.clone()).build(window, cx))
@@ -8547,10 +8546,12 @@ fn srgb_luminance(r: f32, g: f32, b: f32) -> f32 {
 }
 
 fn ink_for_luminance(lum: f32) -> gpui_kit::Hsla {
-    if lum > 0.45 {
-        gpui_kit::hsla(0., 0., 0.05, 1.)
+    // Mid-green 0.55 washes on mocha sit around lum 0.51. Near-black (l=0.05)
+    // reads grey-green there; pick true white at or below 0.55, true black above.
+    if lum > 0.55 {
+        gpui_kit::hsla(0., 0., 0., 1.)
     } else {
-        gpui_kit::hsla(0., 0., 0.98, 1.)
+        gpui_kit::hsla(0., 0., 1., 1.)
     }
 }
 
@@ -9231,6 +9232,21 @@ mod bar_label_tests {
         assert!(
             painted_bar_title_color(&empty, canvas).l < 0.2,
             "a 0% summary wash must still keep dark ink on green"
+        );
+        let mocha = gpui_kit::hsla(240. / 360., 0.2105, 0.149, 1.);
+        let persist_summary = BarLayout {
+            summary: true,
+            progress: None,
+            title: "Persist cart".into(),
+            color: 0xa6e3a1,
+            open_ended: false,
+            ..spike.clone()
+        };
+        let ink = painted_bar_title_color(&persist_summary, mocha);
+        assert!(
+            ink.l > 0.8,
+            "mocha Persist cart (0% summary wash) must use white, not grey-green, l={}",
+            ink.l
         );
     }
 

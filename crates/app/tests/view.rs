@@ -3721,8 +3721,8 @@ fn dates_cell_stays_one_line_with_a_conflict_marker(cx: &mut gpui_kit::TestAppCo
         .debug_bounds("gantt-parent-overflow")
         .expect("bar overflow badge");
     assert!(
-        f32::from(bar_mark.size.width) >= 16.0 && f32::from(bar_mark.size.height) >= 16.0,
-        "the bar ! must be a 16px badge (~14px glyph), got {:?}",
+        f32::from(bar_mark.size.width) >= 20.0 && f32::from(bar_mark.size.height) >= 20.0,
+        "the bar ! must be a 22px badge (true 14px glyph), got {:?}",
         bar_mark.size
     );
 }
@@ -3760,8 +3760,8 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
         "the ! must sit past the bar end so the grip stays hittable, badge_left={badge_left} bar_right={bar_right}"
     );
     assert!(
-        f32::from(badge.size.width) >= 16.0 && f32::from(badge.size.height) >= 16.0,
-        "the bar ! must be a readable 16px badge (~14px glyph), got {:?}",
+        f32::from(badge.size.width) >= 20.0 && f32::from(badge.size.height) >= 20.0,
+        "the bar ! must be a readable 22px badge (true 14px glyph), got {:?}",
         badge.size
     );
     assert!(
@@ -4388,8 +4388,8 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         .debug_bounds("gantt-link-dot-2-link-end")
         .expect("hovered leaf bar must show a link connector");
     assert!(
-        (f32::from(grip.size.width) - 3.0).abs() < 1.0,
-        "the resize grip must be a 3px edge pill, got {}",
+        (f32::from(grip.size.width) - 4.0).abs() < 1.0,
+        "the resize grip must be a 4px edge pill, got {}",
         f32::from(grip.size.width)
     );
     assert!(

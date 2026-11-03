@@ -34,9 +34,9 @@ pub const LINK_HANDLE: f32 = 8.0;
 pub const LINK_HANDLE_HIT: f32 = 16.0;
 /// Parallel dependency lanes stay at least this far apart (stroke is 2px).
 pub const PARALLEL_LANE_MIN: f32 = 10.0;
-/// Parent-overflow `!` on the bar. Matches the Dates-column badge so the
-/// glyph reads at ~14px instead of shrinking to a 9px mark.
-pub const OVERFLOW_BADGE: f32 = 16.0;
+/// Parent-overflow `!` on the bar. The circle is larger than the glyph so a
+/// 20px font still reads as a true 14px bang instead of a 10px mark.
+pub const OVERFLOW_BADGE: f32 = 22.0;
 /// Gap between the painted bar end and the overflow badge.
 pub const OVERFLOW_BADGE_GAP: f32 = 2.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
@@ -2267,6 +2267,9 @@ impl GanttView {
         for arrow in &mut out {
             clip_arrow_to_timeline(arrow, clip_left, clip_right);
         }
+        // Clip first: two long verticals can both clamp to the same
+        // `clip_right` (1–3px stack at the chart edge). Separate after.
+        separate_parallel_verticals(&mut out, clip_left, clip_right);
         out
     }
 }
@@ -2330,6 +2333,95 @@ fn separate_parallel_lanes(arrows: &mut [DependencyArrow]) {
                     arrows[i].lane_y += push;
                 }
                 moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+fn vertical_spans(arrow: &DependencyArrow) -> [(f32, f32, f32); 2] {
+    let v2_end = if arrow.wraps_around_successor() {
+        arrow.gutter_y()
+    } else {
+        arrow.y2
+    };
+    [
+        (
+            arrow.x1,
+            arrow.y1.min(arrow.lane_y),
+            arrow.y1.max(arrow.lane_y),
+        ),
+        (arrow.x2, arrow.lane_y.min(v2_end), arrow.lane_y.max(v2_end)),
+    ]
+}
+
+fn y_ranges_overlap(a: (f32, f32, f32), b: (f32, f32, f32)) -> bool {
+    a.1 <= b.2 + 8.0 && b.1 <= a.2 + 8.0
+}
+
+fn shift_vertical_x(arrow: &mut DependencyArrow, outgoing: bool, delta: f32) {
+    if outgoing {
+        arrow.x1 += delta;
+        return;
+    }
+    let next = arrow.x2 + delta;
+    if !arrow.inbound_right && !arrow.wraps_around_successor() {
+        arrow.x2 = next.min(arrow.x_head - 4.0);
+    } else {
+        arrow.x2 = next;
+    }
+}
+
+/// Keep long inbound/wrap verticals from stacking 1–3px apart (Persist cart
+/// → Go-live vs Cart UI → spike at x≈601).
+fn separate_parallel_verticals(arrows: &mut [DependencyArrow], clip_left: f32, clip_right: f32) {
+    if arrows.len() < 2 {
+        return;
+    }
+    for _ in 0..arrows.len() * 4 {
+        let mut moved = false;
+        for i in 0..arrows.len() {
+            for j in i + 1..arrows.len() {
+                let segs_i = vertical_spans(&arrows[i]);
+                let segs_j = vertical_spans(&arrows[j]);
+                for (si, seg_i) in segs_i.iter().enumerate() {
+                    for (sj, seg_j) in segs_j.iter().enumerate() {
+                        if !y_ranges_overlap(*seg_i, *seg_j) {
+                            continue;
+                        }
+                        let dx = seg_j.0 - seg_i.0;
+                        if dx.abs() >= PARALLEL_LANE_MIN {
+                            continue;
+                        }
+                        let push = (PARALLEL_LANE_MIN - dx.abs()).max(1.0);
+                        let (right, right_out, left, left_out) = if seg_j.0 >= seg_i.0 {
+                            (j, sj == 0, i, si == 0)
+                        } else {
+                            (i, si == 0, j, sj == 0)
+                        };
+                        let right_x = if right_out {
+                            arrows[right].x1
+                        } else {
+                            arrows[right].x2
+                        };
+                        if right_x + push <= clip_right {
+                            shift_vertical_x(&mut arrows[right], right_out, push);
+                            moved = true;
+                        } else {
+                            let left_x = if left_out {
+                                arrows[left].x1
+                            } else {
+                                arrows[left].x2
+                            };
+                            if left_x - push >= clip_left {
+                                shift_vertical_x(&mut arrows[left], left_out, -push);
+                                moved = true;
+                            }
+                        }
+                    }
+                }
             }
         }
         if !moved {
@@ -4841,6 +4933,54 @@ mod tests {
         );
     }
 
+    fn overlapping_vertical_gap(a: &DependencyArrow, b: &DependencyArrow) -> Option<f32> {
+        let mut min_dx = f32::MAX;
+        for seg_a in vertical_spans(a) {
+            for seg_b in vertical_spans(b) {
+                if !y_ranges_overlap(seg_a, seg_b) {
+                    continue;
+                }
+                min_dx = min_dx.min((seg_a.0 - seg_b.0).abs());
+            }
+        }
+        (min_dx < f32::MAX).then_some(min_dx)
+    }
+
+    #[test]
+    fn parallel_verticals_one_px_apart_are_pushed_to_ten() {
+        let a = DependencyArrow {
+            from_id: 1003,
+            to_id: 1013,
+            x1: 200.0,
+            y1: 20.0,
+            x2: 601.0,
+            y2: 180.0,
+            x_head: 640.0,
+            lane_y: 39.0,
+            inbound_right: false,
+        };
+        let b = DependencyArrow {
+            from_id: 1005,
+            to_id: 1012,
+            x1: 210.0,
+            y1: 60.0,
+            x2: 602.0,
+            y2: 220.0,
+            x_head: 360.0,
+            lane_y: 79.0,
+            inbound_right: false,
+        };
+        let mut arrows = vec![a, b];
+        separate_parallel_verticals(&mut arrows, 0.0, 800.0);
+        let dx = overlapping_vertical_gap(&arrows[0], &arrows[1]).expect("Y-overlapping verticals");
+        assert!(
+            dx >= PARALLEL_LANE_MIN,
+            "1px-stacked inbound verticals must separate, dx={dx} x2={},{}",
+            arrows[0].x2,
+            arrows[1].x2
+        );
+    }
+
     #[test]
     fn persist_cart_go_live_clears_the_cart_ui_spike_lane() {
         let mut persist = node(1003, Some(1002));
@@ -4899,6 +5039,106 @@ mod tests {
             persist_live.y2,
             cart_spike.y2
         );
+    }
+
+    /// Mock `work-items.json` tree with the live links Persist cart → Go-live
+    /// and Cart UI → Unparented spike. Parallel inbound/wrap verticals must
+    /// stay at least 6px apart (the stacked x≈601 / 602–603 pair).
+    fn mock_fixture_nodes() -> Vec<WorkItemNode> {
+        let mut checkout = node(1001, None);
+        checkout.title = "Checkout rewrite".into();
+        checkout.work_item_type = "Epic".into();
+        checkout.start_date = Some("2026-07-01T00:00:00Z".into());
+        checkout.target_date = Some("2026-09-30T00:00:00Z".into());
+        let mut cart = node(1002, Some(1001));
+        cart.title = "Cart".into();
+        cart.work_item_type = "Feature".into();
+        cart.start_date = Some("2026-07-06T00:00:00Z".into());
+        cart.target_date = Some("2026-08-14T00:00:00Z".into());
+        let mut persist = node(1003, Some(1002));
+        persist.title = "Persist cart".into();
+        persist.work_item_type = "User Story".into();
+        persist.state = "Active".into();
+        persist.start_date = Some("2026-07-06T00:00:00Z".into());
+        persist.target_date = Some("2026-07-20T00:00:00Z".into());
+        let mut cart_ui = node(1005, Some(1003));
+        cart_ui.title = "Cart UI".into();
+        cart_ui.work_item_type = "Task".into();
+        cart_ui.start_date = Some("2026-07-21T00:00:00Z".into());
+        cart_ui.target_date = None;
+        let mut spike = node(1012, None);
+        spike.title = "Unparented spike".into();
+        spike.work_item_type = "Task".into();
+        spike.start_date = Some("2026-07-21T00:00:00Z".into());
+        spike.target_date = Some("2026-08-04T00:00:00Z".into());
+        spike.predecessors = vec![1005];
+        let mut go_live = node(1013, Some(1001));
+        go_live.title = "Go-live milestone".into();
+        go_live.work_item_type = "Feature".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        go_live.predecessors = vec![1003];
+        let mut grooming = node(1014, Some(1002));
+        grooming.title = "Backlog grooming".into();
+        grooming.work_item_type = "Task".into();
+        grooming.start_date = None;
+        grooming.target_date = None;
+        let mut growth = node(1020, None);
+        growth.title = "Growth experiments".into();
+        growth.work_item_type = "Epic".into();
+        growth.start_date = Some("2026-08-01T00:00:00Z".into());
+        growth.target_date = Some("2026-09-15T00:00:00Z".into());
+        vec![
+            checkout, cart, persist, cart_ui, spike, go_live, grooming, growth,
+        ]
+    }
+
+    fn assert_mock_fixture_parallel_verticals(scale: GanttScale) {
+        let nodes = mock_fixture_nodes();
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let persist_live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Persist cart → Go-live");
+        let cart_spike = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1005 && arrow.to_id == 1012)
+            .expect("Cart UI → spike");
+        let dx = overlapping_vertical_gap(persist_live, cart_spike).unwrap_or_else(|| {
+            [
+                (persist_live.x1 - cart_spike.x1).abs(),
+                (persist_live.x1 - cart_spike.x2).abs(),
+                (persist_live.x2 - cart_spike.x1).abs(),
+                (persist_live.x2 - cart_spike.x2).abs(),
+            ]
+            .into_iter()
+            .fold(f32::MAX, f32::min)
+        });
+        assert!(
+            dx >= 6.0,
+            "{:?}: Persist cart → Go-live vertical must sit ≥6px from Cart UI → spike, dx={dx} persist x1={} x2={} spike x1={} x2={} lanes={},{}",
+            scale,
+            persist_live.x1,
+            persist_live.x2,
+            cart_spike.x1,
+            cart_spike.x2,
+            persist_live.lane_y,
+            cart_spike.lane_y
+        );
+    }
+
+    #[test]
+    fn mock_fixture_parallel_verticals_are_at_least_six_apart() {
+        assert_mock_fixture_parallel_verticals(GanttScale::Month);
+        assert_mock_fixture_parallel_verticals(GanttScale::Week);
     }
 
     #[test]
