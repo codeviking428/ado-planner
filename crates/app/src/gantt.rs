@@ -2109,7 +2109,14 @@ impl GanttView {
                 let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
                 let clip_right = self.timeline_width.max(1.0);
                 if wrap_around {
-                    x_in = clear_wrap_drop_x(x_out, &intervening, false, x_head, clip_right);
+                    x_in = clear_wrap_drop_x(
+                        x_out,
+                        &intervening,
+                        false,
+                        x_head,
+                        pred_left + STUB,
+                        clip_right,
+                    );
                     x_in = x_in.max(pred_left + STUB);
                 } else if !inbound_right && !intervening.is_empty() {
                     let x_vert = clear_vertical_x(
@@ -2589,18 +2596,24 @@ fn clear_vertical_x(
 /// runs in a gap, without sending the loop to the chart left edge. Re-test
 /// each candidate against every occupied span: sliding past the source stub
 /// can still land inside a later overlapping bar.
+///
+/// Open-ended dashed cues count as occupied, same as forward inbound. When
+/// sliding right of a cue would leave the clip, try the gap just left of
+/// that bar's core — but never left of `pred_min_x` / the wrap stub, or the
+/// loop becomes the long left detour wrap exists to avoid.
 fn clear_wrap_drop_x(
     pref: f32,
     intervening: &[&BarLayout],
     include_labels: bool,
     x_head: f32,
+    pred_min_x: f32,
     clip_right: f32,
 ) -> f32 {
     let blocked: Vec<(f32, f32)> = intervening
         .iter()
-        .map(|bar| bar_occupied_x(bar, include_labels, None))
+        .map(|bar| bar_occupied_x(bar, include_labels, Some(clip_right)))
         .collect();
-    let min_x = x_head + DependencyArrow::WRAP_STUB + 1.0;
+    let min_x = pred_min_x.max(x_head + DependencyArrow::WRAP_STUB + 1.0);
     let mut x = pref;
     for _ in 0..=blocked.len() {
         let hits: Vec<&(f32, f32)> = blocked
@@ -5476,11 +5489,11 @@ mod tests {
         assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
         let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
         let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
-        let (child_left, child_right) = bar_occupied_x(child, false, None);
+        let (child_left, child_right) = bar_occupied_x(child, false, Some(gantt.timeline_width));
         let (live_left, live_right) = bar_occupied_x(go_live, false, None);
         assert!(
             !x_hits_span(arrow.x2, child_left, child_right),
-            "vertical x2={} must miss #1005 occupied {child_left}..{child_right}",
+            "vertical x2={} must miss #1005 including its open-ended cue {child_left}..{child_right}",
             arrow.x2
         );
         assert!(
@@ -5673,6 +5686,88 @@ mod tests {
     }
 
     #[test]
+    fn wrap_drop_slides_left_of_an_open_ended_cue() {
+        let pred = BarLayout {
+            id: 1,
+            kind: GanttBarKind::Scheduled,
+            x: 300.0,
+            width: 80.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "pred".into(),
+            title: "Pred".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let mid = BarLayout {
+            id: 2,
+            kind: GanttBarKind::Scheduled,
+            x: 340.0,
+            width: 48.0,
+            y: ROW_HEIGHT,
+            summary: false,
+            milestone: false,
+            label: "mid".into(),
+            title: "Cart UI".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: true,
+        };
+        let succ = BarLayout {
+            id: 3,
+            kind: GanttBarKind::Scheduled,
+            x: 80.0,
+            width: 80.0,
+            y: ROW_HEIGHT * 2.0,
+            summary: false,
+            milestone: false,
+            label: "succ".into(),
+            title: "Succ".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: vec![1],
+            marker: false,
+            open_ended: false,
+        };
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let arrows = gantt.layout_dependency_arrows(&[pred.clone(), mid.clone(), succ]);
+        assert_eq!(arrows.len(), 1);
+        let stub = pred.x + pred.width + 12.0;
+        let (cue_left, cue_right) = bar_occupied_x(&mid, false, Some(gantt.timeline_width));
+        assert!(
+            x_hits_span(stub, cue_left, cue_right),
+            "precondition: source stub {stub} sits in the open-ended cue {cue_left}..{cue_right}"
+        );
+        assert!(
+            arrows[0].wraps_around_successor(),
+            "must keep a local wrap, x2={} x_head={}",
+            arrows[0].x2,
+            arrows[0].x_head
+        );
+        assert!(
+            !x_hits_span(arrows[0].x2, cue_left, cue_right),
+            "wrap vertical x2={} must miss the open-ended cue {cue_left}..{cue_right}",
+            arrows[0].x2
+        );
+        assert!(
+            arrows[0].x2 + 0.5 >= pred.x,
+            "must not detour left of the source, x2={} pred.x={}",
+            arrows[0].x2,
+            pred.x
+        );
+    }
+
+    #[test]
     fn wrap_vertical_misses_gutter_no_dates_pills() {
         let pred = BarLayout {
             id: 1,
@@ -5819,6 +5914,13 @@ mod tests {
             "left-edge overlap must keep the short backward loop, x2={} x_head={}",
             arrow.x2,
             arrow.x_head
+        );
+        let child = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let (cue_left, cue_right) = bar_occupied_x(child, false, Some(gantt.timeline_width));
+        assert!(
+            !x_hits_span(arrow.x2, cue_left, cue_right),
+            "wrap vertical x2={} must miss Cart UI's open-ended cue {cue_left}..{cue_right}",
+            arrow.x2
         );
     }
 
