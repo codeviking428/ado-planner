@@ -137,6 +137,9 @@ pub struct PlannerView {
     toast_pointer: bool,
     /// Toast Undo clicked while spawn_state is busy; replay when I/O frees.
     pending_toast_undo: Option<(u64, UndoAction)>,
+    /// True while a non-date toast Undo spawn is in flight, so a second
+    /// click (mouse-down + click) cannot dismiss the toast as a no-op.
+    toast_undo_inflight: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -354,6 +357,7 @@ impl PlannerView {
             toast_hover_depth: 0,
             toast_pointer: false,
             pending_toast_undo: None,
+            toast_undo_inflight: false,
             _subscriptions: vec![keystrokes],
         };
         this.scope_query.update(cx, |input, cx| {
@@ -990,22 +994,19 @@ impl PlannerView {
         self.dates_anchor = None;
     }
 
-    fn focal_gantt_date(&self) -> jiff::civil::Date {
+    fn focal_gantt_x(&self) -> f32 {
+        let width = self.state.gantt.timeline_width.max(1.0);
         if let Some(id) = self.state.gantt.selected_id
             && let Some(node) = self.state.nodes.iter().find(|node| node.id == id)
             && let Some(date) = parse_iso_date(node.start_date.as_deref())
                 .or_else(|| parse_iso_date(node.target_date.as_deref()))
         {
-            return date;
+            let x = self.state.gantt.x_for_date(date);
+            if x >= 0.0 && x <= width {
+                return x;
+            }
         }
-        let width = self.state.gantt.timeline_width.max(1.0);
-        self.state.gantt.date_for_x(width * 0.5)
-    }
-
-    fn focal_gantt_x(&self) -> f32 {
-        let width = self.state.gantt.timeline_width.max(1.0);
-        let date = self.focal_gantt_date();
-        self.state.gantt.x_for_date(date).clamp(0.0, width)
+        width * 0.5
     }
 
     fn details_overlay(&self) -> bool {
@@ -1568,6 +1569,9 @@ impl PlannerView {
         require_toast: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.toast_undo_inflight {
+            return;
+        }
         if require_toast
             && !self
                 .state
@@ -1603,9 +1607,8 @@ impl PlannerView {
             cx.notify();
             return;
         }
+        self.toast_undo_inflight = true;
         self.spawn_toast_undo(cx, action, undid);
-        self.state.toasts.dismiss_undo();
-        self.state.toasts.dismiss(toast_id);
         self.clamp_toast_hover();
         cx.notify();
     }
@@ -1623,9 +1626,11 @@ impl PlannerView {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
                 this.io_busy = false;
+                this.toast_undo_inflight = false;
                 match outcome {
                     Ok((working, Ok(()))) => {
                         this.state.merge_undo_action(&working, &merge_action);
+                        this.state.toasts.dismiss_undo();
                         this.state.toasts.push(ToastKind::Success, undid);
                     }
                     Ok((working, Err(err))) => {
@@ -2675,9 +2680,9 @@ impl PlannerView {
                                     .when(!selected, |btn| btn.ghost())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.dismiss_overlays();
-                                        let keep = this.focal_gantt_date();
+                                        let keep_x = this.focal_gantt_x();
                                         this.animate_gantt(cx, |gantt| {
-                                            gantt.set_scale_keeping(scale, keep);
+                                            gantt.set_scale_at(scale, keep_x);
                                         });
                                         cx.notify();
                                     })),
@@ -3147,11 +3152,19 @@ impl PlannerView {
             .debug_selector(move || format!("gantt-title-{id}"))
             .flex_1()
             .min_w(px(120.))
-            .truncate()
-            .child(title_owned)
-            .when(!form_open, |el| {
-                el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-            })
+            .overflow_hidden()
+            .child(
+                Button::new(("title-tip", id as u64))
+                    .ghost()
+                    .compact()
+                    .tab_stop(false)
+                    .w_full()
+                    .px_0()
+                    .label(title_owned)
+                    .when(!form_open, |btn| {
+                        btn.tooltip(tip).tooltip_placement(Placement::Top)
+                    }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -3230,7 +3243,7 @@ impl PlannerView {
             full
         };
         let overflow = parent_date_overflow(&self.state.nodes, id);
-        div()
+        h_flex()
             .id(("dates", id as u64))
             .debug_selector(move || {
                 if unscheduled {
@@ -3241,18 +3254,28 @@ impl PlannerView {
             })
             .flex_shrink_0()
             .w(px(DATES_COL_WIDTH))
-            .truncate()
+            .h(px(ROW_HEIGHT))
+            .items_center()
+            .overflow_hidden()
+            .gap_1()
             .text_xs()
             .when(unscheduled, |el| el.text_color(muted))
             .when(overflow, |el| el.text_color(cx.theme().warning))
             .when(editing, |el| el.bg(cx.theme().accent.opacity(0.35)))
-            .child(display.clone())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(display.clone()),
+            )
             .when(overflow, |el| {
                 el.child(
                     div()
                         .id(("dates-overflow", id as u64))
                         .debug_selector(|| "gantt-parent-overflow".into())
-                        .child(" !"),
+                        .flex_shrink_0()
+                        .child("!"),
                 )
             })
             .when(!editing, |el| {
@@ -3545,7 +3568,11 @@ impl PlannerView {
         let weekend_w = self.state.gantt.scale.pixels_per_day(self.state.gantt.zoom);
         let hide_today = matches!(
             self.state.gantt.scale,
-            GanttScale::Day | GanttScale::Week | GanttScale::Month | GanttScale::Quarter
+            GanttScale::Day
+                | GanttScale::Week
+                | GanttScale::Month
+                | GanttScale::Quarter
+                | GanttScale::Year
         )
         .then_some(today_x);
         let major_labels = self
@@ -4021,15 +4048,8 @@ impl PlannerView {
         let milestone = bar.milestone;
         let marker = bar.marker;
         let open_ended = bar.open_ended;
-        let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
         let clip_pad = (-bar.x).max(0.0);
-        let visible_w = (bar.width - clip_pad).max(0.0);
-        let inside = !unscheduled
-            && !milestone
-            && !marker
-            && !summary
-            && !open_ended
-            && visible_w >= title_width.max(40.0);
+        let inside = Self::bar_title_fits_inside(bar);
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
         let show_handles = !summary
@@ -4124,11 +4144,13 @@ impl PlannerView {
                         .child(
                             div()
                                 .absolute()
-                                .right(px(2.))
+                                .right(px(1.))
                                 .top_0()
                                 .bottom_0()
+                                .w(px(crate::gantt::OPEN_ENDED_LINK_HIT))
                                 .flex()
                                 .items_center()
+                                .justify_end()
                                 .text_color(rgb(bar.color))
                                 .occlude()
                                 .cursor_pointer()
@@ -4195,6 +4217,11 @@ impl PlannerView {
                 })
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.set_hovered(if *hovered { Some(id) } else { None }, cx);
+                }))
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    // The bar captures the pointer on mouse-down. External titles
+                    // occlude the timeline, so the captured bar must keep the drag.
+                    this.on_bar_drag_move(event, cx);
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -4333,8 +4360,7 @@ impl PlannerView {
             return None;
         }
         let hovered = self.state.gantt.hovered_id == Some(id);
-        let selected = self.state.gantt.selected_id == Some(id);
-        let show_dot = hovered || selected || (bar.summary && selected);
+        let show_dot = hovered;
         let start_x = bar.x - LINK_HANDLE_HIT - HANDLE_WIDTH;
         let end_x = bar.x + bar.width + HANDLE_WIDTH;
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
@@ -4399,12 +4425,13 @@ impl PlannerView {
         let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
         let clip_pad = (-bar.x).max(0.0);
         let visible_w = (bar.width - clip_pad).max(0.0);
-        !unscheduled
-            && !bar.milestone
-            && !bar.marker
-            && !bar.summary
-            && !bar.open_ended
-            && visible_w >= title_width.max(40.0)
+        if unscheduled || bar.milestone || bar.marker || bar.open_ended {
+            return false;
+        }
+        if bar.x < 0.0 && visible_w >= 32.0 {
+            return true;
+        }
+        !bar.summary && visible_w >= title_width.max(40.0)
     }
 
     pub(crate) fn bar_external_label_frame(
@@ -4472,7 +4499,7 @@ impl PlannerView {
                 .text_color(muted_fg)
                 .px_1()
                 .bg(cx.theme().background)
-                .occlude()
+                .when(!dragging, |el| el.occlude())
                 .child(label)
                 .on_click(
                     cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
@@ -5045,7 +5072,8 @@ impl PlannerView {
                     .id("work-item-form-loading")
                     .debug_selector(|| "work-item-form-loading".into())
                     .w(px(720.))
-                    .h(px(dialog_h.min(280.0)))
+                    .h(px(dialog_h))
+                    .max_h(px(dialog_h))
                     .bg(cx.theme().popover)
                     .text_color(cx.theme().popover_foreground)
                     .rounded_xl()
@@ -5133,7 +5161,9 @@ impl PlannerView {
             .child(
                 v_flex()
                     .id("work-item-form-dialog")
+                    .debug_selector(|| "work-item-form-dialog".into())
                     .w(px(720.))
+                    .h(px(dialog_h))
                     .max_h(px(dialog_h))
                     .bg(cx.theme().popover)
                     .text_color(cx.theme().popover_foreground)
@@ -5273,6 +5303,8 @@ impl PlannerView {
                     )
                     .child(
                         h_flex()
+                            .id("work-item-form-footer")
+                            .flex_shrink_0()
                             .px_6()
                             .py_3()
                             .gap_2()
@@ -5287,13 +5319,18 @@ impl PlannerView {
                                         this.save_form(window, cx)
                                     })),
                             )
-                            .child(Button::new("cancel-form").label("Cancel").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.form_loading = None;
-                                    this.state.close_form();
-                                    cx.notify();
-                                }),
-                            )),
+                            .child(
+                                div()
+                                    .id("cancel-form")
+                                    .debug_selector(|| "cancel-form".into())
+                                    .child(Button::new("cancel-form").label("Cancel").on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.form_loading = None;
+                                            this.state.close_form();
+                                            cx.notify();
+                                        }),
+                                    )),
+                            ),
                     ),
             )
             .into_any_element()
@@ -6312,6 +6349,10 @@ impl PlannerView {
         self.pending_toast_undo.as_ref().map(|(id, _)| *id)
     }
 
+    pub fn toast_undo_inflight_for_test(&self) -> bool {
+        self.toast_undo_inflight
+    }
+
     pub fn set_form_loading_for_test(&mut self, id: i64, title: impl Into<String>) {
         self.form_loading = Some((id, title.into()));
     }
@@ -7239,6 +7280,34 @@ mod bar_label_tests {
         assert!(
             PlannerView::bar_external_label_frame(&bar, 800.0, false).is_none(),
             "an off-screen Today diamond must not float a title at the right edge"
+        );
+    }
+
+    #[test]
+    fn clipped_left_bars_pin_the_title_inside() {
+        let bar = BarLayout {
+            id: 1,
+            kind: GanttBarKind::Scheduled,
+            x: -120.0,
+            width: 280.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Checkout rewrite".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        assert!(
+            PlannerView::bar_title_fits_inside(&bar),
+            "a bar that starts off-screen must keep its title in the visible fragment"
+        );
+        assert!(
+            PlannerView::bar_external_label_frame(&bar, 800.0, false).is_none(),
+            "must not float the title over the grid to the left of a clipped bar"
         );
     }
 }

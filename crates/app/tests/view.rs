@@ -2598,6 +2598,141 @@ fn zoom_percent_is_not_shown_in_the_toolbar(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn month_year_month_keeps_the_range_title(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 0.6;
+    state.gantt.selected_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let (title, jul_x) = view.update(cx, |view, _| {
+        (
+            view.state.gantt.viewport_range_title(),
+            view.state.gantt.x_for_date(Date::new(2026, 7, 1).unwrap()),
+        )
+    });
+    let year = cx.debug_bounds("gantt-scale-Year").expect("Year");
+    cx.simulate_click(year.center(), Modifiers::default());
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.scale, GanttScale::Month);
+        assert_eq!(
+            view.state.gantt.viewport_range_title(),
+            title,
+            "Month→Year→Month must restore the range"
+        );
+        let after = view.state.gantt.x_for_date(Date::new(2026, 7, 1).unwrap());
+        assert!(
+            (after - jul_x).abs() < 2.0,
+            "Jul must stay at the same screen x, {jul_x} vs {after}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn dates_cell_stays_one_line_with_a_conflict_marker(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.target_date = Some("2026-09-01T00:00:00Z".into());
+    }
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let cell = cx.debug_bounds("gantt-dates-cell").expect("dates cell");
+    assert!(
+        cx.debug_bounds("gantt-parent-overflow").is_some(),
+        "a child past its parent dates must show the conflict marker"
+    );
+    assert!(
+        f32::from(cell.size.height) <= ROW_HEIGHT + 1.0,
+        "the Dates column must not wrap to two lines, height={}",
+        f32::from(cell.size.height)
+    );
+}
+
+#[gpui_kit::test]
+fn details_dialog_keeps_a_stable_height(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1,
+        rev: 1,
+        work_item_type: "Epic".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: Vec::new(),
+        }],
+        values: serde_json::Map::new(),
+    }));
+    let (_epic_view, epic_cx) =
+        cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    epic_cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(epic_cx);
+    let epic = epic_cx
+        .debug_bounds("work-item-form-dialog")
+        .expect("epic dialog");
+    let epic_h = f32::from(epic.size.height);
+    let cancel = epic_cx.debug_bounds("cancel-form").expect("Cancel");
+    let cancel_y = f32::from(cancel.origin.y);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 4,
+        rev: 1,
+        work_item_type: "Task".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: Vec::new(),
+        }],
+        values: serde_json::Map::new(),
+    }));
+    let (_task_view, task_cx) =
+        cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    task_cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(task_cx);
+    let task = task_cx
+        .debug_bounds("work-item-form-dialog")
+        .expect("task dialog");
+    let task_cancel = task_cx.debug_bounds("cancel-form").expect("Cancel");
+    assert!(
+        (f32::from(task.size.height) - epic_h).abs() < 1.0,
+        "dialog height must not depend on work item type, epic={epic_h} task={}",
+        f32::from(task.size.height)
+    );
+    assert!(
+        (f32::from(task_cancel.origin.y) - cancel_y).abs() < 1.0,
+        "Cancel must stay put across types, epic y={cancel_y} task y={}",
+        f32::from(task_cancel.origin.y)
+    );
+}
+
+#[gpui_kit::test]
 fn error_toast_copy_and_dismiss_do_not_overlap_the_title(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -4114,12 +4249,8 @@ fn toast_undo_serializes_with_planner_io(cx: &mut gpui_kit::TestAppContext) {
             "toast Undo must hold io_busy so a later team switch or add-item cannot adopt a stale clone"
         );
         assert!(
-            view.state
-                .toasts
-                .items
-                .iter()
-                .all(|toast| toast.undo.is_none()),
-            "starting Undo must consume the control"
+            view.toast_undo_inflight_for_test(),
+            "a second Undo click must not dismiss the link-add toast as a no-op"
         );
     });
 }
