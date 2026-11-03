@@ -57,6 +57,11 @@ pub const OUTSIDE_TITLE_LEFT_GAP: f32 = LINK_HANDLE_HIT + LINK_HANDLE_GAP;
 /// Gap from an outside title's painted right edge to a long finish-to-start
 /// outgoing vertical. Reviewer floor is 6px; 8px covers antialiasing.
 const SOURCE_LABEL_CLEARANCE: f32 = 8.0;
+/// Forward finish-to-start inbound (x2 → head). Sliding this to miss an
+/// intervening open-ended cue parks a 100px+ run on the successor row
+/// (Persist cart → Go-live under Cart UI / spike). Keep the drop next to
+/// the diamond instead.
+const MAX_FORWARD_INBOUND: f32 = 20.0;
 pub const NUDGE_IDLE_MS: u64 = 500;
 pub const TIMELINE_HEADER_H: f32 = 44.0;
 pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
@@ -2315,6 +2320,16 @@ impl GanttView {
                     if x_in < clear && x_head > clear + 4.0 {
                         x_in = clear;
                     }
+                    // A long inbound on the successor row (Month Persist cart
+                    // → Go-live under Cart UI) is worse than dropping through
+                    // an open-ended dashed tail. Enter the diamond from the
+                    // left — but not if that stub recrosses a solid bar.
+                    if x_head - x_in > MAX_FORWARD_INBOUND {
+                        let stub = x_head - STUB;
+                        if !stub_recrosses_solid_intervening(stub, &intervening) {
+                            x_in = stub;
+                        }
+                    }
                 }
                 out.push(DependencyArrow {
                     from_id: *pred_id,
@@ -2720,9 +2735,17 @@ fn dodge_forward_inbounds_off_intervening(
             x
         };
         let next = slide_left(arrow.x2);
-        if next <= arrow.x_head + DependencyArrow::WRAP_STUB {
-            arrow.x2 = next;
+        if next > arrow.x_head + DependencyArrow::WRAP_STUB {
+            continue;
         }
+        // Never park a long inbound on the successor row after clip —
+        // that is the Persist cart → Go-live run under Cart UI / spike.
+        // Solid-body recross is handled before clip; this pass only
+        // nudges short inbounds off a cue the stub still sits on.
+        if arrow.x_head - next > MAX_FORWARD_INBOUND {
+            continue;
+        }
+        arrow.x2 = next;
     }
 }
 
@@ -2854,10 +2877,11 @@ fn dodge_outgoing_off_source_labels(
         // Leave (or pull back into) the handle gap instead.
         if desired > wrap_limit {
             let gap_x = pred.x + painted_w + 12.0;
-            let clear_left = (left - 6.0).max(gap_x);
+            let clear_left = (left - SOURCE_LABEL_CLEARANCE).max(gap_x);
             // Shared-source fan parks the stub 1–2px left of the chip
             // (bar_end+28 vs letters at +30). Snap ≥6px off the letters.
-            if arrow.x1 > left - 6.0 && arrow.x1 < right + 6.0 {
+            if arrow.x1 > left - SOURCE_LABEL_CLEARANCE && arrow.x1 < right + SOURCE_LABEL_CLEARANCE
+            {
                 arrow.x1 = clear_left.clamp(clip_left, clip_right);
             }
             continue;
@@ -3152,7 +3176,7 @@ fn full_outside_title_fits(
     }
     if let Some(today) = today_x
         && label_x < today
-        && label_x + estimated > today - 4.0
+        && label_x + estimated > today - 8.0
     {
         return false;
     }
@@ -3197,9 +3221,34 @@ pub fn bar_outside_label_frame(
     if full_outside_title_fits(right_x, estimated, timeline_w, today_x) {
         return Some((right_x, estimated));
     }
+    let today_blocks_right =
+        today_x.is_some_and(|today| right_x < today && right_x + estimated > today - 8.0);
+    // Milestones stay on the right of the diamond across Week/Month/Quarter
+    // even when the full title clips at the timeline edge. Flip left only
+    // when Today blocks the right side, or the title would not even start
+    // on-screen.
+    let right_starts_on_screen = right_x >= 0.0 && right_x < timeline_w - 4.0;
+    if (bar.milestone || bar.marker) && right_starts_on_screen && !today_blocks_right {
+        return Some((right_x, estimated));
+    }
     let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
     if full_outside_title_fits(left_x, estimated, timeline_w, today_x) {
         return Some((left_x, estimated));
+    }
+    // Last-resort right would paint through Today (launch Year Cart UI
+    // next to the Today line). Prefer a left chip when that side is only
+    // slightly past x=0 so the dodge covers outside-placed titles too.
+    // A deeply negative left_x (Persist cart ~144px at bar.x=40) would
+    // clamp onto Today; those keep the last-resort right. Milestones
+    // stay on the right of the diamond even if that crosses Today —
+    // Week/Month/Quarter must keep the same side.
+    if today_blocks_right && !bar.milestone && !bar.marker {
+        let clamped = left_x.max(2.0);
+        let misses_today = today_x
+            .is_none_or(|today| clamped >= today + 8.0 || clamped + estimated <= today - 8.0);
+        if misses_today && clamped + estimated > 8.0 {
+            return Some((clamped, estimated));
+        }
     }
     Some((right_x, estimated))
 }
@@ -3302,6 +3351,26 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
     } else {
         bar.x + painted_w + HANDLE_WIDTH + LINK_HANDLE_HIT + 16.0 + title_w
     }
+}
+
+fn is_open_ended_cue(bar: &BarLayout) -> bool {
+    bar.open_ended && !bar.milestone && !bar.marker
+}
+
+/// A 12px inbound stub at the successor start must not land inside a
+/// solid intervening body. Open-ended dashed tails are allowed: entering
+/// the diamond from the left beats a long successor-row run that only
+/// exists to miss Cart UI's cue.
+fn stub_recrosses_solid_intervening(stub: f32, intervening: &[&BarLayout]) -> bool {
+    intervening.iter().any(|mid| {
+        if is_open_ended_cue(mid) {
+            return false;
+        }
+        // Body only: outside titles and dashed cues must not block a short
+        // inbound into the diamond (spike's chip, Cart UI's tail).
+        let (left, right) = bar_occupied_x(mid, false, None);
+        x_hits_span(stub, left, right)
+    })
 }
 
 /// Body, and optionally an external title, so a vertical drop misses the row.
@@ -6111,15 +6180,20 @@ mod tests {
             cart_spike.lane_y
         );
         let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
-        let clip_right = (timeline_width - 10.0).max(24.0);
-        let include_labels = !matches!(scale, GanttScale::Year | GanttScale::Quarter);
-        let (occ_left, occ_right) = bar_occupied_x(cart, include_labels, Some(clip_right));
+        let (occ_left, occ_right) = bar_occupied_x(cart, false, None);
+        let head_on_timeline = persist_live.x_head <= timeline_width;
+        let short_inbound =
+            (persist_live.x_head - persist_live.x2).abs() <= MAX_FORWARD_INBOUND + 0.5;
         assert!(
-            persist_live.x2 < occ_left - 0.5 || persist_live.x2 > occ_right + 0.5,
-            "{scale:?}: Persist cart → Go-live inbound must not cut through Cart UI, x2={} occupied={occ_left}..{occ_right} cart={}..{}",
+            !head_on_timeline
+                || short_inbound
+                || persist_live.x2 < occ_left - 0.5
+                || persist_live.x2 > occ_right + 0.5,
+            "{scale:?}: Persist cart → Go-live inbound must enter the diamond from the left or miss Cart UI's solid body, x2={} occupied={occ_left}..{occ_right} cart={}..{} x_head={}",
             persist_live.x2,
             cart.x,
-            cart.x + cart.width
+            cart.x + cart.width,
+            persist_live.x_head
         );
         let cue_bottom = cart.y + cart.paint_top() + cart.paint_h();
         assert!(
@@ -6450,7 +6524,7 @@ mod tests {
         let today = jiff::Zoned::now().date();
         let today_px = gantt.x_for_date(today);
         let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
-        for id in [1002_i64, 1003, 1012, 1013] {
+        for id in [1002_i64, 1003, 1005, 1012, 1013] {
             let bar = bars
                 .iter()
                 .find(|bar| bar.id == id)
@@ -6474,6 +6548,59 @@ mod tests {
                 "launch Year {} must keep the full title, not Pers…/Go-l…, max_w={w} estimated={estimated} x={x}",
                 bar.title
             );
+            if let Some(today) = today_x {
+                let room_before_today = today - 8.0;
+                let can_sit_left_of_today = estimated + 10.0 <= room_before_today
+                    || x + estimated <= room_before_today + 0.5;
+                if can_sit_left_of_today && x < today {
+                    assert!(
+                        x + w <= today - 8.0 || x >= today + 8.0,
+                        "launch Year {} outside label must miss Today when there is room, label={x}+{w} today={today}",
+                        bar.title
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn milestone_chip_stays_right_of_the_diamond_across_scales() {
+        let nodes = mock_fixture_nodes();
+        for scale in [GanttScale::Week, GanttScale::Month, GanttScale::Quarter] {
+            let mut gantt = GanttView {
+                timeline_width: 800.0,
+                ..Default::default()
+            };
+            gantt.auto_fit(&nodes, &[], 800.0);
+            gantt.retarget_year_gutter(|gantt| {
+                gantt.set_scale_from_toolbar(scale, jiff::Zoned::now().date());
+            });
+            let rows = gantt.flatten(&nodes);
+            let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+            let bar = bars.iter().find(|bar| bar.id == 1013).unwrap();
+            if bar_offscreen_edge(bar, gantt.timeline_width).is_some() {
+                continue;
+            }
+            let today = jiff::Zoned::now().date();
+            let today_px = gantt.x_for_date(today);
+            let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+            let (x, w) = bar_outside_label_frame(bar, gantt.timeline_width, true, today_x, false)
+                .expect("Go-live must keep an outside chip");
+            let diamond_right = bar.x + MILESTONE_SIZE;
+            let on_right = x + 1.0 >= diamond_right;
+            let on_left = x + w <= bar.x + 0.1;
+            assert!(
+                on_right || on_left,
+                "{scale:?}: Go-live chip must sit beside the diamond, x={x} diamond={diamond_right}"
+            );
+            if today_x.is_none()
+                || today_x.is_some_and(|today| diamond_right + 6.0 + w <= today - 8.0)
+            {
+                assert!(
+                    on_right,
+                    "{scale:?}: Go-live chip must stay on the right of the diamond when there is room, x={x} diamond={diamond_right}"
+                );
+            }
         }
     }
 
@@ -6514,6 +6641,16 @@ mod tests {
                 live.x1
             );
         }
+        assert!(
+            (live.x_head - live.x2).abs() <= MAX_FORWARD_INBOUND + 0.5,
+            "Month Persist cart → Go-live must enter the diamond from the left, not run along the milestone row, x2={} x_head={}",
+            live.x2,
+            live.x_head
+        );
+        assert!(
+            !live.wraps_around_successor(),
+            "forward Persist cart → Go-live must not wrap along the Go-live row"
+        );
         let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
         let overlaps_x = live.x1.min(live.x2) < right && live.x1.max(live.x2) > left;
         if overlaps_x && live.y2 > live.y1 {
@@ -6576,6 +6713,14 @@ mod tests {
             cart_spike.x1,
             cart_spike.x2
         );
+        if persist_live.x_head <= gantt.timeline_width {
+            assert!(
+                (persist_live.x_head - persist_live.x2).abs() <= MAX_FORWARD_INBOUND + 0.5,
+                "runtime Persist cart → Go-live must enter the diamond from the left, x2={} x_head={}",
+                persist_live.x2,
+                persist_live.x_head
+            );
+        }
     }
 
     #[test]
@@ -7933,11 +8078,15 @@ mod tests {
             "forward milestone links must enter the start, not the right tip"
         );
         let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
-        let (cart_left, cart_right) = bar_occupied_x(cart, true, Some(gantt.timeline_width));
         assert!(
-            !x_hits_span(arrow.x2, cart_left, cart_right),
-            "the inbound vertical must skip Cart UI including its open-ended cue, x2={} cart={cart_left}..{cart_right}",
-            arrow.x2
+            (arrow.x_head - arrow.x2).abs() <= MAX_FORWARD_INBOUND + 0.5,
+            "forward Persist cart → Go-live must enter the diamond from the left, not run along the milestone row, x2={} x_head={}",
+            arrow.x2,
+            arrow.x_head
+        );
+        assert!(
+            !arrow.wraps_around_successor(),
+            "forward Persist cart → Go-live must not wrap along the Go-live row"
         );
         assert!(
             arrow.lane_y < cart.y || arrow.lane_y >= cart.y + ROW_HEIGHT,
@@ -7982,12 +8131,11 @@ mod tests {
             .iter()
             .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
             .expect("#1003→#1013");
-        let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
-        let (cart_left, cart_right) = bar_occupied_x(cart, true, Some(gantt.timeline_width));
         assert!(
-            !x_hits_span(arrow.x2, cart_left, cart_right),
-            "Day-view elbow must not drop through Cart UI, x2={} cart={cart_left}..{cart_right}",
-            arrow.x2
+            (arrow.x_head - arrow.x2).abs() <= MAX_FORWARD_INBOUND + 0.5,
+            "Day-view Persist cart → Go-live must enter the diamond from the left, x2={} x_head={}",
+            arrow.x2,
+            arrow.x_head
         );
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 1013).unwrap();

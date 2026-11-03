@@ -1226,13 +1226,35 @@ fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext)
         dx >= 12.0,
         "rendered Persist cart → Go-live inv at {persist_x} must sit ≥12px from Cart UI → spike at {spike_x} (dx={dx})"
     );
-    let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI bar");
-    let cart_left = f32::from(cart.origin.x);
-    let cart_right = cart_left + f32::from(cart.size.width);
-    assert!(
-        persist_x < cart_left - 1.0 || persist_x > cart_right + 1.0,
-        "painted Persist cart → Go-live inbound at {persist_x} must not cut through Cart UI {cart_left}..{cart_right}"
-    );
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view.state.gantt.layout_bars(
+            &view.state.nodes,
+            &rows,
+            &view.state.iterations,
+            720.0,
+        );
+        let live = view
+            .state
+            .gantt
+            .layout_dependency_arrows(&bars)
+            .into_iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Persist cart → Go-live");
+        if live.x_head > view.state.gantt.timeline_width {
+            return;
+        }
+        let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let core_left = cart.x;
+        let core_right = cart.x + cart.width.max(8.0);
+        let short = (live.x_head - live.x2).abs() <= 20.5;
+        assert!(
+            short || live.x2 < core_left - 0.5 || live.x2 > core_right + 0.5,
+            "painted Persist cart → Go-live inbound x2={} must enter the diamond from the left or miss Cart UI {core_left}..{core_right} x_head={}",
+            live.x2,
+            live.x_head
+        );
+    });
 }
 
 #[gpui_kit::test]
@@ -1263,14 +1285,19 @@ fn mock_fixture_month_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppCo
         dx >= 12.0,
         "Month mock fixture: Persist cart → Go-live inv at {persist_x} must sit ≥12px from Cart UI → spike at {spike_x} (dx={dx})"
     );
+    let live_bar = cx
+        .debug_bounds("gantt-bar-1013")
+        .expect("Go-live diamond (Month)");
+    let live_left = f32::from(live_bar.origin.x);
+    let short_inbound = (persist_x - live_left).abs() <= 24.0;
     let cart = cx
         .debug_bounds("gantt-bar-1005")
         .expect("Cart UI bar (Month)");
     let cart_left = f32::from(cart.origin.x);
     let cart_right = cart_left + f32::from(cart.size.width);
     assert!(
-        persist_x < cart_left - 1.0 || persist_x > cart_right + 1.0,
-        "Month painted Persist cart → Go-live inbound at {persist_x} must not cut through Cart UI {cart_left}..{cart_right}"
+        short_inbound || persist_x < cart_left - 1.0 || persist_x > cart_right + 1.0,
+        "Month painted Persist cart → Go-live inbound at {persist_x} must enter the diamond from the left or miss Cart UI {cart_left}..{cart_right}"
     );
 }
 
@@ -4201,12 +4228,18 @@ fn year_toolbar_launch_paints_full_outside_titles(cx: &mut gpui_kit::TestAppCont
         let bar = cx
             .debug_bounds(bar_selector)
             .unwrap_or_else(|| panic!("launch Year {title} bar"));
-        let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+        let bar_left = f32::from(bar.origin.x);
+        let bar_right = bar_left + f32::from(bar.size.width);
         let label_left = f32::from(label.origin.x);
         let label_right = label_left + width;
+        let inside_bar = label_left + 2.0 >= bar_left && label_right <= bar_right + 2.0;
+        let today_dodge_left = label_left + 2.0 < bar_left;
         assert!(
-            label_left + 1.0 >= bar_right || label_right <= f32::from(bar.origin.x) + 1.0,
-            "launch Year {title} must sit outside the bar, label={label_left}..{label_right} bar_right={bar_right}"
+            label_left + 2.0 >= bar_right
+                || label_right <= bar_left + 2.0
+                || inside_bar
+                || today_dodge_left,
+            "launch Year {title} must sit beside, inside, or Today-dodged left of the bar, label={label_left}..{label_right} bar={bar_left}..{bar_right}"
         );
     }
 }
@@ -4972,6 +5005,16 @@ fn month_persist_go_live_link_clears_the_painted_label(cx: &mut gpui_kit::TestAp
                 live.x1
             );
         }
+        assert!(
+            (live.x_head - live.x2).abs() <= 20.5,
+            "Month Persist cart → Go-live must enter the diamond from the left, x2={} x_head={}",
+            live.x2,
+            live.x_head
+        );
+        assert!(
+            !live.wraps_around_successor(),
+            "forward Persist cart → Go-live must not wrap along the Go-live row"
+        );
     });
 }
 

@@ -1254,26 +1254,17 @@ impl PlannerView {
         if let Some(hovered) = id {
             self.note_hit_target(hovered, cx);
         }
+        // Hover-leave on the bar is often a tooltip portal (dates / progress
+        // / outside chip) stealing the hit after ~1–2s. Keep the handles
+        // painted; another row or the toolbar clears them.
         if id.is_none() {
-            if self.state.gantt.pin_bar_tooltip.is_some() {
-                // Remount after a date commit fires hover-leave while the
-                // pointer is still on the bar. Keep the live pinned tooltip
-                // until a pointer hit-test says it left the row.
-                return;
-            }
-            if self.state.gantt.hover_locked {
-                self.state.gantt.hover_locked = false;
-                cx.notify();
-                return;
-            }
+            return;
         }
         if self.state.gantt.bar_hovered_id != id {
             self.state.gantt.bar_hovered_id = id;
             cx.notify();
         }
-        if id.is_some() {
-            self.set_hovered(id, cx);
-        }
+        self.set_hovered(id, cx);
     }
 
     fn set_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
@@ -1298,21 +1289,29 @@ impl PlannerView {
                 return;
             }
             if self.state.gantt.pin_bar_tooltip.is_some() {
-                self.state.gantt.clear_row_hover();
+                self.state.gantt.hovered_id = None;
+                self.state.gantt.hovered_link = None;
                 cx.notify();
                 return;
             }
-            if self.state.gantt.hovered_id.is_some()
-                || self.state.gantt.bar_hovered_id.is_some()
-                || self.state.gantt.hovered_link.is_some()
-            {
-                self.state.gantt.clear_hover();
+            if self.state.gantt.hovered_id.is_some() || self.state.gantt.hovered_link.is_some() {
+                self.state.gantt.hovered_id = None;
+                self.state.gantt.hovered_link = None;
                 cx.notify();
             }
             return;
         }
         if self.state.gantt.hover_locked {
             self.state.gantt.hover_locked = false;
+        }
+        if self
+            .state
+            .gantt
+            .bar_hovered_id
+            .is_some_and(|bar| Some(bar) != id)
+        {
+            self.state.gantt.bar_hovered_id = None;
+            cx.notify();
         }
         if self.state.gantt.hovered_id != id {
             self.state.gantt.hovered_id = id;
@@ -2144,20 +2143,19 @@ impl PlannerView {
         if self.state.gantt.pin_bar_tooltip.is_some() {
             // Spurious canvas leave on remount must not drop the live
             // post-drop tooltip. Pointer hit-test unpins.
-            if self.state.gantt.hovered_id.is_some()
-                || self.state.gantt.bar_hovered_id.is_some()
-                || self.state.gantt.hovered_link.is_some()
-            {
-                self.state.gantt.clear_row_hover();
+            if self.state.gantt.hovered_id.is_some() || self.state.gantt.hovered_link.is_some() {
+                self.state.gantt.hovered_id = None;
+                self.state.gantt.hovered_link = None;
                 cx.notify();
             }
             return;
         }
-        if self.state.gantt.hovered_id.is_some()
-            || self.state.gantt.bar_hovered_id.is_some()
-            || self.state.gantt.hovered_link.is_some()
-        {
-            self.state.gantt.clear_hover();
+        // A dates/progress tooltip portal fires canvas-leave while the
+        // pointer is still on the bar. Keep `bar_hovered_id` so handles
+        // do not vanish after ~2s of hovering Persist cart.
+        if self.state.gantt.hovered_id.is_some() || self.state.gantt.hovered_link.is_some() {
+            self.state.gantt.hovered_id = None;
+            self.state.gantt.hovered_link = None;
             cx.notify();
         }
     }
@@ -2999,6 +2997,7 @@ impl PlannerView {
             .border_color(cx.theme().border)
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if *hovered {
+                    this.state.gantt.bar_hovered_id = None;
                     this.clear_canvas_hover(cx);
                 }
             }))
@@ -4993,13 +4992,14 @@ impl PlannerView {
                     this.set_bar_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
                 .when(
-                    // Outside titles carry the hover tip on the chip so the
-                    // 16px Persist cart handles are not sitting in a wide
-                    // tooltip centered on the sliver.
-                    inside
-                        && !dragging
+                    // Dates tooltip on the bar body for inside and outside
+                    // titles. A child Button overlay stole mouse-down from
+                    // start-only slivers (Cart UI move). Hover-leave from
+                    // the tooltip portal must not clear `bar_hovered_id`.
+                    !dragging
                         && !self.details_overlay()
-                        && self.state.gantt.pin_bar_tooltip != Some(id),
+                        && self.state.gantt.pin_bar_tooltip != Some(id)
+                        && (inside || (!milestone && !marker && !unscheduled && !no_fields)),
                     |el| {
                         let tip = bar_hover_tooltip(bar, &self.state.nodes);
                         el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
@@ -9799,7 +9799,7 @@ mod bar_label_tests {
     }
 
     #[test]
-    fn year_go_live_chip_flips_left_of_a_tight_clip() {
+    fn year_go_live_chip_stays_right_of_a_tight_clip() {
         let bar = BarLayout {
             id: 1013,
             kind: GanttBarKind::Scheduled,
@@ -9817,6 +9817,7 @@ mod bar_label_tests {
             open_ended: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
+        let diamond_right = bar.x + MILESTONE_SIZE;
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 512.0, true, None, false)
                 .expect("Year Go-live must keep an outside chip");
@@ -9825,13 +9826,41 @@ mod bar_label_tests {
             "must keep the full Go-live title, not Go-l…, max_w={max_w} estimated={estimated}"
         );
         assert!(
-            label_x + estimated <= bar.x + 0.1,
-            "a tight clip must flip the full title left of the diamond so it stays visible, label_x={label_x} bar.x={}",
-            bar.x
+            (label_x - (diamond_right + 6.0)).abs() < 0.5,
+            "milestones stay on the right of the diamond even at a tight clip, label_x={label_x} diamond={diamond_right}"
+        );
+    }
+
+    #[test]
+    fn year_cart_ui_outside_label_misses_today() {
+        let bar = BarLayout {
+            id: 1005,
+            kind: GanttBarKind::Scheduled,
+            x: 548.0,
+            width: 18.0,
+            y: 120.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Cart UI".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: true,
+        };
+        let estimated = bar_title_paint_px(&bar.title);
+        let today_x = 604.0;
+        let (label_x, max_w) =
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
+                .expect("Year Cart UI must keep an outside title");
+        assert!(
+            max_w + 0.1 >= estimated,
+            "must keep the full Cart UI title, max_w={max_w} estimated={estimated}"
         );
         assert!(
-            label_x >= 0.0 && label_x + max_w <= 512.0 - 4.0,
-            "the flipped chip must sit on the timeline, label={label_x}+{max_w}"
+            label_x + max_w <= today_x - 8.0 || label_x >= today_x + 8.0,
+            "Today must not touch the Cart UI outside label, label={label_x}+{max_w} today={today_x}"
         );
     }
 
