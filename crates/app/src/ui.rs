@@ -5692,8 +5692,9 @@ impl PlannerView {
         let today_px = self.state.gantt.x_for_date(today);
         let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
         let overflow = parent_date_overflow(&self.state.nodes, id);
-        // Full title beside a sliver. Prefer the right; flip left to miss
-        // Today; last resort still paints the full glyphs (never "Pers…").
+        // Full title beside a sliver. Prefer the right; flip left when the
+        // full glyphs cannot sit on the right (clip or Today); last resort
+        // still paints the full title (never "Pers…").
         let (label_x, max_w) =
             Self::bar_external_label_frame(bar, timeline_w, true, today_x, overflow)?;
         let label = bar.title.clone();
@@ -9508,7 +9509,7 @@ mod bar_label_tests {
     }
 
     #[test]
-    fn outside_label_stays_on_the_right_after_a_right_edge_grow() {
+    fn outside_label_stays_visible_after_a_right_edge_grow() {
         let bar = BarLayout {
             id: 1014,
             kind: GanttBarKind::Scheduled,
@@ -9529,19 +9530,24 @@ mod bar_label_tests {
             !PlannerView::bar_title_fits_inside(&bar),
             "precondition: #1014 title is wider than the bar"
         );
-        let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false);
-        if let Some((label_x, max_w)) = frame {
-            assert!(
-                label_x >= bar.x + bar.width - 1.0,
-                "a right-edge resize must not flip the title to the left of the bar, label_x={label_x} bar={}..{}",
-                bar.x,
-                bar.x + bar.width
-            );
-            assert!(
-                max_w >= 40.0,
-                "an outside label must stay readable, not clip to a letter, max_w={max_w}"
-            );
-        }
+        let estimated = bar_title_paint_px(&bar.title);
+        let (label_x, max_w) =
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
+                .expect("#1014 must keep a visible outside title after a right-edge grow");
+        assert!(
+            max_w + 0.1 >= estimated,
+            "an outside label must stay the full title, not clip to a letter, max_w={max_w}"
+        );
+        assert!(
+            label_x >= 0.0 && label_x + max_w <= 800.0 - 4.0,
+            "the full title must sit on the timeline, not past the clip, label={label_x}+{max_w}"
+        );
+        assert!(
+            label_x + max_w <= bar.x + 0.1 || label_x + 1.0 >= bar.x + bar.width,
+            "the title must sit beside the bar, label_x={label_x} bar={}..{}",
+            bar.x,
+            bar.x + bar.width
+        );
     }
 
     #[test]
@@ -9793,7 +9799,7 @@ mod bar_label_tests {
     }
 
     #[test]
-    fn year_go_live_chip_keeps_full_title_on_a_tight_clip() {
+    fn year_go_live_chip_flips_left_of_a_tight_clip() {
         let bar = BarLayout {
             id: 1013,
             kind: GanttBarKind::Scheduled,
@@ -9811,17 +9817,58 @@ mod bar_label_tests {
             open_ended: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let diamond_right = bar.x + MILESTONE_SIZE;
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 512.0, true, None, false)
                 .expect("Year Go-live must keep an outside chip");
         assert!(
-            (label_x - (diamond_right + 6.0)).abs() < 0.5,
-            "a tight clip must keep the full title on the right of the diamond, label_x={label_x} diamond={diamond_right}"
-        );
-        assert!(
             max_w + 0.1 >= estimated,
             "must keep the full Go-live title, not Go-l…, max_w={max_w} estimated={estimated}"
+        );
+        assert!(
+            label_x + estimated <= bar.x + 0.1,
+            "a tight clip must flip the full title left of the diamond so it stays visible, label_x={label_x} bar.x={}",
+            bar.x
+        );
+        assert!(
+            label_x >= 0.0 && label_x + max_w <= 512.0 - 4.0,
+            "the flipped chip must sit on the timeline, label={label_x}+{max_w}"
+        );
+    }
+
+    #[test]
+    fn year_near_clip_sliver_keeps_a_visible_full_title() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 460.0,
+            width: 24.0,
+            y: 80.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let estimated = bar_title_paint_px(&bar.title);
+        let (label_x, max_w) =
+            PlannerView::bar_external_label_frame(&bar, 512.0, true, None, false)
+                .expect("a near-clip Year sliver must keep an outside title");
+        assert!(
+            max_w + 0.1 >= estimated,
+            "must keep the full Persist cart title, not Pers…, max_w={max_w} estimated={estimated}"
+        );
+        assert!(
+            label_x + estimated <= bar.x + 0.1,
+            "when the right side is clipped, the full title must sit left of the bar, label_x={label_x} bar.x={}",
+            bar.x
+        );
+        assert!(
+            label_x >= 0.0 && label_x + max_w <= 512.0 - 4.0,
+            "the full title must be on-timeline, not past the clip, label={label_x}+{max_w}"
         );
     }
 
@@ -9863,11 +9910,14 @@ mod bar_label_tests {
             open_ended: false,
         };
         let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, None, true);
-        if let Some((label_x, _)) = frame {
-            let handle_left = bar.x + bar.width + LINK_HANDLE_GAP;
+        if let Some((label_x, max_w)) = frame {
+            let right_handle = bar.x + bar.width + LINK_HANDLE_GAP;
+            let left_handle = bar.x - LINK_HANDLE_HIT - 2.0;
+            let misses_right = label_x >= right_handle + LINK_HANDLE_HIT - 0.5;
+            let misses_left = label_x + max_w <= left_handle + 0.5;
             assert!(
-                label_x >= handle_left + LINK_HANDLE_HIT - 0.5,
-                "an outside title at the clip must not cover the link handle, label_x={label_x} handle_left={handle_left}"
+                misses_right || misses_left,
+                "an outside title at the clip must not cover a link handle, label={label_x}+{max_w} right_handle={right_handle} left_handle={left_handle}"
             );
         }
     }

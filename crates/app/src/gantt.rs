@@ -2380,7 +2380,13 @@ impl GanttView {
                 if out[index].wraps_around_successor() {
                     out[index].x2 += x_shift;
                 }
-                let dir = if out[index].y2 >= out[index].y1 {
+                // Fan down when the source paints an outside title so the
+                // second lane stays below the chip. Fan up lands in the
+                // letters; clamp then collapses both runs onto min_lane.
+                let outside_title = by_id
+                    .get(&out[index].from_id)
+                    .is_some_and(|pred| !bar_title_is_inside(pred) && !bar_is_gutter(pred));
+                let dir = if out[index].y2 >= out[index].y1 && !outside_title {
                     -1.0
                 } else {
                     1.0
@@ -2401,7 +2407,12 @@ impl GanttView {
         // MIN_STUB / clip can park a dodged inbound back onto an intervening
         // open-ended cue (Persist cart → Go-live on Cart UI at Month 512).
         let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
-        dodge_outgoing_off_source_labels(&mut out, bars, clip_left, clip_right, timeline_w);
+        let today = jiff::Zoned::now().date();
+        let today_px = self.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
+        dodge_outgoing_off_source_labels(
+            &mut out, bars, clip_left, clip_right, timeline_w, today_x,
+        );
         dodge_forward_inbounds_off_intervening(
             &mut out,
             bars,
@@ -2413,7 +2424,9 @@ impl GanttView {
         separate_shared_source_outgoing(&mut out, clip_left, clip_right);
         // Parallel-vertical pushes can slide a stub back under the source
         // title; re-apply per-arrow dodge after the last fan.
-        dodge_outgoing_off_source_labels(&mut out, bars, clip_left, clip_right, timeline_w);
+        dodge_outgoing_off_source_labels(
+            &mut out, bars, clip_left, clip_right, timeline_w, today_x,
+        );
         // Shared-source Y fan can lift the new Persist cart → Go-live run
         // into the outside chip; put it back ≥6px below, still in-row.
         clamp_lanes_off_source_titles(&mut out, bars);
@@ -2769,14 +2782,23 @@ fn separate_shared_source_outgoing(
 
 #[cfg(test)]
 fn bar_outside_title_span(bar: &BarLayout) -> Option<(f32, f32)> {
-    bar_outside_title_span_clipped(bar, 10_000.0)
+    bar_outside_title_span_clipped(bar, 10_000.0, None)
 }
 
 /// Occupancy of the painted outside chip. Same frame as `bar_outside_label_frame`
 /// so a Persist cart → Go-live stub cannot sit 1–2px from the letters while
-/// unit tests pass against a different span.
-fn bar_outside_title_span_clipped(bar: &BarLayout, timeline_w: f32) -> Option<(f32, f32)> {
-    let (left, width) = bar_outside_label_frame(bar, timeline_w, true, None, false)?;
+/// unit tests pass against a different span. Skip gutter pills (they never
+/// paint an outside title) and honour Today so a flipped chip is occupied
+/// on the side the letters actually sit.
+fn bar_outside_title_span_clipped(
+    bar: &BarLayout,
+    timeline_w: f32,
+    today_x: Option<f32>,
+) -> Option<(f32, f32)> {
+    if bar_is_gutter(bar) {
+        return None;
+    }
+    let (left, width) = bar_outside_label_frame(bar, timeline_w, true, today_x, false)?;
     Some((left, left + width))
 }
 
@@ -2791,13 +2813,16 @@ fn dodge_outgoing_off_source_labels(
     clip_left: f32,
     clip_right: f32,
     timeline_w: f32,
+    today_x: Option<f32>,
 ) {
     let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
     for arrow in arrows.iter_mut() {
         let Some(pred) = by_id.get(&arrow.from_id) else {
             continue;
         };
-        let Some((left, right)) = bar_outside_title_span_clipped(pred, timeline_w.max(1.0)) else {
+        let Some((left, right)) =
+            bar_outside_title_span_clipped(pred, timeline_w.max(1.0), today_x)
+        else {
             continue;
         };
         let painted_w = if pred.milestone || pred.marker {
@@ -2854,7 +2879,8 @@ fn dodge_outgoing_off_source_labels(
 
 /// Keep a long outgoing horizontal ≥6px below the source's outside title
 /// after shared-source Y fan. Stay in the source row (Cart UI is the next
-/// row under Persist cart).
+/// row under Persist cart). The in-row band is only a few pixels, so
+/// re-spread shared-source runs inside it instead of collapsing onto one y.
 fn clamp_lanes_off_source_titles(arrows: &mut [DependencyArrow], bars: &[BarLayout]) {
     const CLEAR: f32 = 6.0;
     const STROKE: f32 = 2.0;
@@ -2873,6 +2899,34 @@ fn clamp_lanes_off_source_titles(arrows: &mut [DependencyArrow], bars: &[BarLayo
         let min_lane = label_top + OUTSIDE_LABEL_H + CLEAR;
         let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
         arrow.lane_y = arrow.lane_y.max(min_lane).min(in_row);
+    }
+    let mut by_from: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (index, arrow) in arrows.iter().enumerate() {
+        let Some(pred) = by_id.get(&arrow.from_id) else {
+            continue;
+        };
+        if bar_title_is_inside(pred) || bar_is_gutter(pred) || arrow.y2 <= arrow.y1 {
+            continue;
+        }
+        by_from.entry(arrow.from_id).or_default().push(index);
+    }
+    for indexes in by_from.values_mut() {
+        if indexes.len() < 2 {
+            continue;
+        }
+        indexes.sort_by_key(|&index| arrows[index].to_id);
+        let pred = by_id[&arrows[indexes[0]].from_id];
+        let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
+        let min_lane = label_top + OUTSIDE_LABEL_H + CLEAR;
+        let in_row = pred.y + ROW_HEIGHT - STROKE - 1.0;
+        let span = in_row - min_lane;
+        if span < 2.0 {
+            continue;
+        }
+        let last = (indexes.len() - 1) as f32;
+        for (rank, &index) in indexes.iter().enumerate() {
+            arrows[index].lane_y = min_lane + span * rank as f32 / last;
+        }
     }
 }
 
@@ -3107,8 +3161,9 @@ fn full_outside_title_fits(
 
 /// Overlay frame for a title that does not fit inside the bar. Always the
 /// full glyph width — never a 40px "Pers…" clip. Prefer the right of the
-/// bar; flip left when the full title cannot sit before Today; last resort
-/// keeps the full title on the right even if it crosses Today.
+/// bar; flip left when the full title cannot sit on the right (clip or
+/// Today) if the left side can hold it; last resort keeps the full title
+/// on the right even if it crosses Today.
 pub fn bar_outside_label_frame(
     bar: &BarLayout,
     timeline_w: f32,
@@ -3116,7 +3171,7 @@ pub fn bar_outside_label_frame(
     today_x: Option<f32>,
     overflow_badge: bool,
 ) -> Option<(f32, f32)> {
-    if bar_title_is_inside(bar) {
+    if bar_is_gutter(bar) || bar_title_is_inside(bar) {
         return None;
     }
     if bar_offscreen_edge(bar, timeline_w).is_some() {
@@ -3142,13 +3197,9 @@ pub fn bar_outside_label_frame(
     if full_outside_title_fits(right_x, estimated, timeline_w, today_x) {
         return Some((right_x, estimated));
     }
-    // Flip left only to miss Today. A tight clip after a right-edge resize
-    // (#1014) must not jump the title to the other side of the bar.
-    if today_x.is_some() {
-        let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
-        if full_outside_title_fits(left_x, estimated, timeline_w, today_x) {
-            return Some((left_x, estimated));
-        }
+    let left_x = bar.x - estimated - OUTSIDE_TITLE_LEFT_GAP;
+    if full_outside_title_fits(left_x, estimated, timeline_w, today_x) {
+        return Some((left_x, estimated));
     }
     Some((right_x, estimated))
 }
@@ -6262,6 +6313,124 @@ mod tests {
             "horizontal must still sit ≥6px below the Persist cart chip, lane={} chip_bottom={}",
             live.lane_y,
             label_top + OUTSIDE_LABEL_H
+        );
+    }
+
+    #[test]
+    fn year_shared_source_outside_title_lanes_stay_apart() {
+        let mut nodes = mock_fixture_nodes();
+        if let Some(spike) = nodes.iter_mut().find(|node| node.id == 1012) {
+            spike.predecessors = vec![1003];
+        }
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        assert!(
+            !bar_title_is_inside(pred),
+            "precondition: Year Persist cart paints an outside title"
+        );
+        let spike = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+            .expect("Year Persist cart → spike");
+        let live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Year Persist cart → Go-live");
+        let label_top = pred.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
+        let min_lane = label_top + OUTSIDE_LABEL_H + 6.0;
+        let in_row = pred.y + ROW_HEIGHT - 2.0 - 1.0;
+        for arrow in [spike, live] {
+            assert!(
+                arrow.lane_y + 0.5 >= min_lane && arrow.lane_y <= in_row + 0.5,
+                "shared-source lane must sit ≥6px below the chip and in-row, to={} lane={} band={min_lane}..{in_row}",
+                arrow.to_id,
+                arrow.lane_y
+            );
+        }
+        let dy = (spike.lane_y - live.lane_y).abs();
+        assert!(
+            dy >= 2.0,
+            "clamp must not collapse both Persist cart outgoings onto one stroke, dy={dy} spike={} live={}",
+            spike.lane_y,
+            live.lane_y
+        );
+    }
+
+    #[test]
+    fn occupancy_skips_gutter_pills() {
+        let pill = BarLayout {
+            id: 1014,
+            kind: GanttBarKind::NoFields,
+            x: 10.0,
+            width: 80.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Backlog grooming".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        assert!(
+            bar_outside_title_span_clipped(&pill, 800.0, None).is_none(),
+            "No-dates pills never paint an outside title, so arrows must not dodge a phantom chip"
+        );
+        assert!(
+            bar_outside_label_frame(&pill, 800.0, true, None, false).is_none(),
+            "gutter pills must not get an outside overlay frame"
+        );
+    }
+
+    #[test]
+    fn occupancy_matches_a_today_flipped_chip() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 300.0,
+            width: 24.0,
+            y: 80.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Persist cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let estimated = bar_title_paint_px(&bar.title);
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let today_x = right_x + 20.0;
+        assert!(
+            today_x - right_x < estimated,
+            "precondition: full title cannot fit before Today"
+        );
+        let (paint_x, paint_w) = bar_outside_label_frame(&bar, 800.0, true, Some(today_x), false)
+            .expect("Today on the right must keep a full Persist cart chip");
+        let (occ_left, occ_right) = bar_outside_title_span_clipped(&bar, 800.0, Some(today_x))
+            .expect("occupancy must see the painted chip");
+        assert!(
+            (occ_left - paint_x).abs() < 0.5 && (occ_right - (paint_x + paint_w)).abs() < 0.5,
+            "dodge occupancy must match the painted frame, paint={paint_x}..{} occ={occ_left}..{occ_right}",
+            paint_x + paint_w
+        );
+        assert!(
+            paint_x + paint_w <= bar.x + 0.1,
+            "fixture: Today must flip the chip left of the bar, paint_x={paint_x} bar.x={}",
+            bar.x
         );
     }
 
