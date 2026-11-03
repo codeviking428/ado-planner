@@ -354,12 +354,11 @@ impl DependencyArrow {
         }
     }
 
-    /// Keep × on the predecessor bar, left of the outgoing stub. The stub
-    /// shares its pixel with the link handle; putting × there blocks drags.
-    const REMOVE_INSET: f32 = 28.0;
+    /// Sit above the outgoing stub, off the predecessor bar and the line.
+    const REMOVE_ABOVE: f32 = 18.0;
 
     pub fn remove_control_pos(&self) -> (f32, f32) {
-        (self.x1 - Self::REMOVE_INSET, self.y1)
+        (self.x1, self.y1 - Self::REMOVE_ABOVE)
     }
 
     pub fn gutter_y(&self) -> f32 {
@@ -1586,10 +1585,14 @@ impl GanttView {
             .clone();
         let kind = if bar.milestone || bar.summary || bar.marker {
             GestureKind::Move
+        } else if bar.open_ended {
+            if x >= bar.x + bar.width - OPEN_ENDED_LINK_HIT {
+                GestureKind::Link
+            } else {
+                GestureKind::Move
+            }
         } else if x <= bar.x + HANDLE_WIDTH {
             GestureKind::ResizeStart
-        } else if bar.open_ended && x >= bar.x + bar.width - OPEN_ENDED_LINK_HIT {
-            GestureKind::Link
         } else if x >= bar.x + bar.width - HANDLE_WIDTH {
             GestureKind::ResizeEnd
         } else {
@@ -1598,9 +1601,31 @@ impl GanttView {
         Some((bar, kind))
     }
 
+    /// Drop target for a link drag, including the bar's handle/edge padding
+    /// and the rest of the row band so an edge release still arms the link.
+    pub fn hit_test_link_target(bars: &[BarLayout], x: f32, y: f32) -> Option<i64> {
+        const EDGE: f32 = HANDLE_WIDTH + LINK_HANDLE_HIT + 12.0;
+        if let Some(bar) = bars.iter().find(|bar| {
+            let width = if bar.milestone || bar.marker {
+                MILESTONE_SIZE
+            } else {
+                bar.width.max(8.0)
+            };
+            y >= bar.y && y < bar.y + ROW_HEIGHT && x >= bar.x - EDGE && x <= bar.x + width + EDGE
+        }) {
+            return Some(bar.id);
+        }
+        bars.iter()
+            .find(|bar| y >= bar.y && y < bar.y + ROW_HEIGHT)
+            .map(|bar| bar.id)
+    }
+
     pub fn layout_dependency_arrows(&self, bars: &[BarLayout]) -> Vec<DependencyArrow> {
         const STUB: f32 = 12.0;
-        const HEAD_GAP: f32 = 4.0;
+        // Keep the inbound stub left of the successor's link handle.
+        const HEAD_GAP: f32 = HANDLE_WIDTH + LINK_HANDLE_HIT + 4.0;
+        const INCOMING_FAN: f32 = 10.0;
+        const LANE_SEP: f32 = 6.0;
         let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
         let mut out = Vec::new();
         for bar in bars {
@@ -1640,6 +1665,28 @@ impl GanttView {
                     x_head,
                     lane_y,
                 });
+            }
+        }
+        let mut incoming: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (index, arrow) in out.iter().enumerate() {
+            incoming.entry(arrow.to_id).or_default().push(index);
+        }
+        for indexes in incoming.values_mut() {
+            indexes.sort_by_key(|&index| out[index].from_id);
+            if indexes.len() < 2 {
+                continue;
+            }
+            for (rank, &index) in indexes.iter().enumerate() {
+                let shift = rank as f32 * INCOMING_FAN;
+                let lane_shift = rank as f32 * LANE_SEP;
+                out[index].x_head -= shift;
+                out[index].x2 -= shift;
+                let dir = if out[index].y2 >= out[index].y1 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                out[index].lane_y += dir * lane_shift;
             }
         }
         out
@@ -1682,6 +1729,20 @@ fn bar_title_px(title: &str) -> f32 {
     title.chars().count() as f32 * 6.5 + 16.0
 }
 
+/// Same-width bars keep the same placement regardless of title length or
+/// whether the row is a summary, so Growth and Platform match.
+pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
+    if bar.kind == GanttBarKind::Unscheduled || bar.milestone || bar.marker || bar.open_ended {
+        return false;
+    }
+    let clip_pad = (-bar.x).max(0.0);
+    let visible_w = (bar.width - clip_pad).max(0.0);
+    if bar.x < 0.0 && visible_w >= 32.0 {
+        return true;
+    }
+    visible_w >= BAR_LABEL_INSIDE_MIN
+}
+
 /// Right edge of a bar including an external title, so arrows skip labels.
 pub fn bar_label_right(bar: &BarLayout) -> f32 {
     let painted_w = if bar.milestone || bar.marker {
@@ -1690,12 +1751,7 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
         bar.width.max(8.0)
     };
     let title_w = bar_title_px(&bar.title);
-    let inside = !bar.marker
-        && !bar.milestone
-        && !bar.summary
-        && !bar.open_ended
-        && painted_w >= title_w.max(40.0);
-    if inside {
+    if bar_title_is_inside(bar) {
         bar.x + painted_w
     } else {
         bar.x + painted_w + 10.0 + title_w
@@ -2481,10 +2537,19 @@ mod tests {
             "the body of a start-only marker must still move"
         );
         assert_eq!(
-            GanttView::hit_test_bar(&[bar], 100.0 + OPEN_ENDED_MARKER_WIDTH - 2.0, 4.0)
-                .map(|(_, kind)| kind),
+            GanttView::hit_test_bar(
+                std::slice::from_ref(&bar),
+                100.0 + OPEN_ENDED_MARKER_WIDTH - 2.0,
+                4.0
+            )
+            .map(|(_, kind)| kind),
             Some(GestureKind::Link),
             "only the ▸ edge of a start-only marker starts a link"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&[bar], 100.0 + 2.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::Move),
+            "the left of an 18px start-only marker must move, not resize"
         );
     }
 
@@ -3134,15 +3199,105 @@ mod tests {
         };
         let (x, y) = arrow.remove_control_pos();
         assert!(
-            x <= arrow.x1 - 20.0,
-            "× must sit left of the outgoing stub so it does not cover the link handle, got x={x} x1={}",
+            (x - arrow.x1).abs() < 1.0,
+            "× must sit on the outgoing stub, not on the predecessor bar, got x={x} x1={}",
             arrow.x1
         );
-        assert_eq!(y, arrow.y1);
+        assert!(
+            y <= arrow.y1 - 12.0,
+            "× must sit above the predecessor bar and the line, got y={y} y1={}",
+            arrow.y1
+        );
         assert!(
             (y - arrow.y2).abs() > ROW_HEIGHT,
             "× must not sit on the successor row, got y={y} y2={}",
             arrow.y2
+        );
+    }
+
+    #[test]
+    fn overlapping_incoming_links_are_fanned_apart() {
+        let mut a = node(1, None);
+        let mut b = node(2, None);
+        let mut c = node(3, None);
+        a.title = "Persist cart".into();
+        b.title = "Go-live".into();
+        b.start_date = None;
+        b.target_date = Some("2026-08-15T00:00:00Z".into());
+        c.title = "Unparented spike".into();
+        c.start_date = Some("2026-07-21T00:00:00Z".into());
+        c.target_date = Some("2026-08-04T00:00:00Z".into());
+        c.predecessors = vec![1, 2];
+        let nodes = vec![a, b, c];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert_eq!(arrows.len(), 2);
+        let succ = bars.iter().find(|bar| bar.id == 3).unwrap();
+        let dx = (arrows[0].x_head - arrows[1].x_head).abs();
+        let dy = (arrows[0].lane_y - arrows[1].lane_y).abs();
+        assert!(
+            dx >= 8.0 || dy >= 5.0,
+            "two links into the same bar must not share one polyline, dx={dx} dy={dy}"
+        );
+        for arrow in &arrows {
+            assert!(
+                arrow.x_head <= succ.x - HANDLE_WIDTH - LINK_HANDLE_HIT,
+                "inbound stub must stay left of the successor handle, x_head={} bar.x={}",
+                arrow.x_head,
+                succ.x
+            );
+            let (rx, ry) = arrow.remove_control_pos();
+            let pred = bars.iter().find(|bar| bar.id == arrow.from_id).unwrap();
+            assert!(
+                rx >= pred.x + pred.width - 1.0,
+                "× must not overlap the predecessor bar end, ×x={rx} pred_end={}",
+                pred.x + pred.width
+            );
+            assert!(
+                ry < pred.y + 8.0,
+                "× must sit above the predecessor bar, ×y={ry} pred.y={}",
+                pred.y
+            );
+        }
+    }
+
+    #[test]
+    fn link_drop_at_a_bar_edge_still_hits() {
+        let bar = BarLayout {
+            id: 2,
+            kind: GanttBarKind::Scheduled,
+            x: 200.0,
+            width: 80.0,
+            y: 40.0,
+            summary: false,
+            milestone: false,
+            label: "bar".into(),
+            title: "bar".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        assert_eq!(
+            GanttView::hit_test_link_target(std::slice::from_ref(&bar), 200.0, 44.0),
+            Some(2),
+            "the start edge of a target must still count as a drop"
+        );
+        assert_eq!(
+            GanttView::hit_test_link_target(std::slice::from_ref(&bar), 280.0, 44.0),
+            Some(2),
+            "the end edge of a target must still count as a drop"
+        );
+        assert_eq!(
+            GanttView::hit_test_link_target(std::slice::from_ref(&bar), 240.0, 44.0),
+            Some(2)
         );
     }
 

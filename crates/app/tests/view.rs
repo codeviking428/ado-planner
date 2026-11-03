@@ -91,6 +91,10 @@ fn rendered_gantt_shows_scale_header_and_bars(cx: &mut gpui_kit::TestAppContext)
         "at least one Gantt bar should be painted"
     );
     assert!(
+        cx.debug_bounds("gantt-sync-status").is_some(),
+        "the toolbar must show a subtle save/sync status"
+    );
+    assert!(
         cx.debug_bounds("header-filters-label").is_some(),
         "Roots/Types/States must be grouped under a Filters label"
     );
@@ -480,6 +484,23 @@ fn typed_unparseable_dates_do_not_clear_the_range() {
         start_only_over_range.1.is_none(),
         "typing a start date only must clear Target Date even when the calendar still holds a range"
     );
+}
+
+#[test]
+fn typed_milestone_diamond_is_not_a_parse_error() {
+    assert!(
+        typed_dates_error("◆ Aug 15").is_none(),
+        "a target-only Dates seed must not show a parse error"
+    );
+    assert!(typed_dates_error("◆ Jul 20").is_none());
+    let calendar = PickerDate::Single(Some(chrono::NaiveDate::from_ymd_opt(2026, 8, 15).unwrap()));
+    let picked = dates_from_range_picker(calendar, "◆ Aug 15", "◆ Aug 15")
+        .expect("diamond target-only must parse");
+    assert!(
+        picked.0.is_none(),
+        "◆ Aug 15 must stay target-only, not become a start date"
+    );
+    assert_eq!(picked.1, Some(Date::new(2026, 8, 15).unwrap()));
 }
 
 #[gpui_kit::test]
@@ -1493,6 +1514,72 @@ fn form_range_field_is_labelled_dates(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn milestone_details_dialog_parses_the_diamond_prefix(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut values = serde_json::Map::new();
+    values.insert(
+        "System.Title".into(),
+        serde_json::json!("Go-live milestone"),
+    );
+    values.insert(
+        ado_core::TARGET_DATE_FIELD.into(),
+        serde_json::json!("2026-08-15T00:00:00Z"),
+    );
+    state.form = Some(FormDraft::from_model(ado_core::WorkItemFormModel {
+        id: 1013,
+        rev: 1,
+        work_item_type: "Feature".into(),
+        system_controls: Vec::new(),
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "planning".into(),
+                label: "Planning".into(),
+                controls: vec![
+                    ado_core::FormControl {
+                        id: ado_core::START_DATE_FIELD.into(),
+                        reference_name: ado_core::START_DATE_FIELD.into(),
+                        label: "Start Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                    ado_core::FormControl {
+                        id: ado_core::TARGET_DATE_FIELD.into(),
+                        reference_name: ado_core::TARGET_DATE_FIELD.into(),
+                        label: "Target Date".into(),
+                        kind: ado_core::FormControlKind::DateTime,
+                        required: false,
+                        read_only: false,
+                        visible: true,
+                        options: None,
+                    },
+                ],
+            }],
+        }],
+        values,
+    }));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("form-dates-label").is_some(),
+        "a milestone date field must be labelled Dates, not Target Date"
+    );
+    view.update(cx, |view, cx| {
+        assert!(
+            view.form_dates_error_text(cx).is_none(),
+            "opening a target-only item seeded with ◆ must not show a parse error, got {:?}",
+            view.form_dates_error_text(cx)
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn placeholder_drop_on_august_keeps_august_dates(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -2481,6 +2568,53 @@ fn releasing_a_link_drag_on_empty_space_clears_the_rubber_band(cx: &mut gpui_kit
     assert!(
         cx.debug_bounds("gantt-link-preview").is_none(),
         "the stray rubber-band must not stay after release"
+    );
+}
+
+#[gpui_kit::test]
+fn releasing_a_link_drag_at_a_target_edge_arms_the_link(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.hovered_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1-link-end")
+        .expect("link handle");
+    cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let target = cx.debug_bounds("gantt-bar-2").expect("target bar");
+    let edge = point(
+        target.origin.x + target.size.width - px(1.),
+        target.origin.y + target.size.height / 2.0,
+    );
+    cx.simulate_mouse_move(edge, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view.state.gantt.gesture.as_ref().expect("still linking");
+        assert_eq!(
+            gesture.link_to,
+            Some(2),
+            "releasing at the target's edge must arm the link, not drop it"
+        );
+    });
+    cx.simulate_mouse_up(edge, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "mouse-up at the target edge must clear the rubber-band gesture"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-preview").is_none(),
+        "the stray rubber-band must not stay after an edge drop"
     );
 }
 

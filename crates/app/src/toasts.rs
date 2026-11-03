@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const TOAST_CAP: usize = 2;
-const SUCCESS_TTL: Duration = Duration::from_secs(7);
-const UNDO_TTL: Duration = Duration::from_secs(8);
-const WARNING_TTL: Duration = Duration::from_secs(8);
+const SUCCESS_TTL: Duration = Duration::from_secs(10);
+const UNDO_TTL: Duration = Duration::from_secs(12);
+const WARNING_TTL: Duration = Duration::from_secs(10);
 const ERROR_TTL: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

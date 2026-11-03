@@ -46,7 +46,7 @@ use crate::gantt::{
     LINK_HANDLE, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NUDGE_IDLE_MS, NudgeAxis,
     PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SPLITTER_WIDTH, SUMMARY_BAR_H,
     SavedGanttView, TIMELINE_HEADER_H, TODAY_PILL_GAP, TODAY_PILL_W, TYPE_COL_WIDTH,
-    parent_date_overflow,
+    bar_title_is_inside, parent_date_overflow,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -2759,6 +2759,28 @@ impl PlannerView {
                         this.scroll_or_select(3, cx);
                     })),
             )
+            .child(
+                div()
+                    .id("gantt-sync-status")
+                    .debug_selector(|| "gantt-sync-status".into())
+                    .ml_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.sync_status_text()),
+            )
+    }
+
+    fn sync_status_text(&self) -> &'static str {
+        if self.state.hierarchy_loading {
+            "Loading…"
+        } else if self.io_busy
+            || !self.date_save_busy.is_empty()
+            || self.state.form.as_ref().is_some_and(|form| form.saving)
+        {
+            "Saving…"
+        } else {
+            "Synced"
+        }
     }
 
     fn render_tree(
@@ -4079,6 +4101,8 @@ impl PlannerView {
         let show_progress = !open_ended && (summary || progress_value > 0.0);
         let progress_w =
             (bar.width.max(8.0) * progress_value).max(if progress_value > 0.0 { 4.0 } else { 0.0 });
+        let visible_progress_w = (progress_w - clip_pad).max(0.0);
+        let inner_label_fg = inner_bar_label_color(bar.color);
         let bar_selector = format!("gantt-bar-{id}");
         let progress_selector = format!("gantt-bar-progress-{id}");
         let mut items = vec![
@@ -4158,15 +4182,13 @@ impl PlannerView {
                                     MouseButton::Left,
                                     cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.state.gantt.select_row(id);
-                                        this.focus_planner(window, cx);
-                                        this.dismiss_overlays();
-                                        let _ = this.state.begin_bar_gesture(
+                                        this.continue_or_begin_bar_gesture(
                                             id,
                                             GestureKind::Link,
                                             open_ended_link_origin,
+                                            window,
+                                            cx,
                                         );
-                                        cx.notify();
                                     }),
                                 )
                                 .child("▸"),
@@ -4177,14 +4199,25 @@ impl PlannerView {
                         .border_2()
                         .border_color(cx.theme().muted_foreground)
                 })
-                .text_color(if summary { muted_fg } else { bar_label_fg })
+                .text_color(if inside {
+                    inner_label_fg
+                } else if summary {
+                    muted_fg
+                } else {
+                    bar_label_fg
+                })
                 .when(!milestone && !marker && !unscheduled && !open_ended, |el| {
-                    el.border_1()
-                        .border_color(if selected || (hovered && !dragging) {
-                            cx.theme().primary
+                    el.border_1().border_color(if summary {
+                        if selected {
+                            cx.theme().primary.opacity(0.4)
                         } else {
-                            cx.theme().border
-                        })
+                            cx.theme().border.opacity(0.6)
+                        }
+                    } else if selected || (hovered && !dragging) {
+                        cx.theme().primary.opacity(0.55)
+                    } else {
+                        cx.theme().border
+                    })
                 })
                 .overflow_hidden()
                 .when(show_progress, |el| {
@@ -4193,26 +4226,28 @@ impl PlannerView {
                             .id(("gantt-bar-progress", id as u64))
                             .debug_selector(move || progress_selector.clone())
                             .absolute()
-                            .left_0()
+                            .left(px(clip_pad))
                             .top_0()
                             .bottom_0()
-                            .w(px(progress_w))
+                            .w(px(visible_progress_w))
                             .when(summary, |el| el.bg(rgb(bar.color)))
                             .when(!summary, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.22))),
                     )
                 })
-                .when(!milestone && !marker, |el| {
+                .when(inside && !milestone && !marker, |el| {
                     el.child(
                         div()
+                            .absolute()
+                            .inset_0()
                             .pl(px(label_pad + clip_pad))
                             .pr(px(label_pad))
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
                             .truncate()
                             .text_xs()
-                            .child(if inside {
-                                bar.title.clone()
-                            } else {
-                                String::new()
-                            }),
+                            .text_color(inner_label_fg)
+                            .child(bar.title.clone()),
                     )
                 })
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -4227,6 +4262,17 @@ impl PlannerView {
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
+                        if this
+                            .state
+                            .gantt
+                            .gesture
+                            .as_ref()
+                            .is_some_and(|gesture| gesture.kind == GestureKind::Link)
+                        {
+                            this.state.gantt.set_link_target(id);
+                            cx.notify();
+                            return;
+                        }
                         this.state.gantt.select_row(id);
                         this.focus_planner(window, cx);
                         if event.click_count >= 2 {
@@ -4313,11 +4359,7 @@ impl PlannerView {
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.dismiss_overlays();
-                                this.state.gantt.select_row(id);
-                                this.focus_planner(window, cx);
-                                let _ = this.state.begin_bar_gesture(id, kind, origin);
-                                cx.notify();
+                                this.continue_or_begin_bar_gesture(id, kind, origin, window, cx);
                             }),
                         )
                         .into_any_element(),
@@ -4390,23 +4432,32 @@ impl PlannerView {
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.state.gantt.select_row(id);
-                            this.focus_planner(window, cx);
-                            this.dismiss_overlays();
-                            let _ = this.state.begin_bar_gesture(id, GestureKind::Link, origin);
-                            cx.notify();
+                            this.continue_or_begin_bar_gesture(
+                                id,
+                                GestureKind::Link,
+                                origin,
+                                window,
+                                cx,
+                            );
                         }),
                     )
-                    .child(div().size_full().when(show_dot, |el| {
-                        el.flex().items_center().justify_center().child(
-                            div()
-                                .size(px(LINK_HANDLE))
-                                .rounded_full()
-                                .bg(cx.theme().background)
-                                .border_2()
-                                .border_color(cx.theme().danger),
-                        )
-                    }))
+                    .child(
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(show_dot, |el| {
+                                el.child(
+                                    div()
+                                        .size(px(LINK_HANDLE))
+                                        .rounded_full()
+                                        .bg(cx.theme().danger)
+                                        .border_2()
+                                        .border_color(cx.theme().background),
+                                )
+                            }),
+                    )
             });
         Some(
             div()
@@ -4421,17 +4472,7 @@ impl PlannerView {
     }
 
     fn bar_title_fits_inside(bar: &crate::gantt::BarLayout) -> bool {
-        let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
-        let title_width = bar.title.chars().count() as f32 * 6.5 + 16.0;
-        let clip_pad = (-bar.x).max(0.0);
-        let visible_w = (bar.width - clip_pad).max(0.0);
-        if unscheduled || bar.milestone || bar.marker || bar.open_ended {
-            return false;
-        }
-        if bar.x < 0.0 && visible_w >= 32.0 {
-            return true;
-        }
-        !bar.summary && visible_w >= title_width.max(40.0)
+        bar_title_is_inside(bar)
     }
 
     pub(crate) fn bar_external_label_frame(
@@ -4501,6 +4542,9 @@ impl PlannerView {
                 .bg(cx.theme().background)
                 .when(!dragging, |el| el.occlude())
                 .child(label)
+                .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                    this.apply_scroll(event, cx);
+                }))
                 .on_click(
                     cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
                         this.state.gantt.select_row(id);
@@ -5345,12 +5389,9 @@ impl PlannerView {
             .get(&control.reference_name)
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let has_target = crate::form::all_controls(&form.model)
-            .iter()
-            .any(|item| item.reference_name == ado_core::TARGET_DATE_FIELD);
         let label = if control.kind == FormControlKind::DateTime
-            && control.reference_name == ado_core::START_DATE_FIELD
-            && has_target
+            && (control.reference_name == ado_core::START_DATE_FIELD
+                || control.reference_name == ado_core::TARGET_DATE_FIELD)
         {
             "Dates".to_string()
         } else {
@@ -5909,16 +5950,7 @@ impl PlannerView {
         let y: f32 = event.position.y.into();
         self.state
             .update_bar_gesture(x - self.state.gantt.timeline_origin_x);
-        if self
-            .state
-            .gantt
-            .gesture
-            .as_ref()
-            .is_some_and(|gesture| gesture.kind == GestureKind::Link)
-            && !self.state.gantt.pointer_in_rows(x, y)
-        {
-            self.state.gantt.clear_link_target();
-        }
+        self.arm_link_target_from_pointer(x, y);
         if event.dragging() || event.pressed_button.is_some() {
             self.saw_pressed_drag = true;
             cx.notify();
@@ -5929,6 +5961,66 @@ impl PlannerView {
             self.commit_gesture(cx);
             return;
         }
+        cx.notify();
+    }
+
+    fn arm_link_target_from_pointer(&mut self, window_x: f32, window_y: f32) {
+        if !self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link)
+        {
+            return;
+        }
+        if self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .and_then(|gesture| gesture.link_to)
+            .is_some()
+        {
+            return;
+        }
+        let local_x = window_x - self.state.gantt.timeline_origin_x;
+        let local_y = window_y - self.state.gantt.timeline_origin_y - TIMELINE_HEADER_H;
+        let visible = self.state.visible_nodes();
+        let rows = self.state.gantt.flatten(&visible);
+        let content_h = (self.state.gantt.viewport_h - TIMELINE_HEADER_H).max(80.0);
+        let bars = self
+            .state
+            .gantt
+            .layout_bars(&visible, &rows, &self.state.iterations, content_h);
+        if let Some(id) = GanttView::hit_test_link_target(&bars, local_x, local_y) {
+            self.state.gantt.set_link_target(id);
+        }
+    }
+
+    fn continue_or_begin_bar_gesture(
+        &mut self,
+        id: i64,
+        kind: GestureKind,
+        origin: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link)
+        {
+            self.state.gantt.set_link_target(id);
+            cx.notify();
+            return;
+        }
+        self.state.gantt.select_row(id);
+        self.focus_planner(window, cx);
+        self.dismiss_overlays();
+        let _ = self.state.begin_bar_gesture(id, kind, origin);
         cx.notify();
     }
 
@@ -6831,6 +6923,9 @@ pub fn dates_from_range_picker_in_years(
     {
         return typed_edit;
     }
+    if let TypedDateRange::Parsed(None, Some(target)) = parsed {
+        return Some((None, Some(target)));
+    }
     match date {
         PickerDate::Range(Some(start), Some(end)) => {
             Some((naive_to_jiff(start), naive_to_jiff(end)))
@@ -6951,18 +7046,44 @@ enum TypedDateRange {
     Invalid,
 }
 
+fn inner_bar_label_color(color: u32) -> gpui_kit::Hsla {
+    let r = ((color >> 16) & 0xff) as f32 / 255.0;
+    let g = ((color >> 8) & 0xff) as f32 / 255.0;
+    let b = (color & 0xff) as f32 / 255.0;
+    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if lum > 0.62 {
+        gpui_kit::hsla(0., 0., 0.10, 1.)
+    } else {
+        gpui_kit::hsla(0., 0., 0.98, 1.)
+    }
+}
+
+fn strip_target_only_prefix(typed: &str) -> (bool, String) {
+    let text = typed.trim();
+    for prefix in ['◆', '◇', '♦'] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return (true, rest.trim().to_string());
+        }
+    }
+    (false, text.to_string())
+}
+
 fn parse_typed_date_range(
     typed: &str,
     start_year: Option<i16>,
     target_year: Option<i16>,
 ) -> TypedDateRange {
-    let text = typed.trim();
+    let (target_only, text) = strip_target_only_prefix(typed);
     if text.is_empty() {
         return TypedDateRange::Empty;
     }
-    let parts = split_typed_date_parts(text);
+    let parts = split_typed_date_parts(&text);
     match parts.as_slice() {
         [] => TypedDateRange::Empty,
+        [one] if target_only => match parse_user_date(Some(one), target_year.or(start_year)) {
+            Some(target) => TypedDateRange::Parsed(None, Some(target)),
+            None => TypedDateRange::Invalid,
+        },
         [start] => match parse_user_date(Some(start), start_year) {
             Some(start) => TypedDateRange::Parsed(Some(start), None),
             None => TypedDateRange::Invalid,
@@ -7060,8 +7181,10 @@ impl Render for PlannerView {
                 this.state.gantt.hover_locked = true;
                 if this.state.gantt.gesture.is_some() {
                     let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
                     this.state
                         .update_bar_gesture(x - this.state.gantt.timeline_origin_x);
+                    this.arm_link_target_from_pointer(x, y);
                     this.saw_pressed_drag = true;
                     this.commit_gesture(cx);
                 }
@@ -7308,6 +7431,41 @@ mod bar_label_tests {
         assert!(
             PlannerView::bar_external_label_frame(&bar, 800.0, false).is_none(),
             "must not float the title over the grid to the left of a clipped bar"
+        );
+    }
+
+    #[test]
+    fn wide_leaf_and_summary_bars_place_titles_the_same_way() {
+        let leaf = BarLayout {
+            id: 1,
+            kind: GanttBarKind::Scheduled,
+            x: 20.0,
+            width: 200.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: String::new(),
+            title: "Cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+        };
+        let summary = BarLayout {
+            id: 2,
+            summary: true,
+            title: "Growth experiments".into(),
+            ..leaf.clone()
+        };
+        assert_eq!(
+            PlannerView::bar_title_fits_inside(&leaf),
+            PlannerView::bar_title_fits_inside(&summary),
+            "title length and summary vs leaf must not disagree on inside vs outside"
+        );
+        assert!(
+            PlannerView::bar_title_fits_inside(&leaf),
+            "a wide bar must keep the title inside"
         );
     }
 }
