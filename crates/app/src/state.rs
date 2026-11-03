@@ -12,6 +12,7 @@ use ado_core::{
 };
 use ado_session::{LoginCreds, PlannerSession, SharedSession};
 use jiff::ToSpan;
+use jiff::Unit;
 use jiff::civil::Date;
 use serde_json::{Value, json};
 
@@ -24,7 +25,9 @@ use crate::gantt::{
 };
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
-use crate::toasts::{EditHistory, HistoryEntry, ToastKind, Toasts, UndoAction, error_text};
+use crate::toasts::{
+    EditHistory, HistoryEntry, ToastExtra, ToastKind, Toasts, UndoAction, error_text,
+};
 use crate::updater::Updater;
 
 #[derive(Clone)]
@@ -73,6 +76,8 @@ pub enum DateSaveRole {
     Redo,
     /// Toast Undo already updated history; persist the restored dates.
     Restore,
+    /// Shift descendants after a parent move; persist without replacing the parent toast.
+    Cascade,
 }
 
 /// Date change already applied and recorded locally; persist over HTTP next.
@@ -1280,6 +1285,9 @@ impl PlannerState {
                 }
             }
             DateSaveRole::Restore => {}
+            DateSaveRole::Cascade => {
+                self.discard_dates_after(pending.id, &pending.after_start, &pending.after_target);
+            }
         }
     }
 
@@ -2754,7 +2762,7 @@ impl PlannerState {
         target: Option<Date>,
         previous: &WorkItemNode,
     ) {
-        self.toasts.push_undo(
+        self.toasts.push_undo_extra(
             dates_changed_message(
                 &self.item_title(id),
                 parse_iso_date(previous.start_date.as_deref()),
@@ -2768,7 +2776,60 @@ impl PlannerState {
                 target_date: previous.target_date.clone(),
                 rev: previous.rev,
             },
+            parent_move_extra(&self.nodes, previous, start, target),
         );
+    }
+
+    /// Shift every descendant's dates by `delta_days` and queue persists.
+    pub fn shift_descendants_now(
+        &mut self,
+        parent_id: i64,
+        delta_days: i32,
+    ) -> Vec<PendingDateSave> {
+        if delta_days == 0 {
+            return Vec::new();
+        }
+        let ids = descendant_ids(&self.nodes, parent_id);
+        let mut pending = Vec::new();
+        for id in ids {
+            let Some(previous) = self.nodes.iter().find(|node| node.id == id).cloned() else {
+                continue;
+            };
+            if !previous.has_date_fields {
+                continue;
+            }
+            let start = parse_iso_date(previous.start_date.as_deref())
+                .map(|date| date.saturating_add(delta_days.days()));
+            let target = parse_iso_date(previous.target_date.as_deref())
+                .map(|date| date.saturating_add(delta_days.days()));
+            if start.is_none() && target.is_none() {
+                continue;
+            }
+            let after_start = start
+                .map(iso_date_only)
+                .or_else(|| previous.start_date.clone());
+            let after_target = target
+                .map(iso_date_only)
+                .or_else(|| previous.target_date.clone());
+            if after_start == previous.start_date && after_target == previous.target_date {
+                continue;
+            }
+            let _ = self.apply_optimistic_partial(id, start, target);
+            if self.history_recording {
+                self.record_dates(id, &previous, after_start.clone(), after_target.clone());
+            }
+            pending.push(PendingDateSave {
+                id,
+                start,
+                target,
+                after_start,
+                after_target,
+                rev: previous.rev,
+                previous,
+                role: DateSaveRole::Cascade,
+            });
+        }
+        pending
     }
 
     pub(crate) fn item_title(&self, id: i64) -> String {
@@ -2976,6 +3037,76 @@ fn dates_range_message(
     }
 }
 
+fn descendant_ids(nodes: &[WorkItemNode], parent_id: i64) -> Vec<i64> {
+    let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+    for node in nodes {
+        if let Some(pid) = node.parent_id {
+            children.entry(pid).or_default().push(node.id);
+        }
+    }
+    let mut out = Vec::new();
+    let mut stack = children.get(&parent_id).cloned().unwrap_or_default();
+    while let Some(id) = stack.pop() {
+        out.push(id);
+        if let Some(kids) = children.get(&id) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    out
+}
+
+fn day_delta(from: Date, to: Date) -> Option<i32> {
+    to.since((Unit::Day, from)).ok().map(|span| span.get_days())
+}
+
+fn parent_move_extra(
+    nodes: &[WorkItemNode],
+    previous: &WorkItemNode,
+    after_start: Option<Date>,
+    after_target: Option<Date>,
+) -> Option<ToastExtra> {
+    if !nodes.iter().any(|node| node.parent_id == Some(previous.id)) {
+        return None;
+    }
+    let before_start = parse_iso_date(previous.start_date.as_deref())?;
+    let before_target = parse_iso_date(previous.target_date.as_deref())?;
+    let after_start = after_start?;
+    let after_target = after_target?;
+    if dates_is_resize(
+        Some(before_start),
+        Some(before_target),
+        Some(after_start),
+        Some(after_target),
+    ) {
+        return None;
+    }
+    let start_delta = day_delta(before_start, after_start)?;
+    let target_delta = day_delta(before_target, after_target)?;
+    if start_delta == 0 || start_delta != target_delta {
+        return None;
+    }
+    Some(ToastExtra::MoveChildren {
+        parent_id: previous.id,
+        delta_days: start_delta,
+    })
+}
+
+fn dates_is_resize(
+    before_start: Option<Date>,
+    before_target: Option<Date>,
+    after_start: Option<Date>,
+    after_target: Option<Date>,
+) -> bool {
+    let xor = (before_start != after_start) != (before_target != after_target);
+    if !xor {
+        return false;
+    }
+    let one_sided_move = (before_start.is_some() != before_target.is_some())
+        && (after_start.is_none() == before_start.is_none())
+        && (after_target.is_none() == before_target.is_none());
+    !one_sided_move
+}
+
 fn dates_changed_message(
     title: &str,
     before_start: Option<Date>,
@@ -2997,15 +3128,8 @@ fn dates_changed_message(
             (None, Some(target)) => format!("Scheduled {title} {}", toast_date(target)),
             _ => format!("Scheduled {title}"),
         }
-    } else if (before_start != after_start) != (before_target != after_target) {
-        let one_sided_move = (before_start.is_some() != before_target.is_some())
-            && (after_start.is_none() == before_start.is_none())
-            && (after_target.is_none() == before_target.is_none());
-        if one_sided_move {
-            dates_moved_message(title, after_start, after_target)
-        } else {
-            dates_resized_message(title, after_start, after_target)
-        }
+    } else if dates_is_resize(before_start, before_target, after_start, after_target) {
+        dates_resized_message(title, after_start, after_target)
     } else {
         dates_moved_message(title, after_start, after_target)
     }
@@ -3030,6 +3154,8 @@ fn dates_undo_message(
         )
     } else if now_clear {
         format!("Cleared dates on {}", quote_name(title))
+    } else if dates_is_resize(before_start, before_target, after_start, after_target) {
+        dates_resized_message(title, before_start, before_target)
     } else {
         dates_moved_message(title, before_start, before_target)
     }
@@ -3542,6 +3668,102 @@ mod toast_copy_tests {
         assert_eq!(
             undone_message(&original),
             "Undone cleared dates on \"Cart UI\""
+        );
+    }
+
+    #[test]
+    fn undo_of_a_resize_reuses_the_resized_verb() {
+        use super::{dates_undo_message, undone_message};
+        let start = Date::new(2026, 7, 6).unwrap();
+        let target = Date::new(2026, 8, 14).unwrap();
+        let resized_start = Date::new(2026, 7, 9).unwrap();
+        let resized_end = Date::new(2026, 8, 17).unwrap();
+        let original = dates_undo_message(
+            "Cart",
+            Some(start),
+            Some(target),
+            Some(start),
+            Some(resized_end),
+        );
+        assert!(
+            original.starts_with("Resized \"Cart\" to"),
+            "undo of a resize must keep Resized, got {original}"
+        );
+        assert!(
+            original.contains("14"),
+            "undo must name the restored dates, got {original}"
+        );
+        let undid = undone_message(&original);
+        assert!(
+            undid.starts_with("Undone resized"),
+            "undo toast must reuse the resize verb, got {undid}"
+        );
+        let moved = dates_undo_message(
+            "Cart",
+            Some(start),
+            Some(target),
+            Some(resized_start),
+            Some(resized_end),
+        );
+        assert!(
+            moved.starts_with("Moved \"Cart\" to"),
+            "undo of a two-sided move must keep Moved, got {moved}"
+        );
+    }
+
+    #[test]
+    fn parent_move_offers_shift_children() {
+        use super::parent_move_extra;
+        use crate::toasts::ToastExtra;
+        let mut nodes = super::fake_hierarchy(3);
+        let previous = nodes[0].clone();
+        let start = Date::new(2026, 7, 9).unwrap();
+        let target = Date::new(2026, 7, 23).unwrap();
+        match parent_move_extra(&nodes, &previous, Some(start), Some(target)) {
+            Some(ToastExtra::MoveChildren {
+                parent_id,
+                delta_days,
+            }) => {
+                assert_eq!(parent_id, 1);
+                assert_eq!(delta_days, 3);
+            }
+            other => panic!("expected MoveChildren, got {other:?}"),
+        }
+        nodes[0].parent_id = Some(99);
+        nodes[1].parent_id = Some(99);
+        nodes[2].parent_id = Some(99);
+        assert!(
+            parent_move_extra(&nodes, &previous, Some(start), Some(target)).is_none(),
+            "a leaf move must not offer Move children too"
+        );
+    }
+
+    #[test]
+    fn shift_descendants_moves_child_dates() {
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("ado-planner-shift-test")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        state.nodes = super::fake_hierarchy(3);
+        state.history_recording = true;
+        let pending = state.shift_descendants_now(1, 3);
+        assert!(
+            pending.iter().any(|save| save.id == 2),
+            "direct children must shift, got {:?}",
+            pending.iter().map(|save| save.id).collect::<Vec<_>>()
+        );
+        let child = state.nodes.iter().find(|node| node.id == 2).expect("child");
+        assert_eq!(child.start_date.as_deref(), Some("2026-07-09T00:00:00Z"));
+        assert_eq!(child.target_date.as_deref(), Some("2026-07-23T00:00:00Z"));
+        assert_eq!(
+            pending[0].role,
+            super::DateSaveRole::Cascade,
+            "children persist must not replace the parent undo toast"
         );
     }
 }

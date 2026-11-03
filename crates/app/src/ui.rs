@@ -55,7 +55,7 @@ use crate::paths::AppPaths;
 use crate::state::{
     DateSaveRole, PendingDateSave, PlannerState, undone_message as undone_toast_message,
 };
-use crate::toasts::{ToastKind, UndoAction};
+use crate::toasts::{ToastExtra, ToastKind, UndoAction};
 
 actions!(
     ado_planner,
@@ -68,6 +68,7 @@ const DATES_ERROR_SLOT_H: f32 = 32.0;
 const SAVING_HOLD_MS: u64 = 400;
 const PROGRESS_ROLLUP_TIP: &str =
     "Progress is rolled up from child work-item states. Active counts as half done.";
+const DATES_ROLLUP_TIP: &str = "Dates roll up from children";
 
 fn debug_hit_enabled() -> bool {
     std::env::var("ADO_PLANNER_DEBUG_HIT")
@@ -1579,6 +1580,30 @@ impl PlannerView {
                                 .child(Button::new(("undo-toast", id)).label("Undo")),
                         )
                     })
+                    .when_some(toast.extra.clone(), |el, extra| {
+                        let extra_down = extra.clone();
+                        el.child(
+                            div()
+                                .id(("toast-extra-wrap", id))
+                                .debug_selector(|| "toast-move-children".into())
+                                .occlude()
+                                .flex_shrink_0()
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.arm_toast_pointer();
+                                        cx.stop_propagation();
+                                        this.apply_toast_extra(id, extra_down.clone(), cx);
+                                    }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.apply_toast_extra(id, extra.clone(), cx);
+                                }))
+                                .child(Button::new(("extra-toast", id)).label("Move children too")),
+                        )
+                    })
                     .child(
                         div()
                             .id(("toast-dismiss-wrap", id))
@@ -1693,6 +1718,32 @@ impl PlannerView {
         self.toast_undo_inflight = true;
         self.spawn_toast_undo(cx, action, undid);
         self.clamp_toast_hover();
+        cx.notify();
+    }
+
+    fn apply_toast_extra(&mut self, toast_id: u64, extra: ToastExtra, cx: &mut Context<Self>) {
+        let Some(toast) = self
+            .state
+            .toasts
+            .items
+            .iter_mut()
+            .find(|toast| toast.id == toast_id)
+        else {
+            return;
+        };
+        if toast.extra.take().is_none() {
+            return;
+        }
+        let ToastExtra::MoveChildren {
+            parent_id,
+            delta_days,
+        } = extra;
+        let pending = self.state.shift_descendants_now(parent_id, delta_days);
+        for save in pending {
+            self.enqueue_date_save(cx, save);
+        }
+        self.queue_form_dates_from_draft();
+        self.note_toasts_changed(cx);
         cx.notify();
     }
 
@@ -4241,13 +4292,13 @@ impl PlannerView {
                     )
                 })
             })
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                this.on_bar_drag_move(event, cx);
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.on_bar_drag_move(event, window, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.commit_gesture(cx);
+                cx.listener(|this, _, window, cx| {
+                    this.commit_gesture(window, cx);
                 }),
             )
     }
@@ -4465,14 +4516,18 @@ impl PlannerView {
                             .absolute()
                             .top_0()
                             .bottom_0()
-                            .left(px(if can_resize { grip_w } else { 0.0 }))
-                            .right(px(if can_resize { grip_w } else { 0.0 }))
-                            .pl(px(if can_resize {
+                            .left(px(if can_resize || summary { grip_w } else { 0.0 }))
+                            .right(px(if can_resize || summary { grip_w } else { 0.0 }))
+                            .pl(px(if can_resize || summary {
                                 4.0 + clip_pad
                             } else {
                                 label_pad + clip_pad
                             }))
-                            .pr(px(if can_resize { 4.0 } else { label_pad }))
+                            .pr(px(if can_resize || summary {
+                                4.0
+                            } else {
+                                label_pad
+                            }))
                             .flex()
                             .items_center()
                             .overflow_hidden()
@@ -4483,15 +4538,18 @@ impl PlannerView {
                     )
                 })
                 .children(self.bar_inner_resize_grips(bar, dragging, cx))
+                .children(self.bar_summary_edge_affordances(bar, dragging, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.set_hovered(if *hovered { Some(id) } else { None }, cx);
                 }))
-                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                    this.set_hovered(Some(id), cx);
-                    // The bar captures the pointer on mouse-down. External titles
-                    // occlude the timeline, so the captured bar must keep the drag.
-                    this.on_bar_drag_move(event, cx);
-                }))
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                        this.set_hovered(Some(id), cx);
+                        // The bar captures the pointer on mouse-down. External titles
+                        // occlude the timeline, so the captured bar must keep the drag.
+                        this.on_bar_drag_move(event, window, cx);
+                    }),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -4630,14 +4688,16 @@ impl PlannerView {
                         this.set_hovered(Some(id), cx);
                     }
                 }))
-                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                    if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
-                        gesture.kind == GestureKind::Link && gesture.id != id
-                    }) {
-                        this.state.gantt.set_link_target(id);
-                    }
-                    this.on_bar_drag_move(event, cx);
-                }))
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                        if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+                            gesture.kind == GestureKind::Link && gesture.id != id
+                        }) {
+                            this.state.gantt.set_link_target(id);
+                        }
+                        this.on_bar_drag_move(event, window, cx);
+                    }),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -4645,6 +4705,93 @@ impl PlannerView {
                         let x: f32 = event.position.x.into();
                         this.begin_classified_bar_gesture(id, &layout, x, window, cx);
                     }),
+                )
+                .into_any_element()
+        })
+        .collect()
+    }
+
+    /// Inner 8px of a summary bar. Not-allowed cursor + rollup tooltip; no move.
+    fn bar_summary_edge_affordances(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        dragging: bool,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        if !bar.summary || dragging {
+            return Vec::new();
+        }
+        let id = bar.id;
+        let linking = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link);
+        let grip_w = bar.inner_grip_width();
+        let layout = bar.clone();
+        [
+            ("start", "summary-edge-start", true),
+            ("end", "summary-edge-end", false),
+        ]
+        .into_iter()
+        .map(|(name, handle_id, at_start)| {
+            let selector = format!("gantt-summary-edge-{id}-{name}");
+            let layout = layout.clone();
+            div()
+                .id((handle_id, id as u64))
+                .debug_selector(move || selector.clone())
+                .absolute()
+                .when(at_start, |el| el.left_0())
+                .when(!at_start, |el| el.right_0())
+                .top_0()
+                .bottom_0()
+                .w(px(grip_w))
+                .when(!linking, |el| el.occlude())
+                .bg(gpui_kit::hsla(0., 0., 0., 0.01))
+                .cursor(CursorStyle::OperationNotAllowed)
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.set_hovered(Some(id), cx);
+                    }
+                }))
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                        if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+                            gesture.kind == GestureKind::Link && gesture.id != id
+                        }) {
+                            this.state.gantt.set_link_target(id);
+                        }
+                        this.on_bar_drag_move(event, window, cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        let x: f32 = event.position.x.into();
+                        this.begin_classified_bar_gesture(id, &layout, x, window, cx);
+                    }),
+                )
+                .child(
+                    Button::new((
+                        if at_start {
+                            "summary-edge-tip-start"
+                        } else {
+                            "summary-edge-tip-end"
+                        },
+                        id as u64,
+                    ))
+                    .ghost()
+                    .compact()
+                    .tab_stop(false)
+                    .absolute()
+                    .inset_0()
+                    .w_full()
+                    .h_full()
+                    .tooltip(DATES_ROLLUP_TIP)
+                    .tooltip_placement(Placement::Top)
+                    .tooltip_show_delay(Duration::from_millis(450)),
                 )
                 .into_any_element()
         })
@@ -4693,14 +4840,16 @@ impl PlannerView {
                             this.set_hovered(Some(id), cx);
                         }
                     }))
-                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                        if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
-                            gesture.kind == GestureKind::Link && gesture.id != id
-                        }) {
-                            this.state.gantt.set_link_target(id);
-                        }
-                        this.on_bar_drag_move(event, cx);
-                    }))
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                            if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+                                gesture.kind == GestureKind::Link && gesture.id != id
+                            }) {
+                                this.state.gantt.set_link_target(id);
+                            }
+                            this.on_bar_drag_move(event, window, cx);
+                        }),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -6271,7 +6420,12 @@ impl PlannerView {
         });
     }
 
-    fn on_bar_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+    fn on_bar_drag_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.state.gantt.gesture.is_none() {
             return;
         }
@@ -6288,7 +6442,7 @@ impl PlannerView {
         }
         if self.saw_pressed_drag {
             self.saw_pressed_drag = false;
-            self.commit_gesture(cx);
+            self.commit_gesture(window, cx);
             return;
         }
         cx.notify();
@@ -6421,11 +6575,15 @@ impl PlannerView {
             cx.notify();
             return;
         }
-        let (_, kind) = self.classify_bar_hit(id, layout, window_x);
-        let origin = self.pointer_layout_x(window_x, Some(id));
+        let (zone, kind) = self.classify_bar_hit(id, layout, window_x);
         self.state.gantt.select_row(id);
         self.focus_planner(window, cx);
         self.dismiss_overlays();
+        if matches!(zone, BarHitZone::RollupEdge | BarHitZone::Outside) {
+            cx.notify();
+            return;
+        }
+        let origin = self.pointer_layout_x(window_x, Some(id));
         let _ = self.state.begin_bar_gesture(id, kind, origin);
         cx.notify();
     }
@@ -6457,7 +6615,7 @@ impl PlannerView {
         cx.notify();
     }
 
-    fn commit_gesture(&mut self, cx: &mut Context<Self>) {
+    fn commit_gesture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.saw_pressed_drag = false;
         if self.state.gantt.gesture.is_none() {
             return;
@@ -6473,6 +6631,7 @@ impl PlannerView {
             self.state.gantt.selected_link = None;
             self.state.gantt.clear_hover();
             cx.notify();
+            window.refresh();
             cx.refresh_windows();
             if let Some((from_id, Some(to_id))) = pair
                 && from_id != to_id
@@ -6490,6 +6649,7 @@ impl PlannerView {
             self.enqueue_date_save(cx, pending);
         }
         cx.notify();
+        window.refresh();
         cx.refresh_windows();
     }
 
@@ -6572,7 +6732,11 @@ impl PlannerView {
                                     && let Some(toast) = working.toasts.items.last()
                                 {
                                     if let Some(undo) = toast.undo.clone() {
-                                        this.state.toasts.push_undo(toast.message.clone(), undo);
+                                        this.state.toasts.push_undo_extra(
+                                            toast.message.clone(),
+                                            undo,
+                                            toast.extra.clone(),
+                                        );
                                     } else {
                                         this.state
                                             .toasts
@@ -7637,7 +7801,7 @@ impl Render for PlannerView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
+            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                 if this.toast_pointer {
                     this.toast_pointer = false;
                     if this.state.gantt.gesture.is_none()
@@ -7659,7 +7823,7 @@ impl Render for PlannerView {
                     this.state.update_bar_gesture(local_x);
                     this.arm_link_target_from_pointer(x, y);
                     this.saw_pressed_drag = true;
-                    this.commit_gesture(cx);
+                    this.commit_gesture(window, cx);
                 }
                 if this.state.gantt.splitter_drag.take().is_some() {
                     cx.notify();
@@ -7704,7 +7868,7 @@ impl Render for PlannerView {
                     return;
                 }
                 if this.state.gantt.gesture.is_some() {
-                    this.on_bar_drag_move(event, cx);
+                    this.on_bar_drag_move(event, window, cx);
                     return;
                 }
                 if this.state.gantt.schedule_drag.is_some() {

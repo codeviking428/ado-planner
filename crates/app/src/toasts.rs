@@ -96,6 +96,12 @@ impl EditHistory {
     }
 }
 
+/// Extra toast action offered after a parent bar move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToastExtra {
+    MoveChildren { parent_id: i64, delta_days: i32 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
     pub id: u64,
@@ -103,6 +109,7 @@ pub struct Toast {
     pub message: String,
     pub copyable: bool,
     pub undo: Option<UndoAction>,
+    pub extra: Option<ToastExtra>,
     pub created_at: Instant,
 }
 
@@ -131,6 +138,7 @@ impl Toasts {
             message: message.into(),
             copyable,
             undo: None,
+            extra: None,
             created_at: Instant::now(),
         });
         self.cap();
@@ -159,6 +167,15 @@ impl Toasts {
     }
 
     pub fn push_undo(&mut self, message: impl Into<String>, undo: UndoAction) -> u64 {
+        self.push_undo_extra(message, undo, None)
+    }
+
+    pub fn push_undo_extra(
+        &mut self,
+        message: impl Into<String>,
+        undo: UndoAction,
+        extra: Option<ToastExtra>,
+    ) -> u64 {
         self.dismiss_success();
         self.next_id += 1;
         self.items.push(Toast {
@@ -167,6 +184,7 @@ impl Toasts {
             message: message.into(),
             copyable: false,
             undo: Some(undo),
+            extra,
             created_at: Instant::now(),
         });
         self.cap();

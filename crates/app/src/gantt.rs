@@ -371,7 +371,7 @@ impl BarLayout {
         match self.hit_zone_at_window_x(x, self.x, self.x + self.width) {
             BarHitZone::ResizeStart => Some(GestureKind::ResizeStart),
             BarHitZone::ResizeEnd => Some(GestureKind::ResizeEnd),
-            BarHitZone::Move | BarHitZone::Outside => None,
+            BarHitZone::Move | BarHitZone::RollupEdge | BarHitZone::Outside => None,
         }
     }
 
@@ -386,14 +386,22 @@ impl BarLayout {
         if window_x < painted_left || window_x > painted_right {
             return BarHitZone::Outside;
         }
+        let width = (painted_right - painted_left).max(1.0);
+        let grip = HANDLE_WIDTH.min(width / 2.0).max(1.0);
+        let on_start = window_x <= painted_left + grip;
+        let on_end = window_x >= painted_right - grip;
+        if self.summary {
+            if on_start || on_end {
+                return BarHitZone::RollupEdge;
+            }
+            return BarHitZone::Move;
+        }
         if !self.can_resize() {
             return BarHitZone::Move;
         }
-        let width = (painted_right - painted_left).max(1.0);
-        let grip = HANDLE_WIDTH.min(width / 2.0).max(1.0);
-        if window_x <= painted_left + grip {
+        if on_start {
             BarHitZone::ResizeStart
-        } else if window_x >= painted_right - grip {
+        } else if on_end {
             BarHitZone::ResizeEnd
         } else {
             BarHitZone::Move
@@ -407,6 +415,7 @@ pub enum BarHitZone {
     ResizeStart,
     ResizeEnd,
     Move,
+    RollupEdge,
     Outside,
 }
 
@@ -416,6 +425,7 @@ impl BarHitZone {
             Self::ResizeStart => "resize-start",
             Self::ResizeEnd => "resize-end",
             Self::Move => "move",
+            Self::RollupEdge => "rollup-edge",
             Self::Outside => "outside",
         }
     }
@@ -425,7 +435,7 @@ impl BarHitZone {
             Self::ResizeStart => Some(GestureKind::ResizeStart),
             Self::ResizeEnd => Some(GestureKind::ResizeEnd),
             Self::Move => Some(GestureKind::Move),
-            Self::Outside => None,
+            Self::RollupEdge | Self::Outside => None,
         }
     }
 }
@@ -1714,8 +1724,13 @@ impl GanttView {
                 y >= bar.y && y < bar.y + ROW_HEIGHT && x >= bar.x && x <= bar.x + bar.width
             })?
             .clone();
-        let kind = if bar.milestone || bar.summary || bar.marker {
+        let kind = if bar.milestone || bar.marker {
             GestureKind::Move
+        } else if bar.summary {
+            match bar.hit_zone_at_window_x(x, bar.x, bar.x + bar.width) {
+                BarHitZone::Move => GestureKind::Move,
+                _ => return None,
+            }
         } else if bar.open_ended {
             if x >= bar.x + bar.width - OPEN_ENDED_LINK_HIT {
                 GestureKind::Link
@@ -2415,9 +2430,25 @@ mod tests {
             ..bar
         };
         assert_eq!(
-            GanttView::hit_test_bar(&[summary], 176.0, 4.0).map(|(_, kind)| kind),
+            GanttView::hit_test_bar(std::slice::from_ref(&summary), 140.0, 4.0)
+                .map(|(_, kind)| kind),
             Some(GestureKind::Move),
-            "a parent summary bar has no resize handles"
+            "the body of a parent summary bar can still move"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&summary), 176.0, 4.0)
+                .map(|(_, kind)| kind),
+            None,
+            "a parent summary edge must not silently move"
+        );
+        assert_eq!(
+            summary.hit_zone_at_window_x(176.0, summary.x, summary.x + summary.width),
+            BarHitZone::RollupEdge
+        );
+        assert_eq!(
+            summary.hit_zone_at_window_x(177.0, summary.x, summary.x + summary.width),
+            BarHitZone::RollupEdge,
+            "3px inside a summary end must stay RollupEdge"
         );
     }
 

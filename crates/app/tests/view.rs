@@ -8,7 +8,7 @@ use ado_planner::gantt::{
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
-use ado_planner::toasts::{HistoryEntry, ToastKind, UndoAction};
+use ado_planner::toasts::{HistoryEntry, ToastExtra, ToastKind, UndoAction};
 use ado_planner::ui::PlannerView;
 use ado_planner::ui::{
     date_field_text, dates_from_range_picker, dates_from_range_picker_in_years,
@@ -4098,6 +4098,65 @@ fn parent_summary_bar_shows_link_handles_without_resize(cx: &mut gpui_kit::TestA
         cx.debug_bounds("gantt-resize-handle-1-end").is_none(),
         "a parent summary bar must not grow resize handles"
     );
+    assert!(
+        cx.debug_bounds("gantt-summary-edge-1-end").is_some(),
+        "a parent summary bar must show a not-allowed edge affordance"
+    );
+    assert!(
+        cx.debug_bounds("gantt-summary-edge-1-start").is_some(),
+        "a parent summary bar must show a not-allowed start-edge affordance"
+    );
+}
+
+#[gpui_kit::test]
+fn summary_edge_does_not_silently_move(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1").expect("summary bar");
+    let edge = point(
+        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(edge, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "a summary edge must not start a move, got {:?}",
+            view.state.gantt.gesture.as_ref().map(|g| g.kind)
+        );
+        let hit = view
+            .last_bar_hit_for_test()
+            .expect("summary edge must record a window-coord hit");
+        assert_eq!(
+            hit.zone,
+            BarHitZone::RollupEdge,
+            "3px inside a summary end must be rollup-edge, got {}",
+            hit.zone.as_str()
+        );
+    });
+    cx.simulate_mouse_up(edge, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let body = cx.debug_bounds("gantt-bar-1").expect("summary bar");
+    cx.simulate_mouse_down(body.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("the body of a summary bar can still move");
+        assert_eq!(gesture.kind, GestureKind::Move);
+        assert_eq!(gesture.id, 1);
+    });
 }
 
 #[gpui_kit::test]
@@ -4300,6 +4359,22 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
             "Target Date must change"
         );
     });
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_some(),
+        "a live resize must show the date preview chip"
+    );
+    cx.simulate_mouse_up(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "mouse-up must end the resize gesture"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_none(),
+        "the preview chip must clear when the resize ends, without waiting for another mouse-move"
+    );
 }
 
 fn click_painted_bar_inset(
@@ -4439,6 +4514,99 @@ fn toast_undo_does_not_eat_the_next_bar_click(cx: &mut gpui_kit::TestAppContext)
             .expect("first click after Undo must start a bar gesture, not be ignored");
         assert_eq!(gesture.id, 2);
         assert_eq!(gesture.kind, GestureKind::Move);
+    });
+}
+
+#[gpui_kit::test]
+fn toast_undo_of_a_resize_reuses_the_resized_verb(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let before_start = Some("2026-07-06T00:00:00Z".to_string());
+    let before_target = Some("2026-07-20T00:00:00Z".to_string());
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.start_date = before_start.clone();
+        node.target_date = Some("2026-07-24T00:00:00Z".into());
+    }
+    state.history.push(HistoryEntry::Dates {
+        id: 2,
+        before_start: before_start.clone(),
+        before_target: before_target.clone(),
+        after_start: before_start.clone(),
+        after_target: Some("2026-07-24T00:00:00Z".into()),
+    });
+    state.toasts.push_undo(
+        "Resized \"Work Item 1\" to Jul 6 → Jul 24",
+        UndoAction::RestoreDates {
+            id: 2,
+            start_date: before_start,
+            target_date: before_target,
+            rev: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let undo = cx.debug_bounds("toast-undo").expect("Undo");
+    cx.simulate_click(undo.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let messages: Vec<String> = view
+            .state
+            .toasts
+            .items
+            .iter()
+            .map(|toast| toast.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.to_lowercase().starts_with("undone resized")),
+            "undo of a resize must reuse Resized, got {messages:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn parent_move_toast_offers_move_children_too(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.toasts.push_undo_extra(
+        "Moved \"Work Item 0\" to Jul 9 → Jul 23",
+        UndoAction::RestoreDates {
+            id: 1,
+            start_date: Some("2026-07-06T00:00:00Z".into()),
+            target_date: Some("2026-07-20T00:00:00Z".into()),
+            rev: 1,
+        },
+        Some(ToastExtra::MoveChildren {
+            parent_id: 1,
+            delta_days: 3,
+        }),
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let extra = cx
+        .debug_bounds("toast-move-children")
+        .expect("Move children too");
+    cx.simulate_mouse_down(extra.center(), MouseButton::Left, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .all(|toast| toast.extra.is_none()),
+            "Move children too must consume the extra action"
+        );
     });
 }
 
