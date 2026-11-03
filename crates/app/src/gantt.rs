@@ -607,6 +607,10 @@ pub struct GanttView {
     /// After mouse-up, ignore hover until the pointer moves so a bar drag
     /// does not leave a stuck row highlight under a stationary cursor.
     pub hover_locked: bool,
+    /// Scroll delta applied by [`GanttView::snap_cramped_leading_column`]'s
+    /// Year/Quarter gutter park. [`GanttView::unsnap_year_gutter`] subtracts
+    /// this exact amount so Month→Year→Month does not drift.
+    pub year_gutter_snap: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -643,6 +647,7 @@ impl Default for GanttView {
             splitter_drag: None,
             schedule_drag: None,
             hover_locked: false,
+            year_gutter_snap: 0.0,
         }
     }
 }
@@ -922,12 +927,8 @@ impl GanttView {
         if !matches!(self.scale, GanttScale::Year | GanttScale::Quarter) {
             return;
         }
-        let gutter_right = UNSCHEDULED_GUTTER_RIGHT;
-        let month_start = GanttScale::Month.floor_date(self.date_for_x(gutter_right));
-        let x = self.x_for_date(month_start);
-        if (x - gutter_right).abs() < 1.0 {
-            self.scroll_x += gutter_right;
-        }
+        self.scroll_x -= self.year_gutter_snap;
+        self.year_gutter_snap = 0.0;
     }
 
     /// If the leftover column at x=0 is a sliver, align the period start to
@@ -948,7 +949,9 @@ impl GanttView {
                 x = self.x_for_date(month_start);
             }
             if x < gutter_right {
-                self.scroll_x += x - gutter_right;
+                let delta = x - gutter_right;
+                self.scroll_x += delta;
+                self.year_gutter_snap += delta;
             }
             return;
         }
@@ -2101,9 +2104,9 @@ fn bar_title_px(title: &str) -> f32 {
     title.chars().count() as f32 * 6.5 + 16.0
 }
 
-/// Inside when the visible fragment can hold the title; otherwise the label
-/// floats outside instead of truncating. Clipped-left bars keep the title in
-/// the on-screen fragment so it does not jump to the grid.
+/// Inside when the visible text area can hold the title; otherwise the label
+/// floats to the right of the bar instead of truncating (monday.com). Measure
+/// the inner width after grips/padding so Year slivers do not clip to "C".
 pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
     if bar.kind == GanttBarKind::Unscheduled
         || bar.kind == GanttBarKind::NoFields
@@ -2115,11 +2118,18 @@ pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
     }
     let clip_pad = (-bar.x).max(0.0);
     let visible_w = (bar.width - clip_pad).max(0.0);
-    if bar.x < 0.0 && visible_w >= 32.0 {
-        return true;
-    }
-    let title_w = bar_title_px(&bar.title);
-    visible_w >= (title_w + 12.0).max(32.0)
+    let grip = if bar.can_resize() || bar.summary {
+        bar.inner_grip_width()
+    } else {
+        0.0
+    };
+    let h_pad = if bar.can_resize() || bar.summary {
+        8.0
+    } else {
+        12.0
+    };
+    let inner = (visible_w - grip * 2.0 - h_pad).max(0.0);
+    inner >= bar_title_px(&bar.title)
 }
 
 /// Right edge of a bar including an external title, so arrows skip labels.
@@ -3571,6 +3581,44 @@ mod tests {
             !bar_title_is_inside(&bars[0]),
             "a title that does not fit the visible bar must go outside"
         );
+    }
+
+    #[test]
+    fn year_sliver_titles_paint_outside_instead_of_clipping() {
+        let cases = [
+            ("Cart", "2026-07-06T00:00:00Z", "2026-08-14T00:00:00Z"),
+            (
+                "Persist cart",
+                "2026-08-04T00:00:00Z",
+                "2026-08-21T00:00:00Z",
+            ),
+            (
+                "Unparented spike",
+                "2026-07-21T00:00:00Z",
+                "2026-08-04T00:00:00Z",
+            ),
+        ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        for (title, start, target) in cases {
+            let mut item = node(1, None);
+            item.title = title.into();
+            item.start_date = Some(start.into());
+            item.target_date = Some(target.into());
+            let rows = gantt.flatten(&[item.clone()]);
+            let bars = gantt.layout_bars(&[item], &rows, &[], 720.0);
+            assert_eq!(bars.len(), 1, "{title}");
+            assert!(
+                !bar_title_is_inside(&bars[0]),
+                "Year {title:?} at width {} must sit to the right of the bar, not clip inside",
+                bars[0].width
+            );
+        }
     }
 
     #[test]
@@ -5799,6 +5847,38 @@ mod tests {
             gantt.x_for_date(jul)
         );
         assert_eq!(gantt.date_for_x(keep_x), keep_date);
+    }
+
+    #[test]
+    fn month_year_month_via_gutter_snap_keeps_the_left_edge() {
+        let jul = Date::new(2026, 7, 1).unwrap();
+        for scroll_x in [0.0, -9.0] {
+            let mut gantt = GanttView {
+                origin: jul,
+                scale: GanttScale::Month,
+                zoom: 1.0,
+                scroll_x,
+                timeline_width: 800.0,
+                ..Default::default()
+            };
+            let jul_x = gantt.x_for_date(jul);
+            let left = gantt.date_for_x(0.0);
+            gantt.set_scale_at(GanttScale::Year, 0.0);
+            gantt.snap_cramped_leading_column();
+            gantt.unsnap_year_gutter();
+            gantt.set_scale_at(GanttScale::Month, 0.0);
+            gantt.snap_cramped_leading_column();
+            assert!(
+                (gantt.x_for_date(jul) - jul_x).abs() < 1.0,
+                "Month→Year→Month must not shift Jul, scroll_x={scroll_x} before={jul_x} after={}",
+                gantt.x_for_date(jul)
+            );
+            assert_eq!(
+                gantt.date_for_x(0.0),
+                left,
+                "left-edge date must round-trip, scroll_x={scroll_x}"
+            );
+        }
     }
 
     #[test]

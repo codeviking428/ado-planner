@@ -4081,11 +4081,9 @@ impl PlannerView {
             .gantt
             .header_tick_labels_except(width, hide_today);
         let today_on_screen = today_x >= 0.0 && today_x <= width;
-        let today_label_top = if matches!(self.state.gantt.scale, GanttScale::Year) {
-            22.0
-        } else {
-            2.0
-        };
+        // Sit on the major row with year/month banners. Year ticks are months
+        // at y=22; putting Today there overlaps "Nov".
+        let today_label_top = 2.0;
         let today_label_x = if today_on_screen {
             if today_x + TODAY_PILL_GAP + TODAY_PILL_W > width - 4.0 {
                 (today_x - TODAY_PILL_W - 4.0).max(4.0)
@@ -5284,14 +5282,19 @@ impl PlannerView {
         if let Some(today) = today_x {
             let label_right = label_x + estimated.min(max_w);
             if label_x < today && label_right > today - 4.0 {
-                if left_x >= 0.0 && left_x + estimated <= today - 4.0 {
+                let before = (today - 8.0 - label_x).max(0.0);
+                let after = today + 8.0;
+                if before >= estimated {
+                    max_w = before;
+                } else if after + 24.0 < timeline_w {
+                    // Don't clip to a letter: jump past Today and keep the title.
+                    label_x = after;
+                    max_w = (timeline_w - label_x - 4.0).max(24.0);
+                } else if left_x >= 0.0 && left_x + estimated <= today - 4.0 {
                     label_x = left_x;
                     max_w = (today - 8.0 - label_x).max(24.0);
                 } else {
-                    max_w = (today - 8.0 - label_x).max(0.0);
-                    if max_w < 8.0 {
-                        return None;
-                    }
+                    max_w = before.max(estimated);
                 }
             }
         }
@@ -8751,6 +8754,10 @@ mod bar_label_tests {
             label_x + max_w <= today_x - 4.0 || label_x >= today_x + 4.0,
             "Year Cart label must not sit on the Today line, label={label_x}..{} today={today_x}",
             label_x + max_w
+        );
+        assert!(
+            max_w + 0.1 >= "Cart".chars().count() as f32 * 6.5,
+            "Year Cart must keep a full-width outside label, not clip to a letter, max_w={max_w}"
         );
     }
 }

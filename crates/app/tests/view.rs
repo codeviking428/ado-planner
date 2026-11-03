@@ -3376,10 +3376,88 @@ fn month_year_month_keeps_the_range_title(cx: &mut gpui_kit::TestAppContext) {
         );
         let after = view.state.gantt.x_for_date(Date::new(2026, 7, 1).unwrap());
         assert!(
-            (after - jul_x).abs() < 2.0,
+            (after - jul_x).abs() < 1.0,
             "Jul must stay at the same screen x, {jul_x} vs {after}"
         );
     });
+}
+
+#[gpui_kit::test]
+fn year_today_label_does_not_overlap_month_ticks(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let year = cx.debug_bounds("gantt-scale-Year").expect("Year");
+    cx.simulate_click(year.center(), Modifiers::default());
+    draw(cx);
+    let today = cx
+        .debug_bounds("gantt-today-label")
+        .expect("Year Today label");
+    let tick = cx.debug_bounds("gantt-tick-0").expect("Year month tick");
+    let today_top = f32::from(today.origin.y);
+    let today_bottom = today_top + f32::from(today.size.height);
+    let tick_top = f32::from(tick.origin.y);
+    assert!(
+        today_bottom <= tick_top + 1.0,
+        "Year Today at {today_top}..{today_bottom} must sit on the year row, not on month ticks at {tick_top}"
+    );
+}
+
+#[gpui_kit::test]
+fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 1) {
+        node.title = "Cart".into();
+    }
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 2) {
+        node.title = "Persist cart".into();
+        node.start_date = Some("2026-08-04T00:00:00Z".into());
+        node.target_date = Some("2026-08-21T00:00:00Z".into());
+    }
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 3) {
+        node.title = "Unparented spike".into();
+        node.start_date = Some("2026-07-21T00:00:00Z".into());
+        node.target_date = Some("2026-08-04T00:00:00Z".into());
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    for (id, title) in [
+        (1_i64, "Cart"),
+        (2, "Persist cart"),
+        (3, "Unparented spike"),
+    ] {
+        let selector = match id {
+            1 => "gantt-bar-label-1",
+            2 => "gantt-bar-label-2",
+            3 => "gantt-bar-label-3",
+            _ => unreachable!("fixture ids"),
+        };
+        let label = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("Year {title} must paint an outside label"));
+        assert!(
+            f32::from(label.size.width) >= 36.0,
+            "Year {title} label width {} must not clip to a letter",
+            f32::from(label.size.width)
+        );
+    }
 }
 
 #[gpui_kit::test]
