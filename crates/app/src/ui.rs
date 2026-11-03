@@ -8566,14 +8566,21 @@ fn painted_bar_title_color(
     bar: &crate::gantt::BarLayout,
     canvas: gpui_kit::Hsla,
 ) -> gpui_kit::Hsla {
-    // Open-ended / summary bars are a wash over the grid. Measure that
-    // painted colour, not the saturated type swatch, so orange Cart UI
-    // stays dark-ink on a light Day/Week wash.
-    if bar.open_ended || bar.summary {
-        let alpha = if bar.open_ended { 0.22 } else { 0.55 };
-        let painted = canvas.blend(rgb(bar.color).opacity(alpha).into());
+    // Open-ended bars are a wash over the grid. Summary bars fill progress
+    // with the saturated type colour, so measure that fill once any children
+    // are complete — not the 0.55 wash — or the title vanishes on the fill.
+    if bar.open_ended {
+        let painted = canvas.blend(rgb(bar.color).opacity(0.22).into());
         let rgb = painted.to_rgb();
         ink_for_luminance(srgb_luminance(rgb.r, rgb.g, rgb.b))
+    } else if bar.summary {
+        if bar.progress.unwrap_or(0.0) > 0.0 {
+            inner_bar_label_color_darkened(bar.color, 0.0)
+        } else {
+            let painted = canvas.blend(rgb(bar.color).opacity(0.55).into());
+            let rgb = painted.to_rgb();
+            ink_for_luminance(srgb_luminance(rgb.r, rgb.g, rgb.b))
+        }
     } else {
         let darken = if bar.progress.unwrap_or(0.0) > 0.0 {
             0.22
@@ -9196,11 +9203,34 @@ mod bar_label_tests {
         let cart_ui = BarLayout {
             open_ended: true,
             progress: None,
-            ..spike
+            ..spike.clone()
         };
         assert!(
             painted_bar_title_color(&cart_ui, canvas).l < 0.2,
             "an open-ended orange wash must keep dark ink"
+        );
+        let cart = BarLayout {
+            id: 1002,
+            summary: true,
+            progress: Some(1.0),
+            title: "Cart".into(),
+            color: 0xa6e3a1,
+            open_ended: false,
+            ..spike.clone()
+        };
+        let ink = painted_bar_title_color(&cart, canvas);
+        assert!(
+            ink.l < 0.2,
+            "a completed summary must not paint type-coloured text on its progress fill, l={}",
+            ink.l
+        );
+        let empty = BarLayout {
+            progress: None,
+            ..cart
+        };
+        assert!(
+            painted_bar_title_color(&empty, canvas).l < 0.2,
+            "a 0% summary wash must still keep dark ink on green"
         );
     }
 
