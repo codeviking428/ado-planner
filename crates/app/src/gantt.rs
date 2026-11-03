@@ -641,7 +641,7 @@ pub struct GanttView {
     pub hovered_link: Option<(i64, i64)>,
     /// After a date drop, keep that bar's tooltip mounted without waiting for
     /// a new mouse-enter. Tied to this bar id; cleared when the pointer
-    /// leaves that bar's painted box (or on `clear_hover`).
+    /// leaves that bar's row (or on `clear_hover`).
     pub pin_bar_tooltip: Option<i64>,
     pub collapsed: HashSet<i64>,
     pub gesture: Option<Gesture>,
@@ -1867,12 +1867,14 @@ impl GanttView {
     /// Year ticks are months on the row *below* the Today pill. Thin every
     /// other month from the first painted tick so leftover Jul yields
     /// Jul, Sep, Nov, Jan, Mar — not calendar-odd names that skip Jan.
-    /// Day/Week still shift the in-month number off the Today line so "2"
-    /// stays readable. Month/Year/Quarter ticks keep their column x
-    /// (different row from the pill) so a Today dodge cannot crowd Nov.
-    pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
-        const HIDE_PAD: f32 = 22.0;
-        const SHIFT: f32 = 16.0;
+    /// Day/Week ticks sit on that same lower row (pill at y=2, ticks at
+    /// y=22), so they keep their column x. Shifting the Today number used
+    /// to hide Day "4" and shove "3".
+    pub fn header_tick_labels_except(
+        &self,
+        width: f32,
+        _hide_x: Option<f32>,
+    ) -> Vec<(f32, String)> {
         let mut ticks: Vec<(f32, String)> = self
             .timeline_ticks(width)
             .into_iter()
@@ -1884,25 +1886,6 @@ impl GanttView {
                 }
             })
             .collect();
-        if let Some(today) = hide_x
-            && !matches!(
-                self.scale,
-                GanttScale::Year | GanttScale::Quarter | GanttScale::Month
-            )
-            && let Some(index) = ticks
-                .iter()
-                .enumerate()
-                .filter(|(_, (x, _))| (x - today).abs() < HIDE_PAD)
-                .min_by(|(_, (a, _)), (_, (b, _))| {
-                    (a - today)
-                        .abs()
-                        .partial_cmp(&(b - today).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(index, _)| index)
-        {
-            ticks[index].0 = today + SHIFT;
-        }
         let min_gap = if matches!(self.scale, GanttScale::Quarter) {
             48.0
         } else {
@@ -2341,9 +2324,14 @@ impl GanttView {
                 if rank == 0 {
                     continue;
                 }
-                let x_shift = rank as f32 * INCOMING_FAN;
+                // Shared-source jogs (Persist cart → spike vs Persist cart →
+                // Go-live) must clear PARALLEL_VERT_MIN, not the 10px inbound fan.
+                let x_shift = rank as f32 * PARALLEL_VERT_MIN;
                 let lane_shift = rank as f32 * LANE_SEP;
                 out[index].x1 += x_shift;
+                if out[index].wraps_around_successor() {
+                    out[index].x2 += x_shift;
+                }
                 let dir = if out[index].y2 >= out[index].y1 {
                     -1.0
                 } else {
@@ -2361,9 +2349,11 @@ impl GanttView {
         // Clip first: two long verticals can both clamp to the same
         // `clip_right` (1–3px stack at the chart edge). Separate after.
         separate_parallel_verticals(&mut out, clip_left, clip_right);
+        separate_shared_source_outgoing(&mut out, clip_left, clip_right);
         // MIN_STUB / clip can park a dodged inbound back onto an intervening
         // open-ended cue (Persist cart → Go-live on Cart UI at Month 512).
         let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
+        dodge_outgoing_off_source_labels(&mut out, bars, clip_left, clip_right);
         dodge_forward_inbounds_off_intervening(
             &mut out,
             bars,
@@ -2372,6 +2362,7 @@ impl GanttView {
             clip_right,
         );
         separate_parallel_verticals(&mut out, clip_left, clip_right);
+        separate_shared_source_outgoing(&mut out, clip_left, clip_right);
         out
     }
 }
@@ -2658,11 +2649,111 @@ fn dodge_forward_inbounds_off_intervening(
     }
 }
 
+/// Shared-source outgoing stubs (Persist cart → spike vs Persist cart →
+/// Go-live) can restack to 1–3px after clip even when lanes are apart.
+/// Spread `x1` by `PARALLEL_VERT_MIN` without touching inbound `x2`.
+fn separate_shared_source_outgoing(
+    arrows: &mut [DependencyArrow],
+    clip_left: f32,
+    clip_right: f32,
+) {
+    if arrows.len() < 2 {
+        return;
+    }
+    let mut by_from: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (index, arrow) in arrows.iter().enumerate() {
+        by_from.entry(arrow.from_id).or_default().push(index);
+    }
+    for indexes in by_from.values_mut() {
+        if indexes.len() < 2 {
+            continue;
+        }
+        indexes.sort_by_key(|&index| arrows[index].to_id);
+        for _ in 0..indexes.len() * 4 {
+            let mut moved = false;
+            for pair in indexes.windows(2) {
+                let left = pair[0];
+                let right = pair[1];
+                let dx = arrows[right].x1 - arrows[left].x1;
+                if dx.abs() >= PARALLEL_VERT_MIN {
+                    continue;
+                }
+                let push = (PARALLEL_VERT_MIN - dx.abs()).max(1.0);
+                if shift_vertical(
+                    &mut arrows[right],
+                    VertKind::Outgoing,
+                    push,
+                    clip_left,
+                    clip_right,
+                ) || shift_vertical(
+                    &mut arrows[left],
+                    VertKind::Outgoing,
+                    -push,
+                    clip_left,
+                    clip_right,
+                ) {
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+}
+
+fn bar_outside_title_span(bar: &BarLayout) -> Option<(f32, f32)> {
+    if bar_title_is_inside(bar) || bar_is_gutter(bar) {
+        return None;
+    }
+    let title_w = bar_title_px(&bar.title);
+    if title_w < 4.0 {
+        return None;
+    }
+    let right = bar_label_right(bar);
+    let left = right - title_w;
+    Some((left, right))
+}
+
+/// The outgoing vertical at `x1` must miss the source's own outside title
+/// (Persist cart → Go-live through "Persist cart"). Intervening-only dodge
+/// never sees the source row.
+fn dodge_outgoing_off_source_labels(
+    arrows: &mut [DependencyArrow],
+    bars: &[BarLayout],
+    clip_left: f32,
+    clip_right: f32,
+) {
+    let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
+    for arrow in arrows.iter_mut() {
+        let Some(pred) = by_id.get(&arrow.from_id) else {
+            continue;
+        };
+        let Some((left, right)) = bar_outside_title_span(pred) else {
+            continue;
+        };
+        if !x_hits_span(arrow.x1, left, right) {
+            continue;
+        }
+        let next = (right + 8.0).clamp(clip_left, clip_right);
+        if (next - arrow.x1).abs() < 0.5 {
+            continue;
+        }
+        if arrow.wraps_around_successor() && next <= wrap_floor(arrow) {
+            continue;
+        }
+        let delta = next - arrow.x1;
+        arrow.x1 = next;
+        if arrow.wraps_around_successor() {
+            arrow.x2 = (arrow.x2 + delta).clamp(clip_left, clip_right);
+        }
+    }
+}
+
 fn clip_arrow_to_timeline(arrow: &mut DependencyArrow, left: f32, right: f32) {
     let clamp_span = |x: f32| x.clamp(left, right);
-    // Keep the head on the successor. Pulling it to `left` parks ▶ on the
-    // chart edge and on top of gutter "No dates" pills.
-    arrow.x_head = arrow.x_head.clamp(0.0, right);
+    // Keep the head on the successor. Do not pull ▶ off a diamond that sits
+    // near the clip (Persist cart → Go-live) or onto a gutter "No dates".
     if arrow.x_head > left + 1.0 {
         arrow.x1 = clamp_span(arrow.x1);
         arrow.x2 = clamp_span(arrow.x2);
@@ -2672,12 +2763,13 @@ fn clip_arrow_to_timeline(arrow: &mut DependencyArrow, left: f32, right: f32) {
     }
     const MIN_STUB: f32 = 10.0;
     // Only expand a collapsed inbound stub. Do not shrink wrap-around elbows.
+    // Dated FS / milestone heads stay on the successor start — moving x_head
+    // to the clip made Go-live's ▶ stop short of the diamond.
     if arrow.inbound_right {
         if arrow.x2 < arrow.x_head + MIN_STUB {
             arrow.x2 = (arrow.x_head + MIN_STUB).min(right);
         }
         if arrow.x_head > right - MIN_STUB {
-            arrow.x_head = (right - MIN_STUB).max(left);
             arrow.x2 = right;
         }
     } else if (arrow.x_head - arrow.x2).abs() < MIN_STUB {
@@ -2687,10 +2779,6 @@ fn clip_arrow_to_timeline(arrow: &mut DependencyArrow, left: f32, right: f32) {
             0.0
         };
         arrow.x2 = (arrow.x_head - MIN_STUB).max(floor);
-        if arrow.x_head < left + MIN_STUB && arrow.x_head > left + 1.0 {
-            arrow.x_head = (left + MIN_STUB).min(right);
-            arrow.x2 = left;
-        }
     }
 }
 
@@ -5207,14 +5295,79 @@ mod tests {
         let arrows = gantt.layout_dependency_arrows(&bars);
         assert_eq!(arrows.len(), 2);
         let dx = (arrows[0].x1 - arrows[1].x1).abs();
-        let dy = (arrows[0].lane_y - arrows[1].lane_y).abs();
         assert!(
-            dx >= 8.0 || dy >= PARALLEL_LANE_MIN,
-            "Persist cart → spike and Persist cart → Go-live must not share one vertical, dx={dx} dy={dy} x1={},{} lane={},{}",
+            dx >= PARALLEL_VERT_MIN,
+            "shared-source Persist cart jogs must sit ≥{PARALLEL_VERT_MIN}px apart, dx={dx} x1={},{} lane={},{}",
             arrows[0].x1,
             arrows[1].x1,
             arrows[0].lane_y,
             arrows[1].lane_y
+        );
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        if let Some((left, right)) = bar_outside_title_span(pred) {
+            for arrow in &arrows {
+                assert!(
+                    !x_hits_span(arrow.x1, left, right),
+                    "outgoing vertical must miss the Persist cart label, x1={} label={left}..{right} to={}",
+                    arrow.x1,
+                    arrow.to_id
+                );
+            }
+        }
+        let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        let live = arrows.iter().find(|arrow| arrow.to_id == 1013).unwrap();
+        assert!(
+            (live.x_head - go_live.x).abs() < 1.0,
+            "Go-live arrowhead must sit on the diamond, x_head={} diamond={}",
+            live.x_head,
+            go_live.x
+        );
+    }
+
+    #[test]
+    fn month_shared_source_persist_jogs_stay_sixteen_apart() {
+        let mut nodes = mock_fixture_nodes();
+        if let Some(spike) = nodes.iter_mut().find(|node| node.id == 1012) {
+            spike.predecessors = vec![1003];
+        }
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            timeline_width: 512.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let persist_spike = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+            .expect("Persist cart → spike");
+        let persist_live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Persist cart → Go-live");
+        let dx = (persist_spike.x1 - persist_live.x1).abs();
+        assert!(
+            dx >= PARALLEL_VERT_MIN,
+            "Month 512 shared-source jogs must sit ≥{PARALLEL_VERT_MIN}px apart, dx={dx} spike x1={} live x1={}",
+            persist_spike.x1,
+            persist_live.x1
+        );
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        if let Some((left, right)) = bar_outside_title_span(pred) {
+            assert!(
+                !x_hits_span(persist_live.x1, left, right),
+                "Persist cart → Go-live must not cross the Persist cart label, x1={} label={left}..{right}",
+                persist_live.x1
+            );
+        }
+        let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        assert!(
+            (persist_live.x_head - go_live.x).abs() < 1.0,
+            "Go-live ▶ must sit on the diamond, x_head={} diamond={}",
+            persist_live.x_head,
+            go_live.x
         );
     }
 
@@ -5891,10 +6044,10 @@ mod tests {
     }
 
     #[test]
-    fn day_header_keeps_the_month_and_shifts_today_number() {
+    fn day_header_keeps_the_month_and_today_number() {
         let today = Date::new(2026, 11, 2).unwrap();
         let gantt = GanttView {
-            origin: today,
+            origin: today.saturating_sub(5.days()),
             scale: GanttScale::Day,
             zoom: 1.0,
             timeline_width: 800.0,
@@ -5910,8 +6063,8 @@ mod tests {
             labels
                 .iter()
                 .filter(|(_, label)| label == "2")
-                .all(|(x, _)| (x - today_x).abs() >= 14.0),
-            "the 2 must sit off the Today line: {labels:?} today_x={today_x}"
+                .all(|(x, _)| (x - today_x).abs() < 2.0),
+            "the 2 must stay on its column under the Today pill: {labels:?} today_x={today_x}"
         );
         let majors = gantt.header_major_labels_except(800.0, Some(today_x));
         assert!(

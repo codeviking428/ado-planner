@@ -1119,8 +1119,12 @@ impl PlannerView {
         // Scale/zoom remounts the toast stack and can drop the hover-leave, which
         // used to leave `paused` stuck and freeze TTL across view switches.
         self.toast_hover_depth = 0;
+        self.toast_pause_ready = false;
         self.state.toasts.paused = false;
         self.state.toasts.expire();
+        self.toast_expiry_gen += 1;
+        self.toast_expiry_armed = false;
+        self.schedule_toast_expiry(cx);
         let from = self.visible_camera();
         self.state.gantt.restore(from);
         apply(&mut self.state.gantt);
@@ -1247,11 +1251,14 @@ impl PlannerView {
     }
 
     fn set_bar_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
+        if let Some(hovered) = id {
+            self.release_pin_if_other_row(hovered, cx);
+        }
         if id.is_none() {
             if self.state.gantt.pin_bar_tooltip.is_some() {
                 // Remount after a date commit fires hover-leave while the
                 // pointer is still on the bar. Keep the live pinned tooltip
-                // until a pointer hit-test says it left.
+                // until a pointer hit-test says it left the row.
                 return;
             }
             if self.state.gantt.hover_locked {
@@ -1270,6 +1277,9 @@ impl PlannerView {
     }
 
     fn set_hovered(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
+        if let Some(hovered) = id {
+            self.release_pin_if_other_row(hovered, cx);
+        }
         let linking = self
             .state
             .gantt
@@ -5663,12 +5673,24 @@ impl PlannerView {
                 .flex()
                 .items_center()
                 .justify_center()
+                .occlude()
                 .bg(warn)
                 .text_color(cx.theme().background)
                 .text_size(px(20.))
                 .line_height(px(20.))
                 .font_weight(gpui_kit::FontWeight::BOLD)
                 .child("!")
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.set_hovered(Some(id), cx);
+                    }
+                }))
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    this.set_hovered(Some(id), cx);
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    this.clear_pinned_tooltip_if_pointer_left(x, y, cx);
+                }))
                 .child(
                     Button::new(("overflow-tip", id as u64))
                         .ghost()
@@ -5708,8 +5730,11 @@ impl PlannerView {
             GanttScale::Quarter | GanttScale::Year
         );
         let overflow = parent_date_overflow(&self.state.nodes, id);
+        // Year/Quarter slivers jump to the Today line when dodged, leaving
+        // the title detached from its bar. Keep the chip on the bar.
+        let today_for_label = if cramped { None } else { Some(today_x) };
         let (label_x, max_w) =
-            Self::bar_external_label_frame(bar, timeline_w, true, Some(today_x), overflow)?;
+            Self::bar_external_label_frame(bar, timeline_w, true, today_for_label, overflow)?;
         if cramped && !bar.milestone && max_w < 56.0 {
             return None;
         }
@@ -5731,6 +5756,17 @@ impl PlannerView {
                 .text_xs()
                 .text_color(muted_fg)
                 .when(!dragging, |el| el.occlude())
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.set_hovered(Some(id), cx);
+                    }
+                }))
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    this.set_hovered(Some(id), cx);
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    this.clear_pinned_tooltip_if_pointer_left(x, y, cx);
+                }))
                 .child(bar_title_chip(label, muted_fg))
                 .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                     this.apply_scroll(event, cx);
@@ -7421,16 +7457,52 @@ impl PlannerView {
         }
         // The live dates chip sits in empty row space beside the bar. Treat
         // a move onto it as still on the bar so the pin does not drop.
-        if let Some(tip) = *self.pinned_tooltip_bounds.borrow()
-            && tip.id == id
+        if self.pointer_on_pinned_tooltip(id, window_x, window_y) {
+            return Some(true);
+        }
+        Some(false)
+    }
+
+    fn pointer_on_pinned_tooltip(&self, id: i64, window_x: f32, window_y: f32) -> bool {
+        const SLOP: f32 = 8.0;
+        let Some(tip) = *self.pinned_tooltip_bounds.borrow() else {
+            return false;
+        };
+        tip.id == id
             && window_x >= tip.left - SLOP
             && window_x <= tip.right + SLOP
             && window_y >= tip.top - SLOP
             && window_y <= tip.bottom + SLOP
-        {
-            return Some(true);
+    }
+
+    /// True while the pointer is on the pinned bar's row (including empty
+    /// space and the dates chip). Occluded siblings (`!`, outside titles)
+    /// live on this Y span, so leave is a row test, not a bar-box test.
+    fn pointer_on_pinned_row(&self, id: i64, window_y: f32) -> Option<bool> {
+        let painted = self.painted_bar_bounds.borrow().get(&id).copied()?;
+        const SLOP: f32 = 8.0;
+        let bar_h = (painted.bottom - painted.top).max(1.0);
+        let row_top = painted.top - ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
+        let row_bottom = row_top + ROW_HEIGHT;
+        Some(window_y >= row_top - SLOP && window_y <= row_bottom + SLOP)
+    }
+
+    fn release_pinned_tooltip(&mut self, cx: &mut Context<Self>) {
+        if self.state.gantt.pin_bar_tooltip.take().is_some() {
+            self.pinned_tooltip_bounds.borrow_mut().take();
+            cx.notify();
         }
-        Some(false)
+    }
+
+    fn release_pin_if_other_row(&mut self, hovered: i64, cx: &mut Context<Self>) {
+        if self
+            .state
+            .gantt
+            .pin_bar_tooltip
+            .is_some_and(|pin| pin != hovered)
+        {
+            self.release_pinned_tooltip(cx);
+        }
     }
 
     fn clear_pinned_tooltip_if_pointer_left(
@@ -7443,12 +7515,12 @@ impl PlannerView {
             return;
         };
         // Missing bounds are a remount, not a leave. Keep the pin.
-        if self.pointer_on_bar(id, window_x, window_y) != Some(false) {
+        if self.pointer_on_pinned_row(id, window_y) != Some(false)
+            || self.pointer_on_pinned_tooltip(id, window_x, window_y)
+        {
             return;
         }
-        self.state.gantt.pin_bar_tooltip = None;
-        self.pinned_tooltip_bounds.borrow_mut().take();
-        cx.notify();
+        self.release_pinned_tooltip(cx);
     }
 
     fn classify_bar_hit(
@@ -8382,11 +8454,14 @@ impl PlannerView {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, cx| {
+                    this.toast_expiry_armed = false;
                     if this.toast_expiry_gen != expiry_gen {
+                        if !this.state.toasts.items.is_empty() {
+                            this.schedule_toast_expiry(cx);
+                        }
                         return;
                     }
                     this.state.toasts.expire();
-                    this.toast_expiry_armed = false;
                     if !this.state.toasts.items.is_empty() {
                         this.schedule_toast_expiry(cx);
                     }
@@ -9353,9 +9428,9 @@ mod bar_label_tests {
     }
 
     #[test]
-    fn year_view_cart_label_does_not_cross_today() {
-        // Year zoom-out: Cart is a short sliver (Jul–Aug) whose outside
-        // title would otherwise run across Today (Nov).
+    fn year_view_cart_label_stays_on_the_bar() {
+        // Year zoom-out: Cart is a short sliver. A Today dodge used to park
+        // the title on the Today line, detached from the bar.
         let bar = BarLayout {
             id: 1002,
             kind: GanttBarKind::Scheduled,
@@ -9372,14 +9447,18 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
         };
-        let today_x = 184.0;
         let (label_x, max_w) =
-            PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
+            PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
                 .expect("Cart is too short for an inside title on Year");
+        let bar_right = bar.x + bar.width.max(8.0);
         assert!(
-            label_x + max_w <= today_x - 4.0 || label_x >= today_x + 4.0,
-            "Year Cart label must not sit on the Today line, label={label_x}..{} today={today_x}",
-            label_x + max_w
+            label_x + 1.0 >= bar_right,
+            "Year Cart label must sit next to the bar, not at the Today line, label_x={label_x} bar={}..{bar_right}",
+            bar.x
+        );
+        assert!(
+            label_x < bar_right + 80.0,
+            "Year Cart label must stay on the bar, not jump to Today, label_x={label_x} bar_right={bar_right}"
         );
         assert!(
             max_w + 0.1 >= "Cart".chars().count() as f32 * 8.0,

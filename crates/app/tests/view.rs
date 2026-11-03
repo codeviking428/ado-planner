@@ -3848,6 +3848,35 @@ fn day_today_label_does_not_hide_the_next_tick(cx: &mut gpui_kit::TestAppContext
         today_bottom <= min_tick_top + 1.0,
         "Day Today at {today_top}..{today_bottom} must stay on the major row, not cover ticks at {min_tick_top}"
     );
+    if let Some(line) = cx.debug_bounds("gantt-today") {
+        let line_x = f32::from(line.origin.x);
+        let mut on_column = false;
+        for selector in [
+            "gantt-tick-0",
+            "gantt-tick-1",
+            "gantt-tick-2",
+            "gantt-tick-3",
+            "gantt-tick-4",
+            "gantt-tick-5",
+            "gantt-tick-6",
+            "gantt-tick-7",
+            "gantt-tick-8",
+            "gantt-tick-9",
+        ] {
+            let Some(tick) = cx.debug_bounds(selector) else {
+                continue;
+            };
+            let tick_left = f32::from(tick.origin.x);
+            if (tick_left - line_x).abs() < 6.0 {
+                on_column = true;
+                break;
+            }
+        }
+        assert!(
+            on_column,
+            "Day Today tick must stay on the Today line at {line_x}, not shift off the column"
+        );
+    }
 }
 
 #[gpui_kit::test]
@@ -3990,6 +4019,25 @@ fn year_bar_labels_paint_beside_the_bar(cx: &mut gpui_kit::TestAppContext) {
             f32::from(label.size.width) >= 36.0,
             "Year {title} label width {} must not clip to a letter",
             f32::from(label.size.width)
+        );
+        let bar_selector = match id {
+            1 => "gantt-bar-1",
+            2 => "gantt-bar-2",
+            3 => "gantt-bar-3",
+            _ => unreachable!("fixture ids"),
+        };
+        let bar = cx
+            .debug_bounds(bar_selector)
+            .unwrap_or_else(|| panic!("Year {title} bar"));
+        let label_left = f32::from(label.origin.x);
+        let bar_left = f32::from(bar.origin.x);
+        let bar_right = bar_left + f32::from(bar.size.width);
+        let on_right =
+            label_left + 4.0 >= bar_right - 8.0 && (label_left - bar_right).abs() < 120.0;
+        let on_left = label_left + 8.0 <= bar_left + 4.0 && (bar_left - label_left).abs() < 160.0;
+        assert!(
+            on_right || on_left,
+            "Year {title} label must sit next to its bar, not at the Today line, label_x={label_left} bar={bar_left}..{bar_right}"
         );
     }
 }
@@ -6188,6 +6236,48 @@ fn pinned_tooltip_unpins_when_the_pointer_leaves_the_row(cx: &mut gpui_kit::Test
         assert_eq!(
             view.state.gantt.pin_bar_tooltip, None,
             "leaving the bar's row at the same X must unpin the live tooltip"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn pinned_tooltip_unpins_when_hovering_another_rows_overflow(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        view.state.gantt.pin_bar_tooltip = Some(1002);
+    });
+    draw(cx);
+    let persist = cx.debug_bounds("gantt-bar-1003").expect("Persist cart bar");
+    cx.simulate_mouse_move(persist.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "moving onto Persist cart must unpin the Cart dates chip so two tooltips do not stack"
+        );
+        view.state.gantt.pin_bar_tooltip = Some(1002);
+    });
+    draw(cx);
+    let bang = point(
+        persist.origin.x + persist.size.width + px(28.),
+        persist.origin.y + persist.size.height / 2.0,
+    );
+    cx.simulate_mouse_move(bang, None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.pin_bar_tooltip, None,
+            "moving onto Persist cart's ! must unpin the Cart dates chip"
         );
     });
 }
