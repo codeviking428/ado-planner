@@ -7303,6 +7303,53 @@ fn parent_summary_bar_resizes_without_the_link_dot_stealing(cx: &mut gpui_kit::T
 }
 
 #[gpui_kit::test]
+fn short_year_parent_has_no_rollup_edge(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 1.0;
+    state.gantt.origin = Date::new(2026, 1, 1).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1").expect("Year parent sliver");
+    let bar_w = f32::from(bar.size.width);
+    assert!(
+        bar_w > 8.0 && bar_w <= 24.5,
+        "Year 14-day parent should be a 16–24px sliver, width={bar_w}"
+    );
+    assert!(
+        cx.debug_bounds("gantt-summary-edge-1-start").is_none(),
+        "a 16–24px Year parent must not paint a rollup not-allowed start"
+    );
+    assert!(
+        cx.debug_bounds("gantt-summary-edge-1-end").is_none(),
+        "a 16–24px Year parent must not paint a rollup not-allowed end"
+    );
+    let edge = point(bar.origin.x + px(2.), bar.center().y);
+    cx.simulate_mouse_down(edge, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("a short Year parent edge must still move");
+        assert_eq!(
+            gesture.kind,
+            GestureKind::Move,
+            "16–24px parent edges must stay Move, got {:?}",
+            gesture.kind
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn summary_edge_does_not_silently_move(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();

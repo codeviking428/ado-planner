@@ -522,14 +522,14 @@ impl BarLayout {
     }
 
     /// 8px rollup edges only when they leave a Move body in the center.
-    /// Target-only diamonds (16px) and year-scale slivers stay all-Move.
-    /// Parents with their own dates resize instead of showing a not-allowed edge.
+    /// Same floor as `can_resize`: 16–24px Year/Quarter parents stay
+    /// all-Move. Wider dated parents resize instead of a not-allowed edge.
     pub fn shows_rollup_edges(&self) -> bool {
         self.summary
             && !self.can_resize()
             && !self.milestone
             && !self.marker
-            && self.width > HANDLE_WIDTH * 2.0
+            && self.width > HANDLE_WIDTH * 2.0 + LINK_HANDLE_INSET + 2.0
     }
 
     /// Classify a timeline-x on this painted bar. `None` is the move body.
@@ -554,7 +554,6 @@ impl BarLayout {
         if window_x < painted_left || window_x > painted_right {
             return BarHitZone::Outside;
         }
-        let width = (painted_right - painted_left).max(1.0);
         let (start, end_resize, link) = self.edge_zones_for(self.width.max(1.0));
         let on_link = link > 0.0 && window_x >= painted_right - link;
         let on_start = start > 0.0 && window_x <= painted_left + start;
@@ -568,9 +567,9 @@ impl BarLayout {
             return BarHitZone::Link;
         }
         if self.summary && !self.can_resize() {
-            // Two 8px edges meet on a 16px bar; skip them so a short parent
-            // (diamond, year sliver) still has a Move body.
-            if self.shows_rollup_edges() && width > HANDLE_WIDTH * 2.0 && (on_start || on_end) {
+            // Two 8px edges meet on a 16–24px bar; skip them so a short
+            // parent (diamond, Year sliver) still has a Move body.
+            if self.shows_rollup_edges() && (on_start || on_end) {
                 return BarHitZone::RollupEdge;
             }
             return BarHitZone::Move;
@@ -5618,11 +5617,25 @@ mod tests {
                 !short.can_resize(),
                 "{width}px must stay all-Move so grips cannot eat the body"
             );
+            assert!(
+                !short.shows_rollup_edges(),
+                "{width}px parent must not paint not-allowed rollup edges"
+            );
             let right = short.x + width;
             assert_eq!(
                 short.hit_zone_at_window_x(short.x + width / 2.0, short.x, right),
                 BarHitZone::Move,
                 "{width}px center must move"
+            );
+            assert_eq!(
+                short.hit_zone_at_window_x(short.x + 1.0, short.x, right),
+                BarHitZone::Move,
+                "{width}px start edge must move, not RollupEdge"
+            );
+            assert_eq!(
+                short.hit_zone_at_window_x(right - 1.0, short.x, right),
+                BarHitZone::Move,
+                "{width}px end edge must move, not RollupEdge"
             );
         }
         let resizable = BarLayout { width: 32.0, ..bar };
