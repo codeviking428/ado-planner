@@ -2487,6 +2487,15 @@ impl GanttView {
         dodge_outgoing_off_source_labels(
             &mut out, bars, clip_left, clip_right, timeline_w, today_x,
         );
+        // Shared-source fan parks Persist cart → Go-live 16px right of the
+        // spike stub, then inbound nudge pulls x2 left of Cart UI — a
+        // short stub right and a 40px double-back. Collapse that run so
+        // the outgoing sits on the inbound column (left of the spike,
+        // still ≥8px from it and off the source chip).
+        straighten_forward_backtracks(&mut out, bars, timeline_w, today_x);
+        separate_shared_source_outgoing_off_labels(
+            &mut out, bars, clip_left, clip_right, timeline_w, today_x,
+        );
         // Shared-source Y fan can lift the new Persist cart → Go-live run
         // into the outside chip; put it back ≥6px below, still in-row.
         clamp_lanes_off_source_titles(&mut out, bars);
@@ -3052,6 +3061,53 @@ fn separate_shared_source_inbounds(
                 break;
             }
         }
+    }
+}
+
+/// Pull a forward finish-to-start outgoing back onto its inbound column
+/// when routing walked `x1` right of the bar then `x2` left of the handle.
+/// Stubs that already cleared the source chip (zoomed-out Persist cart →
+/// Go-live past the letters) keep that long right route.
+fn straighten_forward_backtracks(
+    arrows: &mut [DependencyArrow],
+    bars: &[BarLayout],
+    timeline_w: f32,
+    today_x: Option<f32>,
+) {
+    let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
+    for arrow in arrows.iter_mut() {
+        if arrow.wraps_around_successor() || arrow.inbound_right {
+            continue;
+        }
+        if arrow.x1 <= arrow.x2 + 1.0 {
+            continue;
+        }
+        let Some(pred) = by_id.get(&arrow.from_id) else {
+            continue;
+        };
+        let pred_end = if pred.milestone || pred.marker {
+            pred.x + MILESTONE_SIZE
+        } else {
+            pred.x + pred.width
+        };
+        let natural = pred_end + DependencyArrow::WRAP_STUB;
+        // Day-view Cart UI dodges pull x2 left of a natural stub (pred_end+12)
+        // while the successor is far right. Collapsing that onto x2 exits
+        // left of the source bar. Only a fan-parked stub (x1 past natural)
+        // is a true double-back — inbound pulled left of Cart UI after the
+        // shared-source jog sat 16px right of the spike.
+        if arrow.x1 <= natural + 1.0 {
+            continue;
+        }
+        if arrow.x_head - arrow.x2 <= MAX_FORWARD_INBOUND + DependencyArrow::WRAP_STUB {
+            continue;
+        }
+        if let Some((_, right)) = bar_outside_title_span_clipped(pred, timeline_w.max(1.0), today_x)
+            && arrow.x1 >= right + SOURCE_LABEL_CLEARANCE - 0.5
+        {
+            continue;
+        }
+        arrow.x1 = arrow.x2;
     }
 }
 
@@ -3622,9 +3678,10 @@ pub fn outside_label_is_beside_bar(
 /// Body-relative Y ranges where the Today line should break so it does
 /// not paint through an outside-title chip that stays beside its bar.
 ///
-/// Year uses the occupancy frame plus a 2px Y pad so the line draws under
-/// sliver pills (R74). Other scales use glyph width and an exact 16px chip
-/// so Quarter occupancy over-width cannot false-gap Go-live/spike (R75).
+/// Year uses a full-row hole so the stroke breaks around the pill instead
+/// of threading the 12px pad above/below a 16px chip (R78). Other scales
+/// use glyph width and an exact 16px chip so Quarter occupancy over-width
+/// cannot false-gap Go-live/spike (R75).
 pub fn today_line_chip_skips(
     bars: &[BarLayout],
     today_x: f32,
@@ -3656,7 +3713,9 @@ pub fn today_line_chip_skips(
             }
             let top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
             let (top, bottom) = if year {
-                (top - 2.0, top + OUTSIDE_LABEL_H + 4.0)
+                // Full-row hole so the stroke visibly breaks around the pill
+                // instead of threading the 12px padding above/below it.
+                (bar.y + 1.0, bar.y + ROW_HEIGHT - 1.0)
             } else {
                 (top, top + OUTSIDE_LABEL_H)
             };
@@ -3667,7 +3726,9 @@ pub fn today_line_chip_skips(
     let mut merged: Vec<(f32, f32)> = Vec::new();
     for skip in skips {
         match merged.last_mut() {
-            Some(prev) if skip.0 <= prev.1 + 1.0 => prev.1 = prev.1.max(skip.1),
+            // Year full-row holes must not fuse into one blank band across
+            // consecutive labeled rows; leave a 2px tick between pills.
+            Some(prev) if skip.0 <= prev.1 => prev.1 = prev.1.max(skip.1),
             _ => merged.push(skip),
         }
     }
@@ -6915,6 +6976,20 @@ mod tests {
             persist_spike.x2,
             cart.x
         );
+        assert!(
+            persist_live.x1 <= persist_live.x2 + 8.0,
+            "auto-fit Month Persist cart → Go-live must not stub right then double back, x1={} x2={}",
+            persist_live.x1,
+            persist_live.x2
+        );
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        if let Some((left, right)) = bar_outside_title_span(pred) {
+            assert!(
+                persist_live.x1 + 0.5 >= right + 6.0 || persist_live.x1 <= left - 6.0 + 0.5,
+                "auto-fit Month first stub must sit ≥6px from the Persist cart label, x1={} label={left}..{right}",
+                persist_live.x1
+            );
+        }
     }
 
     #[test]
@@ -6939,24 +7014,27 @@ mod tests {
             return;
         };
         let skips = today_line_chip_skips(&bars, today_x, gantt.timeline_width, GanttScale::Year);
-        for id in [1005_i64, 1012, 1013] {
+        let miss_right = today_x + 3.0 + TODAY_LABEL_CLEARANCE;
+        for id in [1001_i64, 1003, 1005, 1012, 1013] {
             let bar = bars.iter().find(|bar| bar.id == id).unwrap();
-            let Some((x, w)) =
-                bar_outside_label_frame(bar, gantt.timeline_width, true, Some(today_x), false)
-            else {
+            let Some((x, w)) = bar_outside_label_frame(
+                bar,
+                gantt.timeline_width,
+                true,
+                Some(today_x),
+                bar.overflow_badge,
+            ) else {
                 continue;
             };
-            if x >= today_x + 5.0 || x + w <= today_x - 2.0 {
+            if x >= miss_right || x + w <= today_x - 2.0 {
                 continue;
             }
-            let chip_top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-            let chip_bottom = chip_top + OUTSIDE_LABEL_H;
-            let gapped = skips
-                .iter()
-                .any(|&(top, bottom)| top <= chip_top + 1.0 && bottom >= chip_bottom - 1.0);
+            let gapped = skips.iter().any(|&(top, bottom)| {
+                top <= bar.y + 2.0 && bottom + 0.5 >= bar.y + ROW_HEIGHT - 2.0
+            });
             assert!(
                 gapped,
-                "Year before Today: {} occupancy {x}..{} overlaps Today {today_x} so the line must skip the chip, skips={skips:?}",
+                "Year before Today: {} occupancy {x}..{} overlaps Today {today_x} so the line must skip the row, skips={skips:?}",
                 bar.title,
                 x + w
             );

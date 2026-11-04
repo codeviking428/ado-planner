@@ -1576,6 +1576,18 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
             "launch camera: Persist cart → Go-live horizontal hit must be ≥14px tall, got {hit_h}"
         );
     }
+    assert!(
+        (live_out_x - live_x).abs() <= 8.0,
+        "launch camera: Persist cart → Go-live must not stub right then double back, out={live_out_x} inv={live_x}"
+    );
+    if let Some(label) = cx.debug_bounds("gantt-bar-label-1003") {
+        let left = f32::from(label.origin.x);
+        let right = left + f32::from(label.size.width);
+        assert!(
+            live_out_x >= right + 6.0 || live_out_x <= left - 6.0,
+            "launch camera: first stub at {live_out_x} must sit ≥6px from the Persist cart label {left}..{right}"
+        );
+    }
 
     let year = cx.debug_bounds("gantt-scale-Year").expect("Year toolbar");
     cx.simulate_click(year.center(), Modifiers::default());
@@ -1598,20 +1610,36 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
         let Some(label) = cx.debug_bounds(selector) else {
             continue;
         };
+        let label_left = f32::from(label.origin.x);
+        let label_right = label_left + f32::from(label.size.width);
+        let label_top = f32::from(label.origin.y);
+        let label_bottom = label_top + f32::from(label.size.height);
+        let mut covered = 0.0_f32;
         for (index, segment) in segments.iter().enumerate() {
             assert!(
                 !painted_overlap(label, *segment),
-                "launch camera Year before Today: Today body-{index} must not run through {selector} (label x={:.1}..{:.1} y={:.1}..{:.1}, line x={:.1}..{:.1} y={:.1}..{:.1})",
-                f32::from(label.origin.x),
-                f32::from(label.origin.x) + f32::from(label.size.width),
-                f32::from(label.origin.y),
-                f32::from(label.origin.y) + f32::from(label.size.height),
+                "launch camera Year before Today: Today body-{index} must not run through {selector} (label x={label_left:.1}..{label_right:.1} y={label_top:.1}..{label_bottom:.1}, line x={:.1}..{:.1} y={:.1}..{:.1})",
                 f32::from(segment.origin.x),
                 f32::from(segment.origin.x) + f32::from(segment.size.width),
                 f32::from(segment.origin.y),
                 f32::from(segment.origin.y) + f32::from(segment.size.height)
             );
+            let seg_x = f32::from(segment.origin.x);
+            let seg_right = seg_x + f32::from(segment.size.width).max(3.0);
+            if seg_right > label_left && seg_x < label_right {
+                let seg_top = f32::from(segment.origin.y);
+                let seg_bottom = seg_top + f32::from(segment.size.height);
+                let overlap_top = seg_top.max(label_top - 12.0);
+                let overlap_bottom = seg_bottom.min(label_bottom + 12.0);
+                if overlap_bottom > overlap_top {
+                    covered += overlap_bottom - overlap_top;
+                }
+            }
         }
+        assert!(
+            covered < 8.0,
+            "launch camera Year before Today: {selector} must show a visible Today break around the pill, leftover stroke in the row pad={covered}"
+        );
     }
 }
 
