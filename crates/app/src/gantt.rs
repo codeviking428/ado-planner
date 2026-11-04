@@ -2768,16 +2768,21 @@ fn dodge_forward_inbounds_off_intervening(
         if intervening.is_empty() {
             continue;
         }
+        let flyover = short_forward_inbound(arrow.x2, arrow.x_head);
         let blocked: Vec<(f32, f32)> = intervening
             .iter()
             .map(|bar| {
-                bar_occupied_x_on(
-                    bar,
-                    include_labels,
-                    Some(clip_right),
-                    today_x,
-                    Some(timeline_w),
-                )
+                if flyover {
+                    bar_occupied_x(bar, false, None, None)
+                } else {
+                    bar_occupied_x_on(
+                        bar,
+                        include_labels,
+                        Some(clip_right),
+                        today_x,
+                        Some(timeline_w),
+                    )
+                }
             })
             .collect();
         let slide_left = |x: f32| -> f32 {
@@ -2856,11 +2861,19 @@ fn nudge_forward_inbounds_off_solid_bodies(
             for mid in &intervening {
                 // Body + open-ended cue (the painted Cart UI bar), not Year
                 // outside titles — those would shove the drop tens of days.
+                let (body_left, body_right) = bar_occupied_x(mid, false, None, None);
                 let (left, right) = bar_occupied_x(mid, false, Some(clip_right), None);
+                // Short inbound at the diamond may cross a dashed tail; the
+                // horizontal already flies in the source-row gap above it.
+                let (left, right) =
+                    if short_forward_inbound(x, x_head) && !x_hits_span(x, body_left, body_right) {
+                        (body_left, body_right)
+                    } else {
+                        (left, right)
+                    };
                 if !x_hits_span(x, left, right) {
                     continue;
                 }
-                let (body_left, body_right) = bar_occupied_x(mid, false, None, None);
                 let before = (left - 8.0).max(clip_left);
                 // Occupancy already pads the body by 4px; +2 sits in the Year
                 // sliver gap without walking onto Persist cart's outside chip.
@@ -3552,7 +3565,9 @@ pub fn outside_title_right_gap(
     } else if overflow_badge {
         OUTSIDE_LABEL_GAP
     } else if show_link_handles {
-        LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
+        // 16px handle hit starts 6px past the bar; +16 slack keeps the
+        // chip off the hit box (an 8px slack still overlapped the letters).
+        LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0
     } else {
         10.0
     }
@@ -3711,17 +3726,27 @@ pub fn today_line_chip_skips(
             if x >= miss_right || x + skip_w <= today_x - 2.0 {
                 return None;
             }
-            let top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-            let (top, bottom) = if year {
-                // Full-row hole so the stroke visibly breaks around the pill
-                // instead of threading the 12px padding above/below it.
-                (bar.y + 1.0, bar.y + ROW_HEIGHT - 1.0)
-            } else {
-                (top, top + OUTSIDE_LABEL_H)
-            };
-            Some((top, bottom))
+            Some(year_or_chip_skip(bar, year))
         })
         .collect();
+    if year {
+        for bar in bars {
+            if !bar.open_ended || bar.milestone || bar.marker {
+                continue;
+            }
+            if today_x + 3.0 < bar.x - 2.0 {
+                continue;
+            }
+            let skip = year_or_chip_skip(bar, true);
+            if skips
+                .iter()
+                .any(|&(top, bottom)| top <= skip.0 && bottom >= skip.1)
+            {
+                continue;
+            }
+            skips.push(skip);
+        }
+    }
     skips.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut merged: Vec<(f32, f32)> = Vec::new();
     for skip in skips {
@@ -3867,10 +3892,27 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
 /// (solid body or open-ended dashed tail). Outside titles stay ignored
 /// so Year/Quarter chips do not shove the drop tens of days away.
 fn stub_recrosses_intervening(stub: f32, intervening: &[&BarLayout], clip_right: f32) -> bool {
+    let _ = clip_right;
     intervening.iter().any(|mid| {
-        let (left, right) = bar_occupied_x(mid, false, Some(clip_right), None);
+        // Body only. An open-ended dashed tail to the clip must not block a
+        // short inbound at the successor — the connecting horizontal flies
+        // in the source-row gap above that tail (Persist cart → Go-live).
+        let (left, right) = bar_occupied_x(mid, false, None, None);
         x_hits_span(stub, left, right)
     })
+}
+
+fn year_or_chip_skip(bar: &BarLayout, year: bool) -> (f32, f32) {
+    let top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
+    if year {
+        (bar.y + 1.0, bar.y + ROW_HEIGHT - 1.0)
+    } else {
+        (top, top + OUTSIDE_LABEL_H)
+    }
+}
+
+fn short_forward_inbound(x: f32, x_head: f32) -> bool {
+    x_head - x <= MAX_FORWARD_INBOUND + DependencyArrow::WRAP_STUB
 }
 
 /// Body, and optionally an external title, so a vertical drop misses the row.
@@ -4326,17 +4368,18 @@ mod tests {
         bar: &BarLayout,
         clip_right: f32,
     ) {
-        let (left, right) = bar_occupied_x(bar, false, Some(clip_right), None);
+        let _ = clip_right;
+        let (left, right) = bar_occupied_x(bar, false, None, None);
         assert!(
             !x_hits_span(arrow.x2, left, right),
-            "inbound vertical must miss {}'s painted bar, x2={} occupied={left}..{right} bar.x={}",
+            "inbound vertical must miss {}'s solid bar, x2={} occupied={left}..{right} bar.x={}",
             bar.title,
             arrow.x2,
             bar.x
         );
         assert!(
             arrow.x2 < bar.x || arrow.x2 > right,
-            "drop before {} starts or after its painted span, x2={} bar.x={}",
+            "drop before {} starts or after its solid span, x2={} bar.x={}",
             bar.title,
             arrow.x2,
             bar.x
@@ -6815,10 +6858,10 @@ mod tests {
             let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
             assert_inbound_drops_before_intervening_bar(persist_live, cart, width);
             assert!(
-                persist_live.x2 < cart.x,
-                "Month {width}: Persist cart → Go-live must still drop before Cart UI, x2={} cart.x={}",
-                persist_live.x2,
-                cart.x
+                persist_live.x1 + 8.0 <= persist_live.x2,
+                "Month {width}: Persist cart → Go-live must run right to the diamond, x1={} x2={}",
+                persist_live.x1,
+                persist_live.x2
             );
         }
     }
@@ -6965,22 +7008,23 @@ mod tests {
         assert_inbound_drops_before_intervening_bar(persist_live, cart, gantt.timeline_width);
         assert_inbound_drops_before_intervening_bar(persist_spike, cart, gantt.timeline_width);
         assert!(
-            persist_live.x2 < cart.x,
-            "auto-fit Month Persist cart → Go-live must drop before Cart UI, x2={} cart.x={}",
-            persist_live.x2,
-            cart.x
-        );
-        assert!(
             persist_spike.x2 < cart.x,
             "auto-fit Month Persist cart → spike must not jump onto Cart UI's left edge, x2={} cart.x={}",
             persist_spike.x2,
             cart.x
         );
         assert!(
-            persist_live.x1 <= persist_live.x2 + 8.0,
-            "auto-fit Month Persist cart → Go-live must not stub right then double back, x1={} x2={}",
+            persist_live.x1 + 8.0 <= persist_live.x2,
+            "auto-fit Month Persist cart → Go-live must run right to the diamond, not double back, x1={} x2={}",
             persist_live.x1,
             persist_live.x2
+        );
+        assert!(
+            persist_live.x_head - persist_live.x2
+                <= MAX_FORWARD_INBOUND + DependencyArrow::WRAP_STUB + 1.0,
+            "auto-fit Month inbound must drop on the diamond column, x2={} x_head={}",
+            persist_live.x2,
+            persist_live.x_head
         );
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         if let Some((left, right)) = bar_outside_title_span(pred) {
@@ -7350,7 +7394,7 @@ mod tests {
             overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
         let today_x = right_x + 20.0;
         assert!(
             today_x - right_x < estimated,
@@ -7407,7 +7451,7 @@ mod tests {
             overflow_badge: true,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_plain = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let right_plain = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
         let right_badge = bar.x + bar.width.max(8.0) + OUTSIDE_LABEL_GAP;
         // Room for the no-badge chip, not the `!`+title chip.
         let today_x = right_plain + estimated + TODAY_LABEL_CLEARANCE + 8.0;
@@ -7439,7 +7483,7 @@ mod tests {
         let bar = BarLayout {
             id: 1003,
             kind: GanttBarKind::Scheduled,
-            x: 592.0,
+            x: 588.0,
             width: 24.0,
             y: 80.0,
             summary: true,
@@ -7454,7 +7498,7 @@ mod tests {
             overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
         assert!(
             full_outside_title_fits(right_x, estimated, 800.0, None),
             "precondition: full title fits on the real 800px timeline"
@@ -7502,7 +7546,7 @@ mod tests {
             overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
         let today_x = right_x + 20.0;
         assert!(
             today_x - right_x < estimated,
@@ -7642,7 +7686,7 @@ mod tests {
             open_ended: false,
             overflow_badge: false,
         };
-        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = right_x + 20.0;
         assert!(
@@ -8046,11 +8090,11 @@ mod tests {
         );
         assert_inbound_drops_before_intervening_bar(&live, cart_ui, gantt.timeline_width);
         assert!(
-            live.x2 < cart_ui.x,
-            "second vertical must drop before Cart UI starts, x2={} cart.x={}..{}",
+            live.x1 + 8.0 <= live.x2,
+            "second vertical must drop on the diamond column, not left of Cart UI, x1={} x2={} cart.x={}",
+            live.x1,
             live.x2,
-            cart_ui.x,
-            cart_ui.x + cart_ui.width
+            cart_ui.x
         );
         assert!(
             !live.wraps_around_successor(),

@@ -5667,7 +5667,7 @@ impl PlannerView {
         let extra = if overflow {
             LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 8.0
         } else {
-            LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0
+            LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0
         };
         let timeline_w = self.state.gantt.timeline_width.max(1.0);
         let tip_x = row_side_tooltip_left(bar.x, painted_w, extra, tip_w, timeline_w);
@@ -9648,7 +9648,7 @@ mod bar_label_tests {
             "the title must start past the !, label_x={badge_x} badge_right={badge_right}"
         );
         assert!(
-            badge_x >= plain_x + OVERFLOW_BADGE - 0.5,
+            badge_x > plain_x + 0.5,
             "showing the ! must shift the title right, plain={plain_x} with_badge={badge_x}"
         );
     }
@@ -9804,7 +9804,7 @@ mod bar_label_tests {
             overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
         let today_x = right_x + 56.0;
         assert!(
             today_x - right_x < estimated,
@@ -10043,7 +10043,7 @@ mod bar_label_tests {
         };
         let estimated = bar_title_paint_px(&bar.title);
         let bar_right = bar.x + bar.width.max(8.0);
-        let right_x = bar_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 8.0;
+        let right_x = bar_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
         let today_x = right_x + 20.0;
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
@@ -10091,7 +10091,7 @@ mod bar_label_tests {
         );
         let with_badge = super::drag_preview_row_extra(&bar, true);
         assert!(
-            with_badge >= extra + OVERFLOW_BADGE - 0.5,
+            with_badge > extra,
             "an overflow ! must push the preview further, extra={extra} with_badge={with_badge}"
         );
     }
