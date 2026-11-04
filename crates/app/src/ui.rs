@@ -48,8 +48,8 @@ use crate::gantt::{
     DETAILS_PILL_WIDTH, DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind,
     HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT,
     LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS,
-    NudgeAxis, OUTER_LINK_HIT, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP, PARALLEL_LANE_MIN,
-    PLACEHOLDER_BAR_H, RESIZE_HALO_END_OUTSIDE, RESIZE_HALO_OUTSIDE, ROW_HEIGHT,
+    NudgeAxis, OUTER_LINK_HIT, OUTSIDE_LABEL_H, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
+    PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, RESIZE_HALO_END_OUTSIDE, RESIZE_HALO_OUTSIDE, ROW_HEIGHT,
     SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H,
     SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT,
     bar_hover_tooltip, bar_label_right, bar_outside_label_frame, bar_title_is_inside,
@@ -4917,7 +4917,7 @@ impl PlannerView {
                         self.render_pinned_bar_tooltip(bar, dragging, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
-                        self.render_hover_bar_tooltip(bar, dragging, cx)
+                        self.render_hover_bar_tooltip(bar, bars, dragging, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
                         // After arrows/labels so a connector or dates tooltip
@@ -5167,8 +5167,7 @@ impl PlannerView {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_xs()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(muted_fg)
+                            .text_color(header_fg)
                             .child(label)
                     }))
                     .children({
@@ -5197,7 +5196,7 @@ impl PlannerView {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_xs()
-                                    .text_color(header_fg)
+                                    .text_color(header_fg.opacity(0.62))
                                     .child(label.clone())
                             })
                             .collect::<Vec<_>>()
@@ -5238,7 +5237,7 @@ impl PlannerView {
             .children(bars.iter().filter_map(|bar| {
                 // Sibling of the clipped body so first-row pills can sit
                 // in the header band, above the bar, not on the title.
-                self.render_hover_date_pills(bar, dragging, cx)
+                self.render_hover_date_pills(bar, bars, dragging, cx)
             }))
             .children({
                 self.state.gantt.gesture.as_ref().and_then(|gesture| {
@@ -6874,6 +6873,7 @@ impl PlannerView {
     fn render_hover_bar_tooltip(
         &self,
         bar: &crate::gantt::BarLayout,
+        bars: &[crate::gantt::BarLayout],
         dragging: bool,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
@@ -6910,7 +6910,13 @@ impl PlannerView {
         if offscreen_edge_chip(bar, timeline_w).is_some() {
             return None;
         }
-        let pills = hover_date_pill_obstacles(bar, &self.state.nodes);
+        let today = jiff::Zoned::now().date();
+        let today_px = self.state.gantt.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
+        let mut pills = hover_date_pill_obstacles(bar, &self.state.nodes);
+        pills.extend(overlay_neighbor_obstacles(
+            bars, bar.id, timeline_w, today_x,
+        ));
         let toast_band = if self.state.toasts.items.is_empty() {
             0.0
         } else {
@@ -6949,12 +6955,15 @@ impl PlannerView {
         let chip = |el: gpui_kit::Div| {
             el.id(("gantt-hover-tooltip", id as u64))
                 .debug_selector(|| "gantt-hover-tooltip".into())
+                .h(px(HOVER_TOOLTIP_H))
                 .px_2()
-                .py_1()
+                .flex()
+                .items_center()
                 .rounded_md()
                 .bg(cx.theme().popover)
                 .text_color(cx.theme().popover_foreground)
                 .text_xs()
+                .line_height(px(14.))
                 .whitespace_nowrap()
                 .border_1()
                 .border_color(cx.theme().border)
@@ -7020,6 +7029,7 @@ impl PlannerView {
     fn render_hover_date_pills(
         &self,
         bar: &crate::gantt::BarLayout,
+        bars: &[crate::gantt::BarLayout],
         dragging: bool,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
@@ -7037,18 +7047,58 @@ impl PlannerView {
             .as_ref()
             .map(|text| drag_date_pill_text_width(text))
             .unwrap_or(0.0);
-        let (start_x, end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
-        let y = hover_date_pill_y(bar.y, bar.paint_top()) + TIMELINE_HEADER_H;
+        let (mut start_x, mut end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
+        let mut y = hover_date_pill_y(bar.y, bar.paint_top());
+        let timeline_w = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
+        let today = jiff::Zoned::now().date();
+        let today_px = self.state.gantt.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
+        let neighbors = overlay_neighbor_obstacles(bars, id, timeline_w, today_x);
+        let (nudged_start, nudged_y) = nudge_overlay_off(
+            OverlayRect {
+                x: start_x,
+                y,
+                w: start_w,
+                h: DATE_PILL_H,
+            },
+            &neighbors,
+            timeline_w,
+            bar.y,
+            self.state.gantt.viewport_h,
+            0.0,
+        );
+        start_x = nudged_start;
+        y = nudged_y;
+        if end_w > 0.0 {
+            let (nudged_end, _) = nudge_overlay_off(
+                OverlayRect {
+                    x: end_x,
+                    y,
+                    w: end_w,
+                    h: DATE_PILL_H,
+                },
+                &neighbors,
+                timeline_w,
+                bar.y,
+                self.state.gantt.viewport_h,
+                0.0,
+            );
+            end_x = nudged_end;
+        }
+        let y = y + TIMELINE_HEADER_H;
         let date_pill = |text: String| {
             div()
+                .h(px(DATE_PILL_H))
                 .px_2()
-                .py(px(2.))
+                .flex()
+                .items_center()
                 .rounded_sm()
                 .border_1()
                 .border_color(cx.theme().border)
                 .bg(cx.theme().popover)
                 .text_color(cx.theme().popover_foreground)
                 .text_xs()
+                .line_height(px(14.))
                 .whitespace_nowrap()
                 .child(text)
         };
@@ -7212,13 +7262,19 @@ impl PlannerView {
         let min_y = arrow.y1.min(arrow.y2).min(arrow.lane_y).min(gutter_y) - 18.0;
         let from_id = arrow.from_id;
         let to_id = arrow.to_id;
-        let v1 = (arrow.lane_y - arrow.y1).abs().max(2.0);
-        let h_len = (arrow.x2 - arrow.x1).abs().max(2.0);
         let v2_end = if wrap { gutter_y } else { arrow.y2 };
-        let v2 = (v2_end - arrow.lane_y).abs().max(2.0);
-        let stub_h = (arrow.x_head - stub_start).abs().max(2.0);
-        let gutter_h = (stub_start - arrow.x2).abs().max(2.0);
-        let drop = (arrow.y2 - gutter_y).abs().max(2.0);
+        let out_r = corner_inset((arrow.lane_y - arrow.y1).abs());
+        let h_r = corner_inset((arrow.x2 - arrow.x1).abs());
+        let inv_r = corner_inset((v2_end - arrow.lane_y).abs());
+        let stub_r = corner_inset((arrow.x_head - stub_start).abs());
+        let gutter_r = corner_inset((stub_start - arrow.x2).abs());
+        let drop_r = corner_inset((arrow.y2 - gutter_y).abs());
+        let (out_top, v1) = inset_span(arrow.y1, arrow.lane_y, 0.0, out_r);
+        let (h_left, h_len) = inset_span(arrow.x1, arrow.x2, h_r, h_r);
+        let (inv_top, v2) = inset_span(arrow.lane_y, v2_end, inv_r, inv_r);
+        let (stub_left, stub_h) = inset_span(stub_start, arrow.x_head, stub_r, 0.0);
+        let (gutter_left, gutter_h) = inset_span(arrow.x2, stub_start, gutter_r, gutter_r);
+        let (drop_top, drop) = inset_span(gutter_y, arrow.y2, drop_r, drop_r);
         div()
             .absolute()
             .left(px(min_x))
@@ -7227,7 +7283,7 @@ impl PlannerView {
             .h(px(0.))
             .child(self.arrow_segment(
                 arrow.x1 - min_x,
-                arrow.y1.min(arrow.lane_y) - min_y,
+                out_top - min_y,
                 stroke,
                 v1,
                 color,
@@ -7237,7 +7293,7 @@ impl PlannerView {
                 cx,
             ))
             .child(self.arrow_segment(
-                arrow.x1.min(arrow.x2) - min_x,
+                h_left - min_x,
                 arrow.lane_y - min_y,
                 h_len,
                 stroke,
@@ -7249,7 +7305,7 @@ impl PlannerView {
             ))
             .child(self.arrow_segment(
                 arrow.x2 - min_x,
-                arrow.lane_y.min(v2_end) - min_y,
+                inv_top - min_y,
                 stroke,
                 v2,
                 color,
@@ -7260,7 +7316,7 @@ impl PlannerView {
             ))
             .when(wrap, |el| {
                 el.child(self.arrow_segment(
-                    stub_start.min(arrow.x2) - min_x,
+                    gutter_left - min_x,
                     gutter_y - min_y,
                     gutter_h,
                     stroke,
@@ -7272,7 +7328,7 @@ impl PlannerView {
                 ))
                 .child(self.arrow_segment(
                     stub_start - min_x,
-                    gutter_y.min(arrow.y2) - min_y,
+                    drop_top - min_y,
                     stroke,
                     drop,
                     color,
@@ -7283,7 +7339,7 @@ impl PlannerView {
                 ))
             })
             .child(self.arrow_segment(
-                stub_start.min(arrow.x_head) - min_x,
+                stub_left - min_x,
                 arrow.y2 - min_y,
                 stub_h,
                 stroke,
@@ -7293,46 +7349,9 @@ impl PlannerView {
                 "stub",
                 cx,
             ))
-            .child(Self::arrow_elbow(
-                arrow.x1 - min_x,
-                arrow.lane_y - min_y,
-                stroke,
-                color,
+            .children(arrow_polyline_corners(
+                arrow, wrap, min_x, min_y, stroke, color,
             ))
-            .child(Self::arrow_elbow(
-                arrow.x2 - min_x,
-                arrow.lane_y - min_y,
-                stroke,
-                color,
-            ))
-            .when(wrap, |el| {
-                el.child(Self::arrow_elbow(
-                    arrow.x2 - min_x,
-                    gutter_y - min_y,
-                    stroke,
-                    color,
-                ))
-                .child(Self::arrow_elbow(
-                    stub_start - min_x,
-                    gutter_y - min_y,
-                    stroke,
-                    color,
-                ))
-                .child(Self::arrow_elbow(
-                    stub_start - min_x,
-                    arrow.y2 - min_y,
-                    stroke,
-                    color,
-                ))
-            })
-            .when(!wrap, |el| {
-                el.child(Self::arrow_elbow(
-                    stub_start - min_x,
-                    arrow.y2 - min_y,
-                    stroke,
-                    color,
-                ))
-            })
             .child(self.arrow_head_hit(arrow, min_x, min_y, color, cx))
             .when(hovered, |el| {
                 el.child(self.link_hover_chip(arrow, bars, min_x, min_y, cx))
@@ -7644,20 +7663,6 @@ impl PlannerView {
             )
             .child(div().w(px(width)).h(px(height)).rounded_full().bg(color));
         el.into_any_element()
-    }
-
-    /// Capsule join at an L-bend so two 2px rects do not meet as a square.
-    fn arrow_elbow(x: f32, y: f32, stroke: f32, color: gpui_kit::Hsla) -> AnyElement {
-        let size = (stroke * 4.0).max(10.0);
-        div()
-            .absolute()
-            .left(px(x + stroke / 2.0 - size / 2.0))
-            .top(px(y + stroke / 2.0 - size / 2.0))
-            .w(px(size))
-            .h(px(size))
-            .rounded_full()
-            .bg(color)
-            .into_any_element()
     }
 
     fn link_hover_chip_text(&self, from_id: i64, to_id: i64) -> String {
@@ -10686,11 +10691,13 @@ fn hover_tooltip_near_pointer(pointer_x: f32, tip_w: f32, timeline_w: f32) -> f3
     }
 }
 
-const DATE_PILL_H: f32 = 28.0;
-const HOVER_TOOLTIP_H: f32 = 24.0;
-/// Lift hover chips above the bar so they do not cover the title or the
-/// milestone handle dots.
-const HOVER_TOOLTIP_GAP: f32 = 4.0;
+const DATE_PILL_H: f32 = 16.0;
+const HOVER_TOOLTIP_H: f32 = 16.0;
+/// Lift hover chips just above the bar so they stay in the row padding
+/// instead of covering the previous row's bar or label.
+const HOVER_TOOLTIP_GAP: f32 = 2.0;
+/// Connector fillet. Filled elbow discs read as a node at the bend.
+const ARROW_CORNER_R: f32 = 5.0;
 /// Gap from a milestone diamond to the tooltip on either side.
 const MILESTONE_TOOLTIP_PAD: f32 = 6.0;
 
@@ -10770,12 +10777,15 @@ fn nudge_overlay_off(
         let right = hit.x + hit.w + 4.0;
         let left = hit.x - rect.w - 4.0;
         let up = hit.y - rect.h - 4.0;
+        let down = hit.y + hit.h + 4.0;
         if right + rect.w <= timeline_w - 4.0 {
             rect.x = right;
         } else if left >= 0.0 {
             rect.x = left;
+        } else if down + rect.h <= (viewport_h - toast_band).max(0.0) {
+            // Prefer the hovered row over stacking into the row above.
+            rect.y = down;
         } else {
-            // Stay above labels / handle dots instead of dropping onto the bar.
             rect.y = up;
         }
     }
@@ -10790,7 +10800,7 @@ fn nudge_overlay_off(
 }
 
 fn hover_tooltip_y(bar_top: f32) -> f32 {
-    bar_top - HOVER_TOOLTIP_H - HOVER_TOOLTIP_GAP
+    bar_top - HOVER_TOOLTIP_H.max(DATE_PILL_H) - HOVER_TOOLTIP_GAP
 }
 
 fn milestone_handle_obstacles(bar_x: f32, painted_w: f32, bar_top: f32) -> Vec<OverlayRect> {
@@ -10863,7 +10873,7 @@ fn hover_bar_tooltip_origin(place: TooltipPlace, pills: &[OverlayRect]) -> (f32,
 /// the pills sit in the header band (painted as a sibling of the clipped
 /// body) instead of covering the title.
 fn hover_date_pill_y(bar_y: f32, paint_top: f32) -> f32 {
-    bar_y + paint_top - DATE_PILL_H
+    bar_y + paint_top - DATE_PILL_H.max(HOVER_TOOLTIP_H) - HOVER_TOOLTIP_GAP
 }
 
 fn hover_date_pill_rects(
@@ -10921,6 +10931,192 @@ fn hover_date_pill_obstacles(
     )
 }
 
+fn overlay_neighbor_obstacles(
+    bars: &[crate::gantt::BarLayout],
+    skip_id: i64,
+    timeline_w: f32,
+    today_x: Option<f32>,
+) -> Vec<OverlayRect> {
+    let mut out = Vec::new();
+    for bar in bars {
+        if bar.id == skip_id {
+            continue;
+        }
+        let painted_w = if bar.milestone || bar.marker {
+            MILESTONE_SIZE
+        } else {
+            bar.width.max(8.0)
+        };
+        out.push(OverlayRect {
+            x: bar.x,
+            y: bar.y + bar.paint_top(),
+            w: painted_w,
+            h: bar.paint_h(),
+        });
+        if let Some((x, w)) =
+            bar_outside_label_frame(bar, timeline_w, true, today_x, bar.overflow_badge)
+        {
+            out.push(OverlayRect {
+                x,
+                y: bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0),
+                w,
+                h: OUTSIDE_LABEL_H,
+            });
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ArrowDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+fn arrow_dir(from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> Option<ArrowDir> {
+    let dx = to_x - from_x;
+    let dy = to_y - from_y;
+    if dx.abs() < 0.5 && dy.abs() < 0.5 {
+        return None;
+    }
+    if dx.abs() >= dy.abs() {
+        if dx > 0.0 {
+            Some(ArrowDir::Right)
+        } else {
+            Some(ArrowDir::Left)
+        }
+    } else if dy > 0.0 {
+        Some(ArrowDir::Down)
+    } else {
+        Some(ArrowDir::Up)
+    }
+}
+
+fn corner_inset(len: f32) -> f32 {
+    ARROW_CORNER_R.min((len * 0.5 - 1.0).max(0.0))
+}
+
+fn inset_span(a: f32, b: f32, inset_a: f32, inset_b: f32) -> (f32, f32) {
+    if a <= b {
+        let start = a + inset_a;
+        let end = (b - inset_b).max(start);
+        (start, (end - start).max(1.0))
+    } else {
+        let start = b + inset_b;
+        let end = (a - inset_a).max(start);
+        (start, (end - start).max(1.0))
+    }
+}
+
+fn arrow_corner_box(
+    cx: f32,
+    cy: f32,
+    stroke: f32,
+    incoming: ArrowDir,
+    outgoing: ArrowDir,
+) -> Option<(f32, f32, f32, f32, &'static str)> {
+    let r = ARROW_CORNER_R;
+    let half = stroke / 2.0;
+    let size = r + half;
+    match (incoming, outgoing) {
+        (ArrowDir::Right, ArrowDir::Down) | (ArrowDir::Up, ArrowDir::Left) => {
+            Some((cx - r, cy - half, size, size, "tr"))
+        }
+        (ArrowDir::Right, ArrowDir::Up) | (ArrowDir::Down, ArrowDir::Left) => {
+            Some((cx - r, cy - r, size, size, "br"))
+        }
+        (ArrowDir::Left, ArrowDir::Down) | (ArrowDir::Up, ArrowDir::Right) => {
+            Some((cx - half, cy - half, size, size, "tl"))
+        }
+        (ArrowDir::Left, ArrowDir::Up) | (ArrowDir::Down, ArrowDir::Right) => {
+            Some((cx - half, cy - r, size, size, "bl"))
+        }
+        _ => None,
+    }
+}
+
+fn arrow_corner_at(
+    cx: f32,
+    cy: f32,
+    stroke: f32,
+    color: gpui_kit::Hsla,
+    incoming: ArrowDir,
+    outgoing: ArrowDir,
+) -> AnyElement {
+    let Some((left, top, w, h, corner)) = arrow_corner_box(cx, cy, stroke, incoming, outgoing)
+    else {
+        return div().into_any_element();
+    };
+    let rad = px(ARROW_CORNER_R + stroke / 2.0);
+    let el = div()
+        .debug_selector(|| "gantt-dep-corner".into())
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(w))
+        .h(px(h))
+        .overflow_hidden()
+        .border_color(color);
+    let el = match corner {
+        "tr" => el.border_t_2().border_r_2().rounded_tr(rad),
+        "br" => el.border_b_2().border_r_2().rounded_br(rad),
+        "tl" => el.border_t_2().border_l_2().rounded_tl(rad),
+        _ => el.border_b_2().border_l_2().rounded_bl(rad),
+    };
+    el.into_any_element()
+}
+
+fn arrow_polyline_corners(
+    arrow: &crate::gantt::DependencyArrow,
+    wrap: bool,
+    min_x: f32,
+    min_y: f32,
+    stroke: f32,
+    color: gpui_kit::Hsla,
+) -> Vec<AnyElement> {
+    let stub_start = arrow.stub_start();
+    let gutter_y = arrow.gutter_y();
+    let pts: Vec<(f32, f32)> = if wrap {
+        vec![
+            (arrow.x1, arrow.y1),
+            (arrow.x1, arrow.lane_y),
+            (arrow.x2, arrow.lane_y),
+            (arrow.x2, gutter_y),
+            (stub_start, gutter_y),
+            (stub_start, arrow.y2),
+            (arrow.x_head, arrow.y2),
+        ]
+    } else {
+        vec![
+            (arrow.x1, arrow.y1),
+            (arrow.x1, arrow.lane_y),
+            (arrow.x2, arrow.lane_y),
+            (arrow.x2, arrow.y2),
+            (arrow.x_head, arrow.y2),
+        ]
+    };
+    let mut corners = Vec::new();
+    for triple in pts.windows(3) {
+        let Some(incoming) = arrow_dir(triple[0].0, triple[0].1, triple[1].0, triple[1].1) else {
+            continue;
+        };
+        let Some(outgoing) = arrow_dir(triple[1].0, triple[1].1, triple[2].0, triple[2].1) else {
+            continue;
+        };
+        corners.push(arrow_corner_at(
+            triple[1].0 - min_x,
+            triple[1].1 - min_y,
+            stroke,
+            color,
+            incoming,
+            outgoing,
+        ));
+    }
+    corners
+}
+
 /// Arrowhead on the new-link rubber-band. Start-handle drags store inbound
 /// FS (source is the successor), so the ▶ sits on the source start.
 fn link_preview_head(
@@ -10939,21 +11135,18 @@ fn link_preview_head(
     }
 }
 
-fn bar_title_chip(title: String, ink: gpui_kit::Hsla, truncate: bool) -> gpui_kit::Div {
-    // Opaque so a Today segment that still shares the chip's x cannot show
-    // through the letters (R74 drew under the pills; 0.5/0.78 let the stroke
-    // read as running through Persist cart / Go-live / spike).
-    let chip = if ink.l > 0.5 {
-        gpui_kit::hsla(0., 0., 0.12, 1.)
-    } else {
-        gpui_kit::hsla(0., 0., 1., 1.)
-    };
+fn bar_title_chip(title: String, _ink: gpui_kit::Hsla, truncate: bool) -> gpui_kit::Div {
+    // Same boxed chip at every scale: a light fill and dark ink, whether the
+    // title sits inside the bar or beside it. Per-scale invert/plain mixes
+    // read as three different label styles.
     div()
         .debug_selector(|| "gantt-bar-title-chip".into())
         .px_1()
         .rounded_sm()
-        .bg(chip)
-        .text_color(ink)
+        .border_1()
+        .border_color(gpui_kit::hsla(0., 0., 0., 0.12))
+        .bg(gpui_kit::hsla(0., 0., 1., 1.))
+        .text_color(gpui_kit::hsla(240. / 360., 0.21, 0.16, 1.))
         .when(truncate, |el| el.truncate())
         .when(!truncate, |el| el.whitespace_nowrap())
         .child(title)
@@ -11432,7 +11625,7 @@ pub fn start_app(data_dir: Option<PathBuf>, ado_base: Option<String>, vssps_base
 #[cfg(test)]
 mod bar_label_tests {
     use super::*;
-    use crate::gantt::BarLayout;
+    use crate::gantt::{BarLayout, MILESTONE_LABEL_GAP};
     use ado_core::GanttBarKind;
 
     #[test]
@@ -11760,12 +11953,12 @@ mod bar_label_tests {
         let estimated = bar_title_paint_px(&bar.title);
         // Room on the right for the full title, so Today no longer shrinks
         // or jumps the chip. A 104px gap used to cross the line.
-        let today_x = diamond_right + 6.0 + estimated + 40.0;
+        let today_x = diamond_right + MILESTONE_LABEL_GAP + estimated + 40.0;
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, Some(today_x), false)
                 .expect("Go-live must keep an outside chip");
         assert!(
-            (label_x - (diamond_right + 6.0)).abs() < 1.0
+            (label_x - (diamond_right + MILESTONE_LABEL_GAP)).abs() < 1.0
                 || (label_x + 8.0 <= diamond_right && diamond_right - label_x <= 160.0),
             "Quarter Go-live chip must sit next to the diamond, not jump past Today, label_x={label_x} diamond={diamond_right} today={today_x}"
         );
@@ -11926,7 +12119,7 @@ mod bar_label_tests {
             overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_x = bar.x + MILESTONE_SIZE + 6.0;
+        let right_x = bar.x + MILESTONE_SIZE + MILESTONE_LABEL_GAP;
         let today_x = right_x + 56.0;
         assert!(
             today_x - right_x < estimated,
@@ -11967,6 +12160,7 @@ mod bar_label_tests {
         };
         let estimated = bar_title_paint_px(&bar.title);
         let diamond_right = bar.x + MILESTONE_SIZE;
+        let right_x = diamond_right + MILESTONE_LABEL_GAP;
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 512.0, true, None, false)
                 .expect("Year Go-live must keep an outside chip");
@@ -11974,10 +12168,18 @@ mod bar_label_tests {
             max_w + 0.1 >= estimated,
             "must keep the full Go-live title, not Go-l…, max_w={max_w} estimated={estimated}"
         );
+        let on_right = (label_x - right_x).abs() < 0.5;
+        let on_left = label_x + max_w <= bar.x + 0.1;
         assert!(
-            (label_x - (diamond_right + 6.0)).abs() < 0.5,
-            "milestones stay on the right of the diamond even at a tight clip, label_x={label_x} diamond={diamond_right}"
+            on_right || on_left,
+            "milestones stay beside the diamond at a tight clip, label_x={label_x} diamond={diamond_right} right_x={right_x}"
         );
+        if right_x < 512.0 - 4.0 {
+            assert!(
+                on_right,
+                "when the handle-padded slot starts on-canvas, stay on the right, label_x={label_x} right_x={right_x}"
+            );
+        }
     }
 
     #[test]
@@ -12281,12 +12483,12 @@ mod bar_label_tests {
         let y = super::hover_date_pill_y(0.0, 6.0);
         assert_eq!(
             y,
-            6.0 - super::DATE_PILL_H,
+            super::hover_tooltip_y(6.0),
             "first-row pills must sit above the bar rect, not on the title"
         );
         assert_eq!(
             super::hover_date_pill_y(40.0, 6.0),
-            40.0 + 6.0 - super::DATE_PILL_H
+            40.0 + super::hover_tooltip_y(6.0)
         );
         let (start_x, end_x) = super::drag_date_pill_lefts(525.0, 393.0, 40.0, 40.0);
         assert!(
@@ -12310,7 +12512,7 @@ mod bar_label_tests {
             x: tip_x,
             y: tip_y,
             w: 160.0,
-            h: 24.0,
+            h: super::HOVER_TOOLTIP_H,
         };
         for pill in &pills {
             assert!(
@@ -12672,6 +12874,78 @@ mod bar_label_tests {
         assert!(
             end_x > start_x,
             "end pill must stay to the right of start, start_x={start_x} end_x={end_x}"
+        );
+    }
+
+    #[test]
+    fn arrow_corners_are_a_five_px_fillet_not_a_filled_node() {
+        let (left, top, w, h, corner) = super::arrow_corner_box(
+            100.0,
+            40.0,
+            2.0,
+            super::ArrowDir::Right,
+            super::ArrowDir::Down,
+        )
+        .expect("right-then-down is a rounded L");
+        assert_eq!(corner, "tr");
+        assert!(
+            (w - (super::ARROW_CORNER_R + 1.0)).abs() < 0.1
+                && (h - (super::ARROW_CORNER_R + 1.0)).abs() < 0.1,
+            "fillet box must be r+stroke/2, got {w}x{h} at {left},{top}"
+        );
+        assert!(
+            w <= 8.0 && h <= 8.0,
+            "a 5px radius must not paint a 10px filled dot, got {w}x{h}"
+        );
+    }
+
+    #[test]
+    fn hover_overlays_stay_clear_of_the_row_above() {
+        let bar_top = 120.0 + 6.0;
+        let y = super::hover_tooltip_y(bar_top);
+        let persist_bar = super::OverlayRect {
+            x: 40.0,
+            y: 80.0 + 13.0,
+            w: 200.0,
+            h: 14.0,
+        };
+        let persist_label = super::OverlayRect {
+            x: 250.0,
+            y: 80.0 + 12.0,
+            w: 140.0,
+            h: 16.0,
+        };
+        let chip = super::OverlayRect {
+            x: 260.0,
+            y,
+            w: 40.0,
+            h: super::DATE_PILL_H,
+        };
+        let tip = super::OverlayRect {
+            x: 280.0,
+            y,
+            w: 160.0,
+            h: super::HOVER_TOOLTIP_H,
+        };
+        assert!(
+            !super::overlay_overlap(chip, persist_bar)
+                && !super::overlay_overlap(chip, persist_label),
+            "Cart UI date chip must clear Persist cart's bar and label, chip y={y}"
+        );
+        assert!(
+            !super::overlay_overlap(tip, persist_bar)
+                && !super::overlay_overlap(tip, persist_label),
+            "Cart UI tooltip must clear Persist cart, tip y={y}"
+        );
+        let cart = super::OverlayRect {
+            x: 40.0,
+            y: 40.0 + 13.0,
+            w: 400.0,
+            h: 14.0,
+        };
+        assert!(
+            !super::overlay_overlap(chip, cart) && !super::overlay_overlap(tip, cart),
+            "overlays must add row clearance from the Cart bar above, y={y}"
         );
     }
 }

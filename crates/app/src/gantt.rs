@@ -79,6 +79,9 @@ pub const OUTSIDE_LABEL_GAP: f32 =
     LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0;
 /// Outside title chip height, matching `render_gantt_bar_label`.
 pub const OUTSIDE_LABEL_H: f32 = 16.0;
+/// Gap from a diamond to its outside title, past the handle dot so Week/Day
+/// "Go-live" is not covered by the outbound connector.
+pub const MILESTONE_LABEL_GAP: f32 = LINK_HANDLE_GAP + LINK_HANDLE + 4.0;
 /// Gap from a flipped outside title's right edge to the bar's left edge.
 /// The inbound handle sits at `local_left - LINK_HANDLE_HIT - 2`.
 pub const OUTSIDE_TITLE_LEFT_GAP: f32 = LINK_HANDLE_HIT + LINK_HANDLE_GAP;
@@ -3965,7 +3968,7 @@ pub fn outside_title_right_gap(
     overflow_badge: bool,
 ) -> f32 {
     if milestone {
-        6.0
+        MILESTONE_LABEL_GAP
     } else if overflow_badge {
         OUTSIDE_LABEL_GAP
     } else if show_link_handles {
@@ -8819,6 +8822,19 @@ mod tests {
     }
 
     #[test]
+    fn milestone_label_clears_the_handle_dot() {
+        let gap = outside_title_right_gap(true, true, false);
+        assert!(
+            gap >= LINK_HANDLE_GAP + LINK_HANDLE + 2.0,
+            "Go-live title must start past the handle dot, gap={gap}"
+        );
+        assert!(
+            (gap - MILESTONE_LABEL_GAP).abs() < 0.1,
+            "milestone gap must match MILESTONE_LABEL_GAP, got {gap}"
+        );
+    }
+
+    #[test]
     fn occupancy_matches_a_today_flipped_chip() {
         let bar = BarLayout {
             id: 1003,
@@ -9345,7 +9361,8 @@ mod tests {
                 "{scale:?}: Go-live chip must sit beside the diamond, x={x} diamond={diamond_right}"
             );
             if today_x.is_none()
-                || today_x.is_some_and(|today| diamond_right + 6.0 + w <= today - 8.0)
+                || today_x
+                    .is_some_and(|today| diamond_right + MILESTONE_LABEL_GAP + w <= today - 8.0)
             {
                 assert!(
                     on_right,

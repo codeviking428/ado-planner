@@ -14511,3 +14511,99 @@ fn persist_cart_label_stays_beside_the_bar_after_jul_22_move(cx: &mut gpui_kit::
         "the title must travel with the bar, bar_dx={bar_dx} label_dx={label_dx}"
     );
 }
+
+#[gpui_kit::test]
+fn cart_ui_start_chip_does_not_clip_persist_cart_or_cart(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
+    cx.simulate_mouse_move(bar.origin, None, Modifiers::default());
+    draw(cx);
+    let Some(chip) = cx.debug_bounds("gantt-hover-date-start") else {
+        return;
+    };
+    if let Some(label) = cx.debug_bounds("gantt-bar-label-1003") {
+        assert!(
+            !painted_overlap(chip, label),
+            "Cart UI Jul 21 chip must not clip Persist cart, chip=({:.1},{:.1})+{:.1}x{:.1} label=({:.1},{:.1})+{:.1}x{:.1}",
+            f32::from(chip.origin.x),
+            f32::from(chip.origin.y),
+            f32::from(chip.size.width),
+            f32::from(chip.size.height),
+            f32::from(label.origin.x),
+            f32::from(label.origin.y),
+            f32::from(label.size.width),
+            f32::from(label.size.height)
+        );
+    }
+    if let Some(cart) = cx.debug_bounds("gantt-bar-1002") {
+        assert!(
+            !painted_overlap(chip, cart),
+            "date chips must keep row clearance from the Cart bar"
+        );
+        if let Some(tip) = cx.debug_bounds("gantt-hover-tooltip") {
+            assert!(
+                !painted_overlap(tip, cart),
+                "the Cart UI tooltip must keep row clearance from the Cart bar"
+            );
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn go_live_handle_dot_clears_its_label_in_week_and_day(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    for selector in ["gantt-scale-Week", "gantt-scale-Day"] {
+        let scale = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(scale.center(), Modifiers::default());
+        draw(cx);
+        let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+        cx.simulate_click(fit.center(), Modifiers::default());
+        draw(cx);
+        let diamond = cx.debug_bounds("gantt-bar-1013").expect("Go-live");
+        cx.simulate_mouse_move(diamond.center(), None, Modifiers::default());
+        draw(cx);
+        let Some(label) = cx.debug_bounds("gantt-bar-label-1013") else {
+            continue;
+        };
+        let Some(dot) = cx.debug_bounds("gantt-link-dot-1013-link-end") else {
+            continue;
+        };
+        assert!(
+            !painted_overlap(label, dot),
+            "{selector}: Go-live handle dot must sit past the title, label=({:.1},{:.1})+{:.1}x{:.1} dot=({:.1},{:.1})+{:.1}x{:.1}",
+            f32::from(label.origin.x),
+            f32::from(label.origin.y),
+            f32::from(label.size.width),
+            f32::from(label.size.height),
+            f32::from(dot.origin.x),
+            f32::from(dot.origin.y),
+            f32::from(dot.size.width),
+            f32::from(dot.size.height)
+        );
+    }
+}
