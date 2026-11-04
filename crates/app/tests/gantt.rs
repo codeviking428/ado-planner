@@ -1441,6 +1441,72 @@ async fn removing_a_dependency_clears_the_predecessor() {
 }
 
 #[tokio::test]
+async fn bootstrap_marks_a_restored_session_ready_to_persist_links() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.session_token_ready = false;
+    state.bootstrap().await.expect("bootstrap");
+    assert!(
+        state.can_persist_links(),
+        "a stored PAT/Entra session must persist link drags after restart"
+    );
+}
+
+#[tokio::test]
+async fn failed_link_persist_discards_undo_history() {
+    let (mock, mut state, _dir) = signed_in().await;
+    mock.fail_next("/workitems/1005", 503, "link failed");
+    assert!(state.apply_link_now(1005, 1003));
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1005)
+            .is_some_and(|node| node.predecessors.contains(&1003))
+    );
+    assert!(matches!(
+        state.history.undo.last(),
+        Some(HistoryEntry::Link {
+            successor_id: 1005,
+            predecessor_id: 1003,
+            linked: true,
+        })
+    ));
+    let err = state.persist_added_dependency(1005, 1003).await;
+    assert!(err.is_err());
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1005)
+            .is_some_and(|node| !node.predecessors.contains(&1003)),
+        "a failed PATCH must roll the predecessor back"
+    );
+    assert!(
+        !matches!(
+            state.history.undo.last(),
+            Some(HistoryEntry::Link {
+                successor_id: 1005,
+                predecessor_id: 1003,
+                linked: true,
+            })
+        ),
+        "a failed persist must not leave an Added-link undo entry"
+    );
+    assert!(
+        state.toasts.items.iter().all(|toast| {
+            !matches!(
+                &toast.undo,
+                Some(UndoAction::RemoveLink {
+                    successor_id: 1005,
+                    predecessor_id: 1003,
+                })
+            )
+        }),
+        "the Added link undo toast must not survive a failed PATCH"
+    );
+}
+
+#[tokio::test]
 async fn undo_and_redo_restore_dates_and_links() {
     let (_mock, mut state, _dir) = signed_in().await;
     let node = state

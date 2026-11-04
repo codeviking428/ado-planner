@@ -71,9 +71,10 @@ pub struct PlannerState {
     /// extra once PATCH succeeds. A local undo toast is already on screen
     /// at commit; this stash only lives until the persist clone is made.
     shifted_children: HashMap<i64, Vec<PendingDateSave>>,
-    /// True after a real PAT/Entra login so a visual-test idle state
-    /// (signed_in faked, no token) can toast a link without PATCHing.
-    pub(crate) session_token_ready: bool,
+    /// True after a real PAT/Entra login or a restored stored session, so a
+    /// visual-test idle state (signed_in faked, no token) can toast a link
+    /// without PATCHing.
+    pub session_token_ready: bool,
 }
 
 /// Why this date PATCH was queued — so a failed persist can put history back.
@@ -459,6 +460,7 @@ impl PlannerState {
         let info = self.session.inner().lock().await.session_info().await?;
         self.session_info = info;
         self.session_loading = false;
+        self.session_token_ready = self.session_info.signed_in;
         if self.session_info.signed_in {
             self.warn_if_identity_missing();
             self.reload_after_sign_in().await?;
@@ -1299,6 +1301,43 @@ impl PlannerState {
         });
     }
 
+    pub fn can_persist_links(&self) -> bool {
+        self.session_token_ready
+    }
+
+    pub fn restore_optimistic_link(&mut self, successor_id: i64, predecessor_id: i64) {
+        if let Some(live) = self.nodes.iter_mut().find(|node| node.id == successor_id)
+            && !live.predecessors.contains(&predecessor_id)
+        {
+            live.predecessors.push(predecessor_id);
+        }
+    }
+
+    pub fn discard_last_link(&mut self, successor_id: i64, predecessor_id: i64) {
+        match self.history.undo.last() {
+            Some(HistoryEntry::Link {
+                successor_id: entry_succ,
+                predecessor_id: entry_pred,
+                linked: true,
+            }) if *entry_succ == successor_id && *entry_pred == predecessor_id => {
+                self.history.undo.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn dismiss_added_link_undo(&mut self, successor_id: i64, predecessor_id: i64) {
+        self.toasts.items.retain(|toast| {
+            !matches!(
+                &toast.undo,
+                Some(UndoAction::RemoveLink {
+                    successor_id: succ,
+                    predecessor_id: pred,
+                }) if *succ == successor_id && *pred == predecessor_id
+            )
+        });
+    }
+
     pub fn discard_last_dates(&mut self, id: i64) {
         match self.history.undo.last() {
             Some(HistoryEntry::Dates { id: entry_id, .. }) if *entry_id == id => {
@@ -2107,6 +2146,8 @@ impl PlannerState {
             }
             Err(err) => {
                 self.restore_node(previous);
+                self.discard_last_link(successor_id, predecessor_id);
+                self.dismiss_added_link_undo(successor_id, predecessor_id);
                 self.toasts.push(
                     ToastKind::Error,
                     error_text(&err, "Could not add dependency"),

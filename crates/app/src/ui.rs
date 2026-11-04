@@ -150,6 +150,10 @@ pub struct PlannerView {
     skip_saving_hold: bool,
     date_save_busy: HashSet<i64>,
     date_save_queue: VecDeque<PendingDateSave>,
+    /// Optimistic links waiting for `persist_added_dependency` while
+    /// `spawn_state` holds `io_busy`. Lives on the view so `adopt_spawned`
+    /// cannot drop the pair.
+    link_save_queue: VecDeque<(i64, i64)>,
     pending_team: Option<String>,
     update_checked: bool,
     toast_expiry_armed: bool,
@@ -465,6 +469,7 @@ impl PlannerView {
             skip_saving_hold: false,
             date_save_busy: HashSet::new(),
             date_save_queue: VecDeque::new(),
+            link_save_queue: VecDeque::new(),
             pending_team: None,
             update_checked: false,
             toast_expiry_armed: false,
@@ -1035,7 +1040,9 @@ impl PlannerView {
                     Err(_) => tracing::warn!("planner action cancelled"),
                 }
                 this.form_loading = None;
+                this.restore_queued_links();
                 this.replay_pending_toast_undo(cx);
+                this.drain_link_saves(cx);
                 if let Some(team) = this.pending_team.take() {
                     this.queue_team_switch(team, cx);
                 }
@@ -8377,12 +8384,8 @@ impl PlannerView {
             if let Some((from_id, Some(to_id))) = pair
                 && from_id != to_id
                 && self.state.apply_link_now(to_id, from_id)
-                && self.state.session_token_ready
             {
-                self.spawn_state(cx, move |mut state| async move {
-                    let result = state.persist_added_dependency(to_id, from_id).await;
-                    (state, result)
-                });
+                self.enqueue_link_save(to_id, from_id, cx);
             }
             self.request_repaint(Some(window), cx);
             return;
@@ -8440,6 +8443,49 @@ impl PlannerView {
             cx.refresh();
         })
         .detach();
+    }
+
+    fn enqueue_link_save(
+        &mut self,
+        successor_id: i64,
+        predecessor_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .link_save_queue
+            .iter()
+            .any(|&(succ, pred)| succ == successor_id && pred == predecessor_id)
+        {
+            self.link_save_queue
+                .push_back((successor_id, predecessor_id));
+        }
+        self.drain_link_saves(cx);
+    }
+
+    fn restore_queued_links(&mut self) {
+        for &(successor_id, predecessor_id) in &self.link_save_queue {
+            self.state
+                .restore_optimistic_link(successor_id, predecessor_id);
+        }
+    }
+
+    fn drain_link_saves(&mut self, cx: &mut Context<Self>) {
+        if self.io_busy {
+            return;
+        }
+        let Some((to_id, from_id)) = self.link_save_queue.pop_front() else {
+            return;
+        };
+        self.state.restore_optimistic_link(to_id, from_id);
+        if !self.state.session_token_ready {
+            return;
+        }
+        if !self.spawn_state(cx, move |mut state| async move {
+            let result = state.persist_added_dependency(to_id, from_id).await;
+            (state, result)
+        }) {
+            self.link_save_queue.push_front((to_id, from_id));
+        }
     }
 
     fn enqueue_date_save(&mut self, cx: &mut Context<Self>, pending: PendingDateSave) {
@@ -8855,6 +8901,21 @@ impl PlannerView {
         self.date_save_busy.clear();
         self.skip_saving_hold = true;
         self.finish_or_hold_saving_status(cx);
+        self.restore_queued_links();
+        self.drain_link_saves(cx);
+    }
+
+    pub fn enqueue_link_save_for_test(
+        &mut self,
+        successor_id: i64,
+        predecessor_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        self.enqueue_link_save(successor_id, predecessor_id, cx);
+    }
+
+    pub fn link_save_queue_len_for_test(&self) -> usize {
+        self.link_save_queue.len()
     }
 
     pub fn sync_status_for_test(&self) -> String {

@@ -4986,6 +4986,58 @@ fn month_persist_xdotool_style_drag_persists_link_in_the_mock(cx: &mut gpui_kit:
 }
 
 #[gpui_kit::test]
+fn busy_io_still_persists_an_optimistic_link(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, mut state, _dir) = signed_in_with_mock();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.viewport_h = 720.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.set_busy_for_test(true);
+        assert!(view.state.apply_link_now(1005, 1003));
+        view.enqueue_link_save_for_test(1005, 1003, cx);
+        assert_eq!(
+            view.link_save_queue_len_for_test(),
+            1,
+            "io_busy must queue the persist instead of dropping it"
+        );
+        if let Some(node) = view.state.nodes.iter_mut().find(|node| node.id == 1005) {
+            node.predecessors.retain(|id| *id != 1003);
+        }
+        view.complete_undo_io_for_test(cx);
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        if mock_has_predecessor(&runtime, &mock, 1005, 1003) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        mock_has_predecessor(&runtime, &mock, 1005, 1003),
+        "queued persist after busy I/O must PATCH the optimistic link"
+    );
+    view.update(cx, |view, _| {
+        assert!(
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.id == 1005)
+                .is_some_and(|node| node.predecessors.contains(&1003)),
+            "adopt_spawned of the in-flight clone must not wipe the queued link"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn leaving_a_bar_clears_the_hover_resize_cursor(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
