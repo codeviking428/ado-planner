@@ -1291,13 +1291,54 @@ impl GanttView {
         self.set_scale_at(scale, keep_x);
     }
 
-    /// Pan so `date` sits on the viewport centre. Toolbar Day/Week/Month
-    /// with a selection uses this after the leftover-column snap so a
-    /// second round trip cannot drift a month.
+    /// Pan so `date` sits at screen `x`. Toolbar Day/Week/Month derives
+    /// scroll from one focus date (selection start, or viewport centre)
+    /// after leftover-column snap so a round trip keeps the identical range.
+    pub fn pin_date_at(&mut self, date: Date, x: f32) {
+        let now = self.x_for_date(date);
+        self.scroll_x += now - x;
+    }
+
+    /// Pan so `date` sits on the viewport centre.
     pub fn center_date(&mut self, date: Date) {
         let width = self.timeline_width.max(1.0);
-        let x = self.x_for_date(date);
-        self.scroll_x += x - width * 0.5;
+        self.pin_date_at(date, width * 0.5);
+    }
+
+    fn day_week_month(scale: GanttScale) -> bool {
+        matches!(
+            scale,
+            GanttScale::Day | GanttScale::Week | GanttScale::Month
+        )
+    }
+
+    /// Screen x to hold `date` at. On-screen dates keep their current x;
+    /// off-screen dates use the viewport centre.
+    pub fn focus_keep_x(&self, date: Date) -> f32 {
+        let width = self.timeline_width.max(1.0);
+        let raw = self.x_for_date(date);
+        if (0.0..=width).contains(&raw) {
+            raw
+        } else {
+            width * 0.5
+        }
+    }
+
+    /// Toolbar Day/Week/Month/… click, including leftover-column snap.
+    /// Day/Week/Month keep one focus date (selection start, or viewport
+    /// centre) at its screen x so Month→Week→Day→Month restores the
+    /// identical range. Year/Quarter still hold the left-edge date.
+    pub fn apply_toolbar_scale(&mut self, scale: GanttScale, today: Date, keep: Option<Date>) {
+        let from = self.scale;
+        let focus = keep.unwrap_or_else(|| self.viewport_center_date());
+        let keep_x = self.focus_keep_x(focus);
+        let pin = Self::day_week_month(from) && Self::day_week_month(scale) && !self.keep_today;
+        self.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar_keeping(scale, today, keep);
+        });
+        if pin && Self::day_week_month(self.scale) {
+            self.pin_date_at(focus, keep_x);
+        }
     }
 
     /// Change scale while holding the date under `keep_x` still. World-x
@@ -1340,12 +1381,15 @@ impl GanttView {
     /// is not amplified into a clipped Month column. Day/Week/Month keep the
     /// viewport centre (or `keep`) so the visible range does not jump.
     /// Year/Quarter still hold the left-edge date (Month→Year→Month).
+    /// Prefer [`apply_toolbar_scale`] from the toolbar so leftover snap
+    /// cannot drift the focus date.
     pub fn set_scale_from_toolbar(&mut self, scale: GanttScale, today: Date) {
         self.set_scale_from_toolbar_keeping(scale, today, None);
     }
 
     /// Like [`set_scale_from_toolbar`], but pin `keep` (the selection) when
-    /// stepping Day/Week/Month.
+    /// stepping Day/Week/Month. Does not undo leftover-column snap; the
+    /// toolbar path uses [`apply_toolbar_scale`].
     pub fn set_scale_from_toolbar_keeping(
         &mut self,
         scale: GanttScale,
@@ -13529,47 +13573,24 @@ mod tests {
             ..Default::default()
         };
         let centre = gantt.viewport_center_date();
-        gantt.retarget_year_gutter(|gantt| {
-            gantt.set_scale_from_toolbar(GanttScale::Week, today);
-        });
+        gantt.apply_toolbar_scale(GanttScale::Week, today, None);
         assert_eq!(
             gantt.viewport_center_date(),
             centre,
             "Month→Week must keep the centred date, not jump the visible range"
         );
-        gantt.retarget_year_gutter(|gantt| {
-            gantt.set_scale_from_toolbar(GanttScale::Day, today);
-        });
+        gantt.apply_toolbar_scale(GanttScale::Day, today, None);
         assert_eq!(
             gantt.viewport_center_date(),
             centre,
             "Week→Day must keep the centred date"
         );
-        gantt.retarget_year_gutter(|gantt| {
-            gantt.set_scale_from_toolbar(GanttScale::Month, today);
-        });
+        gantt.apply_toolbar_scale(GanttScale::Month, today, None);
         assert_eq!(
             gantt.viewport_center_date(),
             centre,
             "Day→Month must restore the centred date"
         );
-    }
-
-    fn apply_toolbar_scale_keeping(
-        gantt: &mut GanttView,
-        scale: GanttScale,
-        today: Date,
-        keep: Date,
-    ) {
-        gantt.retarget_year_gutter(|gantt| {
-            gantt.set_scale_from_toolbar_keeping(scale, today, Some(keep));
-        });
-        if matches!(
-            gantt.scale,
-            GanttScale::Day | GanttScale::Week | GanttScale::Month
-        ) {
-            gantt.center_date(keep);
-        }
     }
 
     #[test]
@@ -13588,17 +13609,61 @@ mod tests {
             (0.0..=gantt.timeline_width).contains(&before),
             "precondition: selection must start on-screen, x={before}"
         );
-        apply_toolbar_scale_keeping(&mut gantt, GanttScale::Week, today, keep);
+        gantt.apply_toolbar_scale(GanttScale::Week, today, Some(keep));
         let after = gantt.x_for_date(keep);
         assert!(
-            (after - 400.0).abs() < 2.0,
-            "Month→Week must centre the selection, x={after}"
+            (after - before).abs() < 2.0,
+            "Month→Week must keep the selection at its screen x, not centre it, x={after} was {before}"
         );
-        apply_toolbar_scale_keeping(&mut gantt, GanttScale::Day, today, keep);
+        gantt.apply_toolbar_scale(GanttScale::Day, today, Some(keep));
         let day_x = gantt.x_for_date(keep);
         assert!(
-            (day_x - 400.0).abs() < 2.0,
-            "Week→Day must centre the selection, x={day_x}"
+            (day_x - before).abs() < 2.0,
+            "Week→Day must keep the selection at its screen x, x={day_x} was {before}"
+        );
+    }
+
+    #[test]
+    fn toolbar_scale_round_trip_restores_the_identical_range() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let cart = Date::new(2026, 7, 6).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 6, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 0.5,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let range = gantt.viewport_range_title();
+        let cart_x = gantt.x_for_date(cart);
+        assert!(
+            (0.0..=gantt.timeline_width).contains(&cart_x),
+            "precondition: Cart start must be on-screen, x={cart_x} range={range}"
+        );
+        for _ in 0..2 {
+            gantt.apply_toolbar_scale(GanttScale::Week, today, Some(cart));
+            gantt.apply_toolbar_scale(GanttScale::Day, today, Some(cart));
+            gantt.apply_toolbar_scale(GanttScale::Month, today, Some(cart));
+            assert_eq!(
+                gantt.viewport_range_title(),
+                range,
+                "Month→Week→Day→Month must restore {range}, got {}",
+                gantt.viewport_range_title()
+            );
+        }
+        assert_eq!(gantt.scale, GanttScale::Month);
+        let after = gantt.x_for_date(cart);
+        assert!(
+            (after - cart_x).abs() < 2.0,
+            "the selection must stay at its screen x, not drift, x={after} was {cart_x}"
+        );
+        gantt.apply_toolbar_scale(GanttScale::Day, today, None);
+        gantt.apply_toolbar_scale(GanttScale::Month, today, None);
+        assert_eq!(
+            gantt.viewport_range_title(),
+            range,
+            "a plain Day→Month must restore {range} (not shift a month), got {}",
+            gantt.viewport_range_title()
         );
     }
 
@@ -13613,17 +13678,78 @@ mod tests {
             timeline_width: 800.0,
             ..Default::default()
         };
+        let range = gantt.viewport_range_title();
+        let keep_x = gantt.x_for_date(keep);
         for _ in 0..2 {
-            apply_toolbar_scale_keeping(&mut gantt, GanttScale::Week, today, keep);
-            apply_toolbar_scale_keeping(&mut gantt, GanttScale::Day, today, keep);
-            apply_toolbar_scale_keeping(&mut gantt, GanttScale::Month, today, keep);
+            gantt.apply_toolbar_scale(GanttScale::Week, today, Some(keep));
+            gantt.apply_toolbar_scale(GanttScale::Day, today, Some(keep));
+            gantt.apply_toolbar_scale(GanttScale::Month, today, Some(keep));
         }
+        assert_eq!(
+            gantt.viewport_range_title(),
+            range,
+            "a second Day/Week/Month round trip must restore {range}, got {}",
+            gantt.viewport_range_title()
+        );
         let x = gantt.x_for_date(keep);
         assert!(
-            (x - 400.0).abs() < 2.0,
-            "a second Day/Week/Month round trip must still centre the selection, not drift a month, x={x}"
+            (x - keep_x).abs() < 2.0,
+            "a second round trip must keep the selection at its screen x, not centre it, x={x} was {keep_x}"
         );
         assert_eq!(gantt.scale, GanttScale::Month);
+    }
+
+    #[test]
+    fn persist_cart_label_moves_with_the_bar_after_jul_22() {
+        let mut nodes = live_fixture_nodes();
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let before_bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let before = before_bars
+            .iter()
+            .find(|bar| bar.id == 1003)
+            .expect("Persist cart");
+        let before_x = before.x;
+        let before_label =
+            bar_outside_label_frame(before, 800.0, true, None, before.overflow_badge)
+                .map(|(x, _)| x)
+                .unwrap_or(before.x);
+        if let Some(node) = nodes.iter_mut().find(|node| node.id == 1003) {
+            node.start_date = Some("2026-07-22T00:00:00Z".into());
+            node.target_date = Some("2026-08-05T00:00:00Z".into());
+        }
+        let after_bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let after = after_bars
+            .iter()
+            .find(|bar| bar.id == 1003)
+            .expect("moved Persist cart");
+        let after_label = bar_outside_label_frame(after, 800.0, true, None, after.overflow_badge)
+            .map(|(x, w)| {
+                assert!(
+                    outside_label_is_beside_bar(after, x, w, true, after.overflow_badge),
+                    "Jul 22→Aug 5 Persist cart title must stay beside the bar, label={x}+{w} bar.x={} width={}",
+                    after.x,
+                    after.width
+                );
+                x
+            })
+            .unwrap_or(after.x);
+        let bar_dx = after.x - before_x;
+        let label_dx = after_label - before_label;
+        assert!(
+            bar_dx.abs() > 8.0,
+            "precondition: Jul 6→Jul 22 must move the bar, dx={bar_dx}"
+        );
+        assert!(
+            (label_dx - bar_dx).abs() < 8.0,
+            "the title must travel with the bar, not sit ~68px behind, bar_dx={bar_dx} label_dx={label_dx}"
+        );
     }
 
     #[test]

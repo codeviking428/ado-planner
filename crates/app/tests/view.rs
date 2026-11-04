@@ -14352,3 +14352,162 @@ fn short_bar_end_handle_grabs_in_the_gap(cx: &mut gpui_kit::TestAppContext) {
         });
     }
 }
+
+#[gpui_kit::test]
+fn cart_selected_scale_round_trip_keeps_the_range_title(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 6, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 0.5;
+    state.gantt.selected_id = Some(1002);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let range = view.update(cx, |view, _| view.state.gantt.viewport_range_title());
+    for _ in 0..2 {
+        let week = cx.debug_bounds("gantt-scale-Week").expect("Week");
+        cx.simulate_click(week.center(), Modifiers::default());
+        draw(cx);
+        let day = cx.debug_bounds("gantt-scale-Day").expect("Day");
+        cx.simulate_click(day.center(), Modifiers::default());
+        draw(cx);
+        let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+        cx.simulate_click(month.center(), Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.state.gantt.scale, GanttScale::Month);
+            assert_eq!(
+                view.state.gantt.viewport_range_title(),
+                range,
+                "with Cart selected, Month→Week→Day→Month must restore {range}, got {}",
+                view.state.gantt.viewport_range_title()
+            );
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn open_ended_cart_ui_tooltip_follows_the_pointer_on_the_cue(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1005").expect("Cart UI bar");
+    let cue = cx
+        .debug_bounds("gantt-open-ended-cue-1005")
+        .expect("Cart UI open-ended tail");
+    let timeline = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let bar_left = f32::from(bar.origin.x);
+    let bar_right = bar_left + f32::from(bar.size.width);
+    let cue_left = f32::from(cue.origin.x);
+    let cue_w = f32::from(cue.size.width);
+    let clip_right = f32::from(timeline.origin.x) + f32::from(timeline.size.width);
+    let y = cue.origin.y + cue.size.height / 2.0;
+    let mut last_tip: Option<f32> = None;
+    for frac in [0.35, 0.7] {
+        let x = cue_left + cue_w * frac;
+        cx.simulate_mouse_move(point(px(x), y), None, Modifiers::default());
+        draw(cx);
+        let tip = cx
+            .debug_bounds("gantt-hover-tooltip")
+            .expect("Cart UI hover chip");
+        let tip_left = f32::from(tip.origin.x);
+        let tip_right = tip_left + f32::from(tip.size.width);
+        assert!(
+            tip_right <= clip_right + 2.0,
+            "tooltip must clamp to the viewport, not the bar, tip={tip_left}..{tip_right} clip={clip_right}"
+        );
+        let gap = (tip_left - x).abs().min((tip_right - x).abs());
+        assert!(
+            gap < 48.0,
+            "tooltip must sit near the pointer at {x}, not the solid bar {bar_left}..{bar_right}, tip={tip_left}..{tip_right}"
+        );
+        if let Some(prev) = last_tip {
+            assert!(
+                (tip_left - prev).abs() > 4.0,
+                "moving along the cue must move the chip, stuck at {tip_left}"
+            );
+        }
+        last_tip = Some(tip_left);
+    }
+}
+
+#[gpui_kit::test]
+fn persist_cart_label_stays_beside_the_bar_after_jul_22_move(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let before_bar = f32::from(bar.origin.x);
+    let before_label = cx
+        .debug_bounds("gantt-bar-label-1003")
+        .map(|label| f32::from(label.origin.x))
+        .unwrap_or(before_bar);
+    view.update(cx, |view, cx| {
+        if let Some(node) = view.state.nodes.iter_mut().find(|node| node.id == 1003) {
+            node.start_date = Some("2026-07-22T00:00:00Z".into());
+            node.target_date = Some("2026-08-05T00:00:00Z".into());
+        }
+        cx.notify();
+    });
+    draw(cx);
+    let after_bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("moved Persist cart");
+    let after_bar_x = f32::from(after_bar.origin.x);
+    let after_bar_right = after_bar_x + f32::from(after_bar.size.width);
+    let label = cx
+        .debug_bounds("gantt-bar-label-1003")
+        .expect("Persist cart title");
+    let label_x = f32::from(label.origin.x);
+    let label_right = label_x + f32::from(label.size.width);
+    let bar_dx = after_bar_x - before_bar;
+    let label_dx = label_x - before_label;
+    assert!(
+        bar_dx.abs() > 8.0,
+        "precondition: the Jul 22 move must shift the bar, dx={bar_dx}"
+    );
+    let gap_left = after_bar_x - label_right;
+    let gap_right = label_x - after_bar_right;
+    let on_bar = label_x >= after_bar_x - 2.0 && label_right <= after_bar_right + 2.0;
+    let beside = (0.0..=OUTSIDE_LABEL_GAP + 12.0).contains(&gap_right)
+        || (0.0..=OUTSIDE_LABEL_GAP + 12.0).contains(&gap_left);
+    assert!(
+        on_bar || beside,
+        "after Jul 22→Aug 5 the title must sit on or beside the bar, not ~68px away, label={label_x}..{label_right} bar={after_bar_x}..{after_bar_right} bar_dx={bar_dx} label_dx={label_dx}"
+    );
+    assert!(
+        (label_dx - bar_dx).abs() < 16.0,
+        "the title must travel with the bar, bar_dx={bar_dx} label_dx={label_dx}"
+    );
+}

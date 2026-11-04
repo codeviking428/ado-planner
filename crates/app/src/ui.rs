@@ -1351,6 +1351,17 @@ impl PlannerView {
         self.release_tooltip_suppress_if_moved(x, y);
     }
 
+    /// Record the pointer and request a frame so a hover chip can follow it
+    /// along an open-ended cue (bar_hovered_id is already set, so hover
+    /// notify alone would leave the chip stuck on the solid body).
+    fn note_pointer_follow_tooltip(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let prev = self.last_pointer_window;
+        self.note_pointer(x, y);
+        if self.state.gantt.bar_hovered_id.is_some() && prev != Some((x, y)) {
+            cx.notify();
+        }
+    }
+
     const TOOLTIP_SUPPRESS_MOVE_PX: f32 = 2.0;
 
     fn arm_tooltip_suppress(&mut self, x: f32, y: f32) {
@@ -3494,25 +3505,8 @@ impl PlannerView {
                                         this.state.gantt.hover_locked = false;
                                         let keep = this.selected_focal_date();
                                         this.animate_gantt(cx, |gantt| {
-                                            gantt.retarget_year_gutter(|gantt| {
-                                                let today = jiff::Zoned::now().date();
-                                                gantt.set_scale_from_toolbar_keeping(
-                                                    scale, today, keep,
-                                                );
-                                            });
-                                            // Snap leftover Week/Day columns after
-                                            // the scale change; re-centre so a
-                                            // second round trip cannot drift.
-                                            if let Some(keep) = keep
-                                                && matches!(
-                                                    gantt.scale,
-                                                    GanttScale::Day
-                                                        | GanttScale::Week
-                                                        | GanttScale::Month
-                                                )
-                                            {
-                                                gantt.center_date(keep);
-                                            }
+                                            let today = jiff::Zoned::now().date();
+                                            gantt.apply_toolbar_scale(scale, today, keep);
                                         });
                                         cx.notify();
                                     })),
@@ -5690,7 +5684,7 @@ impl PlannerView {
                     |el| {
                         el.child(
                             div()
-                                .id(("gantt-bar-label", id as u64))
+                                .id(("gantt-bar-inner-label", id as u64))
                                 .debug_selector(move || format!("gantt-bar-label-{id}"))
                                 .absolute()
                                 .top_0()
@@ -5729,10 +5723,10 @@ impl PlannerView {
                 .on_mouse_move({
                     let hover_layout = layout.clone();
                     cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                        this.set_bar_hovered(Some(id), cx);
                         let x: f32 = event.position.x.into();
                         let y: f32 = event.position.y.into();
-                        this.note_pointer(x, y);
+                        this.note_pointer_follow_tooltip(x, y, cx);
+                        this.set_bar_hovered(Some(id), cx);
                         this.classify_bar_hover_zone(id, &hover_layout, x, cx);
                         // The bar captures the pointer on mouse-down. External titles
                         // occlude the timeline, so the captured bar must keep the drag.
@@ -6550,10 +6544,10 @@ impl PlannerView {
                     }
                 }))
                 .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                    this.set_bar_hovered(Some(id), cx);
                     let x: f32 = event.position.x.into();
                     let y: f32 = event.position.y.into();
-                    this.note_pointer(x, y);
+                    this.note_pointer_follow_tooltip(x, y, cx);
+                    this.set_bar_hovered(Some(id), cx);
                     this.classify_bar_hover_zone(id, &layout, x, cx);
                 }))
                 .on_mouse_up(
@@ -6925,11 +6919,18 @@ impl PlannerView {
         let origin = self
             .timeline_body_origin_x
             .get()
+            .filter(|x| *x > 1.0)
             .unwrap_or(self.state.gantt.timeline_origin_x);
         let pointer_x = self
             .last_pointer_window
             .map(|(x, _)| x - origin)
-            .unwrap_or(bar.x + painted_w * 0.5);
+            .unwrap_or_else(|| {
+                if bar.open_ended {
+                    bar.x + painted_w
+                } else {
+                    bar.x + painted_w * 0.5
+                }
+            });
         let (tip_x, tip_y) = hover_bar_tooltip_origin(
             TooltipPlace {
                 bar_x: bar.x,
@@ -7647,7 +7648,7 @@ impl PlannerView {
 
     /// Capsule join at an L-bend so two 2px rects do not meet as a square.
     fn arrow_elbow(x: f32, y: f32, stroke: f32, color: gpui_kit::Hsla) -> AnyElement {
-        let size = (stroke * 2.5).max(6.0);
+        let size = (stroke * 4.0).max(10.0);
         div()
             .absolute()
             .left(px(x + stroke / 2.0 - size / 2.0))
@@ -10671,13 +10672,15 @@ fn row_side_tooltip_left(
 }
 
 /// Park a hover chip next to the pointer instead of the bar's start/end.
-/// Long open-ended bars used to flip to x=0 (~350px from the pointer).
+/// Clamp to the chart, never the solid bar: an open-ended cue can sit past
+/// the body (Cart UI at x≈975) while the body is only 722–890.
 fn hover_tooltip_near_pointer(pointer_x: f32, tip_w: f32, timeline_w: f32) -> f32 {
     let pad = 12.0;
     let clip = (timeline_w - tip_w - 4.0).max(0.0);
+    let pointer_x = pointer_x.clamp(0.0, timeline_w.max(0.0));
     let right = pointer_x + pad;
     if right + tip_w <= timeline_w - 4.0 {
-        right.max(0.0).min(clip)
+        right.clamp(0.0, clip)
     } else {
         (pointer_x - pad - tip_w).clamp(0.0, clip)
     }
@@ -10685,6 +10688,9 @@ fn hover_tooltip_near_pointer(pointer_x: f32, tip_w: f32, timeline_w: f32) -> f3
 
 const DATE_PILL_H: f32 = 28.0;
 const HOVER_TOOLTIP_H: f32 = 24.0;
+/// Lift hover chips above the bar so they do not cover the title or the
+/// milestone handle dots.
+const HOVER_TOOLTIP_GAP: f32 = 4.0;
 /// Gap from a milestone diamond to the tooltip on either side.
 const MILESTONE_TOOLTIP_PAD: f32 = 6.0;
 
@@ -10725,6 +10731,7 @@ struct OverlayRect {
     h: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct TooltipPlace {
     bar_x: f32,
     painted_w: f32,
@@ -10748,7 +10755,7 @@ fn nudge_overlay_off(
     mut rect: OverlayRect,
     obstacles: &[OverlayRect],
     timeline_w: f32,
-    row_y: f32,
+    _row_y: f32,
     viewport_h: f32,
     toast_band: f32,
 ) -> (f32, f32) {
@@ -10762,14 +10769,14 @@ fn nudge_overlay_off(
         };
         let right = hit.x + hit.w + 4.0;
         let left = hit.x - rect.w - 4.0;
+        let up = hit.y - rect.h - 4.0;
         if right + rect.w <= timeline_w - 4.0 {
             rect.x = right;
         } else if left >= 0.0 {
             rect.x = left;
         } else {
-            rect.y = (hit.y + hit.h + 4.0)
-                .min(row_y + ROW_HEIGHT - rect.h)
-                .max(row_y);
+            // Stay above labels / handle dots instead of dropping onto the bar.
+            rect.y = up;
         }
     }
     let floor = (viewport_h - toast_band - rect.h).max(0.0);
@@ -10778,20 +10785,64 @@ fn nudge_overlay_off(
     }
     (
         rect.x.clamp(0.0, (timeline_w - rect.w - 4.0).max(0.0)),
-        rect.y.max(0.0),
+        rect.y,
     )
 }
 
-/// Overlay tooltip origin. Milestones prefer the right of the diamond,
-/// flipping left only when that overflows, then clamping on-chart.
-/// Date pills park above the bar, so the chip stays in-row.
+fn hover_tooltip_y(bar_top: f32) -> f32 {
+    bar_top - HOVER_TOOLTIP_H - HOVER_TOOLTIP_GAP
+}
+
+fn milestone_handle_obstacles(bar_x: f32, painted_w: f32, bar_top: f32) -> Vec<OverlayRect> {
+    let h = MILESTONE_SIZE.max(LINK_HANDLE);
+    let y = bar_top - 2.0;
+    vec![
+        OverlayRect {
+            x: bar_x - LINK_HANDLE_GAP - LINK_HANDLE,
+            y,
+            w: LINK_HANDLE,
+            h,
+        },
+        OverlayRect {
+            x: bar_x + painted_w + LINK_HANDLE_GAP,
+            y,
+            w: LINK_HANDLE,
+            h,
+        },
+    ]
+}
+
+/// Overlay tooltip origin. Chips sit above the bar so they do not cover
+/// the title or milestone handle dots. X follows the pointer (or the
+/// diamond), clamped to the chart — never the solid bar extent.
 fn hover_bar_tooltip_origin(place: TooltipPlace, pills: &[OverlayRect]) -> (f32, f32) {
+    let y = hover_tooltip_y(place.bar_top);
     if place.milestone {
         let (x, _, _) =
             milestone_tooltip_place(place.bar_x, place.painted_w, place.tip_w, place.timeline_w);
-        return (x, place.bar_top);
+        let mut obstacles = pills.to_vec();
+        obstacles.extend(milestone_handle_obstacles(
+            place.bar_x,
+            place.painted_w,
+            place.bar_top,
+        ));
+        let (nudged_x, nudged_y) = nudge_overlay_off(
+            OverlayRect {
+                x,
+                y,
+                w: place.tip_w,
+                h: HOVER_TOOLTIP_H,
+            },
+            &obstacles,
+            place.timeline_w,
+            place.row_y,
+            place.viewport_h,
+            place.toast_band,
+        );
+        // Prefer-right chips may overflow the clip (the chart clips them).
+        // Do not squeeze left of the diamond onto the handle dots.
+        return (nudged_x.max(x), nudged_y.min(y));
     }
-    let y = place.bar_top;
     let x = hover_tooltip_near_pointer(place.pointer_x, place.tip_w, place.timeline_w);
     nudge_overlay_off(
         OverlayRect {
@@ -12007,7 +12058,7 @@ mod bar_label_tests {
         // Pointer at the bar end (580); 580+12+120 = 712 fits in 720.
         // Inflated 1.5× used to flip far left.
         let (x, y) = tooltip_at(tip(500.0, 80.0, 8.0, 120.0, 720.0, 40.0, 40.0, false), &[]);
-        assert_eq!(y, 40.0);
+        assert_eq!(y, super::hover_tooltip_y(40.0));
         assert!(
             (x - 592.0).abs() < 0.1,
             "painted 120px still fits beside the pointer; must not flip on 1.5× width, got {x}"
@@ -12036,6 +12087,37 @@ mod bar_label_tests {
             (470.0 - (flip + 140.0)).abs() < 16.0,
             "flipped chip must stay near the pointer, gap={} x={flip}",
             470.0 - (flip + 140.0)
+        );
+        // Pointer on the dashed cue (975 / 1005) past the solid body
+        // (722–890). Clamp to the chart, not the bar extent.
+        let mut cue = tip(722.0, 168.0, 8.0, 160.0, 1100.0, 40.0, 40.0, false);
+        cue.pointer_x = 975.0;
+        let (cue_x, _) = tooltip_at(cue, &[]);
+        let cue_right = cue_x + 160.0;
+        let near_pointer = (cue_x - 987.0).abs() < 1.0 || (975.0 - cue_right).abs() < 16.0;
+        assert!(
+            near_pointer,
+            "cue hover must park next to the pointer at 975, not the solid bar 722–890, got {cue_x}..{cue_right}"
+        );
+        assert!(
+            cue_right <= 1100.0 - 4.0 + 0.1,
+            "tooltip must stay inside the viewport, got {cue_x}..{cue_right}"
+        );
+        assert!(
+            (cue_x - 722.0).abs() > 8.0,
+            "must not pin the chip to the bar start, got {cue_x}"
+        );
+        cue.pointer_x = 1005.0;
+        let (cue2, _) = tooltip_at(cue, &[]);
+        assert!(
+            (cue2 - cue_x).abs() > 8.0,
+            "moving along the cue must move the chip, stuck at {cue2} after {cue_x}"
+        );
+        cue.pointer_x = 1200.0;
+        let (clamped, _) = tooltip_at(cue, &[]);
+        assert!(
+            clamped + 160.0 <= 1100.0 - 4.0 + 0.1,
+            "a pointer past the clip must clamp the chip to the viewport, got {clamped}"
         );
     }
 
@@ -12108,14 +12190,20 @@ mod bar_label_tests {
             "Go-live tooltip prefers the right of the diamond when it fits, got {x}"
         );
         assert_eq!(
-            y, 120.0,
-            "Go-live tooltip must stay in the source row, not cover Unparented spike above, got {y}"
+            y,
+            super::hover_tooltip_y(120.0),
+            "Go-live tooltip sits above the diamond so handle dots stay visible, got {y}"
+        );
+        assert!(
+            y + super::HOVER_TOOLTIP_H <= 120.0 + 0.1,
+            "milestone chip must not cover the handle dots at the diamond, y={y}"
         );
         let (tight_x, tight_y) =
             tooltip_at(tip(40.0, 16.0, 42.0, 180.0, 800.0, 12.0, 0.0, true), &[]);
         assert_eq!(
-            tight_y, 12.0,
-            "left-clip milestone tooltip stays in-row, got {tight_y}"
+            tight_y,
+            super::hover_tooltip_y(12.0),
+            "left-clip milestone tooltip stays above the diamond, got {tight_y}"
         );
         assert!(
             tight_x >= 40.0 + 16.0,
@@ -12136,7 +12224,11 @@ mod bar_label_tests {
         side.pointer_x = 40.0 + 80.0;
         let (side_x, side_y) = tooltip_at(side, &[]);
         assert!((side_x - 132.0).abs() < 0.1);
-        assert_eq!(side_y, 80.0);
+        assert_eq!(side_y, super::hover_tooltip_y(80.0));
+        assert!(
+            side_y + super::HOVER_TOOLTIP_H <= 80.0 + 0.1,
+            "bar tooltip must sit above the title, y={side_y}"
+        );
         let (clamped_x, _) =
             tooltip_at(tip(750.0, 16.0, 8.0, 180.0, 800.0, 120.0, 108.0, true), &[]);
         assert!(
@@ -12158,7 +12250,7 @@ mod bar_label_tests {
             tip(400.0, 16.0, extra, 180.0, 800.0, 120.0, 108.0, true),
             &[],
         );
-        assert_eq!(right_y, 120.0);
+        assert_eq!(right_y, super::hover_tooltip_y(120.0));
         assert!(
             (right_x - (400.0 + 16.0 + pad)).abs() < 0.1,
             "prefer-right left edge must sit next to the diamond, x={right_x}"
@@ -12166,7 +12258,7 @@ mod bar_label_tests {
         // Right overflow: flip left, right edge kisses the diamond.
         let (left_x, left_y) =
             tooltip_at(tip(700.0, 16.0, extra, 180.0, 800.0, 12.0, 0.0, true), &[]);
-        assert_eq!(left_y, 12.0);
+        assert_eq!(left_y, super::hover_tooltip_y(12.0));
         assert!(
             (left_x + 180.0 - (700.0 - pad)).abs() < 0.1,
             "left-flip right edge must sit next to the diamond, x={left_x}"
@@ -12210,9 +12302,9 @@ mod bar_label_tests {
             tip(525.0, 393.0, 42.0, 160.0, 1100.0, 6.0, 0.0, false),
             &pills,
         );
-        assert_eq!(
-            tip_y, 6.0,
-            "first-row tooltip stays on the bar once pills sit above it, got {tip_y}"
+        assert!(
+            tip_y + super::HOVER_TOOLTIP_H <= 6.0 + 0.1,
+            "first-row tooltip sits above the bar so the title stays visible, got {tip_y}"
         );
         let tip = super::OverlayRect {
             x: tip_x,

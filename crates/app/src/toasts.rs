@@ -154,15 +154,25 @@ impl Toasts {
     }
 
     pub fn push(&mut self, kind: ToastKind, message: impl Into<String>) -> u64 {
+        let message = message.into();
         if kind == ToastKind::Success {
             self.dismiss_success();
+        } else if let Some(index) = self
+            .items
+            .iter()
+            .position(|toast| toast.kind == kind && toast.message == message)
+        {
+            let mut toast = self.items.remove(index);
+            toast.created_at = Instant::now();
+            self.items.push(toast);
+            return self.items.last().map(|toast| toast.id).unwrap_or(0);
         }
         self.next_id += 1;
         let copyable = kind == ToastKind::Error;
         self.items.push(Toast {
             id: self.next_id,
             kind,
-            message: message.into(),
+            message,
             copyable,
             undo: None,
             redo: None,
@@ -335,6 +345,24 @@ pub fn json_error_message(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_duplicate_warning_replaces_the_stacked_copy() {
+        let mut toasts = Toasts::default();
+        toasts.push(ToastKind::Warning, "Link already exists");
+        toasts.push(ToastKind::Warning, "Link already exists");
+        assert_eq!(
+            toasts.items.len(),
+            1,
+            "a second identical warning must replace, not stack, got {:?}",
+            toasts
+                .items
+                .iter()
+                .map(|toast| toast.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(toasts.items[0].message, "Link already exists");
+    }
 
     #[test]
     fn a_new_undo_toast_replaces_the_previous_one() {
