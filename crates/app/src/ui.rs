@@ -598,6 +598,7 @@ impl PlannerView {
         self.open_filter = None;
         self.open_flavor = false;
         self.state.gantt.context_menu = None;
+        self.dismiss_empty_timeline_hint();
         self.open_scope = Some(id);
         cx.notify();
     }
@@ -606,6 +607,7 @@ impl PlannerView {
         self.open_filter = None;
         self.open_scope = None;
         self.state.gantt.context_menu = None;
+        self.dismiss_empty_timeline_hint();
         self.open_flavor = open;
     }
 
@@ -1241,6 +1243,10 @@ impl PlannerView {
         self.pending_delete = None;
         self.state.gantt.context_menu = None;
         self.state.gantt.selected_link = None;
+        self.dismiss_empty_timeline_hint();
+    }
+
+    fn dismiss_empty_timeline_hint(&mut self) {
         self.empty_timeline_hint_dismissed = true;
     }
 
@@ -1298,9 +1304,30 @@ impl PlannerView {
             return;
         }
         let painted = self.painted_bar_for(id, layout);
+        let zone = Self::hit_zone_including_painted_link(layout, window_x, painted);
+        self.note_bar_hover_zone(id, zone, cx);
+    }
+
+    /// Grips live in the content box; the 1–2px border is still a link
+    /// sliver so a press on the painted right edge is not a no-op Outside.
+    fn hit_zone_including_painted_link(
+        layout: &crate::gantt::BarLayout,
+        window_x: f32,
+        painted: PaintedBar,
+    ) -> BarHitZone {
         let zone =
             layout.hit_zone_at_window_x(window_x, painted.content_left, painted.content_right);
-        self.note_bar_hover_zone(id, zone, cx);
+        let link = layout.link_zone_width();
+        if zone == BarHitZone::Outside
+            && layout.link_handle_insets_into_bar()
+            && link > 0.0
+            && window_x <= painted.right
+            && window_x >= painted.content_right - link
+        {
+            BarHitZone::Link
+        } else {
+            zone
+        }
     }
 
     fn dismiss_all_overlays(&mut self) {
@@ -1415,6 +1442,7 @@ impl PlannerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dismiss_empty_timeline_hint();
         let mut typed = initial;
         self.inline_dates_error = None;
         if let InlineEdit::Dates(id) = edit {
@@ -1651,6 +1679,7 @@ impl PlannerView {
         self.open_scope = None;
         self.open_flavor = false;
         self.state.gantt.context_menu = None;
+        self.dismiss_empty_timeline_hint();
         self.open_filter = id;
     }
 
@@ -2684,6 +2713,7 @@ impl PlannerView {
                     this.open_scope = None;
                     this.open_flavor = false;
                     this.state.gantt.context_menu = None;
+                    this.dismiss_empty_timeline_hint();
                     this.open_filter = if this.open_filter == Some(id) {
                         None
                     } else {
@@ -4603,6 +4633,11 @@ impl PlannerView {
                     .children(bars.iter().filter_map(|bar| {
                         self.render_pinned_bar_tooltip(bar, dragging, cx)
                     }))
+                    .children(bars.iter().filter_map(|bar| {
+                        // After arrows/labels so a connector or dates tooltip
+                        // cannot steal the last ~6px that start a link.
+                        self.render_gantt_inset_link_sliver(bar, dragging, cx)
+                    }))
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
                             if gesture.kind != GestureKind::Link {
@@ -4722,14 +4757,20 @@ impl PlannerView {
                                         .cursor(CursorStyle::PointingHand)
                                         .text_sm()
                                         .text_color(header_fg)
+                                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                            if !*hovered {
+                                                this.dismiss_empty_timeline_hint();
+                                                cx.notify();
+                                            }
+                                        }))
                                         .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
-                                            this.empty_timeline_hint_dismissed = true;
+                                            this.dismiss_empty_timeline_hint();
                                             this.apply_scroll(event, cx);
                                         }))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
-                                                this.empty_timeline_hint_dismissed = true;
+                                                this.dismiss_empty_timeline_hint();
                                                 cx.notify();
                                             }),
                                         )
@@ -5219,7 +5260,6 @@ impl PlannerView {
                     },
                 )
                 .children(self.bar_inner_resize_grips(bar, dragging, cx))
-                .children(self.bar_inner_link_sliver(bar, dragging, cx))
                 .children(self.bar_summary_edge_affordances(bar, dragging, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.set_bar_hovered(if *hovered { Some(id) } else { None }, cx);
@@ -5233,6 +5273,11 @@ impl PlannerView {
                         && !self.details_overlay()
                         && !self.suppress_bar_tooltip
                         && self.state.gantt.pin_bar_tooltip != Some(id)
+                        && !matches!(
+                            self.hover_bar_zone,
+                            Some((hid, BarHitZone::Link | BarHitZone::ResizeStart | BarHitZone::ResizeEnd))
+                                if hid == id
+                        )
                         && (inside || (!milestone && !marker && !unscheduled && !no_fields)),
                     |el| {
                         let tip = bar_hover_tooltip(bar, &self.state.nodes);
@@ -5469,18 +5514,18 @@ impl PlannerView {
             .collect()
     }
 
-    /// Last child of a resizable dated bar: the last ~6px starts a link
-    /// so a progress fill, title, or bar-body Move cannot steal those pixels.
+    /// Last ~6px of a resizable dated bar, painted above arrows and titles
+    /// so a connector or dates tooltip cannot steal the link zone.
     /// Kept mounted while this bar is the link source so capture, cursor,
     /// and the ghost line survive the drag.
-    fn bar_inner_link_sliver(
+    fn render_gantt_inset_link_sliver(
         &self,
         bar: &crate::gantt::BarLayout,
         _dragging: bool,
         cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
+    ) -> Option<AnyElement> {
         if !bar.can_resize() || !bar.link_handle_insets_into_bar() {
-            return Vec::new();
+            return None;
         }
         let id = bar.id;
         let linking_from_this = self
@@ -5496,25 +5541,33 @@ impl PlannerView {
             .as_ref()
             .is_some_and(|gesture| gesture.kind == GestureKind::Link);
         if linking && !linking_from_this {
-            return Vec::new();
+            return None;
         }
         let link_w = bar.link_zone_width();
         if link_w < 1.0 {
-            return Vec::new();
+            return None;
         }
-        let (_, local_right) = self.painted_timeline_edges(bar);
-        let origin = local_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT / 2.0;
+        let painted = self.painted_bar_for(id, bar);
+        let origin_x = self
+            .timeline_body_origin_x
+            .get()
+            .unwrap_or(self.state.gantt.timeline_origin_x);
+        let content_right = painted.content_right - origin_x;
+        let border = (painted.right - painted.content_right).max(0.0);
+        let sliver_x = content_right - link_w;
+        let sliver_w = link_w + border + 1.0;
+        let handle_origin = content_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT / 2.0;
         let layout = bar.clone();
         let selector = format!("gantt-link-handle-{id}-link-end-inset");
-        vec![
+        Some(
             div()
                 .id(("link-end-inset", id as u64))
                 .debug_selector(move || selector)
                 .absolute()
-                .right_0()
-                .top_0()
-                .bottom_0()
-                .w(px(link_w))
+                .left(px(sliver_x))
+                .top(px(bar.y + bar.paint_top()))
+                .w(px(sliver_w))
+                .h(px(bar.paint_h()))
                 .occlude()
                 .bg(gpui_kit::hsla(0., 0., 0., 0.01))
                 .cursor(CursorStyle::DragLink)
@@ -5549,7 +5602,7 @@ impl PlannerView {
                         this.continue_or_begin_bar_gesture(
                             id,
                             GestureKind::Link,
-                            origin,
+                            handle_origin,
                             x,
                             window,
                             cx,
@@ -5565,7 +5618,7 @@ impl PlannerView {
                     }),
                 )
                 .into_any_element(),
-        ]
+        )
     }
 
     /// Inner 8px of a summary bar. Not-allowed cursor + rollup tooltip; no move.
@@ -8080,10 +8133,9 @@ impl PlannerView {
     ) -> (BarHitZone, GestureKind) {
         let painted = self.painted_bar_for(id, layout);
         // Grips and the inner link sliver are laid out in the content box.
-        // The border box is 1–2px wider, which used to turn the last content
-        // pixels into Move and left only the 1px border as a unique overlay.
-        let zone =
-            layout.hit_zone_at_window_x(window_x, painted.content_left, painted.content_right);
+        // The border box is 1–2px wider; those last painted pixels are still
+        // a link, not Outside (a no-op press).
+        let zone = Self::hit_zone_including_painted_link(layout, window_x, painted);
         let kind = zone.gesture_kind().unwrap_or(GestureKind::Move);
         self.last_bar_hit = Some(BarHitDebug {
             event_x: window_x,
@@ -8234,10 +8286,8 @@ impl PlannerView {
         self.state.gantt.select_row(id);
         self.focus_planner(window, cx);
         self.dismiss_overlays();
-        if kind != GestureKind::Link {
-            self.bar_press_window_x = Some(window_x);
-            self.bar_last_window_x = Some(window_x);
-        }
+        self.bar_press_window_x = Some(window_x);
+        self.bar_last_window_x = Some(window_x);
         let _ = self.state.begin_bar_gesture(id, kind, origin);
         cx.notify();
     }
@@ -8272,12 +8322,15 @@ impl PlannerView {
             cx.refresh_windows();
             if let Some((from_id, Some(to_id))) = pair
                 && from_id != to_id
+                && self.state.apply_link_now(to_id, from_id)
+                && self.state.session_token_ready
             {
                 self.spawn_state(cx, move |mut state| async move {
-                    let result = state.add_dependency(to_id, from_id).await;
+                    let result = state.persist_added_dependency(to_id, from_id).await;
                     (state, result)
                 });
             }
+            self.request_repaint(Some(window), cx);
             return;
         }
         self.state.gantt.clear_row_hover();

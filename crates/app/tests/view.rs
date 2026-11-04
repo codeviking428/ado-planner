@@ -26,6 +26,7 @@ use gpui_kit::{
 };
 use jiff::ToSpan;
 use jiff::civil::Date;
+use std::time::Duration;
 
 fn idle_state(dir: &tempfile::TempDir) -> PlannerState {
     let paths = AppPaths::new(dir.path().to_path_buf());
@@ -165,8 +166,15 @@ fn grab_link_handle(
 fn grab_bar_link_sliver(
     bar: gpui_kit::Bounds<gpui_kit::Pixels>,
 ) -> gpui_kit::Point<gpui_kit::Pixels> {
+    grab_bar_from_right(bar, 4.0)
+}
+
+fn grab_bar_from_right(
+    bar: gpui_kit::Bounds<gpui_kit::Pixels>,
+    inset: f32,
+) -> gpui_kit::Point<gpui_kit::Pixels> {
     point(
-        bar.origin.x + bar.size.width - px(4.),
+        bar.origin.x + bar.size.width - px(inset),
         bar.origin.y + bar.size.height / 2.0,
     )
 }
@@ -1069,6 +1077,62 @@ fn unscheduled_empty_hint_dismisses_on_scroll(cx: &mut gpui_kit::TestAppContext)
     assert!(
         cx.debug_bounds("unscheduled-empty-hint").is_none(),
         "scrolling the timeline must dismiss the empty hint"
+    );
+}
+
+#[gpui_kit::test]
+fn unscheduled_empty_hint_dismisses_on_pointer_leave(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = amego_unscheduled_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let hint = cx
+        .debug_bounds("unscheduled-empty-hint")
+        .expect("all-unscheduled Amego must show the empty-timeline hint");
+    cx.simulate_mouse_move(hint.center(), None, Modifiers::default());
+    draw(cx);
+    let tree = cx.debug_bounds("gantt-tree").expect("tree");
+    cx.simulate_mouse_move(tree.center(), None, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "leaving the hint must dismiss it so it cannot stay pinned"
+    );
+}
+
+#[gpui_kit::test]
+fn unscheduled_empty_hint_dismisses_when_the_picker_opens(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = amego_unscheduled_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_some(),
+        "precondition: all-unscheduled Amego shows the empty-timeline hint"
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_inline_dates(2001, window, cx);
+        });
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-dates").is_some(),
+        "opening Dates must show the range picker"
+    );
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "opening the dates picker must dismiss the empty-timeline hint"
     );
 }
 
@@ -4570,6 +4634,116 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
             "the link cursor must show on hover, before the press"
         );
     });
+}
+
+#[gpui_kit::test]
+fn month_persist_edge_drag_adds_a_link_toast(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let bar_left = f32::from(bar.origin.x);
+    let bar_right = bar_left + f32::from(bar.size.width);
+    assert!(
+        (bar_right - bar_left - 64.0).abs() < 40.0,
+        "Auto-fit Month Persist cart should be a short bar around x=545-609, got {bar_left}..{bar_right}"
+    );
+    for inset in [5.0, 1.0] {
+        cx.simulate_mouse_move(grab_bar_from_right(bar, inset), None, Modifiers::default());
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+                Some(BarHitZone::Link),
+                "hovering {inset}px inside the Persist cart end must be the link zone"
+            );
+            assert_eq!(
+                view.hover_cursor_for_test(),
+                Some("drag-link"),
+                "the last ~6px must show a distinct link cursor, inset={inset}"
+            );
+        });
+    }
+    let at_edge = grab_bar_from_right(bar, 1.0);
+    cx.simulate_mouse_move(at_edge, None, Modifiers::default());
+    cx.background_executor
+        .advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("drag-link"),
+            "the link cursor must survive the dates tooltip delay"
+        );
+    });
+    cx.simulate_mouse_down(at_edge, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "a press on the last painted pixel must start a link, not a no-op"
+        );
+    });
+    let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
+    let start = at_edge;
+    let end = cart.center();
+    for step in 1..=6 {
+        let t = step as f32 / 6.0;
+        let mid = point(
+            start.x + (end.x - start.x) * t,
+            start.y + (end.y - start.y) * t,
+        );
+        cx.simulate_mouse_move(mid, Some(MouseButton::Left), Modifiers::default());
+        draw(cx);
+    }
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let message = view.state.toasts.last_message().unwrap_or_default();
+        assert!(
+            message.starts_with("Added link:")
+                && message.contains("Persist cart")
+                && message.contains("Cart UI"),
+            "a real multi-point drag from the Persist cart sliver onto Cart UI must toast, got {message:?}"
+        );
+        assert!(
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.id == 1005)
+                .is_some_and(|node| node.predecessors.contains(&1003)),
+            "the drop must add Persist cart as a predecessor of Cart UI"
+        );
+        assert!(view.state.gantt.gesture.is_none());
+    });
+    assert!(
+        cx.debug_bounds("toast-title").is_some() || cx.debug_bounds("planner-toast").is_some(),
+        "the Added link toast must paint"
+    );
 }
 
 #[gpui_kit::test]

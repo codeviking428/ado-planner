@@ -71,6 +71,9 @@ pub struct PlannerState {
     /// extra once PATCH succeeds. A local undo toast is already on screen
     /// at commit; this stash only lives until the persist clone is made.
     shifted_children: HashMap<i64, Vec<PendingDateSave>>,
+    /// True after a real PAT/Entra login so a visual-test idle state
+    /// (signed_in faked, no token) can toast a link without PATCHing.
+    pub(crate) session_token_ready: bool,
 }
 
 /// Why this date PATCH was queued — so a failed persist can put history back.
@@ -198,6 +201,7 @@ impl PlannerState {
             history_recording: true,
             team_views: HashMap::new(),
             shifted_children: HashMap::new(),
+            session_token_ready: false,
             prefs,
         }
     }
@@ -479,6 +483,7 @@ impl PlannerState {
                 .push(ToastKind::Error, "Sign-in did not create a Session");
             return Ok(());
         }
+        self.session_token_ready = self.session_info.signed_in;
         self.warn_if_identity_missing();
         self.reload_after_sign_in().await
     }
@@ -491,6 +496,7 @@ impl PlannerState {
                 .push(ToastKind::Error, "Sign-in did not create a Session");
             return Ok(());
         }
+        self.session_token_ready = self.session_info.signed_in;
         self.warn_if_identity_missing();
         self.reload_after_sign_in().await
     }
@@ -507,6 +513,7 @@ impl PlannerState {
     pub async fn logout(&mut self) -> Result<(), AppError> {
         self.session.inner().lock().await.logout().await?;
         self.session_info = self.session.inner().lock().await.session_info().await?;
+        self.session_token_ready = false;
         self.orgs.clear();
         self.projects.clear();
         self.teams.clear();
@@ -2014,6 +2021,58 @@ impl PlannerState {
         if successor_id == predecessor_id {
             return Ok(());
         }
+        if self.scope().is_none() {
+            return Ok(());
+        }
+        if !self.apply_link_now(successor_id, predecessor_id) {
+            return Ok(());
+        }
+        self.persist_added_dependency(successor_id, predecessor_id)
+            .await
+    }
+
+    /// Optimistic link + "Added link" toast. Persist separately so a visual
+    /// drag can assert the toast before ADO I/O returns.
+    pub fn apply_link_now(&mut self, successor_id: i64, predecessor_id: i64) -> bool {
+        if successor_id == predecessor_id {
+            return false;
+        }
+        let Some(node) = self
+            .nodes
+            .iter()
+            .find(|node| node.id == successor_id)
+            .cloned()
+        else {
+            return false;
+        };
+        if node.predecessors.contains(&predecessor_id) {
+            return false;
+        }
+        if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
+            live.predecessors.push(predecessor_id);
+        }
+        if self.history_recording {
+            self.record(HistoryEntry::Link {
+                successor_id,
+                predecessor_id,
+                linked: true,
+            });
+            self.toasts.push_undo(
+                self.link_changed_message("Added", predecessor_id, successor_id),
+                UndoAction::RemoveLink {
+                    successor_id,
+                    predecessor_id,
+                },
+            );
+        }
+        true
+    }
+
+    pub async fn persist_added_dependency(
+        &mut self,
+        successor_id: i64,
+        predecessor_id: i64,
+    ) -> Result<(), AppError> {
         let Some(scope) = self.scope() else {
             return Ok(());
         };
@@ -2025,13 +2084,8 @@ impl PlannerState {
         else {
             return Err(AppError::message("Work Item not found"));
         };
-        if node.predecessors.contains(&predecessor_id) {
-            return Ok(());
-        }
-        let previous = node.clone();
-        if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
-            live.predecessors.push(predecessor_id);
-        }
+        let mut previous = node.clone();
+        previous.predecessors.retain(|id| *id != predecessor_id);
         match self
             .client
             .add_dependency(
@@ -2049,20 +2103,6 @@ impl PlannerState {
                 }
                 self.sync_open_form_from_node(successor_id);
                 self.persist_hierarchy_cache();
-                if self.history_recording {
-                    self.record(HistoryEntry::Link {
-                        successor_id,
-                        predecessor_id,
-                        linked: true,
-                    });
-                    self.toasts.push_undo(
-                        self.link_changed_message("Added", predecessor_id, successor_id),
-                        UndoAction::RemoveLink {
-                            successor_id,
-                            predecessor_id,
-                        },
-                    );
-                }
                 Ok(())
             }
             Err(err) => {
