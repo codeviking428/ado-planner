@@ -18,18 +18,19 @@ pub const SPLITTER_STEP: f32 = 16.0;
 /// Visual 4px edge pills sit in this plate. Hits stay inside the bar on a
 /// resizable body; the end halo covers the last `RESIZE_HALO_INSIDE` pixels
 /// so 2–6px inside the painted end resizes. Link from the outer handle
-/// (`bar_right + LINK_HANDLE_GAP`). Short bars shrink the start, end-resize,
-/// and leftover inner-link zones together so a Move body still exists.
+/// (`bar_right + LINK_HANDLE_GAP`). Each edge zone is capped at a third of
+/// the bar so a 33px sliver still has a Move middle; inner link is dropped
+/// when it would eat that third.
 pub const HANDLE_WIDTH: f32 = 8.0;
 /// Pointer hit for inner start/end resize. Wider than the 4px pill so a
 /// press ~12px inside the edge still resizes instead of moving.
 pub const RESIZE_HIT_WIDTH: f32 = 14.0;
-/// Extra hit around the painted edge: 6px outside, 6px inside so 2–4px
-/// inside the painted end is resize even when painted bounds are 1px off
-/// layout. The outer link handle (bar_right+10) still starts a link; the
-/// end halo only steps 1px past the painted right so that 8px-radius
-/// plate is not stolen.
-pub const RESIZE_HALO_OUTSIDE: f32 = 6.0;
+/// Extra hit around the painted edge: 6px inside so 2–4px inside the
+/// painted end is resize even when painted bounds are 1px off layout.
+/// Start and end only step 1px past the painted edge so the inbound
+/// link-start handle (connector at bar.x−10) and the outer end handle
+/// (bar_right+10) are not stolen.
+pub const RESIZE_HALO_OUTSIDE: f32 = 1.0;
 pub const RESIZE_HALO_INSIDE: f32 = 6.0;
 pub const RESIZE_HALO_END_OUTSIDE: f32 = 1.0;
 /// Selected tree/timeline row tint. Stronger than zebra stripes so the row reads.
@@ -55,9 +56,6 @@ pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// ~6px starts a link, not a resize (wide bars) or a no-op Move (slivers).
 /// Kept at 6 so the 14px end-resize grip stays a unique zone just left of it.
 pub const LINK_HANDLE_INSET: f32 = 6.0;
-/// Floor for the Move body when a short bar still resizes. 1px was
-/// covered by the occluding grips and unhittable on 16–24px slivers.
-const MIN_MOVE_ZONE: f32 = 4.0;
 /// Parallel dependency lanes stay at least this far apart (stroke is 2px).
 pub const PARALLEL_LANE_MIN: f32 = 10.0;
 /// Inbound/wrap verticals. 16px centre-to-centre so the 2px stroke still
@@ -475,8 +473,8 @@ impl BarLayout {
     }
 
     /// Start grip, end-resize grip, and inner link sliver along this bar.
-    /// Outside-in at the right edge: link, then resize, then move. Short
-    /// resizable bars shrink the three zones together and keep a 1px body.
+    /// Outside-in at the right edge: link, then resize, then move. Each
+    /// edge is capped at a third of the width so the middle always moves.
     pub fn edge_zones(&self) -> (f32, f32, f32) {
         self.edge_zones_for(self.width.max(1.0))
     }
@@ -485,28 +483,36 @@ impl BarLayout {
         let width = width.max(1.0);
         let wants_link = self.link_handle_insets_into_bar();
         let wants_resize = self.can_resize();
+        let max_edge = (width / 3.0).max(1.0);
         if !wants_resize && wants_link {
             let link = LINK_HANDLE_INSET.min(width / 2.0).max(1.0);
             return (0.0, 0.0, link);
         }
         if wants_resize && !wants_link {
-            let grip = RESIZE_HIT_WIDTH.min(width / 2.0).max(1.0);
+            let grip = RESIZE_HIT_WIDTH.min(max_edge).max(1.0);
             return (grip, grip, 0.0);
         }
         if !wants_resize {
             return (0.0, 0.0, 0.0);
         }
-        let preferred = RESIZE_HIT_WIDTH * 2.0 + LINK_HANDLE_INSET;
-        if width >= preferred + MIN_MOVE_ZONE {
-            return (RESIZE_HIT_WIDTH, RESIZE_HIT_WIDTH, LINK_HANDLE_INSET);
+        let start = RESIZE_HIT_WIDTH.min(max_edge).max(1.0);
+        let end = RESIZE_HIT_WIDTH.min(max_edge).max(1.0);
+        // Inner link only when a full Move third remains after start+end+link.
+        let link = if wants_link && width - start - end - max_edge >= LINK_HANDLE_INSET - 0.5 {
+            LINK_HANDLE_INSET
+        } else {
+            0.0
+        };
+        (start, end, link)
+    }
+
+    /// End-halo depth, capped so two halos cannot eat a short bar's Move
+    /// third. 6px on a 33px bar still leaves an 11px body.
+    pub fn resize_halo_inside(&self) -> f32 {
+        if !self.can_resize() {
+            return RESIZE_HALO_INSIDE;
         }
-        let available = (width - MIN_MOVE_ZONE).max(3.0);
-        let scale = available / preferred;
-        (
-            (RESIZE_HIT_WIDTH * scale).max(1.0),
-            (RESIZE_HIT_WIDTH * scale).max(1.0),
-            (LINK_HANDLE_INSET * scale).max(1.0),
-        )
+        RESIZE_HALO_INSIDE.min((self.width.max(1.0) / 3.0).max(1.0))
     }
 
     /// Last pixels of a dated bar that start a link (0 if this bar has none).
@@ -567,13 +573,13 @@ impl BarLayout {
         painted_right: f32,
     ) -> BarHitZone {
         let (start, end_resize, link) = self.edge_zones_for(self.width.max(1.0));
+        let halo_in = self.resize_halo_inside();
         if self.can_resize() {
-            if window_x >= painted_left - RESIZE_HALO_OUTSIDE
-                && window_x <= painted_left + RESIZE_HALO_INSIDE
+            if window_x >= painted_left - RESIZE_HALO_OUTSIDE && window_x <= painted_left + halo_in
             {
                 return BarHitZone::ResizeStart;
             }
-            if window_x >= painted_right - RESIZE_HALO_INSIDE
+            if window_x >= painted_right - halo_in
                 && window_x <= painted_right + RESIZE_HALO_END_OUTSIDE
             {
                 return BarHitZone::ResizeEnd;
@@ -6328,26 +6334,168 @@ mod tests {
         assert!(resizable.can_resize(), "25px+ dated bars still resize");
         let (start, end, link) = resizable.edge_zones();
         assert!(
-            start >= 1.0 && end >= 1.0 && link >= 1.0,
-            "a 32px bar must keep all three zones, got start={start} end={end} link={link}"
+            start <= 32.0 / 3.0 + 0.5 && end <= 32.0 / 3.0 + 0.5,
+            "a 32px bar must cap each edge at a third, got start={start} end={end} link={link}"
         );
         assert!(
-            start + end + link + 3.5 < resizable.width,
+            start + end + 0.5 < resizable.width,
             "short-bar zones must leave a hittable Move body, start={start} end={end} link={link}"
         );
         let right = resizable.x + resizable.width;
         assert_eq!(
-            resizable.hit_zone_at_window_x(right - link + 0.5, resizable.x, right),
+            resizable.hit_zone_at_window_x(right - 1.0, resizable.x, right),
             BarHitZone::ResizeEnd,
             "the last pixels of a short dated bar are the resize halo; link from the outer handle"
         );
         assert_eq!(
-            resizable.hit_zone_at_window_x(right - link - end / 2.0, resizable.x, right),
+            resizable.hit_zone_at_window_x(right - end / 2.0, resizable.x, right),
             BarHitZone::ResizeEnd
         );
         assert_eq!(
-            resizable.hit_zone_at_window_x(resizable.x + start + 0.5, resizable.x, right),
-            BarHitZone::Move
+            resizable.hit_zone_at_window_x(resizable.x + resizable.width / 2.0, resizable.x, right),
+            BarHitZone::Move,
+            "the middle third of a short bar must move"
+        );
+    }
+
+    #[test]
+    fn short_bar_caps_edge_zones_so_the_middle_moves() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 629.0,
+            width: 33.0,
+            y: 0.0,
+            summary: true,
+            milestone: false,
+            label: "Persist cart".into(),
+            title: "Persist cart".into(),
+            color: 0x89b4fa,
+            progress: Some(0.5),
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        assert!(bar.can_resize(), "a 33px Persist cart still resizes");
+        let (start, end, link) = bar.edge_zones();
+        assert!(
+            start <= 33.0 / 3.0 + 0.5 && end <= 33.0 / 3.0 + 0.5,
+            "each edge must be ≤ a third of 33px, start={start} end={end} link={link}"
+        );
+        let right = bar.x + bar.width;
+        assert_eq!(
+            bar.hit_zone_at_window_x(bar.x + bar.width / 2.0, bar.x, right),
+            BarHitZone::Move,
+            "a grab in the middle of a 33px bar must move, not resize"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(right - 1.0, bar.x, right),
+            BarHitZone::ResizeEnd,
+            "a drag from near the right end (x≈662) must resize, not be a dead Outside/Link"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(bar.x + 1.0, bar.x, right),
+            BarHitZone::ResizeStart
+        );
+    }
+
+    #[test]
+    fn painted_end_hit_is_live_from_minus_6_to_plus_4() {
+        let bar = BarLayout {
+            id: 1002,
+            kind: GanttBarKind::Scheduled,
+            x: 100.0,
+            width: 80.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "Cart".into(),
+            title: "Cart".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        let left = bar.x;
+        let right = bar.x + bar.width;
+        for offset in -6..=4 {
+            let zone = bar.hit_zone_at_window_x(right + offset as f32, left, right);
+            if offset <= RESIZE_HALO_END_OUTSIDE as i32 {
+                assert_eq!(
+                    zone,
+                    BarHitZone::ResizeEnd,
+                    "painted end {offset:+}px must be ResizeEnd (4px inside is not a dead zone), got {zone:?}"
+                );
+            } else {
+                assert_ne!(
+                    zone,
+                    BarHitZone::ResizeEnd,
+                    "the outer link handle, {offset:+}px past the end, must not be stolen by resize, got {zone:?}"
+                );
+            }
+        }
+        for offset in -6..=4 {
+            let zone = bar.hit_zone_at_window_x(left + offset as f32, left, right);
+            if offset >= -(RESIZE_HALO_OUTSIDE as i32) && offset <= RESIZE_HALO_INSIDE as i32 {
+                assert_eq!(
+                    zone,
+                    BarHitZone::ResizeStart,
+                    "painted start {offset:+}px must be ResizeStart, got {zone:?}"
+                );
+            } else if offset < 0 {
+                assert_ne!(
+                    zone,
+                    BarHitZone::ResizeStart,
+                    "start halo must not steal the inbound link handle at {offset:+}px, got {zone:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn start_halo_does_not_steal_inbound_link_hits() {
+        let bar = BarLayout {
+            id: 1002,
+            kind: GanttBarKind::Scheduled,
+            x: 100.0,
+            width: 80.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "Cart".into(),
+            title: "Cart".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        let left = bar.x;
+        let right = bar.x + bar.width;
+        let connector = left - (LINK_HANDLE_GAP + LINK_HANDLE / 2.0);
+        assert_ne!(
+            bar.hit_zone_at_window_x(connector, left, right),
+            BarHitZone::ResizeStart,
+            "the inbound connector at bar.x−10 must not be ResizeStart"
+        );
+        assert_ne!(
+            bar.hit_zone_at_window_x(left - 6.0, left, right),
+            BarHitZone::ResizeStart,
+            "6px left of the bar is the inbound handle plate, not the start halo"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(left - RESIZE_HALO_OUTSIDE, left, right),
+            BarHitZone::ResizeStart,
+            "the 1px start halo must still resize"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(left + 4.0, left, right),
+            BarHitZone::ResizeStart,
+            "4px inside the painted start must still resize"
         );
     }
 
@@ -11181,6 +11329,28 @@ mod tests {
             pred.y,
             pred.y + ROW_HEIGHT
         );
+        let box_left = succ.x;
+        let box_right = succ.x + MILESTONE_SIZE;
+        let box_top = succ.y + succ.paint_top();
+        let box_bottom = box_top + succ.paint_h();
+        let out_crosses = arrow.y1.min(arrow.lane_y) < box_bottom - 1.0
+            && arrow.y1.max(arrow.lane_y) > box_top + 1.0;
+        let in_crosses = arrow.lane_y.min(arrow.y2) < box_bottom - 1.0
+            && arrow.lane_y.max(arrow.y2) > box_top + 1.0;
+        if out_crosses {
+            assert!(
+                arrow.x1 < box_left - 1.0 || arrow.x1 > box_right + 1.0,
+                "Day Persist cart → Go-live outgoing vertical must miss the Go-live box, x1={} box={box_left}..{box_right}",
+                arrow.x1
+            );
+        }
+        if in_crosses {
+            assert!(
+                arrow.x2 < box_left - 1.0 || arrow.x2 > box_right + 1.0,
+                "Day Persist cart → Go-live inbound vertical must miss the Go-live box, x2={} box={box_left}..{box_right}",
+                arrow.x2
+            );
+        }
     }
 
     fn assert_arrow_misses_go_live_pill(

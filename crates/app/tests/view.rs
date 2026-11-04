@@ -254,6 +254,16 @@ fn grab_outer_link_handle(
     )
 }
 
+/// Inbound connector ~10px left of the painted start.
+fn grab_inbound_link_handle(
+    bar: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> gpui_kit::Point<gpui_kit::Pixels> {
+    point(
+        bar.origin.x - px(LINK_HANDLE_GAP + LINK_HANDLE / 2.0),
+        bar.origin.y + bar.size.height / 2.0,
+    )
+}
+
 fn grab_bar_from_right(
     bar: gpui_kit::Bounds<gpui_kit::Pixels>,
     inset: f32,
@@ -9493,8 +9503,8 @@ fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
     cx.simulate_click(fit.center(), Modifiers::default());
     draw(cx);
     let target = cx
-        .debug_bounds("gantt-bar-label-1013")
-        .or_else(|| cx.debug_bounds("gantt-bar-1013"))
+        .debug_bounds("gantt-bar-1013")
+        .or_else(|| cx.debug_bounds("gantt-bar-label-1013"))
         .expect("Go-live milestone");
     cx.simulate_mouse_move(target.center(), None, Modifiers::default());
     draw(cx);
@@ -9534,6 +9544,21 @@ fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
             "milestone hover copy must include the title, got {tip:?}"
         );
     });
+    let diamond = cx.debug_bounds("gantt-bar-1013").expect("Go-live diamond");
+    let tip = cx
+        .debug_bounds("gantt-hover-tooltip")
+        .expect("Go-live hover tooltip");
+    let diamond_top = f32::from(diamond.origin.y);
+    let tip_top = f32::from(tip.origin.y);
+    let tip_w = f32::from(tip.size.width);
+    assert!(
+        tip_top + 4.0 <= diamond_top,
+        "Go-live tooltip must sit above the diamond so the title is not clipped to Go-liv…, tip_top={tip_top} diamond_top={diamond_top}"
+    );
+    assert!(
+        tip_w >= 80.0,
+        "Go-live tooltip must be wide enough for 'Go-live milestone', width={tip_w}"
+    );
 }
 
 #[gpui_kit::test]
@@ -13064,6 +13089,207 @@ fn dragging_the_end_dot_onto_another_bar_arms_a_dependency(cx: &mut gpui_kit::Te
         assert!(
             view.state.gantt.gesture.is_none(),
             "mouse-up on the target bar must commit the link gesture"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn leaving_a_bar_clears_the_hover_tooltip_and_date_pills(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_some(),
+        "hovering a bar must show the overlay tooltip"
+    );
+    assert!(
+        cx.debug_bounds("gantt-hover-date-start").is_some(),
+        "hovering a bar must show the Start Date pill"
+    );
+    let nav = cx.debug_bounds("gantt-nav").expect("nav");
+    cx.simulate_mouse_move(nav.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.bar_hovered_id, None,
+            "leaving the bar must clear bar hover"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_none(),
+        "the tooltip must not stay after the pointer leaves the bar"
+    );
+    assert!(
+        cx.debug_bounds("gantt-hover-date-start").is_none(),
+        "date pills must not stay after the pointer leaves the bar"
+    );
+}
+
+#[gpui_kit::test]
+fn persist_cart_hover_shows_one_overlay_tooltip(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1003").expect("Persist cart");
+    cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
+    draw(cx);
+    let tips = [
+        cx.debug_bounds("gantt-hover-tooltip").is_some(),
+        cx.debug_bounds("gantt-bar-tooltip").is_some(),
+    ];
+    assert!(tips[0], "Persist cart hover must show the overlay tooltip");
+    assert!(
+        !tips[1],
+        "Persist cart must not also pin a gantt-bar-tooltip; two chips stacked as small+large duplicates"
+    );
+}
+
+#[gpui_kit::test]
+fn end_edge_hit_every_offset_from_minus_6_to_plus_4(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    for offset in -6i32..=4 {
+        let at = point(
+            bar.origin.x + bar.size.width + px(offset as f32),
+            bar.origin.y + bar.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(at, None, Modifiers::default());
+        view.update(cx, |view, _| {
+            let zone = view.hover_bar_zone_for_test().map(|(_, zone)| zone);
+            if offset <= 0 {
+                assert_eq!(
+                    zone,
+                    Some(BarHitZone::ResizeEnd),
+                    "{offset:+}px from the painted end must be ResizeEnd (4px inside is not dead), got {zone:?}"
+                );
+            } else {
+                assert!(
+                    matches!(zone, Some(BarHitZone::ResizeEnd | BarHitZone::Link)),
+                    "{offset:+}px past the end must be live (resize halo or outer link), not a dead no-op, got {zone:?}"
+                );
+            }
+        });
+    }
+    let inside_4 = grab_bar_from_right(bar, 4.0);
+    cx.simulate_mouse_move(inside_4, None, Modifiers::default());
+    cx.simulate_mouse_down(inside_4, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::ResizeEnd),
+            "a press 4px inside the painted end must resize, not be a dead no-op"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn new_link_preview_uses_a_lane_offset_below_the_source_bar(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    cx.simulate_mouse_down(
+        grab_outer_link_handle(bar),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    let preview = cx
+        .debug_bounds("gantt-link-preview")
+        .expect("rubber-band horizontal");
+    let bar_bottom = f32::from(bar.origin.y) + f32::from(bar.size.height);
+    let preview_top = f32::from(preview.origin.y);
+    assert!(
+        preview_top + 1.0 >= bar_bottom,
+        "new-link horizontal must sit in a lane below the source bar, not hug its top edge, preview_top={preview_top} bar_bottom={bar_bottom}"
+    );
+}
+
+#[gpui_kit::test]
+fn start_halo_does_not_steal_inbound_link_hits(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let inbound = cx
+        .debug_bounds("gantt-link-handle-2-link-start")
+        .map(|handle| {
+            point(
+                handle.origin.x + handle.size.width / 2.0,
+                handle.origin.y + handle.size.height / 2.0,
+            )
+        })
+        .unwrap_or_else(|| grab_inbound_link_handle(bar));
+    cx.simulate_mouse_move(inbound, None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::Link),
+            "hovering the inbound connector must classify link, not start-resize"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("drag-link"),
+            "the inbound connector must show the link cursor, not ew-resize"
+        );
+    });
+    cx.simulate_mouse_down(inbound, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "a press on the inbound connector must start a link, not a start resize"
         );
     });
 }
