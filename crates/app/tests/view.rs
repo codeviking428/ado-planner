@@ -1284,9 +1284,8 @@ fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext)
         }
         let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
         assert!(
-            live.x1 + 8.0 <= live.x2,
-            "painted Persist cart → Go-live must run right to the diamond, x1={} x2={} cart.x={}",
-            live.x1,
+            live.x2 < cart.x,
+            "painted Persist cart → Go-live inbound x2={} must drop before Cart UI starts at {}",
             live.x2,
             cart.x
         );
@@ -1325,10 +1324,9 @@ fn mock_fixture_month_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppCo
         .debug_bounds("gantt-bar-1005")
         .expect("Cart UI bar (Month)");
     let cart_left = f32::from(cart.origin.x);
-    let cart_right = cart_left + f32::from(cart.size.width);
     assert!(
-        persist_x > cart_right + 1.0,
-        "Month painted Persist cart → Go-live inbound at {persist_x} must drop past Cart UI {cart_left}..{cart_right}"
+        persist_x < cart_left - 1.0,
+        "Month painted Persist cart → Go-live inbound at {persist_x} must drop before Cart UI at {cart_left}"
     );
 }
 
@@ -1396,10 +1394,9 @@ fn runtime_shared_source_outgoing_jogs_paint_sixteen_apart(cx: &mut gpui_kit::Te
     );
     if let Some(cart) = cx.debug_bounds("gantt-bar-1005") {
         let cart_left = f32::from(cart.origin.x);
-        let cart_right = cart_left + f32::from(cart.size.width);
         assert!(
-            live_in_x > cart_right + 1.0,
-            "painted Persist cart → Go-live inbound at {live_in_x} must drop past Cart UI {cart_left}..{cart_right}"
+            live_in_x < cart_left - 1.0,
+            "painted Persist cart → Go-live inbound at {live_in_x} must drop before Cart UI at {cart_left}"
         );
     }
     let label = cx
@@ -1572,14 +1569,9 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
     );
     let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI bar");
     let cart_left = f32::from(cart.origin.x);
-    let cart_right = cart_left + f32::from(cart.size.width);
     assert!(
-        live_out_x + 8.0 <= live_x,
-        "launch camera: Persist cart → Go-live must run right to the diamond, out={live_out_x} inv={live_x}"
-    );
-    assert!(
-        live_x > cart_right + 1.0,
-        "launch camera: Persist cart → Go-live inbound at {live_x} must drop past Cart UI's solid bar {cart_left}..{cart_right}"
+        live_x < cart_left - 1.0,
+        "launch camera: Persist cart → Go-live inbound at {live_x} must drop before Cart UI at {cart_left}"
     );
     assert!(
         spike_x < cart_left - 1.0,
@@ -1778,10 +1770,9 @@ fn runtime_drag_persist_cart_to_go_live_stays_eight_apart(cx: &mut gpui_kit::Tes
     );
     if let Some(cart) = cx.debug_bounds("gantt-bar-1005") {
         let cart_left = f32::from(cart.origin.x);
-        let cart_right = cart_left + f32::from(cart.size.width);
         assert!(
-            live_x > cart_right + 1.0,
-            "runtime Persist cart → Go-live inbound at {live_x} must drop past Cart UI {cart_left}..{cart_right}"
+            live_x < cart_left - 1.0,
+            "runtime Persist cart → Go-live inbound at {live_x} must drop before Cart UI at {cart_left}"
         );
         assert!(
             spike_x < cart_left - 1.0,
@@ -5624,9 +5615,8 @@ fn month_persist_go_live_link_clears_the_painted_label(cx: &mut gpui_kit::TestAp
         }
         let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
         assert!(
-            live.x1 + 8.0 <= live.x2,
-            "Month Persist cart → Go-live must run right to the diamond, x1={} x2={} cart.x={}",
-            live.x1,
+            live.x2 < cart_ui.x,
+            "Month Persist cart → Go-live inbound must drop before Cart UI, x2={} cart.x={}",
             live.x2,
             cart_ui.x
         );
