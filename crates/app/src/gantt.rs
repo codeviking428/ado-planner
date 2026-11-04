@@ -25,13 +25,14 @@ pub const HANDLE_WIDTH: f32 = 8.0;
 /// Pointer hit for inner start/end resize. Wider than the 4px pill so a
 /// press ~12px inside the edge still resizes instead of moving.
 pub const RESIZE_HIT_WIDTH: f32 = 14.0;
-/// Extra hit around the painted edge: 6px inside so 2–4px inside the
-/// painted end is resize even when painted bounds are 1px off layout.
+/// Extra hit around the painted edge: 8px inside so 2–6px inside the
+/// painted end is resize even when painted bounds are 1–2px off layout
+/// (a 6px halo left a 4px dead band between the grip and the halo).
 /// Start and end only step 1px past the painted edge so the inbound
 /// link-start handle (connector at bar.x−10) and the outer end handle
 /// (bar_right+10) are not stolen.
 pub const RESIZE_HALO_OUTSIDE: f32 = 1.0;
-pub const RESIZE_HALO_INSIDE: f32 = 6.0;
+pub const RESIZE_HALO_INSIDE: f32 = 8.0;
 pub const RESIZE_HALO_END_OUTSIDE: f32 = 1.0;
 /// Selected tree/timeline row tint. Stronger than zebra stripes so the row reads.
 pub const SELECTED_ROW_TINT: f32 = 0.65;
@@ -2721,7 +2722,7 @@ impl GanttView {
         // intersects a painted bar/milestone (or open-ended cue) in the
         // rows it spans. Try exit-right, then back-jog-left, then a
         // left-edge gutter.
-        route_obstacle_aware_verticals(&mut out, bars, clip_left, clip_right);
+        route_obstacle_aware_verticals(&mut out, bars, clip_left, clip_right, timeline_w);
         out
     }
 }
@@ -4198,7 +4199,12 @@ fn force_overlap_back_jog(
 /// Outside titles are not obstacles — they sit in the label slot.
 /// Left pad matches the painted handle so a drop at `bar.x - HANDLE_WIDTH`
 /// is still treated as crossing the bar.
-fn painted_obstacle_x(bar: &BarLayout, clip_right: f32) -> (f32, f32) {
+fn painted_obstacle_x(bar: &BarLayout, clip_right: f32, timeline_w: f32) -> (f32, f32) {
+    // Off-range bars paint a ‹ / › chip at the clip, not at bar.x. Day
+    // Persist cart → Go-live at x≈885 ran through that chip (~880–1025).
+    if let Some((chip_x, chip_w, _, _)) = offscreen_edge_chip(bar, timeline_w.max(clip_right)) {
+        return (chip_x - 2.0, chip_x + chip_w + 2.0);
+    }
     if bar.milestone || bar.marker {
         return (bar.x - 2.0, bar.x + MILESTONE_SIZE + 4.0);
     }
@@ -4226,10 +4232,11 @@ fn painted_obstacles_on_span(
     bars: &[BarLayout],
     skip: impl Fn(&BarLayout) -> bool,
     clip_right: f32,
+    timeline_w: f32,
 ) -> Vec<(f32, f32)> {
     bars.iter()
         .filter(|bar| !skip(bar) && vertical_crosses_painted(y_a, y_b, bar))
-        .map(|bar| painted_obstacle_x(bar, clip_right))
+        .map(|bar| painted_obstacle_x(bar, clip_right, timeline_w))
         .collect()
 }
 
@@ -4254,11 +4261,18 @@ fn first_clear_vertical_x_preferring_spaced(
                 if require_right_of_source && *raw + 0.5 < prefer_min_x {
                     continue;
                 }
-                let obstacles = obstacles_at(*raw);
-                // Prefer the clip, but do not clamp *onto* an obstacle.
                 let clipped = raw.clamp(clip_left, clip_right);
+                // Prefer the painted x, but do not clamp *onto* an
+                // obstacle (Day wrap used to drop through the off-range
+                // successor chip). A raw x left of clip_left can still
+                // sit in the gutter beside an open-ended cue.
+                let obstacles = obstacles_at(clipped);
                 let x = if x_hits_any_obstacle(clipped, &obstacles) {
-                    raw.clamp(4.0, clip_right)
+                    let fallback = raw.clamp(4.0, clip_right);
+                    if x_hits_any_obstacle(fallback, &obstacles) {
+                        continue;
+                    }
+                    fallback
                 } else {
                     clipped
                 };
@@ -4290,6 +4304,7 @@ fn route_obstacle_aware_verticals(
     bars: &[BarLayout],
     clip_left: f32,
     clip_right: f32,
+    timeline_w: f32,
 ) {
     const CLEAR_GAP: f32 = 8.0;
     let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
@@ -4318,13 +4333,26 @@ fn route_obstacle_aware_verticals(
         let inbound_obs_at = |x: f32| {
             let wrap = x > x_head + DependencyArrow::WRAP_STUB && x1_now + 1.0 >= x_head;
             let end = if wrap { gutter_y } else { y2 };
-            painted_obstacles_on_span(
+            let mut obs = painted_obstacles_on_span(
                 lane_y,
                 end,
                 bars,
-                |bar| bar_is_gutter(bar) || bar.id == pred_id || (wrap && bar.id == succ_id),
+                |bar| {
+                    bar_is_gutter(bar)
+                        || bar.id == pred_id
+                        || (wrap
+                            && bar.id == succ_id
+                            && offscreen_edge_chip(bar, timeline_w).is_none())
+                },
                 clip_right,
-            )
+                timeline_w,
+            );
+            // Wrap skips the successor body so the stub can sit at the
+            // clip, but the off-range ‹ / › chip still paints there.
+            if let Some((chip_x, chip_w, _, _)) = offscreen_edge_chip(succ, timeline_w) {
+                obs.push((chip_x - 2.0, chip_x + chip_w + 2.0));
+            }
+            obs
         };
         let conservative_obs = inbound_obs_at(arrows[i].x2);
         let mut inbound_cands = vec![arrows[i].x2, exit_right, back_jog];
@@ -4357,6 +4385,7 @@ fn route_obstacle_aware_verticals(
             bars,
             |bar| bar_is_gutter(bar) || bar.id == pred.id,
             clip_right,
+            timeline_w,
         );
         let mut outgoing_cands = vec![
             arrows[i].x1,
@@ -9560,7 +9589,7 @@ mod tests {
                 if bar.id == pred.id || bar.id == succ.id || bar_is_gutter(bar) {
                     continue;
                 }
-                let (left, right) = painted_obstacle_x(bar, clip_right);
+                let (left, right) = painted_obstacle_x(bar, clip_right, gantt.timeline_width);
                 let inbound_end = if arrow.wraps_around_successor() {
                     arrow.gutter_y()
                 } else {
@@ -9701,7 +9730,8 @@ mod tests {
                         arrow.y2
                     };
                     if vertical_crosses_painted(arrow.lane_y, inbound_end, cart) {
-                        let (left, right) = painted_obstacle_x(cart, timeline_width);
+                        let (left, right) =
+                            painted_obstacle_x(cart, timeline_width, timeline_width);
                         assert!(
                             !x_hits_span(arrow.x2, left, right),
                             "{scale:?} zoom={zoom} width={timeline_width} persist {start}→{target} inbound x2={} must miss Cart UI painted {left}..{right}",
@@ -11440,6 +11470,45 @@ mod tests {
                 label,
             );
         }
+    }
+
+    #[test]
+    fn day_off_range_persist_to_go_live_misses_the_edge_chip() {
+        let mut nodes = live_fixture_nodes();
+        if let Some(persist) = nodes.iter_mut().find(|node| node.id == 1003) {
+            persist.start_date = Some("2026-07-22T00:00:00Z".into());
+            persist.target_date = Some("2026-08-05T00:00:00Z".into());
+        }
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Day,
+            timeline_width: 1024.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Persist cart → Go-live");
+        let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        assert!(
+            bar_offscreen_edge(go_live, gantt.timeline_width).is_some(),
+            "precondition: Day Go-live must be off-range, x={}",
+            go_live.x
+        );
+        let today = jiff::Zoned::now().date();
+        let today_px = gantt.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+        assert_arrow_misses_go_live_pill(
+            arrow,
+            go_live,
+            gantt.timeline_width,
+            today_x,
+            (gantt.timeline_width - 10.0).max(24.0),
+            "day-1024-persist-jul22-aug5",
+        );
     }
 
     #[test]

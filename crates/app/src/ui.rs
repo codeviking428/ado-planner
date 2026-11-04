@@ -332,6 +332,7 @@ impl PlannerView {
             let result = state.bootstrap().await;
             (state, result)
         });
+        view.bind_window_hover_reset(window, cx);
         view
     }
 
@@ -548,6 +549,20 @@ impl PlannerView {
         this
     }
 
+    /// Window deactivate / blur leaves the OS pointer off the bar with no
+    /// mouse-move. Drop the overlay tooltip and date pills; a later move
+    /// re-hits. `last_pointer` is stale across focus changes.
+    fn bind_window_hover_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._subscriptions
+            .push(cx.observe_window_activation(window, |this, _, cx| {
+                this.clear_bar_hover(cx);
+            }));
+        self._subscriptions
+            .push(cx.on_focus_lost(window, |this, _, cx| {
+                this.clear_bar_hover(cx);
+            }));
+    }
+
     /// Build a view that does not fetch a session. Tests use this to render a
     /// prepared `PlannerState` without racing bootstrap.
     pub fn for_state(window: &mut Window, cx: &mut Context<Self>, state: PlannerState) -> Self {
@@ -569,6 +584,7 @@ impl PlannerView {
         );
         view.update_checked = true;
         view.skip_camera_anim = true;
+        view.bind_window_hover_reset(window, cx);
         view
     }
 
@@ -1361,12 +1377,14 @@ impl PlannerView {
 
     fn recompute_hover_at_last_pointer(&mut self, cx: &mut Context<Self>) {
         let Some((x, y)) = self.last_pointer_window else {
+            self.clear_bar_hover(cx);
             return;
         };
         if self.state.gantt.gesture.is_some() {
             return;
         }
         if !self.state.gantt.pointer_in_rows(x, y) {
+            self.clear_bar_hover(cx);
             return;
         }
         let visible = self.state.visible_nodes();
@@ -1387,8 +1405,19 @@ impl PlannerView {
             .iter()
             .find(|bar| local_y >= bar.y && local_y < bar.y + ROW_HEIGHT)
         else {
+            self.clear_bar_hover(cx);
             return;
         };
+        let painted = self.painted_bar_for(bar.id, bar);
+        let slop = LINK_HANDLE_HIT + LINK_HANDLE_GAP + 8.0;
+        let on_bar = x >= painted.left - slop
+            && x <= painted.right + slop
+            && y >= painted.top - 4.0
+            && y <= painted.bottom + 4.0;
+        if !on_bar {
+            self.clear_bar_hover(cx);
+            return;
+        }
         self.set_bar_hovered(Some(bar.id), cx);
         self.classify_bar_hover_zone(bar.id, bar, x, cx);
     }
@@ -4850,7 +4879,7 @@ impl PlannerView {
                     }))
                     .children(bars.iter().flat_map(|bar| {
                         // Sibling of the bar so overflow:hidden cannot clip
-                        // the 1px-outside / 6px-inside resize halo.
+                        // the 1px-outside / 8px-inside resize halo.
                         self.render_resize_halos(bar, dragging, cx)
                     }))
                     .children({
@@ -4861,7 +4890,12 @@ impl PlannerView {
                             let bar = bars.iter().find(|bar| bar.id == gesture.id)?;
                             let x1 = bar.x + bar.width + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
                             let bar_bottom = bar.y + bar.paint_top() + bar.paint_h();
-                            let y1 = (bar_bottom + 6.0).min(bar.y + ROW_HEIGHT - 3.0);
+                            // Lane under the painted bar, not a 2px hug of its
+                            // top. Keep it in the row gap so it does not jump
+                            // onto the next bar.
+                            let y1 = (bar_bottom + 8.0)
+                                .min(bar.y + ROW_HEIGHT - 4.0)
+                                .max(bar_bottom + 4.0);
                             let y2 = gesture.live_y;
                             // Never draw left of the handle: an inset press
                             // maps live_x inside the bar.
@@ -5970,19 +6004,28 @@ impl PlannerView {
             return Vec::new();
         };
         let halo_in = bar.resize_halo_inside();
-        let painted_w = bar.width.max(8.0);
+        let origin = self
+            .timeline_body_origin_x
+            .get()
+            .unwrap_or(self.state.gantt.timeline_origin_x);
+        let painted = self.painted_bar_for(id, bar);
+        // Anchor to the painted border box. Layout `bar.x + width` sat 1–2px
+        // left of debug_bounds, leaving a dead 4px band between the grip
+        // (content-right − 6) and a halo that started too far right.
+        let visual_left = painted.left - origin;
+        let visual_right = painted.right - origin;
         specs
             .into_iter()
             .map(|(handle_id, name, at_start)| {
                 let selector = format!("gantt-resize-halo-{id}-{name}");
                 let layout = layout.clone();
                 let (left, halo_w) = if at_start {
-                    (bar.x - RESIZE_HALO_OUTSIDE, RESIZE_HALO_OUTSIDE + halo_in)
-                } else {
                     (
-                        bar.x + painted_w - halo_in,
-                        halo_in + RESIZE_HALO_END_OUTSIDE,
+                        visual_left - RESIZE_HALO_OUTSIDE,
+                        RESIZE_HALO_OUTSIDE + halo_in,
                     )
+                } else {
+                    (visual_right - halo_in, halo_in + RESIZE_HALO_END_OUTSIDE)
                 };
                 div()
                     .id((handle_id, id as u64))
@@ -6165,7 +6208,7 @@ impl PlannerView {
         let hovered = self.state.gantt.bar_hovered_id == Some(id);
         let selected = self.state.gantt.selected_id == Some(id);
         let show_dot = hovered && !dragging;
-        let (local_left, painted_right) = self.painted_timeline_edges(bar);
+        let (_, painted_right) = self.painted_timeline_edges(bar);
         // Layout-right matches the bar's `.left(bar.x).w(bar.width)` parent.
         // Painted right includes the 1–2px border and shifted the 16px hit
         // left of the visual connector (x=614 linked, x=622 missed).
@@ -6182,7 +6225,10 @@ impl PlannerView {
         // Diamonds and start-only bars keep Move on that edge. The visual
         // dot stays outside; the overflow ! is painted past this hit box.
         let inset = bar.link_zone_width();
-        let start_x = local_left - LINK_HANDLE_HIT - 2.0;
+        // Same 6px gap as the end connector (`bar.right + GAP + HANDLE/2`).
+        // `local_left - HIT - 2` parked the inbound dot 8px off the bar.
+        let start_origin = bar.x - LINK_HANDLE_GAP - LINK_HANDLE / 2.0;
+        let start_x = start_origin - LINK_HANDLE_HIT / 2.0;
         // Wide bars keep the named `link-end` handle in the gap (wheel pan,
         // overflow-badge tests). The last pixels of a resizable bar are a
         // bar-child sliver so they win over the progress fill and body.
@@ -6210,7 +6256,7 @@ impl PlannerView {
                 start_x,
                 LINK_HANDLE_HIT,
                 start_top,
-                start_x + LINK_HANDLE_HIT / 2.0,
+                start_origin,
             ),
             ("link-end", end_x, end_hit_w, end_top, end_origin),
         ];
@@ -6781,7 +6827,7 @@ impl PlannerView {
             .map(|text| drag_date_pill_text_width(text))
             .unwrap_or(0.0);
         let (start_x, end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
-        let y = (bar.y + bar.paint_top() - 18.0).max(0.0);
+        let y = hover_date_pill_y(bar.y, bar.paint_top(), bar.paint_h());
         let date_pill = |text: String| {
             div()
                 .px_2()
@@ -9906,10 +9952,16 @@ impl PlannerView {
         if self.toast_expiry_armed || self.state.toasts.items.is_empty() {
             return;
         }
+        let delay = self
+            .state
+            .toasts
+            .next_expiry_in()
+            .unwrap_or(Duration::from_millis(250))
+            .clamp(Duration::from_millis(50), Duration::from_millis(250));
         self.toast_expiry_armed = true;
         let expiry_gen = self.toast_expiry_gen;
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
+            cx.background_executor().timer(delay).await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, cx| {
                     this.toast_expiry_armed = false;
@@ -9924,6 +9976,7 @@ impl PlannerView {
                         this.schedule_toast_expiry(cx);
                     }
                     cx.notify();
+                    cx.refresh_windows();
                 });
                 cx.refresh();
             }
@@ -10307,7 +10360,8 @@ fn drag_preview_row_extra(bar: &crate::gantt::BarLayout, overflow: bool) -> f32 
 }
 
 /// Place a same-row tooltip to the right of a bar, flipping left at the clip
-/// only when the left side actually fits. Clamping to x=0 would cover the bar.
+/// when that side fits. If neither side holds the chip, clamp so the right
+/// edge stays in the window instead of painting past the clip.
 fn row_side_tooltip_left(
     bar_x: f32,
     painted_w: f32,
@@ -10317,12 +10371,13 @@ fn row_side_tooltip_left(
 ) -> f32 {
     let right = bar_x + painted_w + extra;
     let left = bar_x - extra - tip_w;
+    let clamped = (timeline_w - tip_w - 4.0).max(0.0);
     if right + tip_w <= timeline_w - 4.0 {
         right
     } else if left >= 0.0 {
         left
     } else {
-        right
+        clamped
     }
 }
 
@@ -10338,7 +10393,7 @@ fn hover_bar_tooltip_origin(
     offset_above: bool,
 ) -> (f32, f32) {
     if offset_above {
-        let tip_x = bar_x.max(0.0);
+        let tip_x = bar_x.max(0.0).min((timeline_w - tip_w - 4.0).max(0.0));
         let tip_y = (bar_top - 24.0).max(0.0);
         (tip_x, tip_y)
     } else {
@@ -10346,6 +10401,17 @@ fn hover_bar_tooltip_origin(
             row_side_tooltip_left(bar_x, painted_w, extra, tip_w, timeline_w),
             bar_top,
         )
+    }
+}
+
+/// Park hover date pills above the bar; first-row has no room so they sit
+/// below instead of clamping onto the body and the outer link handle.
+fn hover_date_pill_y(bar_y: f32, paint_top: f32, paint_h: f32) -> f32 {
+    let above = bar_y + paint_top - 18.0;
+    if above >= 0.0 {
+        above
+    } else {
+        bar_y + paint_top + paint_h + 2.0
     }
 }
 
@@ -11477,8 +11543,17 @@ mod bar_label_tests {
         );
         let no_left_room = super::row_side_tooltip_left(40.0, 80.0, 8.0, 300.0, 200.0);
         assert!(
-            (no_left_room - 128.0).abs() < 0.1,
-            "when the left side cannot hold the chip, stay to the right rather than covering the bar, got {no_left_room}"
+            no_left_room + 300.0 <= 200.0 + 0.1 || no_left_room <= 0.0,
+            "when neither side holds the chip, clamp so it does not paint past the window, got {no_left_room}"
+        );
+        assert!(
+            no_left_room >= 0.0,
+            "a clamped tooltip must stay on-canvas, got {no_left_room}"
+        );
+        let clipped = super::row_side_tooltip_left(720.0, 60.0, 8.0, 200.0, 800.0);
+        assert!(
+            clipped + 200.0 <= 800.0 - 4.0 + 0.1,
+            "a wide chip at the right clip must flip or clamp inside the window, got {clipped}"
         );
     }
 
@@ -11495,6 +11570,67 @@ mod bar_label_tests {
             super::hover_bar_tooltip_origin(40.0, 80.0, 8.0, 120.0, 800.0, 80.0, false);
         assert!((side_x - 128.0).abs() < 0.1);
         assert_eq!(side_y, 80.0);
+        let (clamped_x, _) =
+            super::hover_bar_tooltip_origin(750.0, 16.0, 8.0, 180.0, 800.0, 120.0, true);
+        assert!(
+            clamped_x + 180.0 <= 800.0 - 4.0 + 0.1,
+            "a milestone tooltip at the right clip must stay in the window, got {clamped_x}"
+        );
+    }
+
+    #[test]
+    fn hover_date_pills_park_below_the_first_row() {
+        assert_eq!(
+            super::hover_date_pill_y(0.0, 6.0, 28.0),
+            36.0,
+            "first-row pills must sit below the bar, not clamp onto the body"
+        );
+        assert_eq!(
+            super::hover_date_pill_y(40.0, 6.0, 28.0),
+            28.0,
+            "later rows still park the pills above the bar"
+        );
+    }
+
+    #[test]
+    fn cart_end_hit_every_offset_from_minus_8_to_plus_2_is_live() {
+        let bar = BarLayout {
+            id: 1002,
+            kind: GanttBarKind::Scheduled,
+            x: 100.0,
+            width: 80.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "Cart".into(),
+            title: "Cart".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        let left = 100.0;
+        let right = 180.0;
+        let painted = PaintedBar {
+            left,
+            right,
+            top: 10.0,
+            bottom: 38.0,
+            layout_x: bar.x,
+            content_left: left,
+            content_right: right,
+            open_ended: false,
+        };
+        for offset in -8i32..=2 {
+            let zone =
+                PlannerView::hit_zone_including_painted_link(&bar, right + offset as f32, painted);
+            assert!(
+                matches!(zone, BarHitZone::ResizeEnd | BarHitZone::Link),
+                "Cart painted end {offset:+}px must be resize or link, never a dead no-op, got {zone:?}"
+            );
+        }
     }
 
     #[test]

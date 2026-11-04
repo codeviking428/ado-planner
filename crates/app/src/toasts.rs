@@ -280,6 +280,21 @@ impl Toasts {
         self.cap();
     }
 
+    /// Remaining time until the next toast should dismiss. `None` while
+    /// paused or empty so the UI timer can sleep.
+    pub fn next_expiry_in(&self) -> Option<Duration> {
+        if self.paused || self.items.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        self.items
+            .iter()
+            .map(|toast| {
+                Self::ttl(toast).saturating_sub(now.saturating_duration_since(toast.created_at))
+            })
+            .min()
+    }
+
     fn cap(&mut self) {
         if self.items.len() > TOAST_CAP {
             let extra = self.items.len() - TOAST_CAP;
@@ -550,6 +565,26 @@ mod tests {
         assert!(
             !toasts.paused,
             "an empty toast stack must not stay paused after the hovered toast is gone"
+        );
+    }
+
+    #[test]
+    fn next_expiry_in_tracks_remaining_ttl() {
+        let mut toasts = Toasts::default();
+        assert!(
+            toasts.next_expiry_in().is_none(),
+            "an empty stack has no timer"
+        );
+        toasts.push(ToastKind::Success, "Saved");
+        let remaining = toasts.next_expiry_in().expect("armed toast");
+        assert!(
+            remaining <= TOAST_TTL && remaining > TOAST_TTL - Duration::from_secs(1),
+            "a fresh success toast must expire in about {TOAST_TTL:?}, got {remaining:?}"
+        );
+        toasts.paused = true;
+        assert!(
+            toasts.next_expiry_in().is_none(),
+            "a hovered toast must not schedule idle expiry"
         );
     }
 }
