@@ -4,10 +4,10 @@ use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
-    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, PARALLEL_VERT_MIN,
-    ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
-    bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px, insert_index_for_child,
-    outside_label_is_beside_bar,
+    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN,
+    PARALLEL_VERT_MIN, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
+    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px,
+    insert_index_for_child, outside_label_is_beside_bar,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -169,6 +169,23 @@ fn painted_x_gap(
     let a1 = a0 + f32::from(a.size.width);
     let b0 = f32::from(b.origin.x);
     let b1 = b0 + f32::from(b.size.width);
+    if a1 <= b0 {
+        b0 - a1
+    } else if b1 <= a0 {
+        a0 - b1
+    } else {
+        0.0
+    }
+}
+
+fn painted_y_gap(
+    a: gpui_kit::Bounds<gpui_kit::Pixels>,
+    b: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> f32 {
+    let a0 = f32::from(a.origin.y);
+    let a1 = a0 + f32::from(a.size.height);
+    let b0 = f32::from(b.origin.y);
+    let b1 = b0 + f32::from(b.size.height);
     if a1 <= b0 {
         b0 - a1
     } else if b1 <= a0 {
@@ -1572,8 +1589,17 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
     let hit_w = f32::from(horiz.size.width);
     if hit_w > hit_h {
         assert!(
-            hit_h >= 14.0,
-            "launch camera: Persist cart → Go-live horizontal hit must be ≥14px tall, got {hit_h}"
+            (8.0..=PARALLEL_LANE_MIN + 0.5).contains(&hit_h),
+            "launch camera: Persist cart → Go-live horizontal hit must stay clickable without overlapping {PARALLEL_LANE_MIN}px lanes, got {hit_h}"
+        );
+    }
+    if let Some(spike_h) = cx.debug_bounds("gantt-dep-arrow-1003-1012")
+        && painted_x_gap(horiz, spike_h) < 1.0
+    {
+        assert!(
+            !painted_overlap(horiz, spike_h),
+            "launch camera: parallel horizontal hits must not overlap, live y-gap={}",
+            painted_y_gap(horiz, spike_h)
         );
     }
     assert!(

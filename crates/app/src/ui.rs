@@ -47,12 +47,13 @@ use crate::gantt::{
     DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
     LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH,
     NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
-    PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT,
-    SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH,
-    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_outside_label_frame, bar_title_is_inside,
-    bar_title_paint_px, dependency_link_tooltip, header_label_px, offscreen_edge_chip,
-    outside_title_right_gap, parent_date_overflow, parent_overflow_tip,
-    timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
+    PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W,
+    SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H,
+    TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
+    bar_outside_label_frame, bar_title_is_inside, bar_title_paint_px, dependency_link_tooltip,
+    header_label_px, offscreen_edge_chip, outside_title_right_gap, parent_date_overflow,
+    parent_overflow_tip, timeline_is_empty_of_scheduled, today_line_chip_skips,
+    today_line_segments, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -6057,16 +6058,22 @@ impl PlannerView {
         cx: &Context<Self>,
     ) -> AnyElement {
         const HIT: f32 = 14.0;
-        // Verticals use an 8px hit so 16px centres still leave ≥8px between
-        // boxes (a 14px hit on 16px centres was a 2px gap). Horizontals keep
-        // the 14px lane so a 2px stroke stays clickable.
-        let vertical = height >= width;
+        const VERTICAL_HIT: f32 = 8.0;
+        // Role, not aspect: a 2×2 degenerate stub must not pick up a 14px
+        // square. Verticals stay 8px wide so 16px centres keep ≥8px between
+        // boxes. Horizontals cap at PARALLEL_LANE_MIN — a 14px-tall hit on
+        // 10px centres overlapped by 4px and stole hover via occlude().
+        let vertical = matches!(role, "out" | "inv" | "drop");
         let hit_w = if vertical {
-            width.max(8.0)
+            width.max(VERTICAL_HIT)
         } else {
             width.max(HIT)
         };
-        let hit_h = height.max(HIT);
+        let hit_h = if vertical {
+            height.max(HIT)
+        } else {
+            height.clamp(VERTICAL_HIT, PARALLEL_LANE_MIN)
+        };
         let segment_id = if role == "h" {
             format!("gantt-dep-arrow-{from_id}-{to_id}")
         } else {
