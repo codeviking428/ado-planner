@@ -275,6 +275,16 @@ fn grab_bar_from_right(
     )
 }
 
+fn grab_bar_from_left(
+    bar: gpui_kit::Bounds<gpui_kit::Pixels>,
+    inset: f32,
+) -> gpui_kit::Point<gpui_kit::Pixels> {
+    point(
+        bar.origin.x + px(inset),
+        bar.origin.y + bar.size.height / 2.0,
+    )
+}
+
 /// Shifted end-resize grip, just left of the 6px link sliver.
 fn grab_end_resize(bar: gpui_kit::Bounds<gpui_kit::Pixels>) -> gpui_kit::Point<gpui_kit::Pixels> {
     point(
@@ -7572,6 +7582,10 @@ fn day_offscreen_milestone_cue_includes_the_title(cx: &mut gpui_kit::TestAppCont
         cx.debug_bounds("gantt-bar-edge-tooltip").is_some(),
         "hovering an off-range edge chip must show a dates tooltip"
     );
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_none(),
+        "off-range Go-live must not also paint a phantom tooltip at the off-screen diamond"
+    );
 }
 
 #[gpui_kit::test]
@@ -9638,16 +9652,57 @@ fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
     }
 }
 
+fn assert_milestone_tooltip_on_chart(
+    cx: &mut VisualTestContext,
+    scale: &str,
+    diamond: gpui_kit::Bounds<gpui_kit::Pixels>,
+    tip: gpui_kit::Bounds<gpui_kit::Pixels>,
+) {
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    let tip_left = f32::from(tip.origin.x);
+    let tip_right = tip_left + f32::from(tip.size.width);
+    let diamond_left = f32::from(diamond.origin.x);
+    let diamond_right = diamond_left + f32::from(diamond.size.width);
+    let chart_left = f32::from(timeline.origin.x);
+    let chart_right = chart_left + f32::from(timeline.size.width);
+    assert!(
+        tip_left >= chart_left - 1.0,
+        "{scale}: tooltip must not clip at the chart's left edge, tip={tip_left} chart={chart_left}"
+    );
+    assert!(
+        tip_right <= chart_right + 1.0,
+        "{scale}: tooltip must stay inside the chart, tip_right={tip_right} chart_right={chart_right}"
+    );
+    let sits_right = tip_left >= diamond_right - 1.0;
+    let sits_left = tip_right <= diamond_left + 1.0;
+    assert!(
+        sits_right || sits_left,
+        "{scale}: tooltip must sit beside the diamond, tip={tip_left}..{tip_right} diamond={diamond_left}..{diamond_right}"
+    );
+    if sits_right {
+        assert!(
+            tip_left - diamond_right <= 12.0,
+            "{scale}: right-side chip must kiss the diamond, gap={} tip={tip_left} diamond={diamond_right}",
+            tip_left - diamond_right
+        );
+    } else {
+        assert!(
+            diamond_left - tip_right <= 12.0,
+            "{scale}: left-flip chip must kiss the diamond, gap={} tip_right={tip_right} diamond={diamond_left}",
+            diamond_left - tip_right
+        );
+    }
+}
+
 #[gpui_kit::test]
 fn week_and_day_milestone_tooltip_flips_flush_to_the_diamond(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
     state.nodes = mock_fixture_nodes();
-    // Park Go-live mid-timeline so a left flip has room, then near the
-    // left clip so it must flip right. Unit tests cover the math; this
-    // checks the painted chip in Week and Day.
-    state.gantt.origin = Date::new(2026, 8, 1).unwrap();
+    // Park Go-live a few days into the Week window so the right side
+    // has room. Prefer that over a left flip that clips at the chart edge.
+    state.gantt.origin = Date::new(2026, 8, 8).unwrap();
     state.gantt.scale = GanttScale::Week;
     state.gantt.zoom = 1.0;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
@@ -9667,18 +9722,12 @@ fn week_and_day_milestone_tooltip_flips_flush_to_the_diamond(cx: &mut gpui_kit::
         .expect("Week Go-live tooltip");
     let diamond = cx.debug_bounds("gantt-bar-1013").expect("Week diamond");
     let tip_left = f32::from(tip.origin.x);
-    let tip_right = tip_left + f32::from(tip.size.width);
-    let diamond_left = f32::from(diamond.origin.x);
-    let diamond_right = diamond_left + f32::from(diamond.size.width);
+    let diamond_right = f32::from(diamond.origin.x) + f32::from(diamond.size.width);
     assert!(
-        tip_right <= diamond_left + 1.0,
-        "Week: tooltip must sit left of the diamond, tip={tip_left}..{tip_right} diamond={diamond_left}..{diamond_right}"
+        tip_left >= diamond_right - 1.0,
+        "Week: room on the right must keep the tooltip right of the diamond, tip={tip_left} diamond_right={diamond_right}"
     );
-    assert!(
-        diamond_left - tip_right <= 12.0,
-        "Week: left-flip right edge must kiss the diamond, gap={} tip={tip_left}..{tip_right} diamond={diamond_left}",
-        diamond_left - tip_right
-    );
+    assert_milestone_tooltip_on_chart(cx, "Week", diamond, tip);
     view.update(cx, |view, cx| {
         view.state.gantt.scale = GanttScale::Day;
         view.state.gantt.origin = Date::new(2026, 8, 14).unwrap();
@@ -9697,18 +9746,12 @@ fn week_and_day_milestone_tooltip_flips_flush_to_the_diamond(cx: &mut gpui_kit::
         .expect("Day Go-live tooltip");
     let diamond = cx.debug_bounds("gantt-bar-1013").expect("Day diamond");
     let tip_left = f32::from(tip.origin.x);
-    let tip_right = tip_left + f32::from(tip.size.width);
-    let diamond_left = f32::from(diamond.origin.x);
-    let diamond_right = diamond_left + f32::from(diamond.size.width);
+    let diamond_right = f32::from(diamond.origin.x) + f32::from(diamond.size.width);
     assert!(
         tip_left >= diamond_right - 1.0,
-        "Day: tooltip must sit right of the diamond when the left side cannot fit, tip={tip_left}..{tip_right} diamond={diamond_left}..{diamond_right}"
+        "Day: prefer the right of the diamond, tip={tip_left} diamond_right={diamond_right}"
     );
-    assert!(
-        tip_left - diamond_right <= 12.0,
-        "Day: right-flip left edge must kiss the diamond, gap={} tip={tip_left} diamond={diamond_right}",
-        tip_left - diamond_right
-    );
+    assert_milestone_tooltip_on_chart(cx, "Day", diamond, tip);
 }
 
 #[gpui_kit::test]
@@ -13332,6 +13375,7 @@ fn end_edge_hit_every_offset_from_minus_6_to_plus_4(cx: &mut gpui_kit::TestAppCo
     });
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let width_before = f32::from(bar.size.width);
     for offset in -6i32..=4 {
         let at = point(
             bar.origin.x + bar.size.width + px(offset as f32),
@@ -13354,6 +13398,18 @@ fn end_edge_hit_every_offset_from_minus_6_to_plus_4(cx: &mut gpui_kit::TestAppCo
             }
         });
     }
+    for offset in 0i32..=8 {
+        let at = grab_bar_from_left(bar, offset as f32);
+        cx.simulate_mouse_move(at, None, Modifiers::default());
+        view.update(cx, |view, _| {
+            let zone = view.hover_bar_zone_for_test().map(|(_, zone)| zone);
+            assert_eq!(
+                zone,
+                Some(BarHitZone::ResizeStart),
+                "{offset}px inside the painted start must be ResizeStart, got {zone:?}"
+            );
+        });
+    }
     let inside_4 = grab_bar_from_right(bar, 4.0);
     cx.simulate_mouse_move(inside_4, None, Modifiers::default());
     cx.simulate_mouse_down(inside_4, MouseButton::Left, Modifiers::default());
@@ -13369,6 +13425,157 @@ fn end_edge_hit_every_offset_from_minus_6_to_plus_4(cx: &mut gpui_kit::TestAppCo
             "a press 4px inside the painted end must resize, not be a dead no-op"
         );
     });
+    cx.simulate_mouse_up(inside_4, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let inside_start = grab_bar_from_left(bar, 4.0);
+    cx.simulate_mouse_move(inside_start, None, Modifiers::default());
+    cx.simulate_mouse_down(inside_start, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::ResizeStart),
+            "a press 4px inside the painted start must resize, not be a dead no-op"
+        );
+    });
+    cx.simulate_mouse_up(inside_start, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "a no-op release must drop the live resize preview"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_none(),
+        "a no-op release must clear the date preview chip"
+    );
+    let after = cx
+        .debug_bounds("gantt-bar-2")
+        .expect("leaf bar after no-op");
+    assert!(
+        (f32::from(after.size.width) - width_before).abs() < 1.0,
+        "a no-op 4px-inside press must not leave the bar drawn narrower, before={width_before} after={}",
+        f32::from(after.size.width)
+    );
+}
+
+#[gpui_kit::test]
+fn cart_both_edges_resize_and_noop_release_clears_preview(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1002").expect("Cart");
+    let width_before = f32::from(bar.size.width);
+    assert!(
+        width_before > 24.0,
+        "precondition: Cart must be wide enough to resize, width={width_before}"
+    );
+    let mid_y = bar.origin.y + bar.size.height / 2.0;
+    let dates_before = view.update(cx, |view, _| {
+        view.state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1002)
+            .map(|node| (node.start_date.clone(), node.target_date.clone()))
+    });
+    let start_4 = grab_bar_from_left(bar, 4.0);
+    cx.simulate_mouse_move(start_4, None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::ResizeStart),
+            "4px inside Cart's left edge must be ResizeStart"
+        );
+    });
+    cx.simulate_mouse_down(start_4, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::ResizeStart),
+            "a press 4px inside Cart's left edge must start ResizeStart"
+        );
+    });
+    cx.simulate_mouse_up(start_4, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1002").expect("Cart after start");
+    let bar_mid = point(bar.origin.x + bar.size.width / 2.0, mid_y);
+    cx.simulate_mouse_move(bar_mid, None, Modifiers::default());
+    draw(cx);
+    let end_6 = grab_bar_from_right(bar, 6.0);
+    cx.simulate_mouse_move(end_6, None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::ResizeEnd),
+            "6px inside Cart's right edge must be ResizeEnd, not a dead no-op"
+        );
+    });
+    cx.simulate_mouse_down(end_6, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::ResizeEnd),
+            "a press 6px inside Cart's right edge must start ResizeEnd"
+        );
+    });
+    cx.simulate_mouse_up(end_6, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "a no-op Cart resize release must drop the live preview"
+        );
+        let dates = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1002)
+            .map(|node| (node.start_date.clone(), node.target_date.clone()));
+        assert_eq!(
+            dates, dates_before,
+            "a no-op Cart resize must leave Start/Target unchanged"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_none(),
+        "a no-op Cart resize must clear the date preview chip"
+    );
+    let after = cx.debug_bounds("gantt-bar-1002").expect("Cart after no-op");
+    assert!(
+        (f32::from(after.size.width) - width_before).abs() < 1.0,
+        "a no-op Cart press must not leave the bar drawn narrower, before={width_before} after={}",
+        f32::from(after.size.width)
+    );
 }
 
 #[gpui_kit::test]
@@ -13567,6 +13774,35 @@ fn cart_end_edge_hit_every_offset_from_minus_8_to_plus_2(cx: &mut gpui_kit::Test
             assert!(
                 matches!(kind, Some(GestureKind::ResizeEnd | GestureKind::Link)),
                 "a press {offset:+}px from the Cart end must resize or link, never nothing, got {kind:?}"
+            );
+            view.state.cancel_gesture();
+        });
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::default());
+        draw(cx);
+    }
+    for offset in 0i32..=8 {
+        let at = grab_bar_from_left(bar, offset as f32);
+        cx.simulate_mouse_move(at, None, Modifiers::default());
+        view.update(cx, |view, _| {
+            let zone = view.hover_bar_zone_for_test().map(|(_, zone)| zone);
+            assert_eq!(
+                zone,
+                Some(BarHitZone::ResizeStart),
+                "Cart painted start {offset}px inside must be ResizeStart, got {zone:?}"
+            );
+        });
+        cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.state
+                    .gantt
+                    .gesture
+                    .as_ref()
+                    .map(|gesture| gesture.kind),
+                Some(GestureKind::ResizeStart),
+                "a press {offset}px inside Cart's start must resize, got {:?}",
+                view.state.gantt.gesture.as_ref().map(|g| g.kind)
             );
             view.state.cancel_gesture();
         });
