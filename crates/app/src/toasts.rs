@@ -4,7 +4,8 @@ use serde_json::Value;
 
 const TOAST_CAP: usize = 2;
 const TOAST_TTL: Duration = Duration::from_secs(6);
-const UNDO_TOAST_TTL: Duration = Duration::from_secs(8);
+/// Undo/Redo toasts share the same timeout as Saved / error toasts.
+const UNDO_TOAST_TTL: Duration = TOAST_TTL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -391,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_toasts_expire_after_eight_seconds() {
+    fn undo_toasts_expire_at_the_same_ttl_as_other_toasts() {
         let mut toasts = Toasts::default();
         toasts.push_undo(
             "Cleared dates",

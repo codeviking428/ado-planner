@@ -7566,6 +7566,12 @@ fn day_offscreen_milestone_cue_includes_the_title(cx: &mut gpui_kit::TestAppCont
         "Day off-screen Go-live cue must include the diamond and title, not a bare ›, width={}",
         f32::from(cue.size.width)
     );
+    cx.simulate_mouse_move(cue.center(), None, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-edge-tooltip").is_some(),
+        "hovering an off-range edge chip must show a dates tooltip"
+    );
 }
 
 #[gpui_kit::test]
@@ -9630,6 +9636,79 @@ fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
             "Go-live tooltip must sit beside the diamond, not on it, tip={tip_left}..{tip_right} diamond_left={diamond_left}"
         );
     }
+}
+
+#[gpui_kit::test]
+fn week_and_day_milestone_tooltip_flips_flush_to_the_diamond(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    // Park Go-live mid-timeline so a left flip has room, then near the
+    // left clip so it must flip right. Unit tests cover the math; this
+    // checks the painted chip in Week and Day.
+    state.gantt.origin = Date::new(2026, 8, 1).unwrap();
+    state.gantt.scale = GanttScale::Week;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let diamond = cx
+        .debug_bounds("gantt-bar-1013")
+        .or_else(|| cx.debug_bounds("gantt-bar-label-1013"))
+        .expect("Week Go-live");
+    cx.simulate_mouse_move(diamond.center(), None, Modifiers::default());
+    draw(cx);
+    let tip = cx
+        .debug_bounds("gantt-hover-tooltip")
+        .expect("Week Go-live tooltip");
+    let diamond = cx.debug_bounds("gantt-bar-1013").expect("Week diamond");
+    let tip_left = f32::from(tip.origin.x);
+    let tip_right = tip_left + f32::from(tip.size.width);
+    let diamond_left = f32::from(diamond.origin.x);
+    let diamond_right = diamond_left + f32::from(diamond.size.width);
+    assert!(
+        tip_right <= diamond_left + 1.0,
+        "Week: tooltip must sit left of the diamond, tip={tip_left}..{tip_right} diamond={diamond_left}..{diamond_right}"
+    );
+    assert!(
+        diamond_left - tip_right <= 12.0,
+        "Week: left-flip right edge must kiss the diamond, gap={} tip={tip_left}..{tip_right} diamond={diamond_left}",
+        diamond_left - tip_right
+    );
+    view.update(cx, |view, cx| {
+        view.state.gantt.scale = GanttScale::Day;
+        view.state.gantt.origin = Date::new(2026, 8, 14).unwrap();
+        view.state.gantt.scroll_x = 0.0;
+        cx.notify();
+    });
+    draw(cx);
+    let diamond = cx
+        .debug_bounds("gantt-bar-1013")
+        .or_else(|| cx.debug_bounds("gantt-bar-label-1013"))
+        .expect("Day Go-live near the left clip");
+    cx.simulate_mouse_move(diamond.center(), None, Modifiers::default());
+    draw(cx);
+    let tip = cx
+        .debug_bounds("gantt-hover-tooltip")
+        .expect("Day Go-live tooltip");
+    let diamond = cx.debug_bounds("gantt-bar-1013").expect("Day diamond");
+    let tip_left = f32::from(tip.origin.x);
+    let tip_right = tip_left + f32::from(tip.size.width);
+    let diamond_left = f32::from(diamond.origin.x);
+    let diamond_right = diamond_left + f32::from(diamond.size.width);
+    assert!(
+        tip_left >= diamond_right - 1.0,
+        "Day: tooltip must sit right of the diamond when the left side cannot fit, tip={tip_left}..{tip_right} diamond={diamond_left}..{diamond_right}"
+    );
+    assert!(
+        tip_left - diamond_right <= 12.0,
+        "Day: right-flip left edge must kiss the diamond, gap={} tip={tip_left} diamond={diamond_right}",
+        tip_left - diamond_right
+    );
 }
 
 #[gpui_kit::test]
@@ -13728,6 +13807,25 @@ fn first_row_date_pills_do_not_cover_the_bar(cx: &mut gpui_kit::TestAppContext) 
     let start_right = start_left + f32::from(start.size.width);
     let start_top = f32::from(start.origin.y);
     let start_bottom = start_top + f32::from(start.size.height);
+    let bar_top = f32::from(bar.origin.y);
+    assert!(
+        start_bottom <= bar_top + 1.0,
+        "hover pills must sit above the bar, not on Checkout rewrite, pill={start_top}..{start_bottom} bar_top={bar_top}"
+    );
+    if let Some(label) = cx.debug_bounds("gantt-bar-label-1001") {
+        let label_top = f32::from(label.origin.y);
+        let label_bottom = label_top + f32::from(label.size.height);
+        let label_left = f32::from(label.origin.x);
+        let label_right = label_left + f32::from(label.size.width);
+        let overlaps_label = start_top < label_bottom - 1.0
+            && start_bottom > label_top + 1.0
+            && start_left < label_right - 1.0
+            && start_right > label_left + 1.0;
+        assert!(
+            !overlaps_label,
+            "hover pills must not cover Checkout rewrite, pill y={start_top}..{start_bottom} label={label_top}..{label_bottom}"
+        );
+    }
     assert!(
         (start_left - bar_left).abs() < 8.0,
         "first-row start pill must pin to the bar's left edge, pill={start_left} bar_left={bar_left}"

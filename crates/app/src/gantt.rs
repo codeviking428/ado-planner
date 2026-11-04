@@ -1328,28 +1328,45 @@ impl GanttView {
     }
 
     /// Toolbar Day/Week/Month/… click. After Today, re-align so a Year park
-    /// is not amplified into a clipped Month column. Otherwise hold the
-    /// left-edge date (Month→Year→Month). Pull an on-screen Today back in
-    /// on Day/Week/Month steps (Month→Week, Week→Day) and when the camera
-    /// origin is still Today (pointer-zoom then Month).
+    /// is not amplified into a clipped Month column. Day/Week/Month keep the
+    /// viewport centre (or `keep`) so the visible range does not jump.
+    /// Year/Quarter still hold the left-edge date (Month→Year→Month).
     pub fn set_scale_from_toolbar(&mut self, scale: GanttScale, today: Date) {
+        self.set_scale_from_toolbar_keeping(scale, today, None);
+    }
+
+    /// Like [`set_scale_from_toolbar`], but pin `keep` (the selection) when
+    /// stepping Day/Week/Month.
+    pub fn set_scale_from_toolbar_keeping(
+        &mut self,
+        scale: GanttScale,
+        today: Date,
+        keep: Option<Date>,
+    ) {
         if self.keep_today {
             self.set_scale_at(scale, 0.0);
             self.go_today(today);
             return;
         }
+        let from = self.scale;
+        let day_week_month =
+            |s: GanttScale| matches!(s, GanttScale::Day | GanttScale::Week | GanttScale::Month);
+        if day_week_month(from) && day_week_month(scale) {
+            if let Some(keep) = keep {
+                self.set_scale_keeping(scale, keep);
+            } else {
+                self.set_scale(scale);
+            }
+            return;
+        }
         let width = self.timeline_width.max(1.0);
         let today_visible = (0.0..=width).contains(&self.x_for_date(today));
-        let from = self.scale;
         self.set_scale_at(scale, 0.0);
         if !today_visible || from == scale {
             return;
         }
-        let day_week_month =
-            |s: GanttScale| matches!(s, GanttScale::Day | GanttScale::Week | GanttScale::Month);
-        let fine_step = day_week_month(from) && day_week_month(scale);
         let today_is_origin = self.origin == today;
-        if fine_step || (today_is_origin && day_week_month(scale)) {
+        if today_is_origin && day_week_month(scale) {
             self.nudge_today_off_clip(today);
         }
     }
@@ -13493,7 +13510,7 @@ mod tests {
     }
 
     #[test]
-    fn month_to_week_keeps_today_and_november_on_screen() {
+    fn toolbar_day_week_month_keeps_the_centre_date() {
         let today = Date::new(2026, 11, 3).unwrap();
         let mut gantt = GanttView {
             origin: Date::new(2026, 9, 1).unwrap(),
@@ -13502,36 +13519,37 @@ mod tests {
             timeline_width: 800.0,
             ..Default::default()
         };
-        let today_x = gantt.x_for_date(today);
-        assert!(
-            today_x > gantt.timeline_width * 0.7,
-            "precondition: Today must sit near the Month right edge, x={today_x}"
-        );
+        let centre = gantt.viewport_center_date();
         gantt.retarget_year_gutter(|gantt| {
             gantt.set_scale_from_toolbar(GanttScale::Week, today);
         });
-        let week_x = gantt.x_for_date(today);
-        assert!(
-            week_x >= TODAY_MARGIN_PX - 1.0
-                && week_x <= gantt.timeline_width - TODAY_MARGIN_PX + 1.0,
-            "Month→Week must keep Today off the clip, x={week_x}"
+        assert_eq!(
+            gantt.viewport_center_date(),
+            centre,
+            "Month→Week must keep the centred date, not jump the visible range"
         );
-        let nov1 = Date::new(2026, 11, 1).unwrap();
-        let nov_x = gantt.x_for_date(nov1);
-        assert!(
-            nov_x >= 0.0 && nov_x <= gantt.timeline_width,
-            "Month→Week must keep Nov on-screen, x={nov_x}"
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar(GanttScale::Day, today);
+        });
+        assert_eq!(
+            gantt.viewport_center_date(),
+            centre,
+            "Week→Day must keep the centred date"
         );
-        let labels = gantt.header_tick_labels(gantt.timeline_width);
-        assert!(
-            labels.iter().any(|(_, label)| label.contains("Nov")),
-            "Week header must still name Nov, got {labels:?}"
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar(GanttScale::Month, today);
+        });
+        assert_eq!(
+            gantt.viewport_center_date(),
+            centre,
+            "Day→Month must restore the centred date"
         );
     }
 
     #[test]
-    fn week_to_day_keeps_today_as_the_anchor() {
+    fn toolbar_day_week_keeps_the_selected_date() {
         let today = Date::new(2026, 11, 3).unwrap();
+        let keep = Date::new(2026, 10, 12).unwrap();
         let mut gantt = GanttView {
             origin: Date::new(2026, 9, 1).unwrap(),
             scale: GanttScale::Month,
@@ -13539,22 +13557,26 @@ mod tests {
             timeline_width: 800.0,
             ..Default::default()
         };
-        gantt.retarget_year_gutter(|gantt| {
-            gantt.set_scale_from_toolbar(GanttScale::Week, today);
-        });
-        gantt.retarget_year_gutter(|gantt| {
-            gantt.set_scale_from_toolbar(GanttScale::Day, today);
-        });
-        assert_eq!(gantt.scale, GanttScale::Day);
-        let day_x = gantt.x_for_date(today);
+        let before = gantt.x_for_date(keep);
         assert!(
-            day_x >= 0.0 && day_x <= gantt.timeline_width,
-            "Week→Day must keep Today on-screen, x={day_x}"
+            (0.0..=gantt.timeline_width).contains(&before),
+            "precondition: selection must start on-screen, x={before}"
         );
-        let left = gantt.date_for_x(0.0);
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar_keeping(GanttScale::Week, today, Some(keep));
+        });
+        let after = gantt.x_for_date(keep);
         assert!(
-            left >= Date::new(2026, 10, 15).unwrap(),
-            "Week→Day must not jump to early October, left={left}"
+            (after - before).abs() < 1.0,
+            "Month→Week must pin the selection, {before} vs {after}"
+        );
+        gantt.retarget_year_gutter(|gantt| {
+            gantt.set_scale_from_toolbar_keeping(GanttScale::Day, today, Some(keep));
+        });
+        let day_x = gantt.x_for_date(keep);
+        assert!(
+            (day_x - before).abs() < 1.0,
+            "Week→Day must pin the selection, {before} vs {day_x}"
         );
     }
 
