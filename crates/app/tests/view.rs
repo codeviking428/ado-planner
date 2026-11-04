@@ -171,7 +171,7 @@ fn grab_bar_link_sliver(
     )
 }
 
-/// Shifted end-resize grip, just left of the 8px link sliver.
+/// Shifted end-resize grip, just left of the 6px link sliver.
 fn grab_end_resize(bar: gpui_kit::Bounds<gpui_kit::Pixels>) -> gpui_kit::Point<gpui_kit::Pixels> {
     point(
         bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
@@ -4242,13 +4242,18 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
     let sliver_left = f32::from(sliver.origin.x);
     let sliver_w = f32::from(sliver.size.width);
     assert!(
-        sliver_w >= 5.0 && sliver_left <= bar_right - 5.0,
+        sliver_w >= 5.5 && sliver_left <= bar_right - 5.5,
         "inset sliver must cover the last ~6px, sliver={sliver_left}+{sliver_w} bar_right={bar_right}"
     );
     let resize = cx
         .debug_bounds("gantt-resize-handle-1003-end")
         .expect("short Persist cart must keep an end resize grip");
-    let resize_right = f32::from(resize.origin.x) + f32::from(resize.size.width);
+    let resize_w = f32::from(resize.size.width);
+    let resize_right = f32::from(resize.origin.x) + resize_w;
+    assert!(
+        (6.0..=8.5).contains(&resize_w),
+        "end resize must be a 6–8px unique zone, width={resize_w}"
+    );
     assert!(
         resize_right <= sliver_left + 0.5,
         "end resize must sit just left of the link sliver, resize_right={resize_right} sliver_left={sliver_left}"
@@ -4363,6 +4368,41 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
                 .map(|gesture| gesture.kind),
             Some(GestureKind::Move),
             "the Persist cart body inside the edge zones must still move"
+        );
+    });
+    cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
+    view.update(cx, |view, _| {
+        view.state.cancel_gesture();
+    });
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart for hover cursors");
+    cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
+    cx.simulate_mouse_move(grab_end_resize(bar), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::ResizeEnd),
+            "hovering the end grip must classify resize before a press"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("ew-resize"),
+            "the ew-resize cursor must show on hover, before the press"
+        );
+    });
+    cx.simulate_mouse_move(grab_bar_link_sliver(bar), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::Link),
+            "hovering the last pixels must classify link before a press"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("drag-link"),
+            "the link cursor must show on hover, before the press"
         );
     });
 }
@@ -6402,7 +6442,7 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
     assert!(
         handle_right <= bar_right - LINK_HANDLE_INSET + 0.5
             && handle_right + 4.0 >= bar_right - LINK_HANDLE_INSET,
-        "end resize grip must sit just left of the 8px link sliver, handle right {handle_right} vs bar right {bar_right}"
+        "end resize grip must sit just left of the 6px link sliver, handle right {handle_right} vs bar right {bar_right}"
     );
     let grip = cx
         .debug_bounds("gantt-resize-grip-2-end")
@@ -7447,6 +7487,103 @@ fn drop_undo_and_pointer_leave_clear_the_bar_tooltip(cx: &mut gpui_kit::TestAppC
         cx.debug_bounds("gantt-bar-tooltip").is_none(),
         "a stale tooltip must not stay painted over empty space"
     );
+}
+
+#[gpui_kit::test]
+fn ctrl_z_clears_the_hover_chip_so_the_next_press_moves(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let grip = grab_end_resize(bar);
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(grip.x + px(ppd * 3.0), grip.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    cx.simulate_mouse_up(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        view.state.gantt.pin_bar_tooltip = Some(2);
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-tooltip").is_some(),
+        "precondition: dates chip is up after the drop"
+    );
+    let undo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&undo, cx);
+        assert_eq!(view.state.gantt.pin_bar_tooltip, None);
+        assert!(
+            view.suppress_bar_tooltip_for_test(),
+            "undo must suppress the hover chip until the pointer moves"
+        );
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-tooltip").is_none(),
+        "the dates chip must unmount on undo so it cannot swallow the next press"
+    );
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar after undo");
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_some(),
+            "the first press after Ctrl+Z must start a bar gesture, not be swallowed"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn dates_chip_press_starts_a_bar_move(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        view.state.gantt.pin_bar_tooltip = Some(2);
+    });
+    draw(cx);
+    let tip = cx
+        .debug_bounds("gantt-bar-tooltip")
+        .expect("pinned dates chip");
+    cx.simulate_mouse_down(tip.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Move),
+            "a press on the dates chip must move the bar, not disappear as a no-op"
+        );
+        assert_eq!(view.state.gantt.pin_bar_tooltip, None);
+    });
 }
 
 #[gpui_kit::test]
@@ -10827,6 +10964,68 @@ fn start_only_bar_paints_a_right_edge_continuation_cue(cx: &mut gpui_kit::TestAp
         (cue_right - clip_right).abs() < 8.0,
         "the continuation cue must reach the viewport edge, cue_right={cue_right} clip={clip_right}"
     );
+}
+
+#[gpui_kit::test]
+fn open_ended_cart_ui_shows_a_hover_chip_near_its_right_edge(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1005").expect("Cart UI bar");
+    let cue = cx
+        .debug_bounds("gantt-open-ended-cue-1005")
+        .expect("Cart UI open-ended tail");
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+    let cue_left = f32::from(cue.origin.x);
+    assert!(
+        (cue_left - bar_right).abs() < 8.0,
+        "the continuation cue must start at Cart UI's painted right, cue={cue_left} bar_right={bar_right}"
+    );
+    view.update(cx, |view, _| {
+        view.state.gantt.pin_bar_tooltip = Some(1005);
+    });
+    draw(cx);
+    let tip = cx
+        .debug_bounds("gantt-bar-tooltip")
+        .expect("open-ended Cart UI must show a dates chip");
+    let tip_left = f32::from(tip.origin.x);
+    let tip_right = tip_left + f32::from(tip.size.width);
+    let tip_top = f32::from(tip.origin.y);
+    let tip_bottom = tip_top + f32::from(tip.size.height);
+    let bar_top = f32::from(bar.origin.y);
+    let bar_bottom = bar_top + f32::from(bar.size.height);
+    assert!(
+        tip_top < bar_bottom + 4.0 && tip_bottom > bar_top - 4.0,
+        "Cart UI dates chip must sit in the bar's row, tip={tip_top}..{tip_bottom} bar={bar_top}..{bar_bottom}"
+    );
+    let near_core = tip_left + 1.0 >= bar_right - 4.0 && tip_left <= bar_right + 48.0;
+    let flipped_left = tip_right <= f32::from(bar.origin.x) + 4.0;
+    assert!(
+        near_core || flipped_left,
+        "Cart UI dates chip must sit near the solid bar's right edge, tip={tip_left}..{tip_right} bar_right={bar_right}"
+    );
+    let hover = point(
+        px(cue_left + f32::from(cue.size.width).min(80.0) * 0.5),
+        cue.origin.y + cue.size.height / 2.0,
+    );
+    cx.simulate_mouse_move(hover, None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.bar_hovered_id,
+            Some(1005),
+            "hovering Cart UI's open-ended tail must keep the bar hovered so the dates chip can show"
+        );
+    });
 }
 
 #[gpui_kit::test]

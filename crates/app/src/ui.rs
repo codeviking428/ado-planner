@@ -45,11 +45,11 @@ use crate::form::ado_edit_url_on;
 use crate::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH,
     DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
-    LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH,
-    NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
-    PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W,
-    SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H,
-    TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
+    LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE,
+    MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE,
+    OVERFLOW_BADGE_GAP, PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH,
+    SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView,
+    TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
     bar_outside_label_frame, bar_title_is_inside, bar_title_paint_px, header_label_px,
     offscreen_edge_chip, outside_title_right_gap, parent_date_overflow, parent_overflow_tip,
     timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
@@ -207,6 +207,11 @@ pub struct PlannerView {
     pinned_tooltip_bounds: Rc<RefCell<Option<PaintedTooltip>>>,
     /// Last bar mouse-down classification (window x vs painted bounds).
     last_bar_hit: Option<BarHitDebug>,
+    /// Hover hit-zone used to show ew-resize / link cursors before press.
+    hover_bar_zone: Option<(i64, BarHitZone)>,
+    /// After undo/redo, skip the dates chip and GPUI tooltip until the
+    /// pointer moves so a resting cursor cannot swallow the next press.
+    suppress_bar_tooltip: bool,
     /// Start date of the last committed date gesture. Persist without a
     /// mock may revert the node; tests still see that the flick committed.
     last_committed_start_for_test: Option<jiff::civil::Date>,
@@ -225,6 +230,7 @@ struct PaintedBar {
     /// so selecting a bar does not shift the live gesture mapping.
     content_left: f32,
     content_right: f32,
+    open_ended: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -476,6 +482,8 @@ impl PlannerView {
             painted_bar_bounds: Rc::new(RefCell::new(HashMap::new())),
             pinned_tooltip_bounds: Rc::new(RefCell::new(None)),
             last_bar_hit: None,
+            hover_bar_zone: None,
+            suppress_bar_tooltip: false,
             last_committed_start_for_test: None,
             last_committed_target_for_test: None,
             _subscriptions: vec![keystrokes],
@@ -1231,6 +1239,59 @@ impl PlannerView {
         self.state.gantt.selected_link = None;
     }
 
+    /// Undo/redo remounts bars under a still pointer. Drop the dates chip
+    /// and the hover tooltip so the next press reaches the bar, not the chip.
+    fn clear_hover_after_history(&mut self, cx: &mut Context<Self>) {
+        self.state.gantt.clear_hover();
+        self.state.gantt.hover_locked = false;
+        self.pinned_tooltip_bounds.borrow_mut().take();
+        self.hover_bar_zone = None;
+        self.suppress_bar_tooltip = true;
+        cx.notify();
+    }
+
+    fn hover_cursor_style(&self) -> Option<CursorStyle> {
+        if self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link)
+        {
+            return Some(CursorStyle::DragLink);
+        }
+        match self.hover_bar_zone.map(|(_, zone)| zone) {
+            Some(BarHitZone::ResizeStart | BarHitZone::ResizeEnd) => {
+                Some(CursorStyle::ResizeLeftRight)
+            }
+            Some(BarHitZone::Link) => Some(CursorStyle::DragLink),
+            _ => None,
+        }
+    }
+
+    fn note_bar_hover_zone(&mut self, id: i64, zone: BarHitZone, cx: &mut Context<Self>) {
+        if self.hover_bar_zone != Some((id, zone)) {
+            self.hover_bar_zone = Some((id, zone));
+            cx.notify();
+        }
+    }
+
+    fn classify_bar_hover_zone(
+        &mut self,
+        id: i64,
+        layout: &crate::gantt::BarLayout,
+        window_x: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.gantt.gesture.is_some() {
+            return;
+        }
+        let painted = self.painted_bar_for(id, layout);
+        let zone =
+            layout.hit_zone_at_window_x(window_x, painted.content_left, painted.content_right);
+        self.note_bar_hover_zone(id, zone, cx);
+    }
+
     fn dismiss_all_overlays(&mut self) {
         self.dismiss_overlays();
         self.form_loading = None;
@@ -1939,8 +2000,7 @@ impl PlannerView {
             return;
         }
         self.state.gantt.context_menu = None;
-        self.state.gantt.clear_hover();
-        self.state.gantt.hover_locked = false;
+        self.clear_hover_after_history(cx);
         let original = self.state.history_action_message_for_undo(&action);
         let undid = undone_toast_message(&original);
         if matches!(
@@ -2060,7 +2120,7 @@ impl PlannerView {
     }
 
     fn undo_last(&mut self, cx: &mut Context<Self>) {
-        self.state.gantt.clear_hover();
+        self.clear_hover_after_history(cx);
         self.state.gantt.context_menu = None;
         if self.history_hotkey_is_duplicate(true) || self.state.history.undo.is_empty() {
             cx.notify();
@@ -2084,7 +2144,7 @@ impl PlannerView {
     }
 
     fn redo_last(&mut self, cx: &mut Context<Self>) {
-        self.state.gantt.clear_hover();
+        self.clear_hover_after_history(cx);
         if self.history_hotkey_is_duplicate(false) || self.state.history.redo.is_empty() {
             cx.notify();
             return;
@@ -4904,6 +4964,7 @@ impl PlannerView {
                             layout_x,
                             content_left,
                             content_right: content_left + f32::from(bounds.size.width),
+                            open_ended,
                         },
                     );
                 })
@@ -4917,6 +4978,17 @@ impl PlannerView {
                 .h(px(bar_h))
                 .rounded_md()
                 .relative()
+                .when(
+                    matches!(
+                        self.hover_bar_zone,
+                        Some((hid, BarHitZone::ResizeStart | BarHitZone::ResizeEnd)) if hid == id
+                    ),
+                    |el| el.cursor(CursorStyle::ResizeLeftRight),
+                )
+                .when(
+                    matches!(self.hover_bar_zone, Some((hid, BarHitZone::Link)) if hid == id),
+                    |el| el.cursor(CursorStyle::DragLink),
+                )
                 .when(milestone, |el| {
                     el.bg(gpui_kit::transparent_white())
                         .border_0()
@@ -4972,7 +5044,7 @@ impl PlannerView {
                                 .justify_end()
                                 .text_color(rgb(bar.color))
                                 .occlude()
-                                .cursor_pointer()
+                                .cursor(CursorStyle::DragLink)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, window, cx| {
@@ -5108,6 +5180,7 @@ impl PlannerView {
                     // the tooltip portal must not clear `bar_hovered_id`.
                     !dragging
                         && !self.details_overlay()
+                        && !self.suppress_bar_tooltip
                         && self.state.gantt.pin_bar_tooltip != Some(id)
                         && (inside || (!milestone && !marker && !unscheduled && !no_fields)),
                     |el| {
@@ -5116,14 +5189,18 @@ impl PlannerView {
                             .tooltip_show_delay(Duration::from_millis(150))
                     },
                 )
-                .on_mouse_move(
+                .on_mouse_move({
+                    let hover_layout = layout.clone();
                     cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                        this.suppress_bar_tooltip = false;
                         this.set_bar_hovered(Some(id), cx);
+                        let x: f32 = event.position.x.into();
+                        this.classify_bar_hover_zone(id, &hover_layout, x, cx);
                         // The bar captures the pointer on mouse-down. External titles
                         // occlude the timeline, so the captured bar must keep the drag.
                         this.on_bar_drag_move(event, window, cx);
-                    }),
-                )
+                    })
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -5219,8 +5296,9 @@ impl PlannerView {
             .into_any_element()
     }
 
-    /// Inner 8px of each painted end. Last children of the bar so they win
-    /// mouse-down over the title, progress fill, and bar body.
+    /// Inner 8px of each painted end (end grip sits 6px left of the link
+    /// sliver). Last children of the bar so they win mouse-down over the
+    /// title, progress fill, and bar body.
     fn bar_inner_resize_grips(
         &self,
         bar: &crate::gantt::BarLayout,
@@ -5289,18 +5367,28 @@ impl PlannerView {
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.set_bar_hovered(Some(id), cx);
+                            let zone = if at_start {
+                                BarHitZone::ResizeStart
+                            } else {
+                                BarHitZone::ResizeEnd
+                            };
+                            this.note_bar_hover_zone(id, zone, cx);
                         }
                     }))
-                    .on_mouse_move(
+                    .on_mouse_move({
+                        let hover_layout = layout.clone();
                         cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                            this.suppress_bar_tooltip = false;
                             if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
                                 gesture.kind == GestureKind::Link && gesture.id != id
                             }) {
                                 this.state.gantt.set_link_target(id);
                             }
+                            let x: f32 = event.position.x.into();
+                            this.classify_bar_hover_zone(id, &hover_layout, x, cx);
                             this.on_bar_drag_move(event, window, cx);
-                        }),
-                    )
+                        })
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -5330,7 +5418,7 @@ impl PlannerView {
             .collect()
     }
 
-    /// Last child of a resizable dated bar: the last ~6–8px starts a link
+    /// Last child of a resizable dated bar: the last ~6px starts a link
     /// so a progress fill, title, or bar-body Move cannot steal those pixels.
     /// Kept mounted while this bar is the link source so capture, cursor,
     /// and the ghost line survive the drag.
@@ -5382,15 +5470,18 @@ impl PlannerView {
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_bar_hovered(Some(id), cx);
+                        this.note_bar_hover_zone(id, BarHitZone::Link, cx);
                     }
                 }))
                 .on_mouse_move(
                     cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                        this.suppress_bar_tooltip = false;
                         if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
                             gesture.kind == GestureKind::Link && gesture.id != id
                         }) {
                             this.state.gantt.set_link_target(id);
                         }
+                        this.note_bar_hover_zone(id, BarHitZone::Link, cx);
                         this.on_bar_drag_move(event, window, cx);
                     }),
                 )
@@ -5530,7 +5621,7 @@ impl PlannerView {
         let show_dot = hovered && !dragging;
         let (local_left, local_right) = self.painted_timeline_edges(bar);
         // Inner 8px grips resize a wide bar, shifted left of a full-row
-        // inset sliver so the last 8px starts a link. A dated sliver that
+        // inset sliver so the last 6px starts a link. A dated sliver that
         // cannot resize keeps one combined hit box covering those pixels.
         // Diamonds and start-only bars keep Move on that edge. The visual
         // dot stays outside; the overflow ! is painted past this hit box.
@@ -5594,15 +5685,18 @@ impl PlannerView {
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.set_bar_hovered(Some(id), cx);
+                            this.note_bar_hover_zone(id, BarHitZone::Link, cx);
                         }
                     }))
                     .on_mouse_move(
                         cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                            this.suppress_bar_tooltip = false;
                             if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
                                 gesture.kind == GestureKind::Link && gesture.id != id
                             }) {
                                 this.state.gantt.set_link_target(id);
                             }
+                            this.note_bar_hover_zone(id, BarHitZone::Link, cx);
                             this.on_bar_drag_move(event, window, cx);
                         }),
                     )
@@ -5670,7 +5764,7 @@ impl PlannerView {
     fn render_open_ended_cue(
         &self,
         bar: &crate::gantt::BarLayout,
-        _cx: &Context<Self>,
+        cx: &Context<Self>,
     ) -> Option<AnyElement> {
         if !bar.open_ended || bar.summary || bar.marker || bar.milestone {
             return None;
@@ -5689,7 +5783,10 @@ impl PlannerView {
         let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
         let id = bar.id;
         let cue_w = tail_w.max(10.0);
+        let layout = bar.clone();
         let selector = format!("gantt-open-ended-cue-{id}");
+        let tip = bar_hover_tooltip(bar, &self.state.nodes);
+        let show_tip = !self.details_overlay() && !self.suppress_bar_tooltip;
         Some(
             div()
                 .id(("open-ended-cue", id as u64))
@@ -5705,6 +5802,22 @@ impl PlannerView {
                 .border_color(rgb(bar.color).opacity(0.55))
                 .rounded_md()
                 .overflow_hidden()
+                .occlude()
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.set_bar_hovered(Some(id), cx);
+                    }
+                }))
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    this.suppress_bar_tooltip = false;
+                    this.set_bar_hovered(Some(id), cx);
+                    let x: f32 = event.position.x.into();
+                    this.classify_bar_hover_zone(id, &layout, x, cx);
+                }))
+                .when(show_tip, |el| {
+                    el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .tooltip_show_delay(Duration::from_millis(150))
+                })
                 .child(
                     div()
                         .absolute()
@@ -5860,7 +5973,11 @@ impl PlannerView {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let id = bar.id;
-        if self.state.gantt.pin_bar_tooltip != Some(id) || dragging || self.details_overlay() {
+        if self.state.gantt.pin_bar_tooltip != Some(id)
+            || dragging
+            || self.details_overlay()
+            || self.suppress_bar_tooltip
+        {
             return None;
         }
         let tip = bar_hover_tooltip(bar, &self.state.nodes);
@@ -5883,7 +6000,9 @@ impl PlannerView {
         let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
         let tip_w = (tip.chars().count() as f32 * 7.0 + 24.0).max(48.0);
         let overflow = parent_date_overflow(&self.state.nodes, id);
-        let extra = if overflow {
+        let extra = if bar.open_ended {
+            LINK_HANDLE_INSET + 2.0
+        } else if overflow {
             LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 8.0
         } else {
             LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0
@@ -5891,6 +6010,7 @@ impl PlannerView {
         let timeline_w = self.state.gantt.timeline_width.max(1.0);
         let tip_x = row_side_tooltip_left(bar.x, painted_w, extra, tip_w, timeline_w);
         let tooltip_bounds = self.pinned_tooltip_bounds.clone();
+        let layout = bar.clone();
         Some(
             div()
                 .id(("gantt-bar-tooltip", id as u64))
@@ -5918,6 +6038,31 @@ impl PlannerView {
                 .whitespace_nowrap()
                 .border_1()
                 .border_color(cx.theme().border)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.release_pinned_tooltip(cx);
+                        this.suppress_bar_tooltip = false;
+                        let x: f32 = event.position.x.into();
+                        this.begin_chip_bar_press(id, &layout, x, window, cx);
+                    }),
+                )
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                        this.suppress_bar_tooltip = false;
+                        this.set_bar_hovered(Some(id), cx);
+                        this.on_bar_drag_move(event, window, cx);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                        let x: f32 = event.position.x.into();
+                        let y: f32 = event.position.y.into();
+                        this.release_bar_gesture(x, y, window, cx);
+                    }),
+                )
                 .child(tip)
                 .into_any_element(),
         )
@@ -7746,6 +7891,7 @@ impl PlannerView {
             layout_x: layout.x,
             content_left: origin + layout.x,
             content_right: origin + layout.x + width,
+            open_ended: layout.open_ended,
         }
     }
 
@@ -7781,6 +7927,17 @@ impl PlannerView {
         // a move onto it as still on the bar so the pin does not drop.
         if self.pointer_on_pinned_tooltip(id, window_x, window_y) {
             return Some(true);
+        }
+        if painted.open_ended {
+            let origin = self
+                .timeline_body_origin_x
+                .get()
+                .unwrap_or(self.state.gantt.timeline_origin_x);
+            let clip_right = origin + self.state.gantt.timeline_width;
+            let on_row = window_y >= painted.top - SLOP && window_y <= painted.bottom + SLOP;
+            if on_row && window_x >= painted.right - SLOP && window_x <= clip_right + SLOP {
+                return Some(true);
+            }
         }
         Some(false)
     }
@@ -7904,6 +8061,37 @@ impl PlannerView {
         self.bar_press_window_x = Some(window_x);
         self.bar_last_window_x = Some(window_x);
         let _ = self.state.begin_bar_gesture(id, kind, origin);
+        cx.notify();
+    }
+
+    /// Press on the dates chip must move the bar, not disappear as a no-op.
+    fn begin_chip_bar_press(
+        &mut self,
+        id: i64,
+        _layout: &crate::gantt::BarLayout,
+        window_x: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_toast_pointer_for_new_press();
+        if self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link)
+        {
+            self.state.gantt.set_link_target(id);
+            cx.notify();
+            return;
+        }
+        self.state.gantt.select_row(id);
+        self.focus_planner(window, cx);
+        self.dismiss_overlays();
+        let origin = self.pointer_layout_x(window_x, Some(id));
+        self.bar_press_window_x = Some(window_x);
+        self.bar_last_window_x = Some(window_x);
+        let _ = self.state.begin_bar_gesture(id, GestureKind::Move, origin);
         cx.notify();
     }
 
@@ -8527,6 +8715,23 @@ impl PlannerView {
 
     pub fn last_bar_hit_for_test(&self) -> Option<BarHitDebug> {
         self.last_bar_hit
+    }
+
+    pub fn hover_bar_zone_for_test(&self) -> Option<(i64, BarHitZone)> {
+        self.hover_bar_zone
+    }
+
+    pub fn hover_cursor_for_test(&self) -> Option<&'static str> {
+        match self.hover_cursor_style() {
+            Some(CursorStyle::ResizeLeftRight) => Some("ew-resize"),
+            Some(CursorStyle::DragLink) => Some("drag-link"),
+            Some(_) => Some("other"),
+            None => None,
+        }
+    }
+
+    pub fn suppress_bar_tooltip_for_test(&self) -> bool {
+        self.suppress_bar_tooltip
     }
 
     pub fn toast_pointer_for_test(&self) -> bool {
@@ -9417,15 +9622,29 @@ impl Render for PlannerView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .when(
-                self.state
+                matches!(
+                    self.hover_bar_zone,
+                    Some((_, BarHitZone::ResizeStart | BarHitZone::ResizeEnd))
+                ) && !self
+                    .state
                     .gantt
                     .gesture
                     .as_ref()
                     .is_some_and(|gesture| gesture.kind == GestureKind::Link),
+                |el| el.cursor(CursorStyle::ResizeLeftRight),
+            )
+            .when(
+                self.state
+                    .gantt
+                    .gesture
+                    .as_ref()
+                    .is_some_and(|gesture| gesture.kind == GestureKind::Link)
+                    || matches!(self.hover_bar_zone, Some((_, BarHitZone::Link))),
                 |el| el.cursor(CursorStyle::DragLink),
             )
             .on_mouse_move(cx.listener(|this, _, _, _| {
                 this.arm_toast_pause_from_pointer();
+                this.suppress_bar_tooltip = false;
             }))
             .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                 if this.toast_pointer {

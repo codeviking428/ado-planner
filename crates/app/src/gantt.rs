@@ -37,8 +37,9 @@ pub const LINK_HANDLE_HIT: f32 = 16.0;
 /// Gap between the painted bar end and the outside link handle.
 pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// Right-handle hit reaches this far into the bar so a press on the last
-/// ~6–8px starts a link, not a resize (wide bars) or a no-op Move (slivers).
-pub const LINK_HANDLE_INSET: f32 = 8.0;
+/// ~6px starts a link, not a resize (wide bars) or a no-op Move (slivers).
+/// Kept at 6 so the 8px end-resize grip stays a full 6–8px unique zone.
+pub const LINK_HANDLE_INSET: f32 = 6.0;
 /// Parallel dependency lanes stay at least this far apart (stroke is 2px).
 pub const PARALLEL_LANE_MIN: f32 = 10.0;
 /// Inbound/wrap verticals. 16px centre-to-centre so the 2px stroke still
@@ -626,7 +627,7 @@ pub fn resize_start_handle(bar: &BarLayout) -> (f32, f32) {
 }
 
 /// Inner end grip: `HANDLE_WIDTH` ending `resize_end_link_inset` before
-/// the painted right, so the last 8px of a dated bar can start a link.
+/// the painted right, so the last 6px of a dated bar can start a link.
 pub fn resize_end_handle(bar: &BarLayout) -> (f32, f32) {
     let width = bar.inner_grip_width();
     let inset = bar.resize_end_link_inset();
@@ -4617,7 +4618,7 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(&bars, 176.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::Link),
-            "the last 8px of a dated bar must start a link"
+            "the last 6px of a dated bar must start a link"
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 168.0, 4.0).map(|(_, kind)| kind),
@@ -4646,7 +4647,7 @@ mod tests {
         let (end_x, end_w) = resize_end_handle(&bar);
         assert!(
             (end_x - (bar.x + bar.width - HANDLE_WIDTH - LINK_HANDLE_INSET)).abs() < 0.1,
-            "end grip must sit just left of the 8px link sliver, got {end_x}"
+            "end grip must sit just left of the 6px link sliver, got {end_x}"
         );
         assert!(
             (end_w - HANDLE_WIDTH).abs() < 0.1,
@@ -4689,7 +4690,7 @@ mod tests {
             GanttView::hit_test_bar(std::slice::from_ref(&summary), 176.0, 4.0)
                 .map(|(_, kind)| kind),
             Some(GestureKind::Link),
-            "a parent with its own dates starts a link on the last 8px"
+            "a parent with its own dates starts a link on the last 6px"
         );
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&summary), 168.0, 4.0)
@@ -5520,8 +5521,8 @@ mod tests {
         };
         let (start, end, link) = bar.edge_zones();
         assert!(
-            start >= 6.0 && end >= 6.0 && link >= 6.0,
-            "a 64px bar must keep full-size zones, got start={start} end={end} link={link}"
+            start >= 7.5 && end >= 7.5 && link >= 5.5,
+            "a 64px bar must keep an 8px resize and ~6px link, got start={start} end={end} link={link}"
         );
         let right = bar.x + bar.width;
         assert_eq!(
