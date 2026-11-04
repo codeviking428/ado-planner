@@ -52,8 +52,8 @@ use crate::gantt::{
     SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH,
     UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_outside_label_frame, bar_title_is_inside,
     bar_title_paint_px, header_label_px, offscreen_edge_chip, outside_title_right_gap,
-    parent_date_overflow, parent_overflow_tip, timeline_is_empty_of_scheduled,
-    today_line_chip_skips, today_line_segments, today_pill_left,
+    parent_date_overflow, parent_overflow_tip, related_dependency_ids,
+    timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -225,6 +225,13 @@ pub struct PlannerView {
     /// After undo/redo, skip the dates chip and GPUI tooltip until the
     /// pointer moves so a resting cursor cannot swallow the next press.
     suppress_bar_tooltip: bool,
+    /// Window position where hover tooltips were last suppressed. A
+    /// same-spot mouse-move after drop (GPUI's synthetic hover) must not
+    /// un-suppress; only a real nudge of a couple of pixels does.
+    tooltip_suppress_at: Option<(f32, f32)>,
+    /// Live tooltip copy keyed by bar id, read when GPUI finally shows
+    /// the portal so a delayed tooltip cannot keep pre-move dates.
+    bar_tooltip_live: Rc<RefCell<HashMap<i64, String>>>,
     /// Start date of the last committed date gesture. Persist without a
     /// mock may revert the node; tests still see that the flick committed.
     last_committed_start_for_test: Option<jiff::civil::Date>,
@@ -509,6 +516,8 @@ impl PlannerView {
             last_bar_hit: None,
             hover_bar_zone: None,
             suppress_bar_tooltip: false,
+            tooltip_suppress_at: None,
+            bar_tooltip_live: Rc::new(RefCell::new(HashMap::new())),
             last_committed_start_for_test: None,
             last_committed_target_for_test: None,
             _subscriptions: vec![keystrokes],
@@ -1299,7 +1308,7 @@ impl PlannerView {
         self.state.gantt.hover_locked = false;
         self.pinned_tooltip_bounds.borrow_mut().take();
         self.hover_bar_zone = None;
-        self.suppress_bar_tooltip = true;
+        self.arm_tooltip_suppress_at_last_pointer();
         self.painted_bar_bounds.borrow_mut().clear();
         self.recompute_hover_at_last_pointer(cx);
         self.request_repaint(None, cx);
@@ -1307,6 +1316,41 @@ impl PlannerView {
 
     fn note_pointer(&mut self, x: f32, y: f32) {
         self.last_pointer_window = Some((x, y));
+        self.release_tooltip_suppress_if_moved(x, y);
+    }
+
+    const TOOLTIP_SUPPRESS_MOVE_PX: f32 = 2.0;
+
+    fn arm_tooltip_suppress(&mut self, x: f32, y: f32) {
+        self.suppress_bar_tooltip = true;
+        self.tooltip_suppress_at = Some((x, y));
+        self.last_pointer_window = Some((x, y));
+    }
+
+    fn arm_tooltip_suppress_at_last_pointer(&mut self) {
+        match self.last_pointer_window {
+            Some((x, y)) => self.arm_tooltip_suppress(x, y),
+            None => {
+                self.suppress_bar_tooltip = true;
+                self.tooltip_suppress_at = None;
+            }
+        }
+    }
+
+    fn release_tooltip_suppress_if_moved(&mut self, x: f32, y: f32) {
+        let Some((ox, oy)) = self.tooltip_suppress_at else {
+            if self.suppress_bar_tooltip {
+                self.tooltip_suppress_at = Some((x, y));
+            }
+            return;
+        };
+        let dx = x - ox;
+        let dy = y - oy;
+        if dx * dx + dy * dy < Self::TOOLTIP_SUPPRESS_MOVE_PX * Self::TOOLTIP_SUPPRESS_MOVE_PX {
+            return;
+        }
+        self.tooltip_suppress_at = None;
+        self.suppress_bar_tooltip = false;
     }
 
     fn recompute_hover_at_last_pointer(&mut self, cx: &mut Context<Self>) {
@@ -4449,16 +4493,7 @@ impl PlannerView {
             CriticalPath::default()
         };
         let related_ids: HashSet<i64> = if let Some(hid) = hovered_id {
-            let mut set = HashSet::from([hid]);
-            for bar in bars {
-                if bar.id == hid {
-                    set.extend(bar.predecessors.iter().copied());
-                }
-                if bar.predecessors.contains(&hid) {
-                    set.insert(bar.id);
-                }
-            }
-            set
+            related_dependency_ids(&self.state.visible_nodes(), hid)
         } else {
             HashSet::new()
         };
@@ -4737,7 +4772,7 @@ impl PlannerView {
                     .children({
                         let arrows = self.state.gantt.layout_dependency_arrows(bars);
                         arrows.into_iter().map(|arrow| {
-                            self.render_dependency_arrow(&arrow, bars, &path, cx)
+                            self.render_dependency_arrow(&arrow, bars, &path, &related_ids, cx)
                         })
                     })
                     .children({
@@ -5054,8 +5089,24 @@ impl PlannerView {
                         return None;
                     }
                     let text = crate::gantt::GanttView::drag_preview_text(gesture);
+                    let start_text = compact_date(gesture.live_start);
+                    let end_text = compact_date(gesture.live_target);
                     let bar = bars.iter().find(|bar| bar.id == gesture.id);
-                    let (x, y) = match bar {
+                    let date_pill = |text: String, cx: &Context<Self>| {
+                        div()
+                            .px_2()
+                            .py(px(2.))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().popover)
+                            .text_color(cx.theme().popover_foreground)
+                            .text_xs()
+                            .whitespace_nowrap()
+                            .shadow_md()
+                            .child(text)
+                    };
+                    let (chip_x, y, start_x, end_x) = match bar {
                         Some(bar) => {
                             let painted_w = if bar.milestone || bar.marker {
                                 MILESTONE_SIZE
@@ -5063,14 +5114,11 @@ impl PlannerView {
                                 bar.width.max(8.0)
                             };
                             let tip_w = (text.chars().count() as f32 * 7.0 + 24.0).max(48.0);
-                            // Same row, past handles/`!` and the painted
-                            // outside title so the live dates are not
-                            // covered by "Persist cart".
                             let extra = drag_preview_row_extra(
                                 bar,
                                 parent_date_overflow(&self.state.nodes, bar.id),
                             );
-                            let x = row_side_tooltip_left(
+                            let chip_x = row_side_tooltip_left(
                                 bar.x,
                                 painted_w,
                                 extra,
@@ -5080,40 +5128,74 @@ impl PlannerView {
                             let y = TIMELINE_HEADER_H
                                 + bar.y
                                 + ((ROW_HEIGHT - 22.0) / 2.0).max(2.0);
-                            (x, y)
+                            let end_w = (end_text.chars().count() as f32 * 7.0 + 16.0).max(36.0);
+                            (
+                                chip_x,
+                                y,
+                                bar.x.max(0.0),
+                                (bar.x + painted_w - end_w).max(0.0),
+                            )
                         }
-                        None => (gesture.live_x.max(4.0), 4.0),
+                        None => (gesture.live_x.max(4.0), 4.0, gesture.live_x.max(4.0), 4.0),
                     };
                     Some(
                         div()
-                            .id("gantt-drag-preview")
-                            .debug_selector(|| "gantt-drag-preview".into())
                             .absolute()
-                            .left(px(x))
-                            .top(px(y))
-                            .px_2()
-                            .py(px(3.))
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().popover)
-                            .text_color(cx.theme().popover_foreground)
-                            .text_xs()
-                            .whitespace_nowrap()
-                            .shadow_md()
-                            .occlude()
-                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                                this.on_bar_drag_move(event, window, cx);
-                            }))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                                    let x: f32 = event.position.x.into();
-                                    let y: f32 = event.position.y.into();
-                                    this.release_bar_gesture(x, y, window, cx);
-                                }),
+                            .left_0()
+                            .top_0()
+                            .w(px(0.))
+                            .h(px(0.))
+                            .child(
+                                div()
+                                    .id("gantt-drag-preview")
+                                    .debug_selector(|| "gantt-drag-preview".into())
+                                    .absolute()
+                                    .left(px(chip_x))
+                                    .top(px(y))
+                                    .px_2()
+                                    .py(px(3.))
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().popover)
+                                    .text_color(cx.theme().popover_foreground)
+                                    .text_xs()
+                                    .whitespace_nowrap()
+                                    .shadow_md()
+                                    .occlude()
+                                    .on_mouse_move(cx.listener(
+                                        |this, event: &MouseMoveEvent, window, cx| {
+                                            this.on_bar_drag_move(event, window, cx);
+                                        },
+                                    ))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                                            let x: f32 = event.position.x.into();
+                                            let y: f32 = event.position.y.into();
+                                            this.release_bar_gesture(x, y, window, cx);
+                                        }),
+                                    )
+                                    .child(text),
                             )
-                            .child(text),
+                            .child(
+                                div()
+                                    .id("gantt-drag-date-start")
+                                    .debug_selector(|| "gantt-drag-date-start".into())
+                                    .absolute()
+                                    .left(px(start_x))
+                                    .top(px(y))
+                                    .child(date_pill(start_text, cx)),
+                            )
+                            .child(
+                                div()
+                                    .id("gantt-drag-date-end")
+                                    .debug_selector(|| "gantt-drag-date-end".into())
+                                    .absolute()
+                                    .left(px(end_x))
+                                    .top(px(y))
+                                    .child(date_pill(end_text, cx)),
+                            ),
                     )
                 })
             })
@@ -5175,6 +5257,9 @@ impl PlannerView {
     ) -> AnyElement {
         let layout = bar.clone();
         let id = bar.id;
+        self.bar_tooltip_live
+            .borrow_mut()
+            .insert(id, bar_hover_tooltip(bar, &self.state.nodes));
         let summary = bar.summary;
         let unscheduled = bar.kind == ado_core::GanttBarKind::Unscheduled;
         let no_fields = bar.kind == ado_core::GanttBarKind::NoFields;
@@ -5490,15 +5575,17 @@ impl PlannerView {
                         )
                         && (inside || (!milestone && !marker && !unscheduled && !no_fields)),
                     |el| {
-                        let tip = bar_hover_tooltip(bar, &self.state.nodes);
-                        el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                            .tooltip_show_delay(Duration::from_millis(150))
+                        let live = self.bar_tooltip_live.clone();
+                        el.tooltip(move |window, cx| {
+                            let tip = live.borrow().get(&id).cloned().unwrap_or_default();
+                            Tooltip::new(tip).build(window, cx)
+                        })
+                        .tooltip_show_delay(Duration::from_millis(150))
                     },
                 )
                 .on_mouse_move({
                     let hover_layout = layout.clone();
                     cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                        this.suppress_bar_tooltip = false;
                         this.set_bar_hovered(Some(id), cx);
                         let x: f32 = event.position.x.into();
                         let y: f32 = event.position.y.into();
@@ -5604,7 +5691,7 @@ impl PlannerView {
             .into_any_element()
     }
 
-    /// Inner 8px of each painted end (end grip sits 6px left of the link
+    /// Inner 14px of each painted end (end grip sits 6px left of the link
     /// sliver). Last children of the bar so they win mouse-down over the
     /// title, progress fill, and bar body.
     fn bar_inner_resize_grips(
@@ -5686,13 +5773,14 @@ impl PlannerView {
                     .on_mouse_move({
                         let hover_layout = layout.clone();
                         cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                            this.suppress_bar_tooltip = false;
                             if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
                                 gesture.kind == GestureKind::Link && gesture.id != id
                             }) {
                                 this.state.gantt.set_link_target(id);
                             }
                             let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            this.note_pointer(x, y);
                             this.classify_bar_hover_zone(id, &hover_layout, x, cx);
                             this.on_bar_drag_move(event, window, cx);
                         })
@@ -5801,12 +5889,14 @@ impl PlannerView {
                 }))
                 .on_mouse_move(
                     cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                        this.suppress_bar_tooltip = false;
                         if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
                             gesture.kind == GestureKind::Link && gesture.id != id
                         }) {
                             this.state.gantt.set_link_target(id);
                         }
+                        let x: f32 = event.position.x.into();
+                        let y: f32 = event.position.y.into();
+                        this.note_pointer(x, y);
                         this.note_bar_hover_zone(id, BarHitZone::Link, cx);
                         this.on_bar_drag_move(event, window, cx);
                     }),
@@ -6053,7 +6143,6 @@ impl PlannerView {
                     }))
                     .on_mouse_move(
                         cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                            this.suppress_bar_tooltip = false;
                             let x: f32 = event.position.x.into();
                             let y: f32 = event.position.y.into();
                             this.note_pointer(x, y);
@@ -6146,7 +6235,9 @@ impl PlannerView {
         let cue_w = tail_w.max(10.0);
         let layout = bar.clone();
         let selector = format!("gantt-open-ended-cue-{id}");
-        let tip = bar_hover_tooltip(bar, &self.state.nodes);
+        self.bar_tooltip_live
+            .borrow_mut()
+            .insert(id, bar_hover_tooltip(bar, &self.state.nodes));
         let show_tip = !self.details_overlay() && !self.suppress_bar_tooltip;
         Some(
             div()
@@ -6173,9 +6264,10 @@ impl PlannerView {
                     }
                 }))
                 .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                    this.suppress_bar_tooltip = false;
                     this.set_bar_hovered(Some(id), cx);
                     let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    this.note_pointer(x, y);
                     this.classify_bar_hover_zone(id, &layout, x, cx);
                 }))
                 .on_mouse_up(
@@ -6185,8 +6277,12 @@ impl PlannerView {
                     }),
                 )
                 .when(show_tip, |el| {
-                    el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                        .tooltip_show_delay(Duration::from_millis(150))
+                    let live = self.bar_tooltip_live.clone();
+                    el.tooltip(move |window, cx| {
+                        let tip = live.borrow().get(&id).cloned().unwrap_or_default();
+                        Tooltip::new(tip).build(window, cx)
+                    })
+                    .tooltip_show_delay(Duration::from_millis(150))
                 })
                 .child(
                     div()
@@ -6413,6 +6509,7 @@ impl PlannerView {
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         this.release_pinned_tooltip(cx);
+                        this.tooltip_suppress_at = None;
                         this.suppress_bar_tooltip = false;
                         let x: f32 = event.position.x.into();
                         this.begin_chip_bar_press(id, &layout, x, window, cx);
@@ -6420,7 +6517,9 @@ impl PlannerView {
                 )
                 .on_mouse_move(
                     cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                        this.suppress_bar_tooltip = false;
+                        let x: f32 = event.position.x.into();
+                        let y: f32 = event.position.y.into();
+                        this.note_pointer(x, y);
                         this.set_bar_hovered(Some(id), cx);
                         this.on_bar_drag_move(event, window, cx);
                     }),
@@ -6486,11 +6585,17 @@ impl PlannerView {
                 .text_xs()
                 .text_color(muted_fg)
                 .when(!dragging, |el| el.occlude())
-                .when(!dragging && !self.details_overlay(), |el| {
-                    let tip = bar_hover_tooltip(bar, &self.state.nodes);
-                    el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .when(
+                    !dragging && !self.details_overlay() && !self.suppress_bar_tooltip,
+                    |el| {
+                        let live = self.bar_tooltip_live.clone();
+                        el.tooltip(move |window, cx| {
+                            let tip = live.borrow().get(&id).cloned().unwrap_or_default();
+                            Tooltip::new(tip).build(window, cx)
+                        })
                         .tooltip_show_delay(Duration::from_millis(150))
-                })
+                    },
+                )
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_hovered(Some(id), cx);
@@ -6500,6 +6605,7 @@ impl PlannerView {
                     this.set_hovered(Some(id), cx);
                     let x: f32 = event.position.x.into();
                     let y: f32 = event.position.y.into();
+                    this.note_pointer(x, y);
                     this.clear_pinned_tooltip_if_pointer_left(x, y, cx);
                 }))
                 .on_mouse_up(
@@ -6533,12 +6639,12 @@ impl PlannerView {
         arrow: &DependencyArrow,
         bars: &[crate::gantt::BarLayout],
         path: &CriticalPath,
+        related_ids: &HashSet<i64>,
         cx: &Context<Self>,
     ) -> AnyElement {
         let selected = self.state.gantt.selected_link == Some((arrow.from_id, arrow.to_id));
         let hovered = self.state.gantt.hovered_link == Some((arrow.from_id, arrow.to_id));
-        let related = self.state.gantt.hovered_id == Some(arrow.from_id)
-            || self.state.gantt.hovered_id == Some(arrow.to_id);
+        let related = related_ids.contains(&arrow.from_id) && related_ids.contains(&arrow.to_id);
         let on_critical = path.links.contains(&(arrow.from_id, arrow.to_id));
         let color = if on_critical {
             cx.theme().danger
@@ -8507,6 +8613,8 @@ impl PlannerView {
         let origin = self.pointer_layout_x(window_x, Some(id));
         self.bar_press_window_x = Some(window_x);
         self.bar_last_window_x = Some(window_x);
+        let y = self.last_pointer_window.map(|(_, y)| y).unwrap_or(0.0);
+        self.arm_tooltip_suppress(window_x, y);
         let _ = self.state.begin_bar_gesture(id, kind, origin);
         cx.notify();
     }
@@ -8538,6 +8646,8 @@ impl PlannerView {
         let origin = self.pointer_layout_x(window_x, Some(id));
         self.bar_press_window_x = Some(window_x);
         self.bar_last_window_x = Some(window_x);
+        let y = self.last_pointer_window.map(|(_, y)| y).unwrap_or(0.0);
+        self.arm_tooltip_suppress(window_x, y);
         let _ = self.state.begin_bar_gesture(id, GestureKind::Move, origin);
         cx.notify();
     }
@@ -8609,14 +8719,16 @@ impl PlannerView {
         self.dismiss_overlays();
         self.bar_press_window_x = Some(window_x);
         self.bar_last_window_x = Some(window_x);
+        let y = self.last_pointer_window.map(|(_, y)| y).unwrap_or(0.0);
+        self.arm_tooltip_suppress(window_x, y);
         let _ = self.state.begin_bar_gesture(id, kind, origin);
         cx.notify();
     }
 
     fn commit_gesture(
         &mut self,
-        _window_x: f32,
-        _window_y: f32,
+        window_x: f32,
+        window_y: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8661,9 +8773,10 @@ impl PlannerView {
             self.enqueue_date_save(cx, pending);
             self.note_toasts_changed(cx);
             // Hide the dates chip and hover tooltip on drop so they do not
-            // sit beside the Moved toast. A later pointer move restores hover.
+            // sit beside the Moved toast. A later real pointer move restores
+            // hover; a same-spot mouse-move after mouse-up must not.
             self.state.gantt.pin_bar_tooltip = None;
-            self.suppress_bar_tooltip = true;
+            self.arm_tooltip_suppress(window_x, window_y);
         }
         // Every drop path (commit, no-op release, missed mouse-up) must
         // request a paint so a resize at x=604 does not keep the preview
@@ -9279,6 +9392,11 @@ impl PlannerView {
 
     pub fn set_suppress_bar_tooltip_for_test(&mut self, suppress: bool) {
         self.suppress_bar_tooltip = suppress;
+        if suppress {
+            self.tooltip_suppress_at = self.last_pointer_window;
+        } else {
+            self.tooltip_suppress_at = None;
+        }
     }
 
     pub fn toast_pointer_for_test(&self) -> bool {
@@ -10194,7 +10312,6 @@ impl Render for PlannerView {
                 let y: f32 = event.position.y.into();
                 this.note_pointer(x, y);
                 this.arm_toast_pause_from_pointer();
-                this.suppress_bar_tooltip = false;
             }))
             .on_mouse_up(
                 MouseButton::Left,

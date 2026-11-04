@@ -6,9 +6,9 @@ use ado_planner::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind,
     HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_INSET, MILESTONE_SIZE,
     MIN_TIMELINE_WIDTH, OUTER_LINK_HIT, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN,
-    ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
-    bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px, insert_index_for_child,
-    outside_label_is_beside_bar,
+    RESIZE_HIT_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
+    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px,
+    insert_index_for_child, outside_label_is_beside_bar,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -4644,8 +4644,8 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
     let resize_w = f32::from(resize.size.width);
     let resize_right = f32::from(resize.origin.x) + resize_w;
     assert!(
-        (6.0..=8.5).contains(&resize_w),
-        "end resize must be a 6–8px unique zone, width={resize_w}"
+        (12.0..=15.0).contains(&resize_w),
+        "end resize must be a ~14px unique zone, width={resize_w}"
     );
     assert!(
         sliver_left <= resize_right + 0.5,
@@ -4733,7 +4733,7 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::ResizeEnd),
-            "the 6–8px just left of the Persist cart sliver must resize, not move"
+            "the 14px just left of the Persist cart sliver must resize, not move"
         );
     });
     let dragged = point(grab_end_resize(bar).x + px(20.), grab_end_resize(bar).y);
@@ -7901,8 +7901,8 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         f32::from(link.size.height)
     );
     assert!(
-        (f32::from(resize.size.width) - HANDLE_WIDTH).abs() < 1.0,
-        "end resize grip must be the inner 8px of the bar, got {}",
+        (f32::from(resize.size.width) - RESIZE_HIT_WIDTH).abs() < 1.0,
+        "end resize grip must be the inner 14px of the bar, got {}",
         f32::from(resize.size.width)
     );
     assert!(
@@ -9269,6 +9269,27 @@ fn drop_hides_the_bar_tooltip_beside_the_moved_toast(cx: &mut gpui_kit::TestAppC
         cx.debug_bounds("gantt-bar-tooltip").is_none(),
         "the bar tooltip must not sit beside the Moved toast after drop"
     );
+    cx.simulate_mouse_move(dest, None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.suppress_bar_tooltip_for_test(),
+            "a same-spot mouse-move after drop must not restore the hover tooltip"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-bar-tooltip").is_none(),
+        "a still pointer after drop must not show the dates tooltip"
+    );
+    let nudged = point(dest.x + px(3.0), dest.y);
+    cx.simulate_mouse_move(nudged, None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            !view.suppress_bar_tooltip_for_test(),
+            "a real pointer nudge after drop must restore hover"
+        );
+    });
 }
 
 #[gpui_kit::test]

@@ -15,11 +15,14 @@ pub const MIN_TIMELINE_WIDTH: f32 = 240.0;
 pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
 pub const SPLITTER_WIDTH: f32 = 8.0;
 pub const SPLITTER_STEP: f32 = 16.0;
-/// Inner grip on each painted end. Hits stay inside the bar on a resizable
-/// body; the last `LINK_HANDLE_INSET` pixels of a dated bar start a link,
-/// so the end grip sits just left of that sliver. Short bars shrink the
-/// start, end-resize, and link zones together so all three still exist.
+/// Visual 4px edge pills sit in this plate. Hits stay inside the bar on a
+/// resizable body; the last `LINK_HANDLE_INSET` pixels of a dated bar start
+/// a link, so the end grip sits just left of that sliver. Short bars shrink
+/// the start, end-resize, and link zones together so all three still exist.
 pub const HANDLE_WIDTH: f32 = 8.0;
+/// Pointer hit for inner start/end resize. Wider than the 4px pill so a
+/// press ~12px inside the edge still resizes instead of moving.
+pub const RESIZE_HIT_WIDTH: f32 = 14.0;
 /// Selected tree/timeline row tint. Stronger than zebra stripes so the row reads.
 pub const SELECTED_ROW_TINT: f32 = 0.65;
 /// Left accent on the selected tree/timeline row.
@@ -41,7 +44,7 @@ pub const OUTER_LINK_HIT: f32 = 18.0;
 pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// Right-handle hit reaches this far into the bar so a press on the last
 /// ~6px starts a link, not a resize (wide bars) or a no-op Move (slivers).
-/// Kept at 6 so the 8px end-resize grip stays a full 6–8px unique zone.
+/// Kept at 6 so the 14px end-resize grip stays a unique zone just left of it.
 pub const LINK_HANDLE_INSET: f32 = 6.0;
 /// Floor for the Move body when a short bar still resizes. 1px was
 /// covered by the occluding grips and unhittable on 16–24px slivers.
@@ -478,21 +481,21 @@ impl BarLayout {
             return (0.0, 0.0, link);
         }
         if wants_resize && !wants_link {
-            let grip = HANDLE_WIDTH.min(width / 2.0).max(1.0);
+            let grip = RESIZE_HIT_WIDTH.min(width / 2.0).max(1.0);
             return (grip, grip, 0.0);
         }
         if !wants_resize {
             return (0.0, 0.0, 0.0);
         }
-        let preferred = HANDLE_WIDTH * 2.0 + LINK_HANDLE_INSET;
+        let preferred = RESIZE_HIT_WIDTH * 2.0 + LINK_HANDLE_INSET;
         if width >= preferred + MIN_MOVE_ZONE {
-            return (HANDLE_WIDTH, HANDLE_WIDTH, LINK_HANDLE_INSET);
+            return (RESIZE_HIT_WIDTH, RESIZE_HIT_WIDTH, LINK_HANDLE_INSET);
         }
         let available = (width - MIN_MOVE_ZONE).max(3.0);
         let scale = available / preferred;
         (
-            (HANDLE_WIDTH * scale).max(1.0),
-            (HANDLE_WIDTH * scale).max(1.0),
+            (RESIZE_HIT_WIDTH * scale).max(1.0),
+            (RESIZE_HIT_WIDTH * scale).max(1.0),
             (LINK_HANDLE_INSET * scale).max(1.0),
         )
     }
@@ -520,7 +523,7 @@ impl BarLayout {
         if start > 0.0 {
             start
         } else {
-            HANDLE_WIDTH.min(self.width / 2.0).max(1.0)
+            RESIZE_HIT_WIDTH.min(self.width / 2.0).max(1.0)
         }
     }
 
@@ -624,13 +627,13 @@ impl BarHitZone {
     }
 }
 
-/// Inner start grip: the first `HANDLE_WIDTH` of the painted bar.
+/// Inner start grip: the first `RESIZE_HIT_WIDTH` of the painted bar.
 pub fn resize_start_handle(bar: &BarLayout) -> (f32, f32) {
     let width = bar.inner_grip_width();
     (bar.x, width)
 }
 
-/// Inner end grip: `HANDLE_WIDTH` ending `resize_end_link_inset` before
+/// Inner end grip: `RESIZE_HIT_WIDTH` ending `resize_end_link_inset` before
 /// the painted right, so the last 6px of a dated bar can start a link.
 pub fn resize_end_handle(bar: &BarLayout) -> (f32, f32) {
     let width = bar.inner_grip_width();
@@ -2375,7 +2378,16 @@ impl GanttView {
                 let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
                 let clip_right = self.timeline_width.max(1.0);
                 let natural_in = x_head - STUB;
-                let wrap_around = !succ_gutter && pred_end > bar.x + STUB && natural_in < pred_left;
+                // Overlap (source starts first, end past the target start) back-
+                // jogs from the left at every scale. Wrap only when a left
+                // inbound would sit left of the source — same-start / true
+                // backward FS — so the drop is not pulled through the target.
+                let overlap_back_jog =
+                    !succ_gutter && !inbound_right && overlap_enters_from_the_left(pred, bar);
+                let wrap_around = !succ_gutter
+                    && pred_end > bar.x + STUB
+                    && natural_in < pred_left
+                    && !overlap_back_jog;
                 let mut x_in = if wrap_around {
                     x_out
                 } else if inbound_right {
@@ -2432,20 +2444,26 @@ impl GanttView {
                         today_x,
                     );
                 }
-                if !succ_gutter && x_in < pred_left && natural_in >= pred_left {
+                if !succ_gutter && x_in < pred_left && natural_in >= pred_left && !overlap_back_jog
+                {
                     // Dodging shoved a forward inbound left of the source.
                     // Drop at the source stub and keep the head on the start
                     // instead of overshooting to a right-edge inbound — unless
                     // that stub sits inside an intervening bar or its cue.
                     // A true back-jog may sit slightly left of the source
                     // (`natural_in < pred_left`); do not pull that to x_out.
+                    // Overlap must not fall back to persist_end+12: that drop
+                    // runs through the successor body/cue (Week Cart UI).
                     let fallback = x_out.max(pred_left + STUB);
                     let hits_intervening = intervening.iter().any(|mid| {
                         let (left, right) =
                             bar_occupied_x(mid, include_labels, Some(clip_right), today_x);
                         x_hits_span(fallback, left, right)
                     });
-                    if !hits_intervening {
+                    let (succ_left, succ_right) =
+                        bar_occupied_x(bar, include_labels, Some(clip_right), today_x);
+                    let hits_successor = x_hits_span(fallback, succ_left, succ_right);
+                    if !hits_intervening && !hits_successor {
                         x_in = fallback;
                     }
                 }
@@ -2642,6 +2660,27 @@ impl GanttView {
         // Shared-source Y fan can lift the new Persist cart → Go-live run
         // into the outside chip; put it back ≥6px below, still in-row.
         clamp_lanes_off_source_titles(&mut out, bars);
+        // Parallel-vertical fans can shove an overlap inbound 16px right
+        // onto the successor (Week Persist cart → Cart UI at x≈884). Pull
+        // those drops left of the target at every scale, then slide any
+        // sibling inbound left so the pair does not restack.
+        force_overlap_back_jog(
+            &mut out,
+            bars,
+            include_labels,
+            clip_left,
+            clip_right,
+            today_x,
+        );
+        separate_shared_source_inbounds(&mut out, clip_left, clip_right);
+        force_overlap_back_jog(
+            &mut out,
+            bars,
+            include_labels,
+            clip_left,
+            clip_right,
+            today_x,
+        );
         out
     }
 }
@@ -4010,7 +4049,7 @@ pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
     let clip_pad = (-bar.x).max(0.0);
     let visible_w = (bar.width - clip_pad).max(0.0);
     let grip = if bar.can_resize() || bar.summary {
-        bar.inner_grip_width()
+        HANDLE_WIDTH.min(bar.width / 2.0)
     } else {
         0.0
     };
@@ -4051,6 +4090,64 @@ pub fn bar_label_right(bar: &BarLayout) -> f32 {
         bar.x + painted_w + 6.0 + title_w
     } else {
         bar.x + painted_w + HANDLE_WIDTH + LINK_HANDLE_HIT + 16.0 + title_w
+    }
+}
+
+fn painted_pred_end(pred: &BarLayout) -> f32 {
+    if pred.milestone || pred.marker {
+        pred.x + MILESTONE_SIZE
+    } else {
+        pred.x + pred.width
+    }
+}
+
+/// Source starts at/before the target and its end sits past the target start.
+/// A left inbound (`succ.x - 12`) is still on/after the source, so a wrap
+/// drop at `pred_end + 12` would run through the target (Cart UI body/cue).
+/// Scale-independent: pixel spans grow with Day/Week, but the 12px stub
+/// does not, so Week is the view that used to flip this into a wrap.
+fn overlap_enters_from_the_left(pred: &BarLayout, succ: &BarLayout) -> bool {
+    let pred_end = painted_pred_end(pred);
+    let natural_in = succ.x - DependencyArrow::WRAP_STUB;
+    pred_end > succ.x + DependencyArrow::WRAP_STUB && natural_in + 0.5 >= pred.x
+}
+
+/// Keep overlapping finish-to-start inbounds left of the successor after
+/// later fans. `separate_parallel_verticals` otherwise pushes a short stub
+/// 16px right onto Cart UI (Week drop at x≈884 through the bar).
+fn force_overlap_back_jog(
+    arrows: &mut [DependencyArrow],
+    bars: &[BarLayout],
+    include_labels: bool,
+    clip_left: f32,
+    clip_right: f32,
+    today_x: Option<f32>,
+) {
+    let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
+    for arrow in arrows.iter_mut() {
+        if arrow.inbound_right {
+            continue;
+        }
+        let Some(pred) = by_id.get(&arrow.from_id) else {
+            continue;
+        };
+        let Some(succ) = by_id.get(&arrow.to_id) else {
+            continue;
+        };
+        if !overlap_enters_from_the_left(pred, succ) {
+            continue;
+        }
+        let (left, right) = bar_occupied_x(succ, include_labels, Some(clip_right), today_x);
+        let stub = (succ.x - DependencyArrow::WRAP_STUB).max(clip_left);
+        let left_of_occ = (left - 8.0).max(clip_left);
+        let want = stub.min(left_of_occ);
+        if x_hits_span(arrow.x2, left, right) || arrow.x2 + 0.5 >= succ.x || arrow.x2 > want + 0.5 {
+            arrow.x2 = want;
+        }
+        let pred_end = painted_pred_end(pred);
+        if arrow.x1 + 0.5 < pred_end {
+            arrow.x1 = (pred_end + DependencyArrow::WRAP_STUB).clamp(clip_left, clip_right);
+        }
     }
 }
 
@@ -4517,6 +4614,34 @@ pub fn critical_path(nodes: &[WorkItemNode]) -> CriticalPath {
     CriticalPath { ids, links }
 }
 
+/// Work items connected to `id` by finish-to-start links in either direction
+/// (the hovered bar's whole dependency chain, matching monday.com highlight).
+pub fn related_dependency_ids(nodes: &[WorkItemNode], id: i64) -> HashSet<i64> {
+    let mut succs: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut preds: HashMap<i64, Vec<i64>> = HashMap::new();
+    for node in nodes {
+        for &from in &node.predecessors {
+            succs.entry(from).or_default().push(node.id);
+            preds.entry(node.id).or_default().push(from);
+        }
+    }
+    let mut out = HashSet::from([id]);
+    let mut stack = vec![id];
+    while let Some(cur) = stack.pop() {
+        for next in preds
+            .get(&cur)
+            .into_iter()
+            .flatten()
+            .chain(succs.get(&cur).into_iter().flatten())
+        {
+            if out.insert(*next) {
+                stack.push(*next);
+            }
+        }
+    }
+    out
+}
+
 pub fn is_completed_state(state: &str) -> bool {
     matches!(
         state.to_ascii_lowercase().as_str(),
@@ -4914,7 +5039,17 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(&bars, 168.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::ResizeEnd),
-            "the 8px just left of the link sliver must still resize"
+            "the 14px just left of the link sliver must still resize"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&bars, 162.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "12px inside the right edge (past the 6px link sliver) must resize"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&bars, 111.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::ResizeStart),
+            "12px inside the left edge must resize"
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 140.0, 4.0).map(|(_, kind)| kind),
@@ -4937,12 +5072,12 @@ mod tests {
         );
         let (end_x, end_w) = resize_end_handle(&bar);
         assert!(
-            (end_x - (bar.x + bar.width - HANDLE_WIDTH - LINK_HANDLE_INSET)).abs() < 0.1,
+            (end_x - (bar.x + bar.width - RESIZE_HIT_WIDTH - LINK_HANDLE_INSET)).abs() < 0.1,
             "end grip must sit just left of the 6px link sliver, got {end_x}"
         );
         assert!(
-            (end_w - HANDLE_WIDTH).abs() < 0.1,
-            "end grip must be the inner 8px, got {end_w}"
+            (end_w - RESIZE_HIT_WIDTH).abs() < 0.1,
+            "end grip must be the inner 14px, got {end_w}"
         );
         assert!(
             end_x + end_w <= bar.x + bar.width + 0.1,
@@ -5077,12 +5212,12 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(
                 std::slice::from_ref(&bar),
-                bar.x + bar.width - LINK_HANDLE_INSET - HANDLE_WIDTH / 2.0,
+                bar.x + bar.width - LINK_HANDLE_INSET - RESIZE_HIT_WIDTH / 2.0,
                 4.0
             )
             .map(|(_, kind)| kind),
             Some(GestureKind::ResizeEnd),
-            "the 8px just left of the link sliver must still resize"
+            "the 14px just left of the link sliver must still resize"
         );
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width / 2.0, 4.0)
@@ -5825,7 +5960,7 @@ mod tests {
             )
             .map(|(_, kind)| kind),
             Some(GestureKind::ResizeEnd),
-            "the inner 8px left of the sliver must still resize"
+            "the inner 14px left of the sliver must still resize"
         );
     }
 
@@ -5850,19 +5985,19 @@ mod tests {
         };
         let (start, end, link) = bar.edge_zones();
         assert!(
-            start >= 7.5 && end >= 7.5 && link >= 5.5,
-            "a 64px bar must keep an 8px resize and ~6px link, got start={start} end={end} link={link}"
+            start >= 13.5 && end >= 13.5 && link >= 5.5,
+            "a 64px bar must keep a 14px resize and ~6px link, got start={start} end={end} link={link}"
         );
         let right = bar.x + bar.width;
         assert_eq!(
             bar.hit_zone_at_window_x(right - 2.0, bar.x, right),
             BarHitZone::Link,
-            "last ~6–8px of a short Persist cart must link"
+            "last ~6px of a short Persist cart must link"
         );
         assert_eq!(
             bar.hit_zone_at_window_x(right - link - end / 2.0, bar.x, right),
             BarHitZone::ResizeEnd,
-            "the 6–8px just left of the sliver must resize"
+            "the 14px just left of the sliver must resize"
         );
         assert_eq!(
             bar.hit_zone_at_window_x(bar.x + bar.width / 2.0, bar.x, right),
@@ -8826,6 +8961,111 @@ mod tests {
         );
     }
 
+    fn overlap_persist_cart_ui_nodes() -> Vec<WorkItemNode> {
+        let mut persist = node(1003, Some(1002));
+        persist.title = "Persist cart".into();
+        persist.start_date = Some("2026-07-06T00:00:00Z".into());
+        persist.target_date = Some("2026-07-25T00:00:00Z".into());
+        let mut cart_ui = node(1005, Some(1003));
+        cart_ui.title = "Cart UI".into();
+        cart_ui.start_date = Some("2026-07-21T00:00:00Z".into());
+        cart_ui.target_date = None;
+        cart_ui.predecessors = vec![1003];
+        vec![node(1001, None), node(1002, Some(1001)), persist, cart_ui]
+    }
+
+    fn assert_overlap_back_jog(gantt: &GanttView, nodes: &[WorkItemNode]) {
+        let rows = gantt.flatten(nodes);
+        let bars = gantt.layout_bars(nodes, &rows, &[], 720.0);
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        if pred.x + pred.width <= succ.x + 12.0 {
+            return;
+        }
+        let arrow = gantt
+            .layout_dependency_arrows(&bars)
+            .into_iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1005)
+            .expect("Persist cart → Cart UI");
+        assert!(
+            !arrow.wraps_around_successor(),
+            "{:?} overlap must not wrap through the target, x1={} x2={} x_head={}",
+            gantt.scale,
+            arrow.x1,
+            arrow.x2,
+            arrow.x_head
+        );
+        assert!(
+            arrow.x2 < succ.x,
+            "{:?} back-jog inbound must sit left of Cart UI, x2={} succ.x={}",
+            gantt.scale,
+            arrow.x2,
+            succ.x
+        );
+        let today = jiff::Zoned::now().date();
+        let today_px = gantt.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+        let (left, right) = bar_occupied_x(succ, true, Some(gantt.timeline_width), today_x);
+        assert!(
+            !x_hits_span(arrow.x2, left, right),
+            "{:?} inbound vertical must not run through Cart UI, x2={} occupied={left}..{right}",
+            gantt.scale,
+            arrow.x2
+        );
+        assert!(
+            arrow.x1 > arrow.x2,
+            "{:?} overlap route is a leftward jog, x1={} x2={}",
+            gantt.scale,
+            arrow.x1,
+            arrow.x2
+        );
+    }
+
+    #[test]
+    fn overlapping_fs_link_back_jogs_in_every_scale() {
+        let nodes = overlap_persist_cart_ui_nodes();
+        for (scale, zoom) in [
+            (GanttScale::Day, 1.0),
+            (GanttScale::Week, 1.0),
+            (GanttScale::Month, 1.0),
+            (GanttScale::Quarter, 2.0),
+            (GanttScale::Year, 4.0),
+        ] {
+            let gantt = GanttView {
+                origin: Date::new(2026, 7, 1).unwrap(),
+                timeline_width: 1100.0,
+                scale,
+                zoom,
+                ..Default::default()
+            };
+            assert_overlap_back_jog(&gantt, &nodes);
+        }
+    }
+
+    #[test]
+    fn week_overlapping_fs_link_with_sibling_arrows_back_jogs() {
+        let mut nodes = overlap_persist_cart_ui_nodes();
+        let mut go_live = node(1013, Some(1001));
+        go_live.title = "Go-live milestone".into();
+        go_live.start_date = None;
+        go_live.target_date = Some("2026-08-15T00:00:00Z".into());
+        go_live.predecessors = vec![1003];
+        let mut spike = node(1012, None);
+        spike.title = "Unparented spike".into();
+        spike.start_date = Some("2026-07-21T00:00:00Z".into());
+        spike.target_date = Some("2026-08-04T00:00:00Z".into());
+        spike.predecessors = vec![1005];
+        nodes.push(go_live);
+        nodes.push(spike);
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 1100.0,
+            scale: GanttScale::Week,
+            ..Default::default()
+        };
+        assert_overlap_back_jog(&gantt, &nodes);
+    }
+
     #[test]
     fn critical_path_is_the_dated_fs_chain_that_finishes_latest() {
         let mut a = node(1, None);
@@ -8858,6 +9098,28 @@ mod tests {
         assert!(
             !path.ids.contains(&2),
             "the earlier-finishing branch is not on the critical path"
+        );
+    }
+
+    #[test]
+    fn related_dependency_ids_walk_the_whole_fs_chain() {
+        let mut a = node(1, None);
+        a.start_date = Some("2026-07-06T00:00:00Z".into());
+        a.target_date = Some("2026-07-10T00:00:00Z".into());
+        let mut b = node(2, None);
+        b.start_date = Some("2026-07-11T00:00:00Z".into());
+        b.target_date = Some("2026-07-20T00:00:00Z".into());
+        b.predecessors = vec![1];
+        let mut c = node(3, None);
+        c.start_date = Some("2026-07-21T00:00:00Z".into());
+        c.target_date = Some("2026-07-25T00:00:00Z".into());
+        c.predecessors = vec![2];
+        let d = node(4, None);
+        let related = related_dependency_ids(&[a, b, c, d], 2);
+        assert_eq!(
+            related,
+            HashSet::from([1, 2, 3]),
+            "hovering the middle of A→B→C must highlight the whole chain, got {related:?}"
         );
     }
 
