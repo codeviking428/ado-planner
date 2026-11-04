@@ -9577,6 +9577,15 @@ fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
         !overlaps_diamond,
         "Go-live tooltip must sit beside the diamond, not on it, tip={tip_left}..{tip_right} y={tip_top}..{tip_bottom} diamond={diamond_left}..{diamond_right}"
     );
+    let gap = if tip_right <= diamond_left + 1.0 {
+        diamond_left - tip_right
+    } else {
+        tip_left - diamond_right
+    };
+    assert!(
+        gap <= 48.0,
+        "Go-live tooltip must stay anchored to the diamond, not ~150px past the title, gap={gap} tip={tip_left}..{tip_right} diamond={diamond_left}..{diamond_right}"
+    );
     if let Some(spike) = cx.debug_bounds("gantt-bar-1012") {
         let spike_top = f32::from(spike.origin.y);
         let spike_bottom = spike_top + f32::from(spike.size.height);
@@ -9605,10 +9614,15 @@ fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
             && tip_right > label_left + 1.0
             && tip_top < label_bottom - 1.0
             && tip_bottom > label_top + 1.0;
-        assert!(
-            !overlaps,
-            "Go-live tooltip must not cover the outside title, tip={tip_left}..{tip_right} label={label_left}..{label_right}"
-        );
+        // Sitting left of the diamond must miss the title. Sitting flush
+        // right (no left gutter) may share the title slot rather than
+        // jumping ~150px past it.
+        if tip_right <= diamond_left + 1.0 {
+            assert!(
+                !overlaps,
+                "Go-live tooltip must not cover the outside title, tip={tip_left}..{tip_right} label={label_left}..{label_right}"
+            );
+        }
     } else {
         assert!(
             tip_right <= diamond_left + 1.0

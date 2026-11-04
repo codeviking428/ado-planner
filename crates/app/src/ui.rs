@@ -4890,9 +4890,6 @@ impl PlannerView {
                         self.render_offscreen_edge(bar, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
-                        self.render_gantt_link_handles(bar, dragging, cx)
-                    }))
-                    .children(bars.iter().filter_map(|bar| {
                         self.render_parent_overflow_badge(bar, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
@@ -4916,6 +4913,11 @@ impl PlannerView {
                         // Sibling of the bar so overflow:hidden cannot clip
                         // the 1px-outside / 8px-inside resize halo.
                         self.render_resize_halos(bar, dragging, cx)
+                    }))
+                    .children(bars.iter().filter_map(|bar| {
+                        // After connectors so a short bar's end ring is not
+                        // hidden under the outgoing stub.
+                        self.render_gantt_link_handles(bar, dragging, cx)
                     }))
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
@@ -5689,6 +5691,9 @@ impl PlannerView {
                                 .truncate()
                                 .text_xs()
                                 .text_color(inner_label_fg)
+                                .when(self.hover_pills_cover_title(bar, dragging), |el| {
+                                    el.opacity(0.22)
+                                })
                                 .child(bar_title_chip(bar.title.clone(), inner_label_fg, true)),
                         )
                     },
@@ -6865,11 +6870,6 @@ impl PlannerView {
                 bar_top: bar.y + bar_top,
                 row_y: bar.y,
                 milestone: bar.milestone || bar.marker,
-                title_w: if bar.milestone || bar.marker {
-                    bar_title_paint_px(&bar.title)
-                } else {
-                    0.0
-                },
                 viewport_h: self.state.gantt.viewport_h,
                 toast_band,
             },
@@ -6902,6 +6902,26 @@ impl PlannerView {
         )
     }
 
+    /// Date pills sit on the bar edges and would cover the title; fade it.
+    fn hover_pills_cover_title(&self, bar: &crate::gantt::BarLayout, dragging: bool) -> bool {
+        if dragging
+            || self.details_overlay()
+            || self.suppress_bar_tooltip
+            || self.state.gantt.gesture.is_some()
+            || bar.milestone
+            || bar.marker
+            || bar.kind == ado_core::GanttBarKind::Unscheduled
+            || bar.kind == ado_core::GanttBarKind::NoFields
+            || self.state.gantt.bar_hovered_id != Some(bar.id)
+        {
+            return false;
+        }
+        self.state
+            .nodes
+            .iter()
+            .any(|node| node.id == bar.id && parse_iso_date(node.start_date.as_deref()).is_some())
+    }
+
     /// Start/Target pills on hover (and after drop, once hover is recomputed).
     /// Parked above the bar so they do not cover the resize halo or outer
     /// link handle.
@@ -6912,16 +6932,7 @@ impl PlannerView {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let id = bar.id;
-        if self.state.gantt.bar_hovered_id != Some(id)
-            || dragging
-            || self.details_overlay()
-            || self.suppress_bar_tooltip
-            || self.state.gantt.gesture.is_some()
-            || bar.milestone
-            || bar.marker
-            || bar.kind == ado_core::GanttBarKind::Unscheduled
-            || bar.kind == ado_core::GanttBarKind::NoFields
-        {
+        if !self.hover_pills_cover_title(bar, dragging) {
             return None;
         }
         let node = self.state.nodes.iter().find(|node| node.id == id)?;
@@ -7027,6 +7038,9 @@ impl PlannerView {
                 .when(!truncate, |el| el.whitespace_nowrap())
                 .text_xs()
                 .text_color(muted_fg)
+                .when(self.hover_pills_cover_title(bar, dragging), |el| {
+                    el.opacity(0.22)
+                })
                 .when(!dragging, |el| el.occlude())
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
@@ -10515,7 +10529,6 @@ struct TooltipPlace {
     bar_top: f32,
     row_y: f32,
     milestone: bool,
-    title_w: f32,
     viewport_h: f32,
     toast_band: f32,
 }
@@ -10569,14 +10582,19 @@ fn nudge_overlay_off(
 fn hover_bar_tooltip_origin(place: TooltipPlace, pills: &[OverlayRect]) -> (f32, f32) {
     let conservative_w = (place.tip_w + 48.0).max(place.tip_w * 1.5);
     if place.milestone {
-        // Stay in the source row. Above covers Unparented spike; below
-        // covers the next bar. Sit left of the diamond, or right of the
-        // outside title when the left gutter is gone — even if that clips.
-        let left = place.bar_x - conservative_w - place.extra.max(8.0);
+        // Stay in the source row, flush to the diamond. A 1.5× width
+        // overestimate used to reject a left fit and jump ~150px past the
+        // outside title. A small font fudge keeps the left fit honest so
+        // the painted chip does not slide onto the diamond. Do not clamp
+        // a right-of-diamond placement back onto it when the chip is wider
+        // than the remaining clip.
+        let pad = place.extra.max(8.0);
+        let fit_w = place.tip_w + 16.0;
+        let left = place.bar_x - fit_w - pad;
         let x = if left >= 0.0 {
             left
         } else {
-            place.bar_x + place.painted_w + 6.0 + place.title_w.max(80.0) + 4.0
+            place.bar_x + place.painted_w + 4.0
         };
         return (x.max(0.0), place.bar_top);
     }
@@ -11853,7 +11871,6 @@ mod bar_label_tests {
             bar_top,
             row_y,
             milestone,
-            title_w: if milestone { 160.0 } else { 0.0 },
             viewport_h: 720.0,
             toast_band: 0.0,
         }
@@ -11882,6 +11899,30 @@ mod bar_label_tests {
         assert!(
             tight_x >= 40.0 + 16.0,
             "left-clip milestone tooltip must sit right of the diamond, got {tight_x}"
+        );
+        assert!(
+            tight_x <= 40.0 + 16.0 + 8.0,
+            "left-clip milestone tooltip must stay flush to the diamond, not jump past the title, got {tight_x}"
+        );
+        // conservative_w (1.5×) parked this ~150px past the title. Stay
+        // flush to the diamond (left if it fits, otherwise immediately right).
+        let (anchored_x, _) =
+            tooltip_at(tip(200.0, 16.0, 42.0, 156.0, 800.0, 12.0, 0.0, true), &[]);
+        let diamond_right = 200.0 + 16.0;
+        let sits_left = anchored_x + 156.0 <= 200.0 + 0.1;
+        let sits_right = anchored_x >= diamond_right - 0.1;
+        assert!(
+            sits_left || sits_right,
+            "Go-live tooltip must sit beside the diamond, got {anchored_x}"
+        );
+        let gap = if sits_left {
+            200.0 - (anchored_x + 156.0)
+        } else {
+            anchored_x - diamond_right
+        };
+        assert!(
+            gap <= 50.0,
+            "Go-live tooltip must stay anchored to the diamond, gap={gap} x={anchored_x}"
         );
         let (side_x, side_y) =
             tooltip_at(tip(40.0, 80.0, 8.0, 120.0, 800.0, 80.0, 80.0, false), &[]);

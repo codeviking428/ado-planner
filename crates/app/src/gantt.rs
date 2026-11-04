@@ -751,6 +751,9 @@ pub struct DependencyArrow {
 
 impl DependencyArrow {
     const WRAP_STUB: f32 = 12.0;
+    /// Overlap back-jog stubs (exit + inbound). Shorter than [`Self::WRAP_STUB`]
+    /// so Week/Month U-turns sit closer to the source bar.
+    const BACK_JOG_STUB: f32 = 8.0;
 
     /// Wrap-around routing drops at the source stub, then runs on the
     /// successor row into a short inbound. Used for a true backward FS
@@ -2475,7 +2478,6 @@ impl GanttView {
                     bar.x + bar.width
                 };
                 let pred_left = pred.x;
-                let x_out = pred_end + STUB;
                 // Finish-to-start always enters the successor start. Gutter
                 // pills keep inbound_right so the head is not a cramped stub
                 // on "No dates". Overlap (source end past target start) back-
@@ -2493,6 +2495,12 @@ impl GanttView {
                 // backward FS — so the drop is not pulled through the target.
                 let overlap_back_jog =
                     !succ_gutter && !inbound_right && overlap_enters_from_the_left(pred, bar);
+                let stub = if overlap_back_jog {
+                    DependencyArrow::BACK_JOG_STUB
+                } else {
+                    STUB
+                };
+                let x_out = pred_end + stub;
                 let wrap_around = !succ_gutter
                     && pred_end > bar.x + STUB
                     && natural_in < pred_left
@@ -2502,7 +2510,7 @@ impl GanttView {
                 } else if inbound_right {
                     x_head + STUB
                 } else {
-                    x_head - STUB
+                    x_head - stub
                 };
                 let lo = pred.y.min(bar.y);
                 let hi = pred.y.max(bar.y);
@@ -4255,15 +4263,16 @@ fn force_overlap_back_jog(
             continue;
         }
         let (left, right) = bar_occupied_x(succ, include_labels, Some(clip_right), today_x);
-        let stub = (succ.x - DependencyArrow::WRAP_STUB).max(clip_left);
+        let stub = (succ.x - DependencyArrow::BACK_JOG_STUB).max(clip_left);
         let left_of_occ = (left - 8.0).max(clip_left);
         let want = stub.min(left_of_occ);
         if x_hits_span(arrow.x2, left, right) || arrow.x2 + 0.5 >= succ.x || arrow.x2 > want + 0.5 {
             arrow.x2 = want;
         }
         let pred_end = painted_pred_end(pred);
-        if arrow.x1 + 0.5 < pred_end {
-            arrow.x1 = (pred_end + DependencyArrow::WRAP_STUB).clamp(clip_left, clip_right);
+        let tight_exit = (pred_end + DependencyArrow::BACK_JOG_STUB).clamp(clip_left, clip_right);
+        if arrow.x1 + 0.5 < pred_end || arrow.x1 > tight_exit + 0.5 {
+            arrow.x1 = tight_exit;
         }
     }
 }
@@ -4393,8 +4402,18 @@ fn route_obstacle_aware_verticals(
             continue;
         };
         let pred_end = painted_pred_end(pred);
-        let exit_right = pred_end + DependencyArrow::WRAP_STUB;
-        let back_jog = arrows[i].x_head - DependencyArrow::WRAP_STUB;
+        let exit_right = pred_end
+            + if overlap_enters_from_the_left(pred, succ) {
+                DependencyArrow::BACK_JOG_STUB
+            } else {
+                DependencyArrow::WRAP_STUB
+            };
+        let back_jog = arrows[i].x_head
+            - if overlap_enters_from_the_left(pred, succ) {
+                DependencyArrow::BACK_JOG_STUB
+            } else {
+                DependencyArrow::WRAP_STUB
+            };
         let lane_y = arrows[i].lane_y;
         let y2 = arrows[i].y2;
         let y1 = arrows[i].y1;
@@ -9643,6 +9662,15 @@ mod tests {
             arrow.x1,
             arrow.x2
         );
+        let pred_end = pred.x + pred.width;
+        assert!(
+            arrow.x1 <= pred_end + DependencyArrow::BACK_JOG_STUB + 1.0,
+            "{:?} back-jog loop must stay tight, x1={} pred_end={} stub={}",
+            gantt.scale,
+            arrow.x1,
+            pred_end,
+            DependencyArrow::BACK_JOG_STUB
+        );
     }
 
     #[test]
@@ -10056,11 +10084,13 @@ mod tests {
         let live_arrows = gantt.layout_dependency_arrows(&live);
         let live_pred = live.iter().find(|bar| bar.id == 1).unwrap();
         assert_eq!(live_arrows.len(), 1);
+        let pred_end = live_pred.x + live_pred.width;
+        let stub = live_arrows[0].x1 - pred_end;
         assert!(
-            (live_arrows[0].x1 - (live_pred.x + live_pred.width + 12.0)).abs() < 1.0,
-            "outgoing stub must follow the live end edge, got {} vs {}",
-            live_arrows[0].x1,
-            live_pred.x + live_pred.width + 12.0
+            (DependencyArrow::BACK_JOG_STUB - 1.0..=DependencyArrow::WRAP_STUB + 1.0)
+                .contains(&stub),
+            "outgoing stub must follow the live end edge, got {} vs pred_end={pred_end}",
+            live_arrows[0].x1
         );
         assert!(
             live_arrows[0].x1 > old_x1 + 4.0,

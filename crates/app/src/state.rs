@@ -1655,6 +1655,7 @@ impl PlannerState {
                 self.history.redo.push(entry.clone());
                 self.push_history_toast(&entry, true);
                 self.sync_open_form_from_node(id);
+                self.clear_selection_if_undo_empty();
                 vec![PendingDateSave {
                     id,
                     start: parse_iso_date(before_start.as_deref()),
@@ -1685,7 +1686,9 @@ impl PlannerState {
                     };
                     self.push_history_toast(&entry, true);
                 }
-                self.pending_from_dates_group(items, true)
+                let pending = self.pending_from_dates_group(items, true);
+                self.clear_selection_if_undo_empty();
+                pending
             }
             _ => Vec::new(),
         }
@@ -2119,6 +2122,7 @@ impl PlannerState {
             return false;
         };
         if node.predecessors.contains(&predecessor_id) {
+            self.toasts.push(ToastKind::Warning, "Link already exists");
             return false;
         }
         if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
@@ -2663,6 +2667,7 @@ impl PlannerState {
                 self.history.redo.push(entry.clone());
             }
             self.push_history_toast(&entry, true);
+            self.clear_selection_if_undo_empty();
         } else {
             self.history.undo.push(entry);
         }
@@ -2950,6 +2955,7 @@ impl PlannerState {
         ) {
             self.clear_selection_after_link_undo();
         }
+        self.clear_selection_if_undo_empty();
         if let Some(msg) = working.toasts.last_error_message() {
             self.toasts.push(ToastKind::Error, msg.to_string());
         }
@@ -2958,6 +2964,13 @@ impl PlannerState {
     fn clear_selection_after_link_undo(&mut self) {
         self.gantt.selected_id = None;
         self.gantt.selected_link = None;
+    }
+
+    fn clear_selection_if_undo_empty(&mut self) {
+        if self.history.undo.is_empty() {
+            self.gantt.selected_id = None;
+            self.gantt.selected_link = None;
+        }
     }
 
     fn discard_history_for_undo(&mut self, action: &UndoAction) {

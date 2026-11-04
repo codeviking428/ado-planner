@@ -450,6 +450,10 @@ async fn undo_after_a_bar_drag_restores_original_dates() {
     let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
     assert_eq!(restored.start_date, original_start);
     assert_eq!(restored.target_date, original_target);
+    assert_eq!(
+        state.gantt.selected_id, None,
+        "undoing the last edit must clear the drag selection"
+    );
 }
 
 #[tokio::test]
@@ -497,6 +501,10 @@ async fn two_drags_then_two_undos_revert_both() {
     let restored = state.nodes.iter().find(|n| n.id == node.id).unwrap();
     assert_eq!(restored.start_date, original_start);
     assert_eq!(restored.target_date, original_target);
+    assert_eq!(
+        state.gantt.selected_id, None,
+        "after all undos the dragged row must not stay selected"
+    );
 }
 
 #[tokio::test]
@@ -1448,6 +1456,24 @@ async fn bootstrap_marks_a_restored_session_ready_to_persist_links() {
     assert!(
         state.can_persist_links(),
         "a stored PAT/Entra session must persist link drags after restart"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_link_drop_toasts_already_exists() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    assert!(
+        state.apply_link_now(1005, 1003),
+        "first Persist cart → Cart UI link must apply"
+    );
+    assert!(
+        !state.apply_link_now(1005, 1003),
+        "a second drop of the same FS link must be a no-op"
+    );
+    assert_eq!(
+        state.toasts.last_message(),
+        Some("Link already exists"),
+        "duplicate link drop must toast instead of staying silent"
     );
 }
 
