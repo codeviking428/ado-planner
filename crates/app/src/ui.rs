@@ -4456,9 +4456,10 @@ impl PlannerView {
                                 .into_iter()
                                 .enumerate()
                                 .map(|(index, (top, height))| {
+                                    let selector = format!("gantt-today-body-{index}");
                                     div()
                                         .id(("gantt-today-body", index as u64))
-                                        .debug_selector(|| "gantt-today-body".into())
+                                        .debug_selector(move || selector)
                                         .absolute()
                                         .left(px(today_x))
                                         .top(px(top))
@@ -8904,10 +8905,13 @@ fn row_side_tooltip_left(
 }
 
 fn bar_title_chip(title: String, ink: gpui_kit::Hsla, truncate: bool) -> gpui_kit::Div {
+    // Opaque so a Today segment that still shares the chip's x cannot show
+    // through the letters (R74 drew under the pills; 0.5/0.78 let the stroke
+    // read as running through Persist cart / Go-live / spike).
     let chip = if ink.l > 0.5 {
-        gpui_kit::hsla(0., 0., 0., 0.5)
+        gpui_kit::hsla(0., 0., 0.12, 1.)
     } else {
-        gpui_kit::hsla(0., 0., 1., 0.78)
+        gpui_kit::hsla(0., 0., 1., 1.)
     };
     div()
         .debug_selector(|| "gantt-bar-title-chip".into())

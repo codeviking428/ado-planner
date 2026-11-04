@@ -2470,16 +2470,15 @@ impl GanttView {
         separate_parallel_verticals(&mut out, clip_left, clip_right);
         separate_shared_source_outgoing(&mut out, clip_left, clip_right);
         separate_shared_source_inbounds(&mut out, clip_left, clip_right);
-        // Spreading can shove a Year inbound back onto Cart UI's sliver.
+        // Spreading can shove an inbound back onto Cart UI (Year sliver or
+        // Month body at cart.x). `separate_parallel_verticals` after a nudge
+        // pushes the right inbound onto Cart UI's left edge (x_head == cart.x
+        // for the spike) and leaves a 2px hit-box gap vs Go-live. Last inbound
+        // move is nudge, then left-only fan if the pair restacked — never a
+        // right parallel push.
         nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
-        separate_parallel_verticals(&mut out, clip_left, clip_right);
         separate_shared_source_inbounds(&mut out, clip_left, clip_right);
-        // Left fan can walk a Year inbound back onto Cart UI's 16px sliver.
-        // Month keeps the post-nudge fan as the last inbound move so the
-        // pair cannot collapse onto Cart UI.x−16.
-        if matches!(self.scale, GanttScale::Year) {
-            nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
-        }
+        nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
         dodge_outgoing_off_source_labels(
             &mut out, bars, clip_left, clip_right, timeline_w, today_x,
         );
@@ -3118,6 +3117,91 @@ fn dodge_outgoing_off_source_labels(
             arrow.x2 = (arrow.x2 + delta).clamp(clip_left, clip_right);
         }
     }
+    separate_shared_source_outgoing_off_labels(
+        arrows, bars, clip_left, clip_right, timeline_w, today_x,
+    );
+}
+
+/// Last dodge can park Persist cart → Go-live 10px past the spike stub
+/// (incoming-fan spacing). 8px hits then leave a 2px bounding-box gap.
+/// Spread `x1` by `PARALLEL_VERT_MIN` without walking onto the source chip:
+/// push right when that still misses the letters, otherwise push the left
+/// stub further left.
+fn separate_shared_source_outgoing_off_labels(
+    arrows: &mut [DependencyArrow],
+    bars: &[BarLayout],
+    clip_left: f32,
+    clip_right: f32,
+    timeline_w: f32,
+    today_x: Option<f32>,
+) {
+    if arrows.len() < 2 {
+        return;
+    }
+    let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
+    let mut by_from: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (index, arrow) in arrows.iter().enumerate() {
+        by_from.entry(arrow.from_id).or_default().push(index);
+    }
+    for indexes in by_from.values_mut() {
+        if indexes.len() < 2 {
+            continue;
+        }
+        indexes.sort_by(|&a, &b| arrows[a].x1.total_cmp(&arrows[b].x1));
+        for _ in 0..indexes.len() * 4 {
+            let mut moved = false;
+            for pair in indexes.windows(2) {
+                let a = pair[0];
+                let b = pair[1];
+                let dx = (arrows[a].x1 - arrows[b].x1).abs();
+                if dx >= PARALLEL_VERT_MIN {
+                    continue;
+                }
+                let (left_i, right_i) = if arrows[a].x1 <= arrows[b].x1 {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                let chip = by_id.get(&arrows[right_i].from_id).and_then(|pred| {
+                    bar_outside_title_span_clipped(pred, timeline_w.max(1.0), today_x)
+                });
+                let push = (arrows[left_i].x1 + PARALLEL_VERT_MIN - arrows[right_i].x1).max(1.0);
+                let right_next = arrows[right_i].x1 + push;
+                let hits_chip = chip.is_some_and(|(left, right)| {
+                    x_hits_span(
+                        right_next,
+                        left - SOURCE_LABEL_CLEARANCE,
+                        right + SOURCE_LABEL_CLEARANCE,
+                    )
+                });
+                if !hits_chip
+                    && shift_vertical(
+                        &mut arrows[right_i],
+                        VertKind::Outgoing,
+                        push,
+                        clip_left,
+                        clip_right,
+                    )
+                {
+                    moved = true;
+                    continue;
+                }
+                let pull = (arrows[right_i].x1 - PARALLEL_VERT_MIN - arrows[left_i].x1).min(-1.0);
+                if shift_vertical(
+                    &mut arrows[left_i],
+                    VertKind::Outgoing,
+                    pull,
+                    clip_left,
+                    clip_right,
+                ) {
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
 }
 
 /// Keep a long outgoing horizontal ≥6px below the source's outside title
@@ -3525,7 +3609,15 @@ pub fn today_line_chip_skips(
             } else {
                 bar_title_px(&bar.title).min(w)
             };
-            if x >= line_right + 2.0 || x + skip_w <= today_x - 2.0 {
+            // Year graze counts: a chip whose left edge sits on the 3px stroke
+            // (Checkout at today+3) still paints through the line. Other
+            // scales keep a 2px miss so Quarter occupancy cannot false-gap.
+            let miss_right = if year {
+                line_right + TODAY_LABEL_CLEARANCE
+            } else {
+                line_right + 2.0
+            };
+            if x >= miss_right || x + skip_w <= today_x - 2.0 {
                 return None;
             }
             let top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
@@ -6697,6 +6789,13 @@ mod tests {
         );
         let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
         assert_inbound_drops_before_intervening_bar(persist_live, cart_ui, gantt.timeline_width);
+        assert_inbound_drops_before_intervening_bar(persist_spike, cart_ui, gantt.timeline_width);
+        assert!(
+            persist_spike.x2 < cart_ui.x,
+            "runtime Persist cart → spike must not jump onto Cart UI's left edge, x2={} cart.x={}",
+            persist_spike.x2,
+            cart_ui.x
+        );
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         let (left, right) = bar_outside_title_span(pred)
             .expect("zoomed-out Month Persist cart must paint an outside title");
@@ -6760,11 +6859,26 @@ mod tests {
             persist_spike.x2,
             persist_live.x2
         );
+        let outgoing_dx = (persist_spike.x1 - persist_live.x1).abs();
+        assert!(
+            outgoing_dx >= PARALLEL_VERT_MIN,
+            "auto-fit Month outgoings must sit ≥{PARALLEL_VERT_MIN}px apart after dodge, dx={outgoing_dx} spike x1={} live x1={}",
+            persist_spike.x1,
+            persist_live.x1
+        );
         let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        assert_inbound_drops_before_intervening_bar(persist_live, cart, gantt.timeline_width);
+        assert_inbound_drops_before_intervening_bar(persist_spike, cart, gantt.timeline_width);
         assert!(
             persist_live.x2 < cart.x,
             "auto-fit Month Persist cart → Go-live must drop before Cart UI, x2={} cart.x={}",
             persist_live.x2,
+            cart.x
+        );
+        assert!(
+            persist_spike.x2 < cart.x,
+            "auto-fit Month Persist cart → spike must not jump onto Cart UI's left edge, x2={} cart.x={}",
+            persist_spike.x2,
             cart.x
         );
     }

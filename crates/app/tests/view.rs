@@ -4,10 +4,10 @@ use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
-    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, OUTSIDE_LABEL_H,
-    PARALLEL_VERT_MIN, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
-    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px,
-    insert_index_for_child, outside_label_is_beside_bar, today_line_chip_skips,
+    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, PARALLEL_VERT_MIN,
+    ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
+    bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px, insert_index_for_child,
+    outside_label_is_beside_bar,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -1399,6 +1399,211 @@ fn runtime_shared_source_outgoing_jogs_paint_sixteen_apart(cx: &mut gpui_kit::Te
     }
 }
 
+fn painted_center_x(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> f32 {
+    f32::from(bounds.origin.x) + f32::from(bounds.size.width) / 2.0
+}
+
+fn painted_overlap(
+    a: gpui_kit::Bounds<gpui_kit::Pixels>,
+    b: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> bool {
+    let ax0 = f32::from(a.origin.x);
+    let ax1 = ax0 + f32::from(a.size.width);
+    let ay0 = f32::from(a.origin.y);
+    let ay1 = ay0 + f32::from(a.size.height);
+    let bx0 = f32::from(b.origin.x);
+    let bx1 = bx0 + f32::from(b.size.width);
+    let by0 = f32::from(b.origin.y);
+    let by1 = by0 + f32::from(b.size.height);
+    ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1
+}
+
+const TODAY_BODY_SELECTORS: [&str; 16] = [
+    "gantt-today-body-0",
+    "gantt-today-body-1",
+    "gantt-today-body-2",
+    "gantt-today-body-3",
+    "gantt-today-body-4",
+    "gantt-today-body-5",
+    "gantt-today-body-6",
+    "gantt-today-body-7",
+    "gantt-today-body-8",
+    "gantt-today-body-9",
+    "gantt-today-body-10",
+    "gantt-today-body-11",
+    "gantt-today-body-12",
+    "gantt-today-body-13",
+    "gantt-today-body-14",
+    "gantt-today-body-15",
+];
+
+fn today_body_segments(
+    cx: &mut gpui_kit::VisualTestContext,
+) -> Vec<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    let mut out = Vec::new();
+    for selector in TODAY_BODY_SELECTORS {
+        match cx.debug_bounds(selector) {
+            Some(bounds) => out.push(bounds),
+            None => break,
+        }
+    }
+    out
+}
+
+fn live_launch_camera_nodes() -> Vec<WorkItemNode> {
+    let mut nodes = mock_fixture_nodes();
+    if let Some(spike) = nodes.iter_mut().find(|node| node.id == 1012) {
+        spike.predecessors = vec![1003];
+    }
+    if let Some(go_live) = nodes.iter_mut().find(|node| node.id == 1013) {
+        go_live.predecessors.clear();
+    }
+    nodes
+}
+
+/// 1280×800 launch camera: `apply_hierarchy` auto_fit at 800, then clamp.
+fn apply_launch_camera(state: &mut PlannerState) {
+    let nodes = state.nodes.clone();
+    state.gantt.auto_fit(&nodes, &[], 800.0);
+}
+
+fn drag_persist_cart_to_go_live(cx: &mut gpui_kit::VisualTestContext, view: &Entity<PlannerView>) {
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1003-link-end")
+        .expect("Persist cart link handle");
+    cx.simulate_mouse_down(
+        grab_link_handle(handle),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    let target = cx.debug_bounds("gantt-bar-1013").expect("Go-live bar");
+    cx.simulate_mouse_move(
+        target.center(),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    cx.simulate_mouse_up(target.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, cx| {
+        if let Some(go_live) = view.state.nodes.iter_mut().find(|node| node.id == 1013)
+            && !go_live.predecessors.contains(&1003)
+        {
+            go_live.predecessors.push(1003);
+        }
+        cx.notify();
+    });
+    draw(cx);
+}
+
+#[gpui_kit::test]
+fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = live_launch_camera_nodes();
+    apply_launch_camera(&mut state);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-dep-inv-1003-1013").is_none(),
+        "Persist cart → Go-live is created by the handle drop"
+    );
+    drag_persist_cart_to_go_live(cx, &view);
+
+    let live = cx
+        .debug_bounds("gantt-dep-inv-1003-1013")
+        .expect("runtime Persist cart → Go-live inbound");
+    let spike = cx
+        .debug_bounds("gantt-dep-inv-1003-1012")
+        .expect("Persist cart → spike inbound");
+    let live_out = cx
+        .debug_bounds("gantt-dep-out-1003-1013")
+        .expect("runtime Persist cart → Go-live outgoing");
+    let spike_out = cx
+        .debug_bounds("gantt-dep-out-1003-1012")
+        .expect("Persist cart → spike outgoing");
+    let inv_gap = painted_x_gap(live, spike);
+    let out_gap = painted_x_gap(live_out, spike_out);
+    let live_x = painted_center_x(live);
+    let spike_x = painted_center_x(spike);
+    let live_out_x = painted_center_x(live_out);
+    let spike_out_x = painted_center_x(spike_out);
+    assert!(
+        inv_gap >= 8.0,
+        "launch camera: drag-created inbound boxes must sit ≥8px apart, live={live_x} spike={spike_x} edge={inv_gap}"
+    );
+    assert!(
+        (live_x - spike_x).abs() >= 8.0,
+        "launch camera: inbound centres must sit ≥8px apart, live={live_x} spike={spike_x}"
+    );
+    assert!(
+        out_gap >= 8.0,
+        "launch camera: outgoing boxes must sit ≥8px apart (was 2px at x≈600/602), live={live_out_x} spike={spike_out_x} edge={out_gap}"
+    );
+    assert!(
+        (live_out_x - spike_out_x).abs() >= PARALLEL_VERT_MIN,
+        "launch camera: outgoing centres must sit ≥{PARALLEL_VERT_MIN}px apart, live={live_out_x} spike={spike_out_x}"
+    );
+    let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI bar");
+    let cart_left = f32::from(cart.origin.x);
+    assert!(
+        live_x < cart_left - 1.0,
+        "launch camera: Persist cart → Go-live inbound at {live_x} must drop before Cart UI at {cart_left}"
+    );
+    assert!(
+        spike_x < cart_left - 1.0,
+        "launch camera: Persist cart → spike inbound at {spike_x} must not jump onto Cart UI's left edge at {cart_left}"
+    );
+    assert!(
+        painted_x_gap(spike, cart) >= 8.0,
+        "launch camera: spike inbound box must sit ≥8px off Cart UI, spike={spike_x} cart_left={cart_left} gap={}",
+        painted_x_gap(spike, cart)
+    );
+
+    let year = cx.debug_bounds("gantt-scale-Year").expect("Year toolbar");
+    cx.simulate_click(year.center(), Modifiers::default());
+    draw(cx);
+    if cx.debug_bounds("gantt-today").is_none() {
+        return;
+    }
+    let segments = today_body_segments(cx);
+    assert!(
+        !segments.is_empty(),
+        "Year before Today: body segments must paint with unique gantt-today-body-N selectors"
+    );
+    for selector in [
+        "gantt-bar-label-1001",
+        "gantt-bar-label-1003",
+        "gantt-bar-label-1005",
+        "gantt-bar-label-1012",
+        "gantt-bar-label-1013",
+    ] {
+        let Some(label) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        for (index, segment) in segments.iter().enumerate() {
+            assert!(
+                !painted_overlap(label, *segment),
+                "launch camera Year before Today: Today body-{index} must not run through {selector} (label x={:.1}..{:.1} y={:.1}..{:.1}, line x={:.1}..{:.1} y={:.1}..{:.1})",
+                f32::from(label.origin.x),
+                f32::from(label.origin.x) + f32::from(label.size.width),
+                f32::from(label.origin.y),
+                f32::from(label.origin.y) + f32::from(label.size.height),
+                f32::from(segment.origin.x),
+                f32::from(segment.origin.x) + f32::from(segment.size.width),
+                f32::from(segment.origin.y),
+                f32::from(segment.origin.y) + f32::from(segment.size.height)
+            );
+        }
+    }
+}
+
 #[gpui_kit::test]
 fn runtime_drag_persist_cart_to_go_live_stays_eight_apart(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
@@ -1470,9 +1675,18 @@ fn runtime_drag_persist_cart_to_go_live_stays_eight_apart(cx: &mut gpui_kit::Tes
     let spike = cx
         .debug_bounds("gantt-dep-inv-1003-1012")
         .expect("Persist cart → spike inbound");
+    let live_out = cx
+        .debug_bounds("gantt-dep-out-1003-1013")
+        .expect("runtime Persist cart → Go-live outgoing");
+    let spike_out = cx
+        .debug_bounds("gantt-dep-out-1003-1012")
+        .expect("Persist cart → spike outgoing");
     let edge = painted_x_gap(live, spike);
-    let live_x = f32::from(live.origin.x) + f32::from(live.size.width) / 2.0;
-    let spike_x = f32::from(spike.origin.x) + f32::from(spike.size.width) / 2.0;
+    let out_edge = painted_x_gap(live_out, spike_out);
+    let live_x = painted_center_x(live);
+    let spike_x = painted_center_x(spike);
+    let live_out_x = painted_center_x(live_out);
+    let spike_out_x = painted_center_x(spike_out);
     assert!(
         edge >= 8.0,
         "drag-created Persist cart → Go-live inv at {live_x} must sit ≥8px from spike at {spike_x} (edge gap={edge})"
@@ -1481,11 +1695,19 @@ fn runtime_drag_persist_cart_to_go_live_stays_eight_apart(cx: &mut gpui_kit::Tes
         (live_x - spike_x).abs() >= 8.0,
         "drag-created inbound centres must sit ≥8px apart, live={live_x} spike={spike_x}"
     );
+    assert!(
+        out_edge >= 8.0,
+        "drag-created outgoing boxes must sit ≥8px apart, live={live_out_x} spike={spike_out_x} edge={out_edge}"
+    );
     if let Some(cart) = cx.debug_bounds("gantt-bar-1005") {
         let cart_left = f32::from(cart.origin.x);
         assert!(
             live_x < cart_left - 1.0,
             "runtime Persist cart → Go-live inbound at {live_x} must drop before Cart UI at {cart_left}"
+        );
+        assert!(
+            spike_x < cart_left - 1.0,
+            "runtime Persist cart → spike inbound at {spike_x} must not jump onto Cart UI at {cart_left}"
         );
     }
 }
@@ -1528,7 +1750,7 @@ fn month_hides_today_when_off_the_chart(cx: &mut gpui_kit::TestAppContext) {
             "Month must not paint an out-of-range Today line at the chart edge"
         );
         assert!(
-            cx.debug_bounds("gantt-today-body").is_none(),
+            today_body_segments(cx).is_empty(),
             "Month must not paint an out-of-range Today body at the chart edge"
         );
     }
@@ -1542,7 +1764,7 @@ fn year_before_today_click_gaps_under_sliver_pills(cx: &mut gpui_kit::TestAppCon
     state.nodes = mock_fixture_nodes();
     let nodes = state.nodes.clone();
     state.gantt.auto_fit(&nodes, &[], 800.0);
-    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
         height: px(800.),
@@ -1554,46 +1776,24 @@ fn year_before_today_click_gaps_under_sliver_pills(cx: &mut gpui_kit::TestAppCon
     if cx.debug_bounds("gantt-today").is_none() {
         return;
     }
-    view.update(cx, |view, _| {
-        let today = jiff::Zoned::now().date();
-        let today_px = view.state.gantt.today_x(today);
-        let tw = view.state.gantt.timeline_width;
-        if !(today_px >= 0.0 && today_px <= tw) {
-            return;
-        }
-        let rows = view.state.gantt.flatten(&view.state.nodes);
-        let bars = view
-            .state
-            .gantt
-            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
-        let skips = today_line_chip_skips(&bars, today_px, tw, GanttScale::Year);
-        for id in [1005_i64, 1012, 1013] {
-            let bar = bars.iter().find(|bar| bar.id == id).unwrap();
-            let chip_top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-            let chip_bottom = chip_top + OUTSIDE_LABEL_H;
-            let Some((x, w)) = ado_planner::gantt::bar_outside_label_frame(
-                bar,
-                tw,
-                true,
-                Some(today_px),
-                bar.overflow_badge,
-            ) else {
-                continue;
-            };
-            if x >= today_px + 5.0 || x + w <= today_px - 2.0 {
-                continue;
-            }
-            let gapped = skips
-                .iter()
-                .any(|&(top, bottom)| top <= chip_top + 1.0 && bottom >= chip_bottom - 1.0);
+    let segments = today_body_segments(cx);
+    for selector in [
+        "gantt-bar-label-1001",
+        "gantt-bar-label-1003",
+        "gantt-bar-label-1005",
+        "gantt-bar-label-1012",
+        "gantt-bar-label-1013",
+    ] {
+        let Some(label) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        for (index, segment) in segments.iter().enumerate() {
             assert!(
-                gapped,
-                "Year before Today: {} must skip Today under the pill, label={x}..{} today={today_px} skips={skips:?}",
-                bar.title,
-                x + w
+                !painted_overlap(label, *segment),
+                "Year before Today: painted Today body-{index} must not run through {selector}"
             );
         }
-    });
+    }
 }
 
 #[gpui_kit::test]
@@ -4678,7 +4878,7 @@ fn year_persist_cart_label_and_go_live_link_clear_today(cx: &mut gpui_kit::TestA
     });
     draw(cx);
     assert!(
-        cx.debug_bounds("gantt-today-body").is_some(),
+        !today_body_segments(cx).is_empty(),
         "Year body Today line must paint above arrows, gapped through chips"
     );
     let persist = cx
@@ -4726,33 +4926,29 @@ fn year_persist_cart_label_and_go_live_link_clear_today(cx: &mut gpui_kit::TestA
             );
         }
     }
-    if let (Some(cart_label), Some(today_line), Some(today_body)) = (
+    if let (Some(cart_label), Some(today_line)) = (
         cx.debug_bounds("gantt-bar-label-1005"),
         cx.debug_bounds("gantt-today"),
-        cx.debug_bounds("gantt-today-body"),
     ) {
+        let segments = today_body_segments(cx);
         let label_left = f32::from(cart_label.origin.x);
         let label_right = label_left + f32::from(cart_label.size.width);
-        let line = today_body;
-        let line_x = f32::from(line.origin.x);
-        let line_right = line_x + f32::from(line.size.width).max(3.0);
         let header_x = f32::from(today_line.origin.x);
-        let today_x = line_x.min(header_x);
-        let today_right = line_right.max(header_x + 3.0);
-        let overlap = label_left < today_right && label_right > today_x;
-        if overlap {
-            let label_top = f32::from(cart_label.origin.y);
-            let label_bottom = label_top + f32::from(cart_label.size.height);
-            let body_top = f32::from(today_body.origin.y);
-            let body_bottom = body_top + f32::from(today_body.size.height);
+        let today_x = segments
+            .first()
+            .map(|line| f32::from(line.origin.x).min(header_x))
+            .unwrap_or(header_x);
+        let today_right = segments
+            .first()
+            .map(|line| {
+                let line_x = f32::from(line.origin.x);
+                (line_x + f32::from(line.size.width).max(3.0)).max(header_x + 3.0)
+            })
+            .unwrap_or(header_x + 3.0);
+        for (index, segment) in segments.iter().enumerate() {
             assert!(
-                body_bottom <= label_top + 1.0 || body_top >= label_bottom - 1.0,
-                "Year Today must skip the Cart UI label, line={body_top}..{body_bottom} label={label_top}..{label_bottom} x={label_left}..{label_right} today={today_x}..{today_right}"
-            );
-        } else {
-            assert!(
-                label_right <= today_x - 2.0 || label_left >= today_right + 2.0,
-                "Year Cart UI label {label_left}..{label_right} must sit ≥2px off Today {today_x}..{today_right}"
+                !painted_overlap(cart_label, *segment),
+                "Year Today body-{index} must skip the Cart UI label, label={label_left}..{label_right} today={today_x}..{today_right}"
             );
         }
     }
