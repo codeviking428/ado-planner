@@ -4,6 +4,7 @@ use serde_json::Value;
 
 const TOAST_CAP: usize = 2;
 const TOAST_TTL: Duration = Duration::from_secs(6);
+const UNDO_TOAST_TTL: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -257,8 +258,12 @@ impl Toasts {
         self.paused = false;
     }
 
-    fn ttl() -> Duration {
-        TOAST_TTL
+    fn ttl(toast: &Toast) -> Duration {
+        if toast.undo.is_some() || toast.redo.is_some() {
+            UNDO_TOAST_TTL
+        } else {
+            TOAST_TTL
+        }
     }
 
     pub fn expire(&mut self) {
@@ -271,7 +276,7 @@ impl Toasts {
         }
         let now = Instant::now();
         self.items
-            .retain(|toast| now.saturating_duration_since(toast.created_at) < Self::ttl());
+            .retain(|toast| now.saturating_duration_since(toast.created_at) < Self::ttl(toast));
         self.cap();
     }
 
@@ -382,18 +387,18 @@ mod tests {
                 rev: 1,
             },
         );
-        toasts.items[0].created_at = Instant::now() - (TOAST_TTL - Duration::from_millis(500));
+        toasts.items[0].created_at = Instant::now() - (UNDO_TOAST_TTL - Duration::from_millis(500));
         toasts.expire();
         assert_eq!(
             toasts.items.len(),
             1,
             "an undo toast with an action button stays just before TTL"
         );
-        toasts.items[0].created_at = Instant::now() - TOAST_TTL;
+        toasts.items[0].created_at = Instant::now() - UNDO_TOAST_TTL;
         toasts.expire();
         assert!(
             toasts.items.is_empty(),
-            "undo toasts with an action dismiss at {TOAST_TTL:?}"
+            "undo toasts with an action dismiss at {UNDO_TOAST_TTL:?}"
         );
     }
 
@@ -528,11 +533,11 @@ mod tests {
                 rev: 1,
             },
         );
-        assert_expires("undo", undo, TOAST_TTL);
+        assert_expires("undo", undo, UNDO_TOAST_TTL);
 
         let mut redo = Toasts::default();
         redo.push_stack("Undone", None, Some(UndoAction::StackRedo));
-        assert_expires("redo", redo, TOAST_TTL);
+        assert_expires("redo", redo, UNDO_TOAST_TTL);
     }
 
     #[test]

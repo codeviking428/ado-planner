@@ -17,7 +17,8 @@ pub const SPLITTER_WIDTH: f32 = 8.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 /// Inner grip on each painted end. Hits stay inside the bar on a resizable
 /// body; the last `LINK_HANDLE_INSET` pixels of a dated bar start a link,
-/// so the end grip sits just left of that sliver.
+/// so the end grip sits just left of that sliver. Short bars shrink the
+/// start, end-resize, and link zones together so all three still exist.
 pub const HANDLE_WIDTH: f32 = 8.0;
 /// Selected tree/timeline row tint. Stronger than zebra stripes so the row reads.
 pub const SELECTED_ROW_TINT: f32 = 0.65;
@@ -36,7 +37,7 @@ pub const LINK_HANDLE_HIT: f32 = 16.0;
 /// Gap between the painted bar end and the outside link handle.
 pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// Right-handle hit reaches this far into the bar so a press on the last
-/// 8px starts a link, not a resize (wide bars) or a no-op Move (slivers).
+/// ~6–8px starts a link, not a resize (wide bars) or a no-op Move (slivers).
 pub const LINK_HANDLE_INSET: f32 = 8.0;
 /// Parallel dependency lanes stay at least this far apart (stroke is 2px).
 pub const PARALLEL_LANE_MIN: f32 = 10.0;
@@ -454,19 +455,67 @@ impl BarLayout {
         self.kind == GanttBarKind::Scheduled && !self.milestone && !self.open_ended && !self.marker
     }
 
+    /// Start grip, end-resize grip, and inner link sliver along this bar.
+    /// Outside-in at the right edge: link, then resize, then move. Short
+    /// resizable bars shrink the three zones together and keep a 1px body.
+    pub fn edge_zones(&self) -> (f32, f32, f32) {
+        self.edge_zones_for(self.width.max(1.0))
+    }
+
+    pub fn edge_zones_for(&self, width: f32) -> (f32, f32, f32) {
+        let width = width.max(1.0);
+        let wants_link = self.link_handle_insets_into_bar();
+        let wants_resize = self.can_resize();
+        if !wants_resize && wants_link {
+            let link = LINK_HANDLE_INSET.min(width / 2.0).max(1.0);
+            return (0.0, 0.0, link);
+        }
+        if wants_resize && !wants_link {
+            let grip = HANDLE_WIDTH.min(width / 2.0).max(1.0);
+            return (grip, grip, 0.0);
+        }
+        if !wants_resize {
+            return (0.0, 0.0, 0.0);
+        }
+        let preferred = HANDLE_WIDTH * 2.0 + LINK_HANDLE_INSET;
+        let min_move = 1.0;
+        if width >= preferred + min_move {
+            return (HANDLE_WIDTH, HANDLE_WIDTH, LINK_HANDLE_INSET);
+        }
+        let available = (width - min_move).max(3.0);
+        let scale = available / preferred;
+        (
+            (HANDLE_WIDTH * scale).max(1.0),
+            (HANDLE_WIDTH * scale).max(1.0),
+            (LINK_HANDLE_INSET * scale).max(1.0),
+        )
+    }
+
+    /// Last pixels of a dated bar that start a link (0 if this bar has none).
+    pub fn link_zone_width(&self) -> f32 {
+        self.edge_zones().2
+    }
+
     /// Shift the end resize grip left by this much so the last
-    /// `LINK_HANDLE_INSET` pixels can be the link sliver.
+    /// `link_zone_width` pixels can be the link sliver.
     pub fn resize_end_link_inset(&self) -> f32 {
         if self.can_resize() && self.link_handle_insets_into_bar() {
-            LINK_HANDLE_INSET
+            self.link_zone_width()
         } else {
             0.0
         }
     }
 
-    /// Inner 8px of each end, split at the midpoint on bars shorter than 16px.
+    /// Inner grip on each painted end, split at the midpoint on bars
+    /// shorter than 16px. Resizable dated bars shrink this with the link
+    /// sliver so a ~64px Month bar still has start, resize, and link.
     pub fn inner_grip_width(&self) -> f32 {
-        HANDLE_WIDTH.min(self.width / 2.0).max(1.0)
+        let (start, _, _) = self.edge_zones();
+        if start > 0.0 {
+            start
+        } else {
+            HANDLE_WIDTH.min(self.width / 2.0).max(1.0)
+        }
     }
 
     /// 8px rollup edges only when they leave a Move body in the center.
@@ -485,7 +534,9 @@ impl BarLayout {
         match self.hit_zone_at_window_x(x, self.x, self.x + self.width) {
             BarHitZone::ResizeStart => Some(GestureKind::ResizeStart),
             BarHitZone::ResizeEnd => Some(GestureKind::ResizeEnd),
-            BarHitZone::Move | BarHitZone::RollupEdge | BarHitZone::Outside => None,
+            BarHitZone::Link | BarHitZone::Move | BarHitZone::RollupEdge | BarHitZone::Outside => {
+                None
+            }
         }
     }
 
@@ -501,11 +552,18 @@ impl BarLayout {
             return BarHitZone::Outside;
         }
         let width = (painted_right - painted_left).max(1.0);
-        let grip = HANDLE_WIDTH.min(width / 2.0).max(1.0);
-        let link_inset = self.resize_end_link_inset().min(width / 2.0);
-        let on_start = window_x <= painted_left + grip;
-        let on_end =
-            window_x >= painted_right - grip - link_inset && window_x < painted_right - link_inset;
+        let (start, end_resize, link) = self.edge_zones_for(self.width.max(1.0));
+        let on_link = link > 0.0 && window_x >= painted_right - link;
+        let on_start = start > 0.0 && window_x <= painted_left + start;
+        let on_end = end_resize > 0.0
+            && window_x >= painted_right - end_resize - link
+            && window_x < painted_right - link;
+        // Last pixels of a resizable dated bar are the link sliver, even on
+        // a summary. Non-resizable slivers keep Move here; the overlay
+        // handle still starts a link on those last pixels.
+        if self.can_resize() && self.link_handle_insets_into_bar() && on_link {
+            return BarHitZone::Link;
+        }
         if self.summary && !self.can_resize() {
             // Two 8px edges meet on a 16px bar; skip them so a short parent
             // (diamond, year sliver) still has a Move body.
@@ -532,6 +590,7 @@ impl BarLayout {
 pub enum BarHitZone {
     ResizeStart,
     ResizeEnd,
+    Link,
     Move,
     RollupEdge,
     Outside,
@@ -542,6 +601,7 @@ impl BarHitZone {
         match self {
             Self::ResizeStart => "resize-start",
             Self::ResizeEnd => "resize-end",
+            Self::Link => "link",
             Self::Move => "move",
             Self::RollupEdge => "rollup-edge",
             Self::Outside => "outside",
@@ -552,6 +612,7 @@ impl BarHitZone {
         match self {
             Self::ResizeStart => Some(GestureKind::ResizeStart),
             Self::ResizeEnd => Some(GestureKind::ResizeEnd),
+            Self::Link => Some(GestureKind::Link),
             Self::Move => Some(GestureKind::Move),
             Self::RollupEdge | Self::Outside => None,
         }
@@ -2208,7 +2269,9 @@ impl GanttView {
             } else {
                 GestureKind::Move
             }
-        } else if bar.link_handle_insets_into_bar() && x >= bar.x + bar.width - LINK_HANDLE_INSET {
+        } else if bar.link_handle_insets_into_bar()
+            && x >= bar.x + bar.width - bar.link_zone_width()
+        {
             GestureKind::Link
         } else {
             bar.resize_kind_at(x).unwrap_or(GestureKind::Move)
@@ -4640,8 +4703,8 @@ mod tests {
         );
         assert_eq!(
             summary.hit_zone_at_window_x(177.0, summary.x, summary.x + summary.width),
-            BarHitZone::Move,
-            "3px inside a summary end is the link sliver, not resize"
+            BarHitZone::Link,
+            "3px inside a summary end is the link sliver, not resize or move"
         );
         let diamond = BarLayout {
             summary: true,
@@ -5420,6 +5483,11 @@ mod tests {
             Some(GestureKind::Link)
         );
         assert_eq!(
+            bar.hit_zone_at_window_x(bar.x + bar.width - 4.0, bar.x, bar.x + bar.width),
+            BarHitZone::Link,
+            "hit-zone must classify the last pixels as Link, not Move"
+        );
+        assert_eq!(
             GanttView::hit_test_bar(
                 std::slice::from_ref(&bar),
                 bar.x + bar.width - LINK_HANDLE_INSET - 4.0,
@@ -5428,6 +5496,70 @@ mod tests {
             .map(|(_, kind)| kind),
             Some(GestureKind::ResizeEnd),
             "the inner 8px left of the sliver must still resize"
+        );
+    }
+
+    #[test]
+    fn short_dated_bar_keeps_link_resize_and_move() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 545.0,
+            width: 64.0,
+            y: 0.0,
+            summary: true,
+            milestone: false,
+            label: "Persist cart".into(),
+            title: "Persist cart".into(),
+            color: 0x89b4fa,
+            progress: Some(0.5),
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        let (start, end, link) = bar.edge_zones();
+        assert!(
+            start >= 6.0 && end >= 6.0 && link >= 6.0,
+            "a 64px bar must keep full-size zones, got start={start} end={end} link={link}"
+        );
+        let right = bar.x + bar.width;
+        assert_eq!(
+            bar.hit_zone_at_window_x(right - 2.0, bar.x, right),
+            BarHitZone::Link,
+            "last ~6–8px of a short Persist cart must link"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(right - link - end / 2.0, bar.x, right),
+            BarHitZone::ResizeEnd,
+            "the 6–8px just left of the sliver must resize"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(bar.x + bar.width / 2.0, bar.x, right),
+            BarHitZone::Move
+        );
+        let tight = BarLayout { width: 20.0, ..bar };
+        let (start, end, link) = tight.edge_zones();
+        assert!(
+            start >= 1.0 && end >= 1.0 && link >= 1.0,
+            "a 20px bar must keep all three zones, got start={start} end={end} link={link}"
+        );
+        assert!(
+            start + end + link < tight.width,
+            "short-bar zones must leave a Move body, start={start} end={end} link={link}"
+        );
+        let right = tight.x + tight.width;
+        assert_eq!(
+            tight.hit_zone_at_window_x(right - link / 2.0, tight.x, right),
+            BarHitZone::Link
+        );
+        assert_eq!(
+            tight.hit_zone_at_window_x(right - link - end / 2.0, tight.x, right),
+            BarHitZone::ResizeEnd
+        );
+        assert_eq!(
+            tight.hit_zone_at_window_x(tight.x + start + 0.5, tight.x, right),
+            BarHitZone::Move
         );
     }
 

@@ -4221,22 +4221,37 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
         height: px(800.),
     });
     draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
     let bar = cx
         .debug_bounds("gantt-bar-1003")
         .expect("Month Persist cart");
-    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+    let bar_w = f32::from(bar.size.width);
+    let bar_right = f32::from(bar.origin.x) + bar_w;
     assert!(
-        f32::from(bar.size.width) > HANDLE_WIDTH * 2.0 + 1.0,
-        "precondition: Month Persist cart must be wide enough to resize, width={}",
-        f32::from(bar.size.width)
+        bar_w > 40.0 && bar_w < 100.0,
+        "Auto-fit Month Persist cart should be a short ~64px bar, width={bar_w}"
     );
     let sliver = cx
         .debug_bounds("gantt-link-handle-1003-link-end-inset")
         .expect("wide dated bar must expose an inset link sliver");
     let sliver_left = f32::from(sliver.origin.x);
+    let sliver_w = f32::from(sliver.size.width);
     assert!(
-        sliver_left <= bar_right - 6.0,
-        "inset sliver must cover the last 6–8px, sliver_left={sliver_left} bar_right={bar_right}"
+        sliver_w >= 5.0 && sliver_left <= bar_right - 5.0,
+        "inset sliver must cover the last ~6px, sliver={sliver_left}+{sliver_w} bar_right={bar_right}"
+    );
+    let resize = cx
+        .debug_bounds("gantt-resize-handle-1003-end")
+        .expect("short Persist cart must keep an end resize grip");
+    let resize_right = f32::from(resize.origin.x) + f32::from(resize.size.width);
+    assert!(
+        resize_right <= sliver_left + 0.5,
+        "end resize must sit just left of the link sliver, resize_right={resize_right} sliver_left={sliver_left}"
     );
     cx.simulate_mouse_down(
         grab_bar_link_sliver(bar),
@@ -4252,7 +4267,7 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::Link),
-            "pressing Month Persist cart's last pixels must start a link, not a resize"
+            "pressing Auto-fit Month Persist cart's last pixels must start a link, not a move"
         );
         assert_eq!(
             view.state.gantt.selected_id,
@@ -4315,7 +4330,39 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::ResizeEnd),
-            "the 8px just left of the Persist cart sliver must still resize"
+            "the 6–8px just left of the Persist cart sliver must resize, not move"
+        );
+    });
+    let dragged = point(grab_end_resize(bar).x + px(20.), grab_end_resize(bar).y);
+    cx.simulate_mouse_move(dragged, Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::ResizeEnd),
+            "dragging the Persist cart end grip must stay a resize"
+        );
+        view.state.cancel_gesture();
+    });
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart for move");
+    cx.simulate_mouse_down(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Move),
+            "the Persist cart body inside the edge zones must still move"
         );
     });
 }
@@ -5684,6 +5731,62 @@ fn dragging_an_unscheduled_row_shows_a_schedule_ghost(cx: &mut gpui_kit::TestApp
     );
     view.update(cx, |view, _| {
         assert_eq!(view.state.gantt.schedule_drag, Some(3));
+    });
+}
+
+#[gpui_kit::test]
+fn hovering_the_undo_toast_pauses_expiry(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.toasts.push_undo(
+        "Moved Persist cart",
+        UndoAction::RestoreDates {
+            id: 1003,
+            start_date: Some("2026-07-06T00:00:00Z".into()),
+            target_date: Some("2026-07-20T00:00:00Z".into()),
+            rev: 1,
+        },
+    );
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let toast = cx.debug_bounds("planner-toast").expect("undo toast");
+    cx.simulate_mouse_move(toast.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.toast_pause_for_test(),
+            "moving onto the undo toast must pause expiry without a test-only hover hook"
+        );
+        view.state.toasts.items[0].created_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        view.state.toasts.expire();
+        assert_eq!(
+            view.state.toasts.items.len(),
+            1,
+            "a hovered undo toast must stay past 5s"
+        );
+    });
+    let undo = cx.debug_bounds("toast-undo").expect("Undo");
+    cx.simulate_mouse_move(undo.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.toast_pause_for_test(),
+            "hovering the Undo button must keep the toast paused"
+        );
+        view.state.toasts.items[0].created_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        view.state.toasts.expire();
+        assert_eq!(
+            view.state.toasts.items.len(),
+            1,
+            "the undo toast must stay open while the pointer is on Undo"
+        );
     });
 }
 
@@ -8407,7 +8510,9 @@ fn click_painted_bar_inset(
     let x = if at_start {
         bar.origin.x + px(inset)
     } else {
-        bar.origin.x + bar.size.width - px(inset + LINK_HANDLE_INSET)
+        // Skip the inner link sliver and the 1–2px selection border so this
+        // lands in the end-resize grip, not the last-pixel link zone.
+        bar.origin.x + bar.size.width - px(inset + LINK_HANDLE_INSET + 2.0)
     };
     let y = bar.origin.y + bar.size.height / 2.0;
     cx.simulate_mouse_down(point(x, y), MouseButton::Left, Modifiers::default());

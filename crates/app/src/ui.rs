@@ -45,11 +45,11 @@ use crate::form::ado_edit_url_on;
 use crate::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH,
     DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
-    LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE,
-    MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE,
-    OVERFLOW_BADGE_GAP, PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH,
-    SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView,
-    TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
+    LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH,
+    NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
+    PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W,
+    SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H,
+    TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
     bar_outside_label_frame, bar_title_is_inside, bar_title_paint_px, header_label_px,
     offscreen_edge_chip, outside_title_right_gap, parent_date_overflow, parent_overflow_tip,
     timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
@@ -224,6 +224,7 @@ struct PaintedBar {
     /// Prepaint content origin. Independent of the 1px/2px selection border
     /// so selecting a bar does not shift the live gesture mapping.
     content_left: f32,
+    content_right: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1760,6 +1761,9 @@ impl PlannerView {
                                 .flex_shrink_0()
                                 .min_w(px(52.))
                                 .cursor_pointer()
+                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                    this.set_toast_hover(*hovered, cx);
+                                }))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
@@ -1785,6 +1789,9 @@ impl PlannerView {
                                 .flex_shrink_0()
                                 .min_w(px(52.))
                                 .cursor_pointer()
+                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                    this.set_toast_hover(*hovered, cx);
+                                }))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
@@ -1809,6 +1816,9 @@ impl PlannerView {
                                 .occlude()
                                 .flex_shrink_0()
                                 .cursor_pointer()
+                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                    this.set_toast_hover(*hovered, cx);
+                                }))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
@@ -1829,6 +1839,9 @@ impl PlannerView {
                             .id(("toast-dismiss-wrap", id))
                             .debug_selector(|| "toast-dismiss".into())
                             .flex_shrink_0()
+                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                this.set_toast_hover(*hovered, cx);
+                            }))
                             .child(Button::new(("dismiss-toast", id)).label("×").on_click(
                                 cx.listener(move |this, _, _, cx| {
                                     this.state.gantt.clear_hover();
@@ -1850,7 +1863,10 @@ impl PlannerView {
         if self.state.toasts.items.is_empty() {
             self.toast_hover_depth = 0;
         }
-        self.state.toasts.paused = self.toast_hover_depth > 0 && self.toast_pause_ready;
+        if hovered {
+            self.toast_pause_ready = true;
+        }
+        self.state.toasts.paused = self.toast_hover_depth > 0;
         cx.notify();
     }
 
@@ -1860,7 +1876,7 @@ impl PlannerView {
         } else {
             self.toast_hover_depth = self.toast_hover_depth.min(1);
         }
-        self.state.toasts.paused = self.toast_hover_depth > 0 && self.toast_pause_ready;
+        self.state.toasts.paused = self.toast_hover_depth > 0;
     }
 
     fn arm_toast_pause_from_pointer(&mut self) {
@@ -4841,6 +4857,22 @@ impl PlannerView {
         let layout_x = bar.x;
         let grip_w = bar.inner_grip_width();
         let end_link_inset = bar.resize_end_link_inset();
+        let (start_zone, end_zone, link_zone) = bar.edge_zones();
+        let progress_left_keep = if can_resize { start_zone } else { 0.0 };
+        let progress_right_keep = if can_resize {
+            end_zone + link_zone
+        } else {
+            0.0
+        };
+        let inner_bar_w = (bar.width.max(8.0) - clip_pad).max(0.0);
+        let progress_fill_max = (inner_bar_w - progress_left_keep - progress_right_keep).max(0.0);
+        let progress_fill_w = if visible_progress_w <= 0.0 {
+            0.0
+        } else {
+            visible_progress_w
+                .min(progress_fill_max)
+                .max(4.0_f32.min(progress_fill_max))
+        };
         // on_prepaint reports the content box; hits use the visible border box.
         let paint_border = if milestone || marker || unscheduled || no_fields || open_ended {
             0.0
@@ -4871,6 +4903,7 @@ impl PlannerView {
                             bottom,
                             layout_x,
                             content_left,
+                            content_right: content_left + f32::from(bounds.size.width),
                         },
                     );
                 })
@@ -5004,10 +5037,10 @@ impl PlannerView {
                             .id(("gantt-bar-progress", id as u64))
                             .debug_selector(move || progress_selector.clone())
                             .absolute()
-                            .left(px(clip_pad))
+                            .left(px(clip_pad + progress_left_keep))
                             .top_0()
                             .bottom_0()
-                            .w(px(visible_progress_w))
+                            .w(px(progress_fill_w))
                             .when(summary, |el| {
                                 el.bg(rgb(bar.color)).child(
                                     Button::new(("progress-tip", id as u64))
@@ -5063,6 +5096,7 @@ impl PlannerView {
                     },
                 )
                 .children(self.bar_inner_resize_grips(bar, dragging, cx))
+                .children(self.bar_inner_link_sliver(bar, dragging, cx))
                 .children(self.bar_summary_edge_affordances(bar, dragging, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.set_bar_hovered(if *hovered { Some(id) } else { None }, cx);
@@ -5296,6 +5330,99 @@ impl PlannerView {
             .collect()
     }
 
+    /// Last child of a resizable dated bar: the last ~6–8px starts a link
+    /// so a progress fill, title, or bar-body Move cannot steal those pixels.
+    /// Kept mounted while this bar is the link source so capture, cursor,
+    /// and the ghost line survive the drag.
+    fn bar_inner_link_sliver(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        _dragging: bool,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        if !bar.can_resize() || !bar.link_handle_insets_into_bar() {
+            return Vec::new();
+        }
+        let id = bar.id;
+        let linking_from_this = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link && gesture.id == id);
+        let linking = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link);
+        if linking && !linking_from_this {
+            return Vec::new();
+        }
+        let link_w = bar.link_zone_width();
+        if link_w < 1.0 {
+            return Vec::new();
+        }
+        let (_, local_right) = self.painted_timeline_edges(bar);
+        let origin = local_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT / 2.0;
+        let layout = bar.clone();
+        let selector = format!("gantt-link-handle-{id}-link-end-inset");
+        vec![
+            div()
+                .id(("link-end-inset", id as u64))
+                .debug_selector(move || selector)
+                .absolute()
+                .right_0()
+                .top_0()
+                .bottom_0()
+                .w(px(link_w))
+                .occlude()
+                .bg(gpui_kit::hsla(0., 0., 0., 0.01))
+                .cursor(CursorStyle::DragLink)
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.set_bar_hovered(Some(id), cx);
+                    }
+                }))
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                        if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+                            gesture.kind == GestureKind::Link && gesture.id != id
+                        }) {
+                            this.state.gantt.set_link_target(id);
+                        }
+                        this.on_bar_drag_move(event, window, cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        let x: f32 = event.position.x.into();
+                        let _ = this.classify_bar_hit(id, &layout, x);
+                        this.bar_press_shift = event.modifiers.shift;
+                        this.continue_or_begin_bar_gesture(
+                            id,
+                            GestureKind::Link,
+                            origin,
+                            x,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                        let x: f32 = event.position.x.into();
+                        let y: f32 = event.position.y.into();
+                        this.release_bar_gesture(x, y, window, cx);
+                    }),
+                )
+                .into_any_element(),
+        ]
+    }
+
     /// Inner 8px of a summary bar. Not-allowed cursor + rollup tooltip; no move.
     fn bar_summary_edge_affordances(
         &self,
@@ -5382,9 +5509,20 @@ impl PlannerView {
             .gesture
             .as_ref()
             .is_some_and(|gesture| gesture.kind == GestureKind::Link);
-        // Keep the handle mounted during a date drag so mouse-up is not lost
-        // when the pink overlay would otherwise unmount mid-gesture.
-        if unscheduled || bar.kind == ado_core::GanttBarKind::NoFields || bar.marker || linking {
+        let linking_from_this = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link && gesture.id == id);
+        // Keep the source handle mounted during a link drag so capture, the
+        // DragLink cursor, and the ghost line survive. Other bars unmount
+        // so their handles cannot steal the drop. Date drags keep handles
+        // so a shrink to 16px cannot drop mouse-up.
+        if unscheduled || bar.kind == ado_core::GanttBarKind::NoFields || bar.marker {
+            return None;
+        }
+        if linking && !linking_from_this {
             return None;
         }
         let hovered = self.state.gantt.bar_hovered_id == Some(id);
@@ -5396,15 +5534,11 @@ impl PlannerView {
         // cannot resize keeps one combined hit box covering those pixels.
         // Diamonds and start-only bars keep Move on that edge. The visual
         // dot stays outside; the overflow ! is painted past this hit box.
-        let inset = if bar.link_handle_insets_into_bar() {
-            LINK_HANDLE_INSET
-        } else {
-            0.0
-        };
+        let inset = bar.link_zone_width();
         let start_x = local_left - LINK_HANDLE_HIT - 2.0;
         // Wide bars keep the named `link-end` handle in the gap (wheel pan,
-        // overflow-badge tests). The inset sliver is a separate overlay so
-        // it can occlude the end grip without stealing pan past the bar.
+        // overflow-badge tests). The last pixels of a resizable bar are a
+        // bar-child sliver so they win over the progress fill and body.
         let split_inset = inset > 0.0 && bar.can_resize();
         let end_x = if inset > 0.0 && !split_inset {
             local_right - inset
@@ -5418,7 +5552,7 @@ impl PlannerView {
         };
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
         let end_origin = local_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT / 2.0;
-        let mut handle_specs = vec![
+        let handle_specs = vec![
             (
                 "link-start",
                 start_x,
@@ -5428,25 +5562,10 @@ impl PlannerView {
             ),
             ("link-end", end_x, end_hit_w, handle_top, end_origin),
         ];
-        if split_inset {
-            handle_specs.push((
-                "link-end-inset",
-                local_right - inset,
-                inset,
-                bar.y,
-                end_origin,
-            ));
-        }
         let handles = handle_specs
             .into_iter()
             .map(|(handle_id, handle_x, hit_w, top, origin)| {
                 let selector = format!("gantt-link-handle-{id}-{handle_id}");
-                let inset_sliver = handle_id == "link-end-inset";
-                let hit_h = if inset_sliver {
-                    ROW_HEIGHT
-                } else {
-                    LINK_HANDLE_HIT
-                };
                 div()
                     .id((handle_id, id as u64))
                     .debug_selector(move || selector.clone())
@@ -5454,7 +5573,7 @@ impl PlannerView {
                     .left(px(handle_x))
                     .top(px(top))
                     .w(px(hit_w))
-                    .h(px(hit_h))
+                    .h(px(LINK_HANDLE_HIT))
                     .flex()
                     .items_center()
                     .when(handle_id == "link-end", |el| el.justify_end())
@@ -5463,7 +5582,7 @@ impl PlannerView {
                         show_dot
                             || selected
                             || dragging
-                            || inset_sliver
+                            || linking_from_this
                             || (handle_id == "link-end" && inset > 0.0 && !split_inset),
                         |el| el.occlude(),
                     )
@@ -5518,7 +5637,7 @@ impl PlannerView {
                             .items_center()
                             .when(handle_id == "link-end", |el| el.justify_end().pr(px(4.)))
                             .when(handle_id != "link-end", |el| el.justify_center())
-                            .when(show_dot && !inset_sliver, |el| {
+                            .when(show_dot, |el| {
                                 el.child(
                                     div()
                                         .debug_selector(move || {
@@ -7626,6 +7745,7 @@ impl PlannerView {
             bottom: row_top + bar_top + bar_h,
             layout_x: layout.x,
             content_left: origin + layout.x,
+            content_right: origin + layout.x + width,
         }
     }
 
@@ -7728,7 +7848,11 @@ impl PlannerView {
         window_x: f32,
     ) -> (BarHitZone, GestureKind) {
         let painted = self.painted_bar_for(id, layout);
-        let zone = layout.hit_zone_at_window_x(window_x, painted.left, painted.right);
+        // Grips and the inner link sliver are laid out in the content box.
+        // The border box is 1–2px wider, which used to turn the last content
+        // pixels into Move and left only the 1px border as a unique overlay.
+        let zone =
+            layout.hit_zone_at_window_x(window_x, painted.content_left, painted.content_right);
         let kind = zone.gesture_kind().unwrap_or(GestureKind::Move);
         self.last_bar_hit = Some(BarHitDebug {
             event_x: window_x,
@@ -9292,6 +9416,14 @@ impl Render for PlannerView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .when(
+                self.state
+                    .gantt
+                    .gesture
+                    .as_ref()
+                    .is_some_and(|gesture| gesture.kind == GestureKind::Link),
+                |el| el.cursor(CursorStyle::DragLink),
+            )
             .on_mouse_move(cx.listener(|this, _, _, _| {
                 this.arm_toast_pause_from_pointer();
             }))
