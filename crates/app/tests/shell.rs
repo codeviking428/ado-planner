@@ -2,8 +2,9 @@
 
 use ado_planner::paths::AppPaths;
 use ado_planner::state::PlannerState;
+use ado_planner::ui::PlannerView;
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
-use gpui_kit::AppContext as _;
+use gpui_kit::px;
 
 async fn signed_in_state() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
     let mock = ado_mock::start().await;
@@ -235,10 +236,21 @@ fn gpui_sign_in_shell_renders(cx: &mut gpui_kit::TestAppContext) {
     let paths = AppPaths::new(dir.path().to_path_buf());
     let store = EncryptedStore::new(Box::new(MemoryStore::new(false)), None);
     let session = PlannerSession::pat(store);
-    cx.update(|cx| {
-        gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
-            cx.new(|cx| ado_planner::ui::PlannerView::new(window, cx, session, paths, None, None))
-        })
-        .expect("window");
+    let mut state = PlannerState::new(paths, session, None, None);
+    // `PlannerView::new` bootstraps on the `ado-client` runtime. Completing
+    // that oneshot while the GPUI test scheduler is ticking panics as
+    // non-deterministic (Windows CI flake). Paint the idle PAT shell instead.
+    state.session_loading = false;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
     });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(
+        cx.debug_bounds("sign-in-shell").is_some(),
+        "the PAT sign-in shell must paint without spawning ADO I/O"
+    );
 }

@@ -1363,9 +1363,10 @@ impl PlannerView {
         if !self.state.gantt.pointer_in_rows(x, y) {
             return;
         }
-        let rows = self.state.gantt.flatten(&self.state.nodes);
+        let visible = self.state.visible_nodes();
+        let rows = self.state.gantt.flatten(&visible);
         let bars = self.state.gantt.layout_bars(
-            &self.state.nodes,
+            &visible,
             &rows,
             &self.state.iterations,
             self.state.gantt.viewport_h.max(720.0),
@@ -2417,6 +2418,7 @@ impl PlannerView {
         let pat_mode = self.state.session_info.auth_mode == AuthMode::Pat;
         v_flex()
             .id("sign-in-shell")
+            .debug_selector(|| "sign-in-shell".into())
             .size_full()
             .items_center()
             .justify_center()

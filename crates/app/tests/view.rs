@@ -9174,6 +9174,74 @@ fn ctrl_z_recomputes_handle_hit_under_a_still_pointer(cx: &mut gpui_kit::TestApp
 }
 
 #[gpui_kit::test]
+fn ctrl_z_recomputes_hover_against_filtered_rows(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.toggle_hidden_type("Task");
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-1005").is_none(),
+        "Hide Task must unmount Cart UI so later rows shift up"
+    );
+    let persist = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let grip = grab_end_resize(persist);
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(grip.x + px(ppd * 3.0), grip.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    cx.simulate_mouse_up(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let go_live = cx
+        .debug_bounds("gantt-bar-1013")
+        .expect("Go-live after Hide Task");
+    cx.simulate_mouse_move(go_live.center(), None, Modifiers::default());
+    draw(cx);
+    let undo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&undo, cx);
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(id, _)| id),
+            Some(1013),
+            "undo must classify the resting pointer against painted rows, not hidden Task rows"
+        );
+        assert_eq!(
+            view.state.gantt.bar_hovered_id,
+            Some(1013),
+            "the first drag after Ctrl+Z must target Go-live, not hidden Cart UI"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn dates_chip_press_starts_a_bar_move(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
