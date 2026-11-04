@@ -4,7 +4,7 @@ use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind,
-    HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE,
+    HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE,
     MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN, ROW_HEIGHT,
     TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
     bar_title_is_inside, bar_title_paint_px, insert_index_for_child, outside_label_is_beside_bar,
@@ -228,6 +228,16 @@ fn grab_bar_link_sliver(
     bar: gpui_kit::Bounds<gpui_kit::Pixels>,
 ) -> gpui_kit::Point<gpui_kit::Pixels> {
     grab_bar_from_right(bar, 4.0)
+}
+
+/// Outer 8px connector in the gap past the bar (~x=618 on Persist cart).
+fn grab_outer_link_handle(
+    bar: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> gpui_kit::Point<gpui_kit::Pixels> {
+    point(
+        bar.origin.x + bar.size.width + px(LINK_HANDLE_GAP + LINK_HANDLE / 2.0),
+        bar.origin.y + bar.size.height / 2.0,
+    )
 }
 
 fn grab_bar_from_right(
@@ -4745,6 +4755,209 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
             "the link cursor must show on hover, before the press"
         );
     });
+}
+
+#[gpui_kit::test]
+fn month_persist_outer_link_handle_starts_a_link_on_bar_hover(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+    cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-dot-1003-link-end").is_some(),
+        "hovering Persist cart must paint the outer link connector"
+    );
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1003-link-end")
+        .expect("outer link handle");
+    let handle_left = f32::from(handle.origin.x);
+    let handle_w = f32::from(handle.size.width);
+    let handle_h = f32::from(handle.size.height);
+    assert!(
+        (handle_w - LINK_HANDLE_HIT).abs() < 0.5 && (handle_h - LINK_HANDLE_HIT).abs() < 0.5,
+        "outer handle must be an ~8px-radius hit, got {handle_w}×{handle_h}"
+    );
+    assert!(
+        handle_left + 0.5 >= bar_right,
+        "outer handle must sit in the gap past the bar, handle_left={handle_left} bar_right={bar_right}"
+    );
+    let handle_center_x = handle_left + handle_w / 2.0;
+    let expected_center = bar_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
+    assert!(
+        (handle_center_x - expected_center).abs() < 2.0,
+        "outer handle must be centered on the gap connector, center={handle_center_x} expected={expected_center}"
+    );
+    cx.simulate_mouse_move(grab_outer_link_handle(bar), None, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-dot-1003-link-end").is_some(),
+        "moving onto the outer handle must keep the connector visible"
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("drag-link"),
+            "the outer handle must show the link cursor on bar hover"
+        );
+    });
+    cx.simulate_mouse_down(
+        grab_outer_link_handle(bar),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "pressing the outer Persist cart handle (~8px past the bar) must start a link"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn month_persist_outer_link_handle_starts_a_link_without_hover(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = None;
+    state.gantt.hovered_id = None;
+    state.gantt.bar_hovered_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    cx.simulate_mouse_down(
+        grab_outer_link_handle(bar),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "the outer handle must start a link without hovering the bar first"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn resize_drop_on_outside_title_paints_toast_without_another_move(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let grip = grab_end_resize(bar);
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(grip.x + px(ppd * 4.0), grip.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_some(),
+        "a live Persist cart resize must show the date preview"
+    );
+    let drop = cx
+        .debug_bounds("gantt-bar-label-1003")
+        .or_else(|| cx.debug_bounds("gantt-drag-preview"))
+        .expect("outside title or preview to drop on");
+    cx.simulate_mouse_up(drop.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "dropping a resize on an occluding title must commit without another mouse-move"
+        );
+        assert!(
+            view.last_committed_target_for_test().is_some()
+                || view.last_committed_start_for_test().is_some(),
+            "the resize drop must commit dates before the next pointer move"
+        );
+        assert!(
+            !view.state.toasts.items.is_empty(),
+            "a toast must be queued on drop, without waiting for another mouse-move"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-drag-preview").is_none(),
+        "the preview chip must clear on drop, without waiting for another mouse-move"
+    );
+    assert!(
+        cx.debug_bounds("toast-title").is_some() || cx.debug_bounds("planner-toast").is_some(),
+        "the resize toast must paint on drop, without waiting for another mouse-move"
+    );
 }
 
 #[gpui_kit::test]

@@ -5827,11 +5827,15 @@ impl PlannerView {
         // Wide bars keep the named `link-end` handle in the gap (wheel pan,
         // overflow-badge tests). The last pixels of a resizable bar are a
         // bar-child sliver so they win over the progress fill and body.
+        // The outer handle is an 8px-radius hit around the 8px connector
+        // at `bar.right + GAP + HANDLE/2` (~x=618 on Persist cart) so a
+        // press past the ~3–6px inset sliver still starts a link.
         let split_inset = inset > 0.0 && bar.can_resize();
+        let end_origin = local_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
         let end_x = if inset > 0.0 && !split_inset {
             local_right - inset
         } else {
-            local_right + LINK_HANDLE_GAP
+            (end_origin - LINK_HANDLE_HIT / 2.0).max(local_right)
         };
         let end_hit_w = if inset > 0.0 && !split_inset {
             inset + LINK_HANDLE_GAP + LINK_HANDLE_HIT
@@ -5839,7 +5843,6 @@ impl PlannerView {
             LINK_HANDLE_HIT
         };
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
-        let end_origin = local_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT / 2.0;
         let handle_specs = vec![
             (
                 "link-start",
@@ -5864,14 +5867,23 @@ impl PlannerView {
                     .h(px(LINK_HANDLE_HIT))
                     .flex()
                     .items_center()
-                    .when(handle_id == "link-end", |el| el.justify_end())
+                    .when(handle_id == "link-end" && !split_inset, |el| {
+                        el.justify_end()
+                    })
+                    .when(handle_id == "link-end" && split_inset, |el| {
+                        el.justify_center()
+                    })
                     .when(handle_id != "link-end", |el| el.justify_center())
                     .when(
-                        show_dot
+                        // Always occlude the outer end handle so a press on
+                        // the gap connector (~8px radius) starts a link
+                        // without first hovering the bar body. The inset
+                        // sliver still owns the last pixels of the bar.
+                        handle_id == "link-end"
+                            || show_dot
                             || selected
                             || dragging
-                            || linking_from_this
-                            || (handle_id == "link-end" && inset > 0.0 && !split_inset),
+                            || linking_from_this,
                         |el| el.occlude(),
                     )
                     .bg(gpui_kit::hsla(0., 0., 0., 0.01))
@@ -5926,7 +5938,12 @@ impl PlannerView {
                             .size_full()
                             .flex()
                             .items_center()
-                            .when(handle_id == "link-end", |el| el.justify_end().pr(px(4.)))
+                            .when(handle_id == "link-end" && !split_inset, |el| {
+                                el.justify_end().pr(px(4.))
+                            })
+                            .when(handle_id == "link-end" && split_inset, |el| {
+                                el.justify_center()
+                            })
                             .when(handle_id != "link-end", |el| el.justify_center())
                             .when(show_dot, |el| {
                                 el.child(
@@ -7951,22 +7968,18 @@ impl PlannerView {
         self.release_bar_gesture(x, y, window, cx);
     }
 
-    /// Commit an active link drag from a mouse-up at any hit target — canvas
+    /// Commit an active drag from a mouse-up at any hit target — canvas
     /// overlay, window root, or an occluding child that is not hovered as
-    /// the root. Move/resize keep their drag-preview overlay.
+    /// the root. Link, move, and resize all share this path so a drop on
+    /// a title, arrow, or tooltip still paints the toast without waiting
+    /// for the next pointer move.
     fn release_link_drag_at(
         &mut self,
         event: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self
-            .state
-            .gantt
-            .gesture
-            .as_ref()
-            .is_some_and(|gesture| gesture.kind == GestureKind::Link)
-        {
+        if self.state.gantt.gesture.is_none() {
             return;
         }
         let x: f32 = event.position.x.into();
@@ -8481,6 +8494,7 @@ impl PlannerView {
             }
             let id = pending.id;
             self.enqueue_date_save(cx, pending);
+            self.note_toasts_changed(cx);
             // Pin a live tooltip only while the pointer is still on the bar
             // so a drop on the tree/header/outside cannot stick. Row hover
             // stays cleared so a finished drag does not keep handles.
@@ -8490,24 +8504,36 @@ impl PlannerView {
                 self.state.gantt.pin_bar_tooltip = None;
             }
         }
+        // Every drop path (commit, no-op release, missed mouse-up) must
+        // request a paint so a resize at x=604 does not keep the preview
+        // chip, live label, and tooltip until the next pointer move.
         self.request_repaint(Some(window), cx);
     }
 
     /// `Window.refresh` is a no-op while GPUI is drawing, so mouse-up during
     /// a frame can leave the preview chip and toast stale until the pointer
-    /// moves. Notify now, on the next frame, and after short timers so a
-    /// still mouse (link drop, left-end resize under the start grip) still
-    /// gets a paint.
+    /// moves. Notify now, defer, on the next two frames, and after short
+    /// timers so a still mouse (link drop, resize under an occluding
+    /// title) still gets a paint.
     fn request_repaint(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         cx.notify();
+        cx.refresh_windows();
+        let entity_id = cx.entity_id();
+        cx.defer(move |cx| {
+            cx.notify(entity_id);
+            cx.refresh_windows();
+        });
         if let Some(window) = window {
             window.refresh();
             window.on_next_frame(|window, cx| {
                 window.refresh();
                 cx.refresh_windows();
+                window.on_next_frame(|window, cx| {
+                    window.refresh();
+                    cx.refresh_windows();
+                });
             });
         }
-        cx.refresh_windows();
         // Mouse-up can land during a frame so the first refresh is a no-op;
         // tick twice so the committed bar and toast paint without waiting
         // for the next mouse-move.
@@ -10013,7 +10039,8 @@ impl Render for PlannerView {
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
                     // Occluding children (arrows, badges, titles) set
                     // BlockMouse, so the root hitbox is not hovered and
-                    // `capture_any_mouse_up` skips the drop. Commit anyway.
+                    // `capture_any_mouse_up` skips the drop. Commit any
+                    // active link/move/resize so the toast paints now.
                     this.release_link_drag_at(event, window, cx);
                 }),
             )
