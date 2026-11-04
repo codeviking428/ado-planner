@@ -32,10 +32,11 @@ use gpui_kit::component::v_flex;
 use gpui_kit::component::{FocusableExt as _, Placement};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Render, Role, ScrollEvent, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px, rgb,
+    Animation, AnimationExt, AnyElement, App, ClipboardItem, Context, CursorStyle, Entity,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, Role,
+    ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions,
+    div, px, rgb,
 };
 use jiff::ToSpan;
 
@@ -1410,7 +1411,7 @@ impl PlannerView {
         let painted = self.painted_bar_for(bar.id, bar);
         let local_x = self.pointer_layout_x(x, Some(bar.id));
         let start_hit = bar.start_link_origin() - OUTER_LINK_HIT / 2.0;
-        let end_hit = bar.end_link_origin() + OUTER_LINK_HIT / 2.0;
+        let end_hit = bar.end_link_hit_left() + bar.outer_link_hit();
         let on_row = local_y >= bar.y && local_y < bar.y + ROW_HEIGHT;
         let on_bar = on_row
             && ((local_x >= start_hit && local_x <= end_hit)
@@ -1504,9 +1505,14 @@ impl PlannerView {
         {
             let start_origin = painted.content_left - LINK_HANDLE_GAP - LINK_HANDLE / 2.0;
             let end_origin = painted.content_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
-            if (window_x - start_origin).abs() <= OUTER_LINK_HIT / 2.0 + 0.5
-                || (window_x - end_origin).abs() <= OUTER_LINK_HIT / 2.0 + 0.5
-            {
+            let end_hit = layout.outer_link_hit();
+            let on_end = if end_hit > OUTER_LINK_HIT {
+                let lo = painted.content_right + RESIZE_HALO_END_OUTSIDE + 1.0;
+                window_x >= lo && window_x <= lo + end_hit
+            } else {
+                (window_x - end_origin).abs() <= OUTER_LINK_HIT / 2.0 + 0.5
+            };
+            if (window_x - start_origin).abs() <= OUTER_LINK_HIT / 2.0 + 0.5 || on_end {
                 return BarHitZone::Link;
             }
         }
@@ -1978,6 +1984,9 @@ impl PlannerView {
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         this.set_toast_hover(*hovered, cx);
                     }))
+                    .on_mouse_move(cx.listener(|this, _, _, _| {
+                        this.arm_toast_pause_from_pointer();
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -2147,10 +2156,9 @@ impl PlannerView {
         if self.state.toasts.items.is_empty() {
             self.toast_hover_depth = 0;
         }
-        if hovered {
-            self.toast_pause_ready = true;
-        }
-        self.state.toasts.paused = self.toast_hover_depth > 0;
+        // A toast that appears under a still pointer (Ctrl+Z → "Undone…")
+        // must not pause until the pointer actually moves.
+        self.state.toasts.paused = self.toast_pause_ready && self.toast_hover_depth > 0;
         cx.notify();
     }
 
@@ -2160,7 +2168,7 @@ impl PlannerView {
         } else {
             self.toast_hover_depth = self.toast_hover_depth.min(1);
         }
-        self.state.toasts.paused = self.toast_hover_depth > 0;
+        self.state.toasts.paused = self.toast_pause_ready && self.toast_hover_depth > 0;
     }
 
     fn arm_toast_pause_from_pointer(&mut self) {
@@ -4944,11 +4952,13 @@ impl PlannerView {
                             let skip_inbound = (x2 - x1).abs() < 16.0
                                 && y2 >= bar.y
                                 && y2 <= bar.y + ROW_HEIGHT;
-                            Some((x1, y1, x2, y2, handle_y, skip_inbound))
+                            Some((x1, y1, x2, y2, handle_y, skip_inbound, from_start))
                         });
-                        rubber.map(|(x1, y1, x2, y2, handle_y, skip_inbound)| {
+                        rubber.map(|(x1, y1, x2, y2, handle_y, skip_inbound, from_start)| {
                             let min_x = x1.min(x2);
                             let min_y = y1.min(y2);
+                            let (head_x, head_y, head) =
+                                link_preview_head(from_start, x1, handle_y, x2, y2);
                             div()
                                 .absolute()
                                 .left(px(0.))
@@ -4987,6 +4997,19 @@ impl PlannerView {
                                             .bg(cx.theme().primary),
                                     )
                                 })
+                                .child(
+                                    div()
+                                        .debug_selector(|| "gantt-link-preview-head".into())
+                                        .absolute()
+                                        .left(px(head_x))
+                                        .top(px(head_y))
+                                        .w(px(18.))
+                                        .h(px(20.))
+                                        .text_xl()
+                                        .line_height(gpui_kit::relative(1.))
+                                        .text_color(cx.theme().primary)
+                                        .child(head),
+                                )
                         })
                     })
                     .children({
@@ -6298,20 +6321,23 @@ impl PlannerView {
         // connector at `bar.right + GAP + HANDLE/2` (~x=616 on Persist cart).
         let split_inset = inset > 0.0 && bar.can_resize();
         let end_origin = layout_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
-        // Inclusive ±8px around the connector (18px plate). A 16px box is
-        // half-open, so the reviewer's x=624 (center+8) sat on the edge.
+        let end_hit = bar.outer_link_hit();
+        // Inclusive ±8px around the connector (18px plate). Short bars grow
+        // the plate into the gap so a grab past the painted end still
+        // links. A 16px box is half-open, so the reviewer's x=624
+        // (center+8) sat on the edge.
         let end_x = if inset > 0.0 && !split_inset {
             local_right - inset
         } else {
-            end_origin - OUTER_LINK_HIT / 2.0
+            bar.end_link_hit_left()
         };
         let end_hit_w = if inset > 0.0 && !split_inset {
-            inset + LINK_HANDLE_GAP + OUTER_LINK_HIT
+            inset + LINK_HANDLE_GAP + end_hit
         } else {
-            OUTER_LINK_HIT
+            end_hit
         };
         let start_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
-        let end_top = bar.y + ((ROW_HEIGHT - OUTER_LINK_HIT) / 2.0).max(0.0);
+        let end_top = bar.y + ((ROW_HEIGHT - end_hit) / 2.0).max(0.0);
         let handle_specs = vec![
             (
                 "link-start",
@@ -6326,13 +6352,10 @@ impl PlannerView {
             .into_iter()
             .map(|(handle_id, handle_x, hit_w, top, origin)| {
                 let selector = format!("gantt-link-handle-{id}-{handle_id}");
-                let dot_left = if handle_id == "link-end" && !split_inset {
-                    (hit_w - LINK_HANDLE - 4.0).max(0.0)
-                } else {
-                    ((hit_w - LINK_HANDLE) / 2.0).max(0.0)
-                };
+                let dot_left = (origin - handle_x - LINK_HANDLE / 2.0)
+                    .clamp(0.0, (hit_w - LINK_HANDLE).max(0.0));
                 let plate_h = if handle_id == "link-end" {
-                    OUTER_LINK_HIT
+                    end_hit
                 } else {
                     LINK_HANDLE_HIT
                 };
@@ -6345,7 +6368,7 @@ impl PlannerView {
                     .top(px(top))
                     .w(px(hit_w))
                     .h(px(if handle_id == "link-end" {
-                        OUTER_LINK_HIT
+                        end_hit
                     } else {
                         LINK_HANDLE_HIT
                     }))
@@ -6826,14 +6849,31 @@ impl PlannerView {
             LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0
         };
         let timeline_w = self.state.gantt.timeline_width.max(1.0);
+        let pills = hover_date_pill_obstacles(bar, &self.state.nodes);
+        let toast_band = if self.state.toasts.items.is_empty() {
+            0.0
+        } else {
+            64.0
+        };
         let (tip_x, tip_y) = hover_bar_tooltip_origin(
-            bar.x,
-            painted_w,
-            extra,
-            tip_w,
-            timeline_w,
-            bar.y + bar_top,
-            bar.milestone || bar.marker,
+            TooltipPlace {
+                bar_x: bar.x,
+                painted_w,
+                extra,
+                tip_w,
+                timeline_w,
+                bar_top: bar.y + bar_top,
+                row_y: bar.y,
+                milestone: bar.milestone || bar.marker,
+                title_w: if bar.milestone || bar.marker {
+                    bar_title_paint_px(&bar.title)
+                } else {
+                    0.0
+                },
+                viewport_h: self.state.gantt.viewport_h,
+                toast_band,
+            },
+            &pills,
         );
         Some(
             div()
@@ -6852,6 +6892,12 @@ impl PlannerView {
                 .border_1()
                 .border_color(cx.theme().border)
                 .child(tip)
+                .with_animation(
+                    ("hover-tip", id as u64),
+                    Animation::new(Duration::from_millis(140))
+                        .with_easing(|t| 1.0 - (1.0 - t) * (1.0 - t)),
+                    |el, delta| el.opacity(0.55 + 0.45 * delta),
+                )
                 .into_any_element(),
         )
     }
@@ -6888,30 +6934,8 @@ impl PlannerView {
             .as_ref()
             .map(|text| drag_date_pill_text_width(text))
             .unwrap_or(0.0);
-        let (mut start_x, mut end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
-        let (y, side) = hover_date_pill_park(bar.y, bar.paint_top());
-        if side {
-            // First row has no room above, and below spills onto the next
-            // bar. Cluster Start/Target to the side of this bar instead.
-            let cluster_w = start_w
-                + if end_w > 0.0 {
-                    DRAG_DATE_PILL_GAP + end_w
-                } else {
-                    0.0
-                };
-            let overflow = parent_date_overflow(&self.state.nodes, id);
-            let extra = if bar.open_ended {
-                LINK_HANDLE_INSET + 2.0
-            } else if overflow {
-                LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 8.0
-            } else {
-                LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0
-            };
-            let timeline_w = self.state.gantt.timeline_width.max(1.0);
-            let cluster = row_side_tooltip_left(bar.x, painted_w, extra, cluster_w, timeline_w);
-            start_x = cluster;
-            end_x = cluster + start_w + DRAG_DATE_PILL_GAP;
-        }
+        let (start_x, end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
+        let y = hover_date_pill_y(bar.y, bar.paint_top());
         let date_pill = |text: String| {
             div()
                 .px_2()
@@ -10471,48 +10495,195 @@ fn row_side_tooltip_left(
     }
 }
 
-/// Overlay tooltip origin. Milestones sit the chip above and left of the
-/// diamond so it does not cover the outside title ("Go-live milestone").
-fn hover_bar_tooltip_origin(
+const DATE_PILL_H: f32 = 18.0;
+const HOVER_TOOLTIP_H: f32 = 24.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OverlayRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+struct TooltipPlace {
     bar_x: f32,
     painted_w: f32,
     extra: f32,
     tip_w: f32,
     timeline_w: f32,
     bar_top: f32,
-    offset_above: bool,
-) -> (f32, f32) {
-    if offset_above {
-        // Overestimate: the overlay sizes to glyphs, and a short estimate
-        // lets the chip run onto the outside title to the right of the
-        // diamond. Keep the chip fully left of the diamond when possible.
-        let conservative_w = (tip_w + 48.0).max(tip_w * 1.35);
-        let left = bar_x - conservative_w - extra.max(8.0);
-        let tip_x = left.max(0.0);
-        let tip_y = if left >= 0.0 {
-            (bar_top - 26.0).max(0.0)
-        } else {
-            // No left gutter: sit below the diamond / outside title.
-            bar_top + painted_w + 6.0
-        };
-        (tip_x, tip_y)
-    } else {
-        (
-            row_side_tooltip_left(bar_x, painted_w, extra, tip_w, timeline_w),
-            bar_top,
-        )
-    }
+    row_y: f32,
+    milestone: bool,
+    title_w: f32,
+    viewport_h: f32,
+    toast_band: f32,
 }
 
-/// Park hover date pills above the bar. First row has no room above, and
-/// below the painted body spills into the next row, so `(y, true)` means
-/// sit beside the bar at its paint top.
-fn hover_date_pill_park(bar_y: f32, paint_top: f32) -> (f32, bool) {
-    let above = bar_y + paint_top - 18.0;
-    if above >= 0.0 {
-        (above, false)
+fn overlay_overlap(a: OverlayRect, b: OverlayRect) -> bool {
+    a.x < b.x + b.w - 1.0 && a.x + a.w > b.x + 1.0 && a.y < b.y + b.h - 1.0 && a.y + a.h > b.y + 1.0
+}
+
+fn nudge_overlay_off(
+    mut rect: OverlayRect,
+    obstacles: &[OverlayRect],
+    timeline_w: f32,
+    row_y: f32,
+    viewport_h: f32,
+    toast_band: f32,
+) -> (f32, f32) {
+    for _ in 0..4 {
+        let Some(hit) = obstacles
+            .iter()
+            .copied()
+            .find(|obstacle| overlay_overlap(rect, *obstacle))
+        else {
+            break;
+        };
+        let right = hit.x + hit.w + 4.0;
+        let left = hit.x - rect.w - 4.0;
+        if right + rect.w <= timeline_w - 4.0 {
+            rect.x = right;
+        } else if left >= 0.0 {
+            rect.x = left;
+        } else {
+            rect.y = (hit.y + hit.h + 4.0)
+                .min(row_y + ROW_HEIGHT - rect.h)
+                .max(row_y);
+        }
+    }
+    let floor = (viewport_h - toast_band - rect.h).max(0.0);
+    if toast_band > 0.0 && rect.y + rect.h > floor {
+        rect.y = floor;
+    }
+    (
+        rect.x.clamp(0.0, (timeline_w - rect.w - 4.0).max(0.0)),
+        rect.y.max(0.0),
+    )
+}
+
+/// Overlay tooltip origin. Milestones sit left of the diamond in the
+/// source row so they do not cover the outside title or Unparented spike
+/// above. First-row date pills take the top of the row, so the chip sits
+/// just below them.
+fn hover_bar_tooltip_origin(place: TooltipPlace, pills: &[OverlayRect]) -> (f32, f32) {
+    let conservative_w = (place.tip_w + 48.0).max(place.tip_w * 1.5);
+    if place.milestone {
+        // Stay in the source row. Above covers Unparented spike; below
+        // covers the next bar. Sit left of the diamond, or right of the
+        // outside title when the left gutter is gone — even if that clips.
+        let left = place.bar_x - conservative_w - place.extra.max(8.0);
+        let x = if left >= 0.0 {
+            left
+        } else {
+            place.bar_x + place.painted_w + 6.0 + place.title_w.max(80.0) + 4.0
+        };
+        return (x.max(0.0), place.bar_top);
+    }
+    let y = if place.row_y < 1.0 && !pills.is_empty() {
+        DATE_PILL_H + 2.0
     } else {
-        (bar_y + paint_top, true)
+        place.bar_top
+    };
+    let x = row_side_tooltip_left(
+        place.bar_x,
+        place.painted_w,
+        place.extra,
+        conservative_w,
+        place.timeline_w,
+    );
+    nudge_overlay_off(
+        OverlayRect {
+            x,
+            y,
+            w: conservative_w,
+            h: HOVER_TOOLTIP_H,
+        },
+        pills,
+        place.timeline_w,
+        place.row_y,
+        place.viewport_h,
+        place.toast_band,
+    )
+}
+
+/// Park hover date pills above the bar. First row has no room above, so
+/// they sit at y=0 (top of the row) at the bar's own start/end — not
+/// clustered off to the side, and not below into the next row.
+fn hover_date_pill_y(bar_y: f32, paint_top: f32) -> f32 {
+    (bar_y + paint_top - DATE_PILL_H).max(0.0)
+}
+
+fn hover_date_pill_rects(
+    bar_x: f32,
+    painted_w: f32,
+    start_w: f32,
+    end_w: f32,
+    y: f32,
+) -> Vec<OverlayRect> {
+    let (start_x, end_x) = drag_date_pill_lefts(bar_x, painted_w, start_w, end_w);
+    let mut rects = vec![OverlayRect {
+        x: start_x,
+        y,
+        w: start_w,
+        h: DATE_PILL_H,
+    }];
+    if end_w > 0.0 {
+        rects.push(OverlayRect {
+            x: end_x,
+            y,
+            w: end_w,
+            h: DATE_PILL_H,
+        });
+    }
+    rects
+}
+
+fn hover_date_pill_obstacles(
+    bar: &crate::gantt::BarLayout,
+    nodes: &[ado_core::WorkItemNode],
+) -> Vec<OverlayRect> {
+    if bar.milestone
+        || bar.marker
+        || bar.kind == ado_core::GanttBarKind::Unscheduled
+        || bar.kind == ado_core::GanttBarKind::NoFields
+    {
+        return Vec::new();
+    }
+    let Some(node) = nodes.iter().find(|node| node.id == bar.id) else {
+        return Vec::new();
+    };
+    let Some(start) = parse_iso_date(node.start_date.as_deref()) else {
+        return Vec::new();
+    };
+    let start_w = drag_date_pill_text_width(&compact_date(start));
+    let end_w = parse_iso_date(node.target_date.as_deref())
+        .map(|date| drag_date_pill_text_width(&compact_date(date)))
+        .unwrap_or(0.0);
+    hover_date_pill_rects(
+        bar.x,
+        bar.width.max(8.0),
+        start_w,
+        end_w,
+        hover_date_pill_y(bar.y, bar.paint_top()),
+    )
+}
+
+/// Arrowhead on the new-link rubber-band. Start-handle drags store inbound
+/// FS (source is the successor), so the ▶ sits on the source start.
+fn link_preview_head(
+    from_start: bool,
+    x1: f32,
+    handle_y: f32,
+    x2: f32,
+    y2: f32,
+) -> (f32, f32, &'static str) {
+    if from_start {
+        (x1 - 8.0, handle_y - 10.0, "▶")
+    } else if x2 >= x1 {
+        (x2 - 16.0, y2 - 10.0, "▶")
+    } else {
+        (x2 - 4.0, y2 - 10.0, "◀")
     }
 }
 
@@ -11658,30 +11829,66 @@ mod bar_label_tests {
         );
     }
 
+    fn tooltip_at(place: super::TooltipPlace, pills: &[super::OverlayRect]) -> (f32, f32) {
+        super::hover_bar_tooltip_origin(place, pills)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tip(
+        bar_x: f32,
+        painted_w: f32,
+        extra: f32,
+        tip_w: f32,
+        timeline_w: f32,
+        bar_top: f32,
+        row_y: f32,
+        milestone: bool,
+    ) -> super::TooltipPlace {
+        super::TooltipPlace {
+            bar_x,
+            painted_w,
+            extra,
+            tip_w,
+            timeline_w,
+            bar_top,
+            row_y,
+            milestone,
+            title_w: if milestone { 160.0 } else { 0.0 },
+            viewport_h: 720.0,
+            toast_band: 0.0,
+        }
+    }
+
     #[test]
-    fn milestone_hover_tooltip_sits_above_the_diamond() {
-        let (x, y) = super::hover_bar_tooltip_origin(400.0, 16.0, 42.0, 180.0, 800.0, 120.0, true);
+    fn milestone_hover_tooltip_sits_beside_the_diamond() {
+        let (x, y) = tooltip_at(
+            tip(400.0, 16.0, 42.0, 180.0, 800.0, 120.0, 108.0, true),
+            &[],
+        );
         assert!(
             x + 180.0 <= 400.0,
             "Go-live tooltip must sit left of the diamond so it does not cover the outside title, got {x}"
         );
-        assert!(
-            y + 20.0 <= 120.0,
-            "Go-live tooltip must sit above the diamond so the title is not clipped to Go-liv…"
+        assert_eq!(
+            y, 120.0,
+            "Go-live tooltip must stay in the source row, not cover Unparented spike above, got {y}"
         );
         let (tight_x, tight_y) =
-            super::hover_bar_tooltip_origin(40.0, 16.0, 42.0, 180.0, 800.0, 12.0, true);
-        assert_eq!(tight_x, 0.0);
+            tooltip_at(tip(40.0, 16.0, 42.0, 180.0, 800.0, 12.0, 0.0, true), &[]);
+        assert_eq!(
+            tight_y, 12.0,
+            "left-clip milestone tooltip stays in-row, got {tight_y}"
+        );
         assert!(
-            tight_y >= 12.0 + 16.0,
-            "a milestone at the left clip must drop below the diamond instead of covering the title, got {tight_y}"
+            tight_x >= 40.0 + 16.0,
+            "left-clip milestone tooltip must sit right of the diamond, got {tight_x}"
         );
         let (side_x, side_y) =
-            super::hover_bar_tooltip_origin(40.0, 80.0, 8.0, 120.0, 800.0, 80.0, false);
+            tooltip_at(tip(40.0, 80.0, 8.0, 120.0, 800.0, 80.0, 80.0, false), &[]);
         assert!((side_x - 128.0).abs() < 0.1);
         assert_eq!(side_y, 80.0);
         let (clamped_x, _) =
-            super::hover_bar_tooltip_origin(750.0, 16.0, 8.0, 180.0, 800.0, 120.0, true);
+            tooltip_at(tip(750.0, 16.0, 8.0, 180.0, 800.0, 120.0, 108.0, true), &[]);
         assert!(
             clamped_x + 180.0 <= 800.0 - 4.0 + 0.1,
             "a milestone tooltip at the right clip must stay in the window, got {clamped_x}"
@@ -11689,19 +11896,56 @@ mod bar_label_tests {
     }
 
     #[test]
-    fn hover_date_pills_park_beside_the_first_row() {
-        let (y, side) = super::hover_date_pill_park(0.0, 6.0);
-        assert!(
-            side,
-            "first-row pills must sit beside the bar, not below into the next row"
-        );
+    fn hover_date_pills_pin_to_the_bar_edges() {
+        let y = super::hover_date_pill_y(0.0, 6.0);
         assert_eq!(
-            y, 6.0,
-            "first-row side pills must align with the painted top, got {y}"
+            y, 0.0,
+            "first-row pills must sit at the top of the row, not below into the next"
         );
-        let (y, side) = super::hover_date_pill_park(40.0, 6.0);
-        assert!(!side, "later rows still park the pills above the bar");
-        assert_eq!(y, 28.0);
+        assert_eq!(super::hover_date_pill_y(40.0, 6.0), 28.0);
+        let (start_x, end_x) = super::drag_date_pill_lefts(525.0, 393.0, 40.0, 40.0);
+        assert!(
+            (start_x - 525.0).abs() < 0.1,
+            "start pill must pin to the bar's left edge, got {start_x}"
+        );
+        assert!(
+            end_x + 40.0 <= 525.0 + 393.0 + 0.5,
+            "end pill must pin to the bar's right edge, got {end_x}"
+        );
+        let pills = super::hover_date_pill_rects(525.0, 393.0, 40.0, 40.0, 0.0);
+        let (tip_x, tip_y) = tooltip_at(
+            tip(525.0, 393.0, 42.0, 160.0, 1100.0, 6.0, 0.0, false),
+            &pills,
+        );
+        assert!(
+            tip_y >= 18.0,
+            "first-row tooltip must sit below the date pills, got {tip_y}"
+        );
+        let tip = super::OverlayRect {
+            x: tip_x,
+            y: tip_y,
+            w: 160.0,
+            h: 24.0,
+        };
+        for pill in &pills {
+            assert!(
+                !super::overlay_overlap(tip, *pill),
+                "tooltip must avoid first-row date pills, tip={tip_x} pill.x={}",
+                pill.x
+            );
+        }
+    }
+
+    #[test]
+    fn start_handle_preview_arrow_points_at_the_source() {
+        let (x, _, glyph) = super::link_preview_head(true, 200.0, 20.0, 80.0, 60.0);
+        assert_eq!(glyph, "▶");
+        assert!(
+            (x - 192.0).abs() < 0.1,
+            "inbound FS preview ▶ must sit on the source start, got {x}"
+        );
+        let (_, _, outbound) = super::link_preview_head(false, 200.0, 20.0, 320.0, 60.0);
+        assert_eq!(outbound, "▶");
     }
 
     #[test]

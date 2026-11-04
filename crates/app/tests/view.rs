@@ -6,9 +6,10 @@ use ado_planner::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind,
     HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_INSET, MILESTONE_SIZE,
     MIN_TIMELINE_WIDTH, OUTER_LINK_HIT, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN,
-    RESIZE_HIT_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
-    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px,
-    insert_index_for_child, outside_label_is_beside_bar, related_dependency_ids,
+    RESIZE_HIT_WIDTH, ROW_HEIGHT, SHORT_BAR_OUTER_LINK_HIT, TODAY_ALIGN, TODAY_PILL_GAP,
+    TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside,
+    bar_title_paint_px, insert_index_for_child, outside_label_is_beside_bar,
+    related_dependency_ids,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -4903,18 +4904,19 @@ fn month_persist_outer_link_handle_starts_a_link_on_bar_hover(cx: &mut gpui_kit:
     let handle_w = f32::from(handle.size.width);
     let handle_h = f32::from(handle.size.height);
     assert!(
-        (handle_w - OUTER_LINK_HIT).abs() < 0.5 && (handle_h - OUTER_LINK_HIT).abs() < 0.5,
-        "outer handle must be an inclusive 8px-radius hit, got {handle_w}×{handle_h}"
+        (handle_w - SHORT_BAR_OUTER_LINK_HIT).abs() < 0.5
+            && (handle_h - SHORT_BAR_OUTER_LINK_HIT).abs() < 0.5,
+        "a short Persist cart must grow the outbound plate, got {handle_w}×{handle_h}"
     );
     assert!(
         handle_left + 0.5 >= bar_right,
         "outer handle must sit in the gap past the bar, handle_left={handle_left} bar_right={bar_right}"
     );
-    let handle_center_x = handle_left + handle_w / 2.0;
-    let expected_center = bar_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
+    let connector = bar_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
     assert!(
-        (handle_center_x - expected_center).abs() < 2.0,
-        "outer handle must be centered on the gap connector, center={handle_center_x} expected={expected_center}"
+        handle_left - 0.5 <= connector && handle_left + handle_w + 0.5 >= connector,
+        "the enlarged plate must cover the gap connector, handle={handle_left}..{} connector={connector}",
+        handle_left + handle_w
     );
     cx.simulate_mouse_move(grab_outer_link_handle(bar), None, Modifiers::default());
     draw(cx);
@@ -5069,16 +5071,18 @@ fn month_persist_edge_presses_have_no_dead_zone(cx: &mut gpui_kit::TestAppContex
         "dead presses on Persist cart edge {dead:?}; probes={kinds:?}; resize={resize_left:.1}..{resize_right:.1} sliver={sliver_left:.1}..{sliver_right:.1} handle={handle_left:.1}..{:.1} center={handle_center:.1} bar_right={bar_right:.1}",
         handle_left + handle_w
     );
+    let connector = bar_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
     assert!(
-        (handle_center - (bar_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0)).abs() < 1.5,
-        "handle center must sit on the gap connector, center={handle_center:.1} bar_right={bar_right:.1}"
+        handle_left - 0.5 <= connector && handle_left + handle_w + 0.5 >= connector,
+        "enlarged plate must cover the gap connector, handle={handle_left:.1}..{:.1} connector={connector:.1}",
+        handle_left + handle_w
     );
-    // 18px plate: center±8 are inside so a press at the reviewer's ~624
-    // (center+8) starts a link. The outgoing stub no longer occludes +4..+8.
+    // Short-bar plate is 28px in the gap. Presses around the connector
+    // (reviewer ~653/659 on a 63px bar) must start a link.
     for (label, x) in [
-        ("center-8", handle_center - 8.0),
-        ("center+4", handle_center + 4.0),
-        ("center+8", handle_center + 8.0),
+        ("connector-8", connector - 8.0),
+        ("connector+4", connector + 4.0),
+        ("connector+8", connector + 8.0),
     ] {
         cx.simulate_mouse_down(point(px(x), mid_y), MouseButton::Left, Modifiers::default());
         draw(cx);
@@ -9563,10 +9567,30 @@ fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
     let tip_w = f32::from(tip.size.width);
     let tip_right = tip_left + tip_w;
     let diamond_bottom = diamond_top + f32::from(diamond.size.height);
+    let diamond_right = diamond_left + f32::from(diamond.size.width);
+    let tip_bottom = tip_top + f32::from(tip.size.height);
+    let overlaps_diamond = tip_left < diamond_right - 1.0
+        && tip_right > diamond_left + 1.0
+        && tip_top < diamond_bottom - 1.0
+        && tip_bottom > diamond_top + 1.0;
     assert!(
-        tip_top + 4.0 <= diamond_top || tip_top + 1.0 >= diamond_bottom,
-        "Go-live tooltip must sit off the diamond so the title is not clipped to Go-liv…, tip_top={tip_top} diamond={diamond_top}..{diamond_bottom}"
+        !overlaps_diamond,
+        "Go-live tooltip must sit beside the diamond, not on it, tip={tip_left}..{tip_right} y={tip_top}..{tip_bottom} diamond={diamond_left}..{diamond_right}"
     );
+    if let Some(spike) = cx.debug_bounds("gantt-bar-1012") {
+        let spike_top = f32::from(spike.origin.y);
+        let spike_bottom = spike_top + f32::from(spike.size.height);
+        let spike_left = f32::from(spike.origin.x);
+        let spike_right = spike_left + f32::from(spike.size.width);
+        let overlaps_spike = tip_left < spike_right - 1.0
+            && tip_right > spike_left + 1.0
+            && tip_top < spike_bottom - 1.0
+            && tip_bottom > spike_top + 1.0;
+        assert!(
+            !overlaps_spike,
+            "Go-live tooltip must not cover Unparented spike, tip y={tip_top}..{tip_bottom} spike={spike_top}..{spike_bottom}"
+        );
+    }
     assert!(
         tip_w >= 80.0,
         "Go-live tooltip must be wide enough for 'Go-live milestone', width={tip_w}"
@@ -13662,50 +13686,78 @@ fn start_link_handle_uses_the_same_gap_as_the_end(cx: &mut gpui_kit::TestAppCont
 fn first_row_date_pills_do_not_cover_the_bar(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
-    let state = idle_state(&dir);
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
         height: px(800.),
     });
     draw(cx);
-    let bar = cx
-        .debug_bounds("gantt-bar-1")
-        .or_else(|| cx.debug_bounds("gantt-bar-2"))
-        .expect("first painted bar");
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1001").expect("Checkout rewrite");
     cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
     draw(cx);
-    let Some(pill) = cx.debug_bounds("gantt-hover-date-start") else {
+    let Some(start) = cx.debug_bounds("gantt-hover-date-start") else {
         return;
     };
-    let bar_top = f32::from(bar.origin.y);
-    let bar_bottom = bar_top + f32::from(bar.size.height);
     let bar_left = f32::from(bar.origin.x);
     let bar_right = bar_left + f32::from(bar.size.width);
-    let pill_top = f32::from(pill.origin.y);
-    let pill_bottom = pill_top + f32::from(pill.size.height);
-    let pill_left = f32::from(pill.origin.x);
-    let pill_right = pill_left + f32::from(pill.size.width);
-    let overlaps_body = pill_top < bar_bottom - 1.0
-        && pill_bottom > bar_top + 1.0
-        && pill_left < bar_right - 1.0
-        && pill_right > bar_left + 1.0;
+    let start_left = f32::from(start.origin.x);
+    let start_right = start_left + f32::from(start.size.width);
+    let start_top = f32::from(start.origin.y);
+    let start_bottom = start_top + f32::from(start.size.height);
     assert!(
-        !overlaps_body,
-        "hover date pills must not cover the bar body, pill={pill_left}..{pill_right} y={pill_top}..{pill_bottom} bar={bar_left}..{bar_right} y={bar_top}..{bar_bottom}"
+        (start_left - bar_left).abs() < 8.0,
+        "first-row start pill must pin to the bar's left edge, pill={start_left} bar_left={bar_left}"
     );
-    if let Some(next) = cx.debug_bounds("gantt-bar-2") {
+    assert!(
+        start_right <= bar_right + 8.0,
+        "first-row pills must not detach past the bar end, start_right={start_right} bar_right={bar_right}"
+    );
+    if let Some(end) = cx.debug_bounds("gantt-hover-date-end") {
+        let end_left = f32::from(end.origin.x);
+        let end_right = end_left + f32::from(end.size.width);
+        assert!(
+            (end_right - bar_right).abs() < 16.0,
+            "first-row end pill must pin to the bar's right edge, end_right={end_right} bar_right={bar_right}"
+        );
+        if let Some(tip) = cx.debug_bounds("gantt-hover-tooltip") {
+            let tip_left = f32::from(tip.origin.x);
+            let tip_right = tip_left + f32::from(tip.size.width);
+            let tip_top = f32::from(tip.origin.y);
+            let tip_bottom = tip_top + f32::from(tip.size.height);
+            let end_top = f32::from(end.origin.y);
+            let end_bottom = end_top + f32::from(end.size.height);
+            let overlaps = tip_left < end_right - 1.0
+                && tip_right > end_left + 1.0
+                && tip_top < end_bottom - 1.0
+                && tip_bottom > end_top + 1.0;
+            assert!(
+                !overlaps,
+                "tooltip must avoid the date pills, tip={tip_left}..{tip_right} end={end_left}..{end_right}"
+            );
+        }
+    }
+    if let Some(next) = cx.debug_bounds("gantt-bar-1002") {
         let next_top = f32::from(next.origin.y);
         let next_bottom = next_top + f32::from(next.size.height);
         let next_left = f32::from(next.origin.x);
         let next_right = next_left + f32::from(next.size.width);
-        let overlaps_next = pill_top < next_bottom - 1.0
-            && pill_bottom > next_top + 1.0
-            && pill_left < next_right - 1.0
-            && pill_right > next_left + 1.0;
+        let overlaps_next = start_top < next_bottom - 1.0
+            && start_bottom > next_top + 1.0
+            && start_left < next_right - 1.0
+            && start_right > next_left + 1.0;
         assert!(
             !overlaps_next,
-            "first-row date pills must not spill onto the next bar, pill y={pill_top}..{pill_bottom} next={next_top}..{next_bottom}"
+            "first-row date pills must not spill onto the next bar, pill y={start_top}..{start_bottom} next={next_top}..{next_bottom}"
         );
     }
 }
@@ -13778,6 +13830,14 @@ fn start_handle_link_preview_originates_at_the_start(cx: &mut gpui_kit::TestAppC
     assert!(
         out_x <= bar_left + 2.0,
         "start-handle preview must drop from the inbound connector, not the right end, out_x={out_x} bar_left={bar_left} bar_right={bar_right}"
+    );
+    let head = cx
+        .debug_bounds("gantt-link-preview-head")
+        .expect("rubber-band arrow");
+    let head_x = f32::from(head.origin.x);
+    assert!(
+        head_x <= bar_left + 4.0,
+        "inbound FS preview ▶ must sit on the source start, head_x={head_x} bar_left={bar_left}"
     );
 }
 
@@ -13863,4 +13923,84 @@ fn hovering_a_tree_row_highlights_the_matching_chart_row(cx: &mut gpui_kit::Test
         cx.debug_bounds("gantt-tree-row-2").is_some(),
         "the grid row must be mounted so it can share the chart hover"
     );
+}
+
+#[gpui_kit::test]
+fn undone_toast_expires_without_a_pointer_move(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state
+        .toasts
+        .push_stack("Undone moved dates", None, Some(UndoAction::StackRedo));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("planner-toast").is_some(),
+        "the Undone toast must paint"
+    );
+    view.update(cx, |view, _| {
+        assert!(
+            !view.toast_pause_for_test(),
+            "appearing under a still pointer must not hover-pause the Undone toast"
+        );
+        view.state.toasts.items[0].created_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        view.state.toasts.expire();
+        assert!(
+            view.state.toasts.items.is_empty(),
+            "an Undone toast must auto-dismiss after its TTL"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn short_bar_end_handle_grabs_in_the_gap(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let width = f32::from(bar.size.width);
+    assert!(
+        width < 80.0,
+        "precondition: Persist cart should be a short bar, width={width}"
+    );
+    let bar_right = f32::from(bar.origin.x) + width;
+    let mid_y = bar.origin.y + bar.size.height / 2.0;
+    for offset in [4.0, 12.0] {
+        cx.simulate_mouse_move(
+            point(px(bar_right + offset), mid_y),
+            None,
+            Modifiers::default(),
+        );
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.hover_bar_zone_for_test(),
+                Some((1003, BarHitZone::Link)),
+                "a grab {offset}px past a short bar's end must hit the enlarged link plate"
+            );
+        });
+    }
 }

@@ -51,6 +51,11 @@ pub const LINK_HANDLE_HIT: f32 = 16.0;
 /// Inclusive 8px radius around the gap connector. `LINK_HANDLE_HIT` (16) is
 /// half-open, so a press at center+8 (reviewer ~624) missed the plate.
 pub const OUTER_LINK_HIT: f32 = 18.0;
+/// Wider outbound plate on short bars (~63px Persist cart) so a grab in
+/// the gap past the painted end still starts a link.
+pub const SHORT_BAR_OUTER_LINK_HIT: f32 = 28.0;
+/// Bars narrower than this use [`SHORT_BAR_OUTER_LINK_HIT`].
+pub const SHORT_BAR_OUTER_LINK: f32 = 80.0;
 /// Gap between the painted bar end and the outside link handle.
 pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// Right-handle hit reaches this far into the bar so a press on the last
@@ -482,6 +487,31 @@ impl BarLayout {
             self.x + self.width.max(8.0)
         };
         layout_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0
+    }
+
+    /// Outbound handle plate. Short bars grow this into the gap so a grab
+    /// near the painted end (R100 ~653/659 on a 63px bar) still starts a
+    /// link without eating the 2–6px-inside resize halo.
+    pub fn outer_link_hit(&self) -> f32 {
+        if self.width.max(8.0) < SHORT_BAR_OUTER_LINK {
+            SHORT_BAR_OUTER_LINK_HIT
+        } else {
+            OUTER_LINK_HIT
+        }
+    }
+
+    /// Layout-x of the left edge of the outbound handle plate.
+    pub fn end_link_hit_left(&self) -> f32 {
+        let layout_right = if self.milestone || self.marker {
+            self.x + MILESTONE_SIZE
+        } else {
+            self.x + self.width.max(8.0)
+        };
+        if self.outer_link_hit() > OUTER_LINK_HIT {
+            layout_right + RESIZE_HALO_END_OUTSIDE + 1.0
+        } else {
+            self.end_link_origin() - OUTER_LINK_HIT / 2.0
+        }
     }
 
     /// True when the link press is on the inbound connector, not the end.
@@ -6357,6 +6387,20 @@ mod tests {
             bar.hit_zone_at_window_x(right + 4.0, bar.x, right),
             BarHitZone::Outside,
             "the outer link handle, 4px past the end, must not be stolen by resize"
+        );
+        assert!(
+            (bar.outer_link_hit() - SHORT_BAR_OUTER_LINK_HIT).abs() < 0.1,
+            "a 64px bar must grow the outbound plate, got {}",
+            bar.outer_link_hit()
+        );
+        let plate_left = bar.end_link_hit_left();
+        assert!(
+            plate_left >= right + RESIZE_HALO_END_OUTSIDE - 0.1,
+            "the enlarged plate must start past the 1px resize halo, plate_left={plate_left} right={right}"
+        );
+        assert!(
+            plate_left + bar.outer_link_hit() >= right + 20.0,
+            "the enlarged plate must cover grabs well past the painted end"
         );
         assert_eq!(
             bar.hit_zone_at_window_x(right - 5.5, bar.x, right),
