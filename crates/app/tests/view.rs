@@ -8,7 +8,7 @@ use ado_planner::gantt::{
     MIN_TIMELINE_WIDTH, OUTER_LINK_HIT, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN,
     RESIZE_HIT_WIDTH, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
     UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px,
-    insert_index_for_child, outside_label_is_beside_bar,
+    insert_index_for_child, outside_label_is_beside_bar, related_dependency_ids,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -224,11 +224,19 @@ fn grab_link_handle(
     )
 }
 
-/// Last 4px of a dated bar — the inset link sliver, not the end grip.
+/// Leftover ~2px of the 6px inset link sliver, just left of the 4px
+/// resize halo. 2–4px inside the painted end is resize, not link.
 fn grab_bar_link_sliver(
     bar: gpui_kit::Bounds<gpui_kit::Pixels>,
 ) -> gpui_kit::Point<gpui_kit::Pixels> {
-    grab_bar_from_right(bar, 4.0)
+    grab_bar_from_right(bar, 5.5)
+}
+
+/// 3px inside the painted end — the resize halo, not the leftover sliver.
+fn grab_end_resize_halo(
+    bar: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> gpui_kit::Point<gpui_kit::Pixels> {
+    grab_bar_from_right(bar, 3.0)
 }
 
 /// Outer 8px connector in the gap past the bar (~x=618 on Persist cart).
@@ -3918,12 +3926,13 @@ fn drag_end_clears_row_hover_and_link_handles(cx: &mut gpui_kit::TestAppContext)
     draw(cx);
     view.update(cx, |view, _| {
         assert_eq!(
-            view.state.gantt.hovered_id, None,
-            "drag end must clear the row highlight"
+            view.state.gantt.hovered_id,
+            Some(1),
+            "drop must recompute hover at the release point so the tooltip returns without a nudge"
         );
         assert_eq!(
             view.state.gantt.hovered_link, None,
-            "drag end must hide link handles"
+            "drag end must not leave a selected-link highlight"
         );
     });
     view.update(cx, |view, _| {
@@ -4638,6 +4647,15 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
         sliver_w >= 5.5 && sliver_left <= bar_right - 5.5,
         "inset sliver must cover the last ~6px, sliver={sliver_left}+{sliver_w} bar_right={bar_right}"
     );
+    let halo = cx
+        .debug_bounds("gantt-resize-halo-1003-end")
+        .expect("dated bar must expose an end resize halo");
+    let halo_left = f32::from(halo.origin.x);
+    let halo_right = halo_left + f32::from(halo.size.width);
+    assert!(
+        halo_left <= bar_right - 3.5 && halo_right >= bar_right + 0.5,
+        "end halo must cover edge−4..+1, halo={halo_left}..{halo_right} bar_right={bar_right}"
+    );
     let resize = cx
         .debug_bounds("gantt-resize-handle-1003-end")
         .expect("short Persist cart must keep an end resize grip");
@@ -4790,17 +4808,30 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
             "the ew-resize cursor must show on hover, before the press"
         );
     });
+    cx.simulate_mouse_move(grab_end_resize_halo(bar), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::ResizeEnd),
+            "hovering 2–4px inside the end edge must classify resize"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("ew-resize"),
+            "2–4px inside the end edge must show the resize cursor"
+        );
+    });
     cx.simulate_mouse_move(grab_bar_link_sliver(bar), None, Modifiers::default());
     view.update(cx, |view, _| {
         assert_eq!(
             view.hover_bar_zone_for_test().map(|(_, zone)| zone),
             Some(BarHitZone::Link),
-            "hovering the last pixels must classify link before a press"
+            "hovering the leftover sliver past the 4px halo must classify link"
         );
         assert_eq!(
             view.hover_cursor_for_test(),
             Some("drag-link"),
-            "the link cursor must show on hover, before the press"
+            "the leftover sliver must show a link cursor"
         );
     });
 }
@@ -5253,22 +5284,35 @@ fn month_persist_edge_drag_adds_a_link_toast(cx: &mut gpui_kit::TestAppContext) 
         (bar_right - bar_left - 64.0).abs() < 40.0,
         "Auto-fit Month Persist cart should be a short bar around x=545-609, got {bar_left}..{bar_right}"
     );
-    for inset in [5.0, 1.0] {
+    for inset in [3.0, 1.0] {
         cx.simulate_mouse_move(grab_bar_from_right(bar, inset), None, Modifiers::default());
         view.update(cx, |view, _| {
             assert_eq!(
                 view.hover_bar_zone_for_test().map(|(_, zone)| zone),
-                Some(BarHitZone::Link),
-                "hovering {inset}px inside the Persist cart end must be the link zone"
+                Some(BarHitZone::ResizeEnd),
+                "hovering {inset}px inside the Persist cart end must resize"
             );
             assert_eq!(
                 view.hover_cursor_for_test(),
-                Some("drag-link"),
-                "the last ~6px must show a distinct link cursor, inset={inset}"
+                Some("ew-resize"),
+                "2–4px inside the end edge must show the resize cursor, inset={inset}"
             );
         });
     }
-    let at_edge = grab_bar_from_right(bar, 1.0);
+    cx.simulate_mouse_move(grab_bar_link_sliver(bar), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::Link),
+            "the leftover sliver past the 4px halo must still be the link zone"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("drag-link"),
+            "the leftover sliver must show a distinct link cursor"
+        );
+    });
+    let at_edge = grab_bar_link_sliver(bar);
     cx.simulate_mouse_move(at_edge, None, Modifiers::default());
     cx.background_executor
         .advance_clock(Duration::from_millis(200));
@@ -5291,7 +5335,7 @@ fn month_persist_edge_drag_adds_a_link_toast(cx: &mut gpui_kit::TestAppContext) 
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::Link),
-            "a press on the last painted pixel must start a link, not a no-op"
+            "a press on the leftover sliver must start a link, not a no-op"
         );
     });
     let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
@@ -5371,7 +5415,7 @@ fn month_persist_xdotool_style_drag_persists_link_in_the_mock(cx: &mut gpui_kit:
     let bar = cx
         .debug_bounds("gantt-bar-1003")
         .expect("Month Persist cart");
-    let at_edge = grab_bar_from_right(bar, 1.0);
+    let at_edge = grab_bar_link_sliver(bar);
     cx.simulate_mouse_move(at_edge, None, Modifiers::default());
     cx.simulate_mouse_down(at_edge, MouseButton::Left, Modifiers::default());
     draw(cx);
@@ -5383,7 +5427,7 @@ fn month_persist_xdotool_style_drag_persists_link_in_the_mock(cx: &mut gpui_kit:
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::Link),
-            "a press on the last painted pixel must start a link"
+            "a press on the leftover sliver must start a link"
         );
     });
     let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
@@ -5496,7 +5540,7 @@ fn month_xdotool_mouseup_over_cart_ui_commits_link_in_the_mock(cx: &mut gpui_kit
     let bar = cx
         .debug_bounds("gantt-bar-1003")
         .expect("Month Persist cart");
-    let at_edge = grab_bar_from_right(bar, 1.0);
+    let at_edge = grab_bar_link_sliver(bar);
     cx.simulate_mouse_move(at_edge, None, Modifiers::default());
     cx.simulate_mouse_down(at_edge, MouseButton::Left, Modifiers::default());
     draw(cx);
@@ -5508,7 +5552,7 @@ fn month_xdotool_mouseup_over_cart_ui_commits_link_in_the_mock(cx: &mut gpui_kit
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::Link),
-            "a press on the last painted pixel must start a link"
+            "a press on the leftover sliver must start a link"
         );
     });
     let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
@@ -7062,11 +7106,11 @@ fn overflow_badge_does_not_cover_the_outside_title(cx: &mut gpui_kit::TestAppCon
     let label = cx
         .debug_bounds("gantt-bar-label-2")
         .expect("Persist cart outside title");
-    let badge_right = f32::from(badge.origin.x) + f32::from(badge.size.width);
-    let label_left = f32::from(label.origin.x);
+    let badge_left = f32::from(badge.origin.x);
+    let label_right = f32::from(label.origin.x) + f32::from(label.size.width);
     assert!(
-        label_left >= badge_right - 1.0,
-        "the Persist cart title must sit past the !, label_left={label_left} badge_right={badge_right}"
+        badge_left >= label_right - 1.0,
+        "the Persist cart ! must sit past the outside title, badge_left={badge_left} label_right={label_right}"
     );
 }
 
@@ -7608,7 +7652,11 @@ fn mouse_up_clears_hover_even_when_the_pointer_stays_on_the_bar(cx: &mut gpui_ki
     cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
-        assert_eq!(view.state.gantt.hovered_id, None);
+        assert_eq!(
+            view.state.gantt.hovered_id,
+            Some(1),
+            "mouse-up on the bar must restore hover at the release point"
+        );
         assert!(
             !view.state.gantt.hover_locked,
             "mouse-up must not lock hover or the next tooltip waits a second"
@@ -8928,6 +8976,14 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
         cx.debug_bounds("gantt-drag-preview").is_some(),
         "a live resize must show the date preview chip"
     );
+    assert!(
+        cx.debug_bounds("gantt-drag-date-start").is_some(),
+        "a live resize must show the Start Date pill on the bar"
+    );
+    assert!(
+        cx.debug_bounds("gantt-drag-date-end").is_some(),
+        "a live resize must show the Target Date pill on the bar"
+    );
     let preview = cx
         .debug_bounds("gantt-drag-preview")
         .expect("live resize preview");
@@ -9287,16 +9343,13 @@ fn drop_hides_the_bar_tooltip_beside_the_moved_toast(cx: &mut gpui_kit::TestAppC
     });
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
-    let grip = point(
-        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
-        bar.origin.y + bar.size.height / 2.0,
-    );
-    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    let origin = bar.center();
+    cx.simulate_mouse_down(origin, MouseButton::Left, Modifiers::default());
     draw(cx);
     let ppd = view.update(cx, |view, _| {
         view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
     });
-    let dest = point(grip.x + px(ppd * 5.0), grip.y);
+    let dest = point(origin.x + px(ppd * 5.0), origin.y);
     cx.simulate_mouse_move(dest, Some(MouseButton::Left), Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
@@ -9308,8 +9361,8 @@ fn drop_hides_the_bar_tooltip_beside_the_moved_toast(cx: &mut gpui_kit::TestAppC
         let bar = bars.iter().find(|bar| bar.id == 2).expect("leaf");
         let tip = bar_hover_tooltip(bar, &view.state.nodes);
         assert!(
-            !tip.contains("Jul 20"),
-            "a live drag tooltip must not keep the pre-drag Target Date, got {tip:?}"
+            !tip.contains("Jul 6") || tip.contains("Jul 11"),
+            "a live drag tooltip must follow the in-flight range, got {tip:?}"
         );
     });
     cx.simulate_mouse_up(dest, MouseButton::Left, Modifiers::default());
@@ -9319,43 +9372,164 @@ fn drop_hides_the_bar_tooltip_beside_the_moved_toast(cx: &mut gpui_kit::TestAppC
             "drop must not pin a dates chip beside the Moved toast"
         );
         assert!(
-            view.suppress_bar_tooltip_for_test(),
-            "drop must hide the hover tooltip until the pointer moves"
+            !view.suppress_bar_tooltip_for_test(),
+            "drop must recompute hover at the release point, without a 1px nudge"
+        );
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::Move),
+            "dropping mid-bar must restore the move hover, not leave a leftover ↔"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            None,
+            "dropping mid-bar must not leave an ew-resize cursor stuck"
         );
         assert!(
             !view.state.gantt.hover_locked,
             "drop must not lock hover or the first tooltip after a drag waits ~1s"
         );
-        let committed = view.last_committed_target_for_test();
+        let committed = view.last_committed_start_for_test();
         assert!(
-            committed.is_some_and(|day| day > Date::new(2026, 7, 20).unwrap()),
-            "resize must commit a later Target Date, got {committed:?}"
+            committed.is_some_and(|day| day > Date::new(2026, 7, 6).unwrap()),
+            "move must commit a later Start Date, got {committed:?}"
         );
     });
     draw(cx);
     assert!(
         cx.debug_bounds("gantt-bar-tooltip").is_none(),
-        "the bar tooltip must not sit beside the Moved toast after drop"
+        "the pinned dates chip must not sit beside the Moved toast after drop"
     );
-    cx.simulate_mouse_move(dest, None, Modifiers::default());
+}
+
+#[gpui_kit::test]
+fn two_to_four_px_inside_the_end_edge_resizes(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
     draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let halo = grab_end_resize_halo(bar);
+    cx.simulate_mouse_move(halo, None, Modifiers::default());
     view.update(cx, |view, _| {
-        assert!(
-            view.suppress_bar_tooltip_for_test(),
-            "a same-spot mouse-move after drop must not restore the hover tooltip"
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::ResizeEnd),
+            "2–4px inside the painted end must be the resize halo"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("ew-resize"),
+            "the halo must show the resize cursor"
         );
     });
-    assert!(
-        cx.debug_bounds("gantt-bar-tooltip").is_none(),
-        "a still pointer after drop must not show the dates tooltip"
-    );
-    let nudged = point(dest.x + px(3.0), dest.y);
-    cx.simulate_mouse_move(nudged, None, Modifiers::default());
+    cx.simulate_mouse_down(halo, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::ResizeEnd),
+            "a press 2–4px inside the end edge must resize, not link or no-op"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let target = cx
+        .debug_bounds("gantt-bar-label-1013")
+        .or_else(|| cx.debug_bounds("gantt-bar-1013"))
+        .expect("Go-live milestone");
+    cx.simulate_mouse_move(target.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .hovered_id
+                .or(view.state.gantt.bar_hovered_id),
+            Some(1013),
+            "hovering the diamond or its title must mark Go-live hovered"
+        );
         assert!(
             !view.suppress_bar_tooltip_for_test(),
-            "a real pointer nudge after drop must restore hover"
+            "a milestone hover must not suppress the dates tooltip"
+        );
+        assert!(
+            !matches!(
+                view.hover_bar_zone_for_test(),
+                Some((
+                    _,
+                    BarHitZone::Link | BarHitZone::ResizeStart | BarHitZone::ResizeEnd
+                ))
+            ),
+            "a diamond hover must not sit in a resize/link zone that hides the tooltip, got {:?}",
+            view.hover_bar_zone_for_test()
+        );
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 1013).expect("Go-live");
+        let tip = bar_hover_tooltip(bar, &view.state.nodes);
+        assert!(
+            tip.contains("Go-live milestone"),
+            "milestone hover copy must include the title, got {tip:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn hovering_a_bar_highlights_the_related_fs_chain(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1003").expect("Persist cart");
+    cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.hovered_id, Some(1003));
+        let related = related_dependency_ids(&view.state.nodes, 1003);
+        assert!(
+            related.contains(&1003) && related.contains(&1013),
+            "hovering Persist cart must highlight its FS chain including Go-live, got {related:?}"
         );
     });
 }

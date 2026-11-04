@@ -48,11 +48,12 @@ use crate::gantt::{
     HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT,
     LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS,
     NudgeAxis, OUTER_LINK_HIT, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP, PARALLEL_LANE_MIN,
-    PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT,
-    SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH,
-    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_outside_label_frame, bar_title_is_inside,
-    bar_title_paint_px, header_label_px, offscreen_edge_chip, outside_title_right_gap,
-    parent_date_overflow, parent_overflow_tip, related_dependency_ids,
+    PLACEHOLDER_BAR_H, RESIZE_HALO_END_OUTSIDE, RESIZE_HALO_INSIDE, RESIZE_HALO_OUTSIDE,
+    ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH,
+    SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH,
+    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_label_right, bar_outside_label_frame,
+    bar_title_is_inside, bar_title_paint_px, header_label_px, offscreen_edge_chip,
+    outside_title_right_gap, parent_date_overflow, parent_overflow_tip, related_dependency_ids,
     timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
 };
 use crate::paths::AppPaths;
@@ -4831,6 +4832,11 @@ impl PlannerView {
                         // cannot steal the last ~6px that start a link.
                         self.render_gantt_inset_link_sliver(bar, dragging, cx)
                     }))
+                    .children(bars.iter().flat_map(|bar| {
+                        // Sibling of the bar so overflow:hidden cannot clip
+                        // the 6px-outside / 4px-inside resize halo.
+                        self.render_resize_halos(bar, dragging, cx)
+                    }))
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
                             if gesture.kind != GestureKind::Link {
@@ -5575,7 +5581,9 @@ impl PlannerView {
                             Some((hid, BarHitZone::Link | BarHitZone::ResizeStart | BarHitZone::ResizeEnd))
                                 if hid == id
                         )
-                        && (inside || (!milestone && !marker && !unscheduled && !no_fields)),
+                        && (milestone
+                            || inside
+                            || (!marker && !unscheduled && !no_fields)),
                     |el| {
                         let live = self.bar_tooltip_live.clone();
                         el.tooltip(move |window, cx| {
@@ -5930,6 +5938,127 @@ impl PlannerView {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// Sibling overlay covering roughly edge−6..+4 so overflow:hidden on
+    /// the bar cannot clip the last 2–4px inside the painted edge. Last
+    /// children of the timeline so they win those pixels over the inset
+    /// link sliver; the leftover ~2px of the 6px sliver still starts a link.
+    fn render_resize_halos(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        dragging: bool,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        if bar.milestone || bar.marker {
+            return Vec::new();
+        }
+        if !dragging && !bar.can_resize() && !bar.open_ended {
+            return Vec::new();
+        }
+        let id = bar.id;
+        let linking = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link);
+        let layout = bar.clone();
+        let painted_w = bar.width.max(8.0);
+        let specs: Vec<(&'static str, &'static str, bool)> = if bar.open_ended && !bar.can_resize()
+        {
+            vec![("resize-halo-start", "start", true)]
+        } else if bar.can_resize() || dragging {
+            vec![
+                ("resize-halo-start", "start", true),
+                ("resize-halo-end", "end", false),
+            ]
+        } else {
+            return Vec::new();
+        };
+        specs
+            .into_iter()
+            .map(|(handle_id, name, at_start)| {
+                let selector = format!("gantt-resize-halo-{id}-{name}");
+                let layout = layout.clone();
+                let (left, halo_w) = if at_start {
+                    (
+                        bar.x - RESIZE_HALO_OUTSIDE,
+                        RESIZE_HALO_OUTSIDE + RESIZE_HALO_INSIDE,
+                    )
+                } else {
+                    (
+                        bar.x + painted_w - RESIZE_HALO_INSIDE,
+                        RESIZE_HALO_INSIDE + RESIZE_HALO_END_OUTSIDE,
+                    )
+                };
+                div()
+                    .id((handle_id, id as u64))
+                    .debug_selector(move || selector.clone())
+                    .absolute()
+                    .left(px(left))
+                    .top(px(bar.y + bar.paint_top()))
+                    .w(px(halo_w))
+                    .h(px(bar.paint_h()))
+                    .when(!linking, |el| el.occlude())
+                    .bg(gpui_kit::hsla(0., 0., 0., 0.01))
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                        this.apply_scroll(event, cx);
+                    }))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.set_bar_hovered(Some(id), cx);
+                            let zone = if at_start {
+                                BarHitZone::ResizeStart
+                            } else {
+                                BarHitZone::ResizeEnd
+                            };
+                            this.note_bar_hover_zone(id, zone, cx);
+                        }
+                    }))
+                    .on_mouse_move({
+                        let hover_layout = layout.clone();
+                        cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                            if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+                                gesture.kind == GestureKind::Link && gesture.id != id
+                            }) {
+                                this.state.gantt.set_link_target(id);
+                            }
+                            let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            this.note_pointer(x, y);
+                            this.classify_bar_hover_zone(id, &hover_layout, x, cx);
+                            this.on_bar_drag_move(event, window, cx);
+                        })
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            let x: f32 = event.position.x.into();
+                            let _ = this.classify_bar_hit(id, &layout, x);
+                            let kind = if at_start {
+                                GestureKind::ResizeStart
+                            } else {
+                                GestureKind::ResizeEnd
+                            };
+                            let origin = this.pointer_layout_x(x, Some(id));
+                            this.bar_press_shift = event.modifiers.shift;
+                            this.continue_or_begin_bar_gesture(id, kind, origin, x, window, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            this.release_bar_gesture(x, y, window, cx);
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect()
     }
 
     /// Inner 8px of a summary bar. Not-allowed cursor + rollup tooltip; no move.
@@ -6371,7 +6500,22 @@ impl PlannerView {
             bar.width.max(8.0)
         };
         let warn = cx.theme().warning;
-        let badge_left = bar.x + painted_w + LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP;
+        let after_handle =
+            bar.x + painted_w + LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP;
+        // Sit past an outside title so the yellow ! does not cover the
+        // letters. Inside titles keep the badge just after the link handle.
+        let badge_left = if bar_title_is_inside(bar) {
+            after_handle
+        } else {
+            let timeline_w = self.state.gantt.timeline_width.max(1.0);
+            let today = jiff::Zoned::now().date();
+            let today_px = self.state.gantt.x_for_date(today);
+            let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
+            let title_right = bar_outside_label_frame(bar, timeline_w, true, today_x, true)
+                .map(|(x, w)| x + w)
+                .unwrap_or_else(|| bar_label_right(bar));
+            title_right.max(after_handle) + 8.0
+        };
         Some(
             div()
                 .id(("gantt-overflow", id as u64))
@@ -8774,12 +8918,17 @@ impl PlannerView {
             }
             self.enqueue_date_save(cx, pending);
             self.note_toasts_changed(cx);
-            // Hide the dates chip and hover tooltip on drop so they do not
-            // sit beside the Moved toast. A later real pointer move restores
-            // hover; a same-spot mouse-move after mouse-up must not.
-            self.state.gantt.pin_bar_tooltip = None;
-            self.arm_tooltip_suppress(window_x, window_y);
         }
+        // Hide the pinned dates chip so it does not sit beside the Moved
+        // toast. Recompute hover at the release point so the tooltip and
+        // cursor match the bar under the still pointer — including a no-op
+        // drop that still had a leftover ↔ from the resize grip.
+        self.state.gantt.pin_bar_tooltip = None;
+        self.suppress_bar_tooltip = false;
+        self.tooltip_suppress_at = None;
+        self.note_pointer(window_x, window_y);
+        self.hover_bar_zone = None;
+        self.recompute_hover_at_last_pointer(cx);
         // Every drop path (commit, no-op release, missed mouse-up) must
         // request a paint so a resize at x=604 does not keep the preview
         // chip, live label, and tooltip until the next pointer move.

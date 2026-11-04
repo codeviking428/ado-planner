@@ -23,6 +23,14 @@ pub const HANDLE_WIDTH: f32 = 8.0;
 /// Pointer hit for inner start/end resize. Wider than the 4px pill so a
 /// press ~12px inside the edge still resizes instead of moving.
 pub const RESIZE_HIT_WIDTH: f32 = 14.0;
+/// Extra hit around the painted edge: 6px outside, 4px inside. The last 6px
+/// of a dated bar is a link sliver; 2–4px inside that sliver was a dead
+/// zone because overflow clipped the inner grip. A sibling halo covers it.
+/// The end halo only steps 1px past the painted right so the outer link
+/// handle's 8px radius (starting ~1px past the bar) still starts a link.
+pub const RESIZE_HALO_OUTSIDE: f32 = 6.0;
+pub const RESIZE_HALO_INSIDE: f32 = 4.0;
+pub const RESIZE_HALO_END_OUTSIDE: f32 = 1.0;
 /// Selected tree/timeline row tint. Stronger than zebra stripes so the row reads.
 pub const SELECTED_ROW_TINT: f32 = 0.65;
 /// Left accent on the selected tree/timeline row.
@@ -557,10 +565,22 @@ impl BarLayout {
         painted_left: f32,
         painted_right: f32,
     ) -> BarHitZone {
+        let (start, end_resize, link) = self.edge_zones_for(self.width.max(1.0));
+        if self.can_resize() {
+            if window_x >= painted_left - RESIZE_HALO_OUTSIDE
+                && window_x <= painted_left + RESIZE_HALO_INSIDE
+            {
+                return BarHitZone::ResizeStart;
+            }
+            if window_x >= painted_right - RESIZE_HALO_INSIDE
+                && window_x <= painted_right + RESIZE_HALO_END_OUTSIDE
+            {
+                return BarHitZone::ResizeEnd;
+            }
+        }
         if window_x < painted_left || window_x > painted_right {
             return BarHitZone::Outside;
         }
-        let (start, end_resize, link) = self.edge_zones_for(self.width.max(1.0));
         let on_link = link > 0.0 && window_x >= painted_right - link;
         let on_start = start > 0.0 && window_x <= painted_left + start;
         let on_end = end_resize > 0.0
@@ -1899,8 +1919,15 @@ impl GanttView {
         if gesture.live_start == gesture.live_target {
             compact_date(gesture.live_start)
         } else {
+            let days = gesture
+                .live_target
+                .since((Unit::Day, gesture.live_start))
+                .map(|span| span.get_days())
+                .unwrap_or(0)
+                .max(0)
+                + 1;
             format!(
-                "{} → {}",
+                "{} → {} · {days}d",
                 compact_date(gesture.live_start),
                 compact_date(gesture.live_target)
             )
@@ -2294,12 +2321,13 @@ impl GanttView {
             } else {
                 GestureKind::Move
             }
-        } else if bar.link_handle_insets_into_bar()
-            && x >= bar.x + bar.width - bar.link_zone_width()
-        {
-            GestureKind::Link
         } else {
-            bar.resize_kind_at(x).unwrap_or(GestureKind::Move)
+            match bar.hit_zone_at_window_x(x, bar.x, bar.x + bar.width) {
+                BarHitZone::ResizeStart => GestureKind::ResizeStart,
+                BarHitZone::ResizeEnd => GestureKind::ResizeEnd,
+                BarHitZone::Link => GestureKind::Link,
+                _ => GestureKind::Move,
+            }
         };
         Some((bar, kind))
     }
@@ -2674,6 +2702,16 @@ impl GanttView {
         );
         separate_shared_source_inbounds(&mut out, clip_left, clip_right);
         force_overlap_back_jog(
+            &mut out,
+            bars,
+            include_labels,
+            clip_left,
+            clip_right,
+            today_x,
+        );
+        // Last: each vertical must miss every bar whose row it actually
+        // crosses (Month Persist cart → spike through Cart UI at x≈679).
+        dodge_verticals_off_crossed_bars(
             &mut out,
             bars,
             include_labels,
@@ -4151,6 +4189,130 @@ fn force_overlap_back_jog(
     }
 }
 
+fn vertical_crosses_bar_row(y_a: f32, y_b: f32, bar: &BarLayout) -> bool {
+    let lo = y_a.min(y_b);
+    let hi = y_a.max(y_b);
+    hi - lo > 4.0 && lo < bar.y + ROW_HEIGHT - 1.0 && hi > bar.y + 1.0
+}
+
+/// Slide a vertical off every intervening painted bar it crosses. Prefer a
+/// gap just left of the hit so finish-to-start still enters from the left.
+/// Wrap drops treat open-ended cues as occupied (Month Persist cart → spike
+/// through Cart UI) but must not detour left of the source.
+#[allow(clippy::too_many_arguments)]
+fn slide_vertical_off_crossed_bars(
+    x: f32,
+    y_a: f32,
+    y_b: f32,
+    pred_id: i64,
+    succ_id: i64,
+    bars: &[BarLayout],
+    include_labels: bool,
+    clip_left: f32,
+    clip_right: f32,
+    today_x: Option<f32>,
+    min_x: Option<f32>,
+    include_cues: bool,
+    x_head: Option<f32>,
+) -> f32 {
+    if (y_a - y_b).abs() <= 4.0 {
+        return x;
+    }
+    let cue_right = include_cues.then_some(clip_right);
+    let blocked: Vec<(f32, f32)> = bars
+        .iter()
+        .filter(|bar| {
+            bar.id != pred_id && bar.id != succ_id && vertical_crosses_bar_row(y_a, y_b, bar)
+        })
+        .map(|bar| bar_occupied_x(bar, include_labels, cue_right, today_x))
+        .collect();
+    if blocked.is_empty() {
+        return x;
+    }
+    let floor = min_x.unwrap_or(clip_left).max(clip_left);
+    let mut x = x.clamp(clip_left, clip_right);
+    for _ in 0..=blocked.len() {
+        let hit = blocked
+            .iter()
+            .copied()
+            .find(|(left, right)| x_hits_span(x, *left, *right));
+        let Some((left, right)) = hit else {
+            return x;
+        };
+        let left_cand = (left - 8.0).max(floor);
+        if left_cand < x - 0.5 && !x_hits_span(left_cand, left, right) {
+            x = left_cand;
+            continue;
+        }
+        let right_cand = (right + 8.0).min(clip_right);
+        let right_ok = x_head.is_none_or(|head| right_cand < head - 2.0);
+        if right_cand > x + 0.5 && right_ok && !x_hits_span(right_cand, left, right) {
+            x = right_cand;
+            continue;
+        }
+        return x;
+    }
+    x
+}
+
+/// Keep each polyline vertical out of bars in the rows it spans. Successor
+/// back-jog only clears the target; a Persist cart → spike wrap can still
+/// drop through intervening Cart UI.
+fn dodge_verticals_off_crossed_bars(
+    arrows: &mut [DependencyArrow],
+    bars: &[BarLayout],
+    include_labels: bool,
+    clip_left: f32,
+    clip_right: f32,
+    today_x: Option<f32>,
+) {
+    let pred_x: HashMap<i64, f32> = bars.iter().map(|bar| (bar.id, bar.x)).collect();
+    for arrow in arrows.iter_mut() {
+        let wrap = arrow.wraps_around_successor();
+        let inbound_end = if wrap { arrow.gutter_y() } else { arrow.y2 };
+        // Sit just left of an intervening bar that starts on the source
+        // (Quarter Persist cart / Cart UI), without a chart-wide left detour.
+        let min_x = wrap
+            .then(|| {
+                pred_x
+                    .get(&arrow.from_id)
+                    .copied()
+                    .map(|x| x - HANDLE_WIDTH - 8.0)
+            })
+            .flatten();
+        arrow.x2 = slide_vertical_off_crossed_bars(
+            arrow.x2,
+            arrow.lane_y,
+            inbound_end,
+            arrow.from_id,
+            arrow.to_id,
+            bars,
+            include_labels,
+            clip_left,
+            clip_right,
+            today_x,
+            min_x,
+            wrap,
+            Some(arrow.x_head),
+        );
+        arrow.x1 = slide_vertical_off_crossed_bars(
+            arrow.x1,
+            arrow.y1,
+            arrow.lane_y,
+            arrow.from_id,
+            arrow.to_id,
+            bars,
+            include_labels,
+            clip_left,
+            clip_right,
+            today_x,
+            None,
+            false,
+            None,
+        );
+    }
+}
+
 /// A short inbound stub must not land inside an intervening painted bar
 /// (solid body or open-ended dashed tail). Outside titles stay ignored
 /// so Year/Quarter chips do not shove the drop tens of days away.
@@ -5033,8 +5195,13 @@ mod tests {
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 176.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "2–4px inside the painted end must resize"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&bars, 174.5, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::Link),
-            "the last 6px of a dated bar must start a link"
+            "the leftover ~2px of the 6px sliver, past the 4px halo, still starts a link"
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 168.0, 4.0).map(|(_, kind)| kind),
@@ -5067,8 +5234,13 @@ mod tests {
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 100.0 + 80.0 - 3.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "2–4px inside the right end must resize"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&bars, 100.0 + 80.0 - 5.5, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::Link),
-            "3px inside the right end must start a link"
+            "the leftover sliver past the 4px halo still starts a link"
         );
         let (end_x, end_w) = resize_end_handle(&bar);
         assert!(
@@ -5115,8 +5287,14 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&summary), 176.0, 4.0)
                 .map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "a parent with its own dates resizes 2–4px inside the end"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&summary), 174.5, 4.0)
+                .map(|(_, kind)| kind),
             Some(GestureKind::Link),
-            "a parent with its own dates starts a link on the last 6px"
+            "a parent with its own dates still links on the leftover sliver"
         );
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&summary), 168.0, 4.0)
@@ -5130,8 +5308,13 @@ mod tests {
         );
         assert_eq!(
             summary.hit_zone_at_window_x(177.0, summary.x, summary.x + summary.width),
+            BarHitZone::ResizeEnd,
+            "3px inside a summary end is the resize halo"
+        );
+        assert_eq!(
+            summary.hit_zone_at_window_x(174.5, summary.x, summary.x + summary.width),
             BarHitZone::Link,
-            "3px inside a summary end is the link sliver, not resize or move"
+            "the leftover sliver past the 4px halo still starts a link"
         );
         let diamond = BarLayout {
             summary: true,
@@ -5206,8 +5389,8 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width - 1.0, 4.0)
                 .map(|(_, kind)| kind),
-            Some(GestureKind::Link),
-            "the last pixel of a Week-scale bar must start a link"
+            Some(GestureKind::ResizeEnd),
+            "the last pixel of a Week-scale bar must resize (halo covers edge−4..+6)"
         );
         assert_eq!(
             GanttView::hit_test_bar(
@@ -5239,8 +5422,14 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width - 3.0, 4.0)
                 .map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "2–4px inside the painted end must resize"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width - 5.5, 4.0)
+                .map(|(_, kind)| kind),
             Some(GestureKind::Link),
-            "3px inside the painted end must start a link"
+            "the leftover ~2px of the 6px sliver, past the 4px halo, still starts a link"
         );
         // Painted window edges can sit far from layout.x (tree, gutter, label).
         // Classification must use those edges, not layout-local x.
@@ -5943,14 +6132,30 @@ mod tests {
             "a wide dated bar's last pixels must start a link"
         );
         assert_eq!(
-            GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width - 4.0, 4.0)
+            GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width - 3.0, 4.0)
                 .map(|(_, kind)| kind),
-            Some(GestureKind::Link)
+            Some(GestureKind::ResizeEnd),
+            "2–4px inside the end edge must resize"
         );
         assert_eq!(
-            bar.hit_zone_at_window_x(bar.x + bar.width - 4.0, bar.x, bar.x + bar.width),
+            bar.hit_zone_at_window_x(bar.x + bar.width - 3.0, bar.x, bar.x + bar.width),
+            BarHitZone::ResizeEnd,
+            "2–4px inside the end edge must be ResizeEnd, not a dead Outside/Link"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(bar.x + bar.width + 0.5, bar.x, bar.x + bar.width),
+            BarHitZone::ResizeEnd,
+            "1px past the painted end must still resize"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(bar.x + bar.width + 4.0, bar.x, bar.x + bar.width),
+            BarHitZone::Outside,
+            "the outer link handle, 4px past the end, must not be stolen by resize"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(bar.x + bar.width - 5.5, bar.x, bar.x + bar.width),
             BarHitZone::Link,
-            "hit-zone must classify the last pixels as Link, not Move"
+            "the remaining ~2px of the 6px sliver, past the 4px halo, still starts a link"
         );
         assert_eq!(
             GanttView::hit_test_bar(
@@ -5990,9 +6195,24 @@ mod tests {
         );
         let right = bar.x + bar.width;
         assert_eq!(
-            bar.hit_zone_at_window_x(right - 2.0, bar.x, right),
+            bar.hit_zone_at_window_x(right - 3.0, bar.x, right),
+            BarHitZone::ResizeEnd,
+            "2–4px inside the end edge must resize"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(right + 0.5, bar.x, right),
+            BarHitZone::ResizeEnd,
+            "1px past the painted end must still resize"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(right + 4.0, bar.x, right),
+            BarHitZone::Outside,
+            "the outer link handle, 4px past the end, must not be stolen by resize"
+        );
+        assert_eq!(
+            bar.hit_zone_at_window_x(right - 5.5, bar.x, right),
             BarHitZone::Link,
-            "last ~6px of a short Persist cart must link"
+            "the leftover sliver past the 4px halo still starts a link"
         );
         assert_eq!(
             bar.hit_zone_at_window_x(right - link - end / 2.0, bar.x, right),
@@ -6046,7 +6266,7 @@ mod tests {
         );
         let right = resizable.x + resizable.width;
         assert_eq!(
-            resizable.hit_zone_at_window_x(right - link / 2.0, resizable.x, right),
+            resizable.hit_zone_at_window_x(right - link + 0.5, resizable.x, right),
             BarHitZone::Link
         );
         assert_eq!(
@@ -9066,6 +9286,137 @@ mod tests {
         assert_overlap_back_jog(&gantt, &nodes);
     }
 
+    fn moved_persist_to_spike_nodes() -> Vec<WorkItemNode> {
+        let mut nodes = live_fixture_nodes();
+        if let Some(persist) = nodes.iter_mut().find(|node| node.id == 1003) {
+            persist.start_date = Some("2026-07-20T00:00:00Z".into());
+            persist.target_date = Some("2026-08-03T00:00:00Z".into());
+        }
+        nodes
+    }
+
+    fn assert_verticals_miss_crossed_bars(gantt: &GanttView, nodes: &[WorkItemNode]) {
+        let rows = gantt.flatten(nodes);
+        let bars = gantt.layout_bars(nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let today = jiff::Zoned::now().date();
+        let today_px = gantt.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+        let include_labels = !matches!(gantt.scale, GanttScale::Year | GanttScale::Quarter);
+        for arrow in &arrows {
+            let Some(pred) = bars.iter().find(|bar| bar.id == arrow.from_id) else {
+                continue;
+            };
+            let Some(succ) = bars.iter().find(|bar| bar.id == arrow.to_id) else {
+                continue;
+            };
+            for bar in &bars {
+                if bar.id == pred.id || bar.id == succ.id {
+                    continue;
+                }
+                let (left, right) =
+                    bar_occupied_x(bar, include_labels, Some(gantt.timeline_width), today_x);
+                let inbound_end = if arrow.wraps_around_successor() {
+                    arrow.gutter_y()
+                } else {
+                    arrow.y2
+                };
+                let inbound_crosses = arrow.lane_y.min(inbound_end) < bar.y + ROW_HEIGHT - 1.0
+                    && arrow.lane_y.max(inbound_end) > bar.y + 1.0
+                    && (inbound_end - arrow.lane_y).abs() > 4.0;
+                if inbound_crosses {
+                    assert!(
+                        !x_hits_span(arrow.x2, left, right),
+                        "{:?} inbound {}→{} at x2={} must miss {} occupied {left}..{right}",
+                        gantt.scale,
+                        arrow.from_id,
+                        arrow.to_id,
+                        arrow.x2,
+                        bar.title
+                    );
+                }
+                let outgoing_crosses = arrow.y1.min(arrow.lane_y) < bar.y + ROW_HEIGHT - 1.0
+                    && arrow.y1.max(arrow.lane_y) > bar.y + 1.0
+                    && (arrow.lane_y - arrow.y1).abs() > 4.0;
+                if outgoing_crosses {
+                    assert!(
+                        !x_hits_span(arrow.x1, left, right),
+                        "{:?} outgoing {}→{} at x1={} must miss {} occupied {left}..{right}",
+                        gantt.scale,
+                        arrow.from_id,
+                        arrow.to_id,
+                        arrow.x1,
+                        bar.title
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn month_moved_persist_to_spike_misses_cart_ui() {
+        let nodes = moved_persist_to_spike_nodes();
+        for (timeline_width, zoom) in [(512.0, 1.0), (800.0, 1.0), (1100.0, 1.0), (800.0, 1.6)] {
+            let gantt = GanttView {
+                origin: Date::new(2026, 7, 1).unwrap(),
+                timeline_width,
+                scale: GanttScale::Month,
+                zoom,
+                ..Default::default()
+            };
+            let rows = gantt.flatten(&nodes);
+            let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+            let persist = bars.iter().find(|bar| bar.id == 1003).unwrap();
+            let cart = bars.iter().find(|bar| bar.id == 1005).unwrap();
+            let spike = bars.iter().find(|bar| bar.id == 1012).unwrap();
+            assert!(
+                persist.x + persist.width > cart.x + 12.0,
+                "fixture: moved Persist cart must overlap Cart UI, persist_end={} cart.x={} width={timeline_width} zoom={zoom}",
+                persist.x + persist.width,
+                cart.x
+            );
+            let arrow = gantt
+                .layout_dependency_arrows(&bars)
+                .into_iter()
+                .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+                .expect("Persist cart → Unparented spike");
+            let today = jiff::Zoned::now().date();
+            let today_px = gantt.x_for_date(today);
+            let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+            let (left, right) = bar_occupied_x(cart, true, Some(gantt.timeline_width), today_x);
+            assert!(
+                !x_hits_span(arrow.x2, left, right),
+                "Month Persist cart → spike inbound must not drop through Cart UI, x2={} occupied={left}..{right} persist_end={} cart.x={} spike.x={} width={timeline_width} zoom={zoom}",
+                arrow.x2,
+                persist.x + persist.width,
+                cart.x,
+                spike.x
+            );
+            assert_verticals_miss_crossed_bars(&gantt, &nodes);
+        }
+    }
+
+    #[test]
+    fn moved_persist_to_spike_verticals_miss_crossed_bars_in_every_scale() {
+        let nodes = moved_persist_to_spike_nodes();
+        for (scale, zoom) in [
+            (GanttScale::Day, 1.0),
+            (GanttScale::Week, 1.0),
+            (GanttScale::Month, 1.0),
+            (GanttScale::Quarter, 2.0),
+            (GanttScale::Year, 4.0),
+        ] {
+            let gantt = GanttView {
+                origin: Date::new(2026, 7, 1).unwrap(),
+                timeline_width: 1100.0,
+                scale,
+                zoom,
+                ..Default::default()
+            };
+            assert_verticals_miss_crossed_bars(&gantt, &nodes);
+        }
+    }
+
     #[test]
     fn critical_path_is_the_dated_fs_chain_that_finishes_latest() {
         let mut a = node(1, None);
@@ -9285,7 +9636,7 @@ mod tests {
         assert_eq!(
             GanttView::drag_preview_text(&gesture),
             format!(
-                "{} → {}",
+                "{} → {} · 15d",
                 compact_date(gesture.live_start),
                 compact_date(gesture.live_target)
             )
@@ -11360,6 +11711,26 @@ mod tests {
         assert!(
             tip.contains("Unassigned"),
             "missing assignee must say Unassigned, got {tip:?}"
+        );
+    }
+
+    #[test]
+    fn milestone_hover_tooltip_lists_title_and_date() {
+        let mut item = node(1013, None);
+        item.title = "Go-live milestone".into();
+        item.start_date = None;
+        item.target_date = Some("2026-08-15T00:00:00Z".into());
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(std::slice::from_ref(&item));
+        let bars = gantt.layout_bars(std::slice::from_ref(&item), &rows, &[], 720.0);
+        assert!(bars[0].milestone, "Go-live must layout as a diamond");
+        let tip = bar_hover_tooltip(&bars[0], std::slice::from_ref(&item));
+        assert!(
+            tip.contains("Go-live milestone") && (tip.contains("Aug") || tip.contains("15")),
+            "milestone hover tooltip must show the title and date, got {tip:?}"
         );
     }
 
