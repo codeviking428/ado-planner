@@ -1195,11 +1195,10 @@ impl PlannerView {
 
     fn animate_gantt(&mut self, cx: &mut Context<Self>, apply: impl FnOnce(&mut GanttView)) {
         self.state.gantt.clear_hover();
-        // Scale/zoom remounts the toast stack. Drop every toast so a fresh
-        // success/undo does not survive a Day/Week/… click, and unstick pause.
+        // Scale/zoom remounts the toast stack. Keep the messages; only
+        // unstick hover-pause so TTL still runs after a Day/Week click.
         self.toast_hover_depth = 0;
         self.toast_pause_ready = false;
-        self.state.toasts.clear();
         self.toast_expiry_gen += 1;
         self.toast_expiry_armed = false;
         self.schedule_toast_expiry(cx);
@@ -1409,11 +1408,13 @@ impl PlannerView {
             return;
         };
         let painted = self.painted_bar_for(bar.id, bar);
-        let slop = LINK_HANDLE_HIT + LINK_HANDLE_GAP + 8.0;
-        let on_bar = x >= painted.left - slop
-            && x <= painted.right + slop
-            && y >= painted.top - 4.0
-            && y <= painted.bottom + 4.0;
+        let local_x = self.pointer_layout_x(x, Some(bar.id));
+        let start_hit = bar.start_link_origin() - OUTER_LINK_HIT / 2.0;
+        let end_hit = bar.end_link_origin() + OUTER_LINK_HIT / 2.0;
+        let on_row = local_y >= bar.y && local_y < bar.y + ROW_HEIGHT;
+        let on_bar = on_row
+            && ((local_x >= start_hit && local_x <= end_hit)
+                || (x >= painted.left - 4.0 && x <= painted.right + 4.0));
         if !on_bar {
             self.clear_bar_hover(cx);
             return;
@@ -1501,8 +1502,11 @@ impl PlannerView {
             && layout.kind != ado_core::GanttBarKind::NoFields
             && layout.kind != ado_core::GanttBarKind::Unscheduled
         {
+            let start_origin = painted.content_left - LINK_HANDLE_GAP - LINK_HANDLE / 2.0;
             let end_origin = painted.content_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
-            if (window_x - end_origin).abs() <= OUTER_LINK_HIT / 2.0 + 0.5 {
+            if (window_x - start_origin).abs() <= OUTER_LINK_HIT / 2.0 + 0.5
+                || (window_x - end_origin).abs() <= OUTER_LINK_HIT / 2.0 + 0.5
+            {
                 return BarHitZone::Link;
             }
         }
@@ -3691,7 +3695,11 @@ impl PlannerView {
         let selected_bg = cx.theme().list_active;
         let stripe = cx.theme().muted;
         let row_bg = cx.theme().background;
-        let hovered_id = self.state.gantt.hovered_id;
+        let hovered_id = self
+            .state
+            .gantt
+            .hovered_id
+            .or(self.state.gantt.bar_hovered_id);
         let first_row = self.state.gantt.first_visible_row_index();
         let remainder = self.state.gantt.row_scroll_remainder();
         let show_type = self.state.gantt.show_type_column();
@@ -4091,6 +4099,12 @@ impl PlannerView {
             .flex_1()
             .min_w(px(180.))
             .overflow_hidden()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.set_hovered(if *hovered { Some(id) } else { None }, cx);
+            }))
+            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                this.set_hovered(Some(id), cx);
+            }))
             .child(
                 Button::new(("title-tip", id as u64))
                     .ghost()
@@ -4102,7 +4116,10 @@ impl PlannerView {
                     .label(title_owned)
                     .when(!form_open, |btn| {
                         btn.tooltip(tip).tooltip_placement(Placement::Top)
-                    }),
+                    })
+                    .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                        this.set_hovered(Some(id), cx);
+                    })),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -4145,6 +4162,9 @@ impl PlannerView {
             .flex_shrink_0()
             .truncate()
             .text_xs()
+            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                this.set_hovered(Some(id), cx);
+            }))
             .child(assigned_owned.clone())
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -4193,6 +4213,9 @@ impl PlannerView {
             .w(px(DATES_COL_WIDTH))
             .h(px(ROW_HEIGHT))
             .items_center()
+            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                this.set_hovered(Some(id), cx);
+            }))
             .pl_1()
             .pr(px(8.))
             .gap_1()
@@ -4528,7 +4551,11 @@ impl PlannerView {
         let first_row = self.state.gantt.first_visible_row_index();
         let today_color = cx.theme().primary;
         let selected_id = self.state.gantt.selected_id;
-        let hovered_id = self.state.gantt.hovered_id;
+        let hovered_id = self
+            .state
+            .gantt
+            .hovered_id
+            .or(self.state.gantt.bar_hovered_id);
         let path = if self.state.gantt.show_critical_path {
             crate::gantt::critical_path(&self.state.visible_nodes())
         } else {
@@ -4888,18 +4915,28 @@ impl PlannerView {
                                 return None;
                             }
                             let bar = bars.iter().find(|bar| bar.id == gesture.id)?;
-                            let x1 = bar.x + bar.width + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
+                            let from_start = gesture.link_from_start;
+                            let x1 = if from_start {
+                                bar.start_link_origin()
+                            } else {
+                                bar.end_link_origin()
+                            };
                             // Lane under the painted bar, not a 2px hug of its
                             // top. Keep it in the row gap so it does not jump
                             // onto the next bar.
                             let y1 = bar.link_preview_lane_y();
                             let handle_y = bar.paint_mid_y();
                             let y2 = gesture.live_y;
-                            // Never draw left of the handle: an inset press
-                            // maps live_x inside the bar.
-                            let mut x2 = gesture.live_x.max(x1);
-                            if x2 <= x1 + 2.0 && (y2 - y1).abs() < 2.0 {
-                                x2 = x1 + 12.0;
+                            // End-handle: never draw left through the bar.
+                            // Start-handle: the lane is below the body, so the
+                            // horizontal may run under it toward the pointer.
+                            let mut x2 = if from_start {
+                                gesture.live_x
+                            } else {
+                                gesture.live_x.max(x1)
+                            };
+                            if (x2 - x1).abs() <= 2.0 && (y2 - y1).abs() < 2.0 {
+                                x2 = if from_start { x1 - 12.0 } else { x1 + 12.0 };
                             }
                             // Same-column inbound at row-center y would run
                             // back through the source bar; the outgoing stub
@@ -5343,6 +5380,13 @@ impl PlannerView {
         let inside = Self::bar_title_fits_inside(bar);
         let selected = self.state.gantt.selected_id == Some(id);
         let hovered = self.state.gantt.hovered_id == Some(id);
+        let lifting = dragging
+            && self
+                .state
+                .gantt
+                .gesture
+                .as_ref()
+                .is_some_and(|gesture| gesture.id == id && gesture.kind != GestureKind::Link);
         let can_resize = bar.can_resize();
         let bar_h = if milestone || marker {
             MILESTONE_SIZE
@@ -5392,7 +5436,8 @@ impl PlannerView {
         } else {
             1.0
         };
-        let items = vec![
+        let items =
+            vec![
             div()
                 .id(("gantt-bar", id as u64))
                 .debug_selector(move || bar_selector.clone())
@@ -5427,8 +5472,10 @@ impl PlannerView {
                     bar.width.max(8.0)
                 }))
                 .h(px(bar_h))
-                .rounded_md()
+                .when(milestone || marker || summary, |el| el.rounded_md())
+                .when(!milestone && !marker && !summary, |el| el.rounded_full())
                 .relative()
+                .when(lifting, |el| el.opacity(0.88))
                 .when(
                     matches!(
                         self.hover_bar_zone,
@@ -5480,11 +5527,13 @@ impl PlannerView {
                     },
                 )
                 .when(open_ended && !summary && !marker, |el| {
-                    el.bg(rgb(bar.color).opacity(0.22))
+                    // Solid default-length body; the faded dashed cue + ▸
+                    // carries the "continues" look past the clip.
+                    el.bg(rgb(bar.color))
                         .border_1()
-                        .border_dashed()
                         .when(on_critical_path, |el| el.border_color(cx.theme().danger))
                         .when(!on_critical_path, |el| el.border_color(rgb(bar.color)))
+                        .when(hovered && !dragging, |el| el.opacity(0.92))
                         .child(
                             div()
                                 .absolute()
@@ -5492,10 +5541,6 @@ impl PlannerView {
                                 .top_0()
                                 .bottom_0()
                                 .w(px(crate::gantt::OPEN_ENDED_LINK_HIT))
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .text_color(rgb(bar.color))
                                 .occlude()
                                 .cursor(CursorStyle::DragLink)
                                 .on_mouse_down(
@@ -5511,8 +5556,7 @@ impl PlannerView {
                                             cx,
                                         );
                                     }),
-                                )
-                                .child("▸"),
+                                ),
                         )
                 })
                 .when(unscheduled && !summary && !marker, |el| {
@@ -5545,6 +5589,8 @@ impl PlannerView {
                 .when(!milestone && !marker && !unscheduled && !open_ended, |el| {
                     el.border_color(if on_critical_path {
                         cx.theme().danger
+                    } else if lifting {
+                        cx.theme().primary
                     } else if selected {
                         cx.theme().primary.opacity(0.8)
                     } else if summary {
@@ -5556,8 +5602,8 @@ impl PlannerView {
                     } else {
                         cx.theme().border
                     })
-                    .when(selected || on_critical_path, |el| el.border_2())
-                    .when(!selected && !on_critical_path, |el| el.border_1())
+                    .when(selected || on_critical_path || lifting, |el| el.border_2())
+                    .when(!selected && !on_critical_path && !lifting, |el| el.border_1())
                 })
                 .when(!milestone && !marker, |el| el.overflow_hidden())
                 .when(show_progress, |el| {
@@ -5585,7 +5631,7 @@ impl PlannerView {
                                         .tooltip_show_delay(Duration::from_millis(450)),
                                 )
                             })
-                            .when(!summary, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.22))),
+                            .when(!summary, |el| el.bg(gpui_kit::hsla(0., 0., 0., 0.28))),
                     )
                 })
                 .when(
@@ -9064,11 +9110,17 @@ impl PlannerView {
             let pair = self.state.gantt.take_link_gesture();
             self.state.gantt.selected_link = None;
             self.state.gantt.clear_hover();
-            if let Some((from_id, Some(to_id))) = pair
+            if let Some((from_id, Some(to_id), from_start)) = pair
                 && from_id != to_id
-                && self.state.apply_link_now(to_id, from_id)
             {
-                self.enqueue_link_save(to_id, from_id, cx);
+                let (successor, predecessor) = if from_start {
+                    (from_id, to_id)
+                } else {
+                    (to_id, from_id)
+                };
+                if self.state.apply_link_now(successor, predecessor) {
+                    self.enqueue_link_save(successor, predecessor, cx);
+                }
             }
             self.painted_bar_bounds.borrow_mut().clear();
             self.suppress_bar_tooltip = false;
@@ -10397,8 +10449,8 @@ fn row_side_tooltip_left(
     }
 }
 
-/// Overlay tooltip origin. Milestones sit the chip above the diamond so
-/// "Go-live milestone" is not clipped to "Go-liv…" by the 16px box.
+/// Overlay tooltip origin. Milestones sit the chip above and left of the
+/// diamond so it does not cover the outside title ("Go-live milestone").
 fn hover_bar_tooltip_origin(
     bar_x: f32,
     painted_w: f32,
@@ -10409,8 +10461,18 @@ fn hover_bar_tooltip_origin(
     offset_above: bool,
 ) -> (f32, f32) {
     if offset_above {
-        let tip_x = bar_x.max(0.0).min((timeline_w - tip_w - 4.0).max(0.0));
-        let tip_y = (bar_top - 24.0).max(0.0);
+        // Overestimate: the overlay sizes to glyphs, and a short estimate
+        // lets the chip run onto the outside title to the right of the
+        // diamond. Keep the chip fully left of the diamond when possible.
+        let conservative_w = (tip_w + 48.0).max(tip_w * 1.35);
+        let left = bar_x - conservative_w - extra.max(8.0);
+        let tip_x = left.max(0.0);
+        let tip_y = if left >= 0.0 {
+            (bar_top - 26.0).max(0.0)
+        } else {
+            // No left gutter: sit below the diamond / outside title.
+            bar_top + painted_w + 6.0
+        };
         (tip_x, tip_y)
     } else {
         (
@@ -11576,11 +11638,20 @@ mod bar_label_tests {
     #[test]
     fn milestone_hover_tooltip_sits_above_the_diamond() {
         let (x, y) = super::hover_bar_tooltip_origin(400.0, 16.0, 42.0, 180.0, 800.0, 120.0, true);
-        assert_eq!(x, 400.0);
-        assert_eq!(y, 96.0);
+        assert!(
+            x + 180.0 <= 400.0,
+            "Go-live tooltip must sit left of the diamond so it does not cover the outside title, got {x}"
+        );
         assert!(
             y + 20.0 <= 120.0,
             "Go-live tooltip must sit above the diamond so the title is not clipped to Go-liv…"
+        );
+        let (tight_x, tight_y) =
+            super::hover_bar_tooltip_origin(40.0, 16.0, 42.0, 180.0, 800.0, 12.0, true);
+        assert_eq!(tight_x, 0.0);
+        assert!(
+            tight_y >= 12.0 + 16.0,
+            "a milestone at the left clip must drop below the diamond instead of covering the title, got {tight_y}"
         );
         let (side_x, side_y) =
             super::hover_bar_tooltip_origin(40.0, 80.0, 8.0, 120.0, 800.0, 80.0, false);

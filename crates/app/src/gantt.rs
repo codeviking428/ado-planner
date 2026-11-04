@@ -383,6 +383,9 @@ pub struct Gesture {
     pub link_to: Option<i64>,
     pub had_start: bool,
     pub had_target: bool,
+    /// Pressed the inbound (start) connector. Preview drops from that
+    /// handle; drop treats this bar as the successor (still FS).
+    pub link_from_start: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,6 +469,24 @@ impl BarLayout {
         (bar_bottom + 8.0)
             .min(self.y + ROW_HEIGHT - 4.0)
             .max(bar_bottom + 4.0)
+    }
+
+    pub fn start_link_origin(&self) -> f32 {
+        self.x - LINK_HANDLE_GAP - LINK_HANDLE / 2.0
+    }
+
+    pub fn end_link_origin(&self) -> f32 {
+        let layout_right = if self.milestone || self.marker {
+            self.x + MILESTONE_SIZE
+        } else {
+            self.x + self.width.max(8.0)
+        };
+        layout_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0
+    }
+
+    /// True when the link press is on the inbound connector, not the end.
+    pub fn link_from_start_handle(&self, origin_x: f32) -> bool {
+        origin_x < self.x + self.width.max(8.0) * 0.5
     }
 
     pub fn can_resize(&self) -> bool {
@@ -1772,6 +1793,7 @@ impl GanttView {
                 link_to: None,
                 had_start,
                 had_target,
+                link_from_start: bar.link_from_start_handle(origin_x),
             });
             return Ok(());
         }
@@ -1808,6 +1830,7 @@ impl GanttView {
             link_to: None,
             had_start,
             had_target,
+            link_from_start: false,
         });
         Ok(())
     }
@@ -1906,15 +1929,18 @@ impl GanttView {
         Some((gesture.id, gesture.live_start, gesture.live_target))
     }
 
-    pub fn take_link_gesture(&mut self) -> Option<(i64, Option<i64>)> {
+    /// `(source, drop_target, from_start_handle)`. A start-handle drag still
+    /// stores FS: the source becomes the successor.
+    pub fn take_link_gesture(&mut self) -> Option<(i64, Option<i64>, bool)> {
         let gesture = self.gesture.as_ref()?;
         if gesture.kind != GestureKind::Link {
             return None;
         }
         let from_id = gesture.id;
         let to_id = gesture.link_to.filter(|id| *id != from_id);
+        let from_start = gesture.link_from_start;
         self.gesture = None;
-        Some((from_id, to_id))
+        Some((from_id, to_id, from_start))
     }
 
     pub fn set_link_target(&mut self, id: i64) {
@@ -7099,6 +7125,43 @@ mod tests {
     }
 
     #[test]
+    fn start_handle_link_marks_the_source_as_successor() {
+        let nodes = crate::state::fake_hierarchy(3);
+        let mut gantt = GanttView::default();
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let source = bars
+            .iter()
+            .find(|bar| !bar.milestone && !bar.summary && bar.width > 8.0)
+            .expect("dated leaf");
+        gantt
+            .begin_gesture(
+                source,
+                GestureKind::Link,
+                source.start_link_origin(),
+                &nodes,
+                &[],
+            )
+            .expect("start-handle link");
+        let gesture = gantt.gesture.as_ref().expect("gesture");
+        assert!(
+            gesture.link_from_start,
+            "a press on the inbound connector must flag link_from_start"
+        );
+        let target_id = bars
+            .iter()
+            .map(|bar| bar.id)
+            .find(|id| *id != source.id)
+            .expect("another row");
+        gantt.set_link_target(target_id);
+        assert_eq!(
+            gantt.take_link_gesture(),
+            Some((source.id, Some(target_id), true)),
+            "start-handle drop keeps this bar as source so commit can swap FS ends"
+        );
+    }
+
+    #[test]
     fn parent_bars_report_child_completion() {
         let mut nodes = crate::state::fake_hierarchy(3);
         nodes[1].parent_id = Some(1);
@@ -7249,7 +7312,7 @@ mod tests {
                 &[],
             )
             .expect("link again");
-        assert_eq!(gantt.take_link_gesture(), Some((1, None)));
+        assert_eq!(gantt.take_link_gesture(), Some((1, None, false)));
         assert!(gantt.gesture.is_none());
     }
 

@@ -7461,17 +7461,25 @@ fn toast_ttl_still_expires_across_a_scale_switch(cx: &mut gpui_kit::TestAppConte
     cx.simulate_click(day.center(), Modifiers::default());
     draw(cx);
     assert!(
-        cx.debug_bounds("planner-toast").is_none(),
-        "a fresh toast must dismiss on a view switch"
+        cx.debug_bounds("planner-toast").is_some(),
+        "a fresh toast must survive a view switch"
     );
     view.update(cx, |view, _| {
-        assert!(
-            view.state.toasts.items.is_empty(),
-            "scale switch must clear toasts, not only expire past-TTL items"
+        assert_eq!(
+            view.state.toasts.items.len(),
+            1,
+            "scale switch must keep toasts and only unstick hover-pause"
         );
         assert!(
             !view.toast_pause_for_test(),
             "scale switch must clear a stuck toast pause"
+        );
+        view.state.toasts.items[0].created_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        view.state.toasts.expire();
+        assert!(
+            view.state.toasts.items.is_empty(),
+            "TTL must still dismiss the toast after a scale switch"
         );
     });
 }
@@ -9549,16 +9557,41 @@ fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
         .debug_bounds("gantt-hover-tooltip")
         .expect("Go-live hover tooltip");
     let diamond_top = f32::from(diamond.origin.y);
+    let diamond_left = f32::from(diamond.origin.x);
     let tip_top = f32::from(tip.origin.y);
+    let tip_left = f32::from(tip.origin.x);
     let tip_w = f32::from(tip.size.width);
+    let tip_right = tip_left + tip_w;
+    let diamond_bottom = diamond_top + f32::from(diamond.size.height);
     assert!(
-        tip_top + 4.0 <= diamond_top,
-        "Go-live tooltip must sit above the diamond so the title is not clipped to Go-liv…, tip_top={tip_top} diamond_top={diamond_top}"
+        tip_top + 4.0 <= diamond_top || tip_top + 1.0 >= diamond_bottom,
+        "Go-live tooltip must sit off the diamond so the title is not clipped to Go-liv…, tip_top={tip_top} diamond={diamond_top}..{diamond_bottom}"
     );
     assert!(
         tip_w >= 80.0,
         "Go-live tooltip must be wide enough for 'Go-live milestone', width={tip_w}"
     );
+    if let Some(label) = cx.debug_bounds("gantt-bar-label-1013") {
+        let label_left = f32::from(label.origin.x);
+        let label_right = label_left + f32::from(label.size.width);
+        let label_top = f32::from(label.origin.y);
+        let label_bottom = label_top + f32::from(label.size.height);
+        let tip_bottom = tip_top + f32::from(tip.size.height);
+        let overlaps = tip_left < label_right - 1.0
+            && tip_right > label_left + 1.0
+            && tip_top < label_bottom - 1.0
+            && tip_bottom > label_top + 1.0;
+        assert!(
+            !overlaps,
+            "Go-live tooltip must not cover the outside title, tip={tip_left}..{tip_right} label={label_left}..{label_right}"
+        );
+    } else {
+        assert!(
+            tip_right <= diamond_left + 1.0
+                || tip_left >= diamond_left + f32::from(diamond.size.width) - 1.0,
+            "Go-live tooltip must sit beside the diamond, not on it, tip={tip_left}..{tip_right} diamond_left={diamond_left}"
+        );
+    }
 }
 
 #[gpui_kit::test]
@@ -13653,5 +13686,160 @@ fn first_row_date_pills_do_not_cover_the_bar(cx: &mut gpui_kit::TestAppContext) 
     assert!(
         !overlaps,
         "hover date pills must sit above or below the bar, not on the body, pill={pill_top}..{pill_bottom} bar={bar_top}..{bar_bottom}"
+    );
+}
+
+#[gpui_kit::test]
+fn ctrl_z_keeps_handles_when_the_pointer_is_on_the_start_handle(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    let start = grab_inbound_link_handle(bar);
+    cx.simulate_mouse_move(start, None, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-start").is_some(),
+        "precondition: the inbound connector must show while the pointer is on it"
+    );
+    let undo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&undo, cx);
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.bar_hovered_id,
+            Some(2),
+            "Ctrl+Z must keep bar hover when the pointer is still on the start handle"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-dot-2-link-start").is_some(),
+        "the start handle must stay painted without re-entering the bar"
+    );
+}
+
+#[gpui_kit::test]
+fn start_handle_link_preview_originates_at_the_start(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    cx.simulate_mouse_down(
+        grab_inbound_link_handle(bar),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    let out = cx
+        .debug_bounds("gantt-link-preview-out")
+        .expect("outgoing stub");
+    let bar_left = f32::from(bar.origin.x);
+    let bar_right = bar_left + f32::from(bar.size.width);
+    let out_x = f32::from(out.origin.x);
+    assert!(
+        out_x <= bar_left + 2.0,
+        "start-handle preview must drop from the inbound connector, not the right end, out_x={out_x} bar_left={bar_left} bar_right={bar_right}"
+    );
+}
+
+#[gpui_kit::test]
+fn start_handle_drop_makes_the_source_the_successor(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let source = cx.debug_bounds("gantt-bar-2").expect("source bar");
+    cx.simulate_mouse_down(
+        grab_inbound_link_handle(source),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    let target = cx.debug_bounds("gantt-bar-3").expect("drop target");
+    cx.simulate_mouse_move(
+        target.center(),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    cx.simulate_mouse_up(target.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let source = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 2)
+            .expect("source");
+        let target = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 3)
+            .expect("target");
+        assert!(
+            source.predecessors.contains(&3),
+            "start-handle drop must make this bar wait on the target (inbound FS), got {:?}",
+            source.predecessors
+        );
+        assert!(
+            !target.predecessors.contains(&2),
+            "start-handle drop must not make the target wait on this bar, got {:?}",
+            target.predecessors
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn hovering_a_tree_row_highlights_the_matching_chart_row(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let band = cx.debug_bounds("gantt-row-band-2").expect("chart row");
+    let on_chart = point(
+        band.origin.x + px(8.),
+        band.origin.y + band.size.height / 2.0,
+    );
+    cx.simulate_mouse_move(on_chart, None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.hovered_id,
+            Some(2),
+            "hovering the chart row must set the shared row hover used by the grid"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-tree-row-2").is_some(),
+        "the grid row must be mounted so it can share the chart hover"
     );
 }

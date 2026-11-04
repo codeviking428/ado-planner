@@ -2533,12 +2533,19 @@ impl PlannerState {
     }
 
     pub async fn commit_gesture(&mut self) -> Result<(), AppError> {
-        if let Some((from_id, to_id)) = self.gantt.take_link_gesture() {
+        if let Some((from_id, to_id, from_start)) = self.gantt.take_link_gesture() {
             self.gantt.clear_hover();
             if let Some(to_id) = to_id
                 && to_id != from_id
             {
-                return self.add_dependency(to_id, from_id).await;
+                // Start-handle drag: this bar is the successor (inbound FS).
+                // End-handle drag: this bar is the predecessor (outbound FS).
+                let (successor, predecessor) = if from_start {
+                    (from_id, to_id)
+                } else {
+                    (to_id, from_id)
+                };
+                return self.add_dependency(successor, predecessor).await;
             }
             return Ok(());
         }
