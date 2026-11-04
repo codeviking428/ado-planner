@@ -14393,6 +14393,136 @@ fn cart_selected_scale_round_trip_keeps_the_range_title(cx: &mut gpui_kit::TestA
 }
 
 #[gpui_kit::test]
+fn reclicking_month_with_cart_selected_does_not_pan(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 6, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 0.5;
+    state.gantt.selected_id = Some(1002);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let (scroll, keep_x, range) = view.update(cx, |view, _| {
+        let keep = Date::new(2026, 7, 6).unwrap();
+        (
+            view.state.gantt.scroll_x,
+            view.state.gantt.x_for_date(keep),
+            view.state.gantt.viewport_range_title(),
+        )
+    });
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.scale, GanttScale::Month);
+        assert!(
+            (view.state.gantt.scroll_x - scroll).abs() < 0.5,
+            "re-clicking Month must not pan, scroll {} vs {scroll}",
+            view.state.gantt.scroll_x
+        );
+        let after = view.state.gantt.x_for_date(Date::new(2026, 7, 6).unwrap());
+        assert!(
+            (after - keep_x).abs() < 0.5,
+            "re-clicking Month must not move Cart, x={after} was {keep_x}"
+        );
+        assert_eq!(view.state.gantt.viewport_range_title(), range);
+    });
+}
+
+#[gpui_kit::test]
+fn today_then_week_with_cart_selected_stays_on_today(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.selected_id = Some(1002);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let today_btn = cx.debug_bounds("gantt-today-btn").expect("Today");
+    cx.simulate_click(today_btn.center(), Modifiers::default());
+    draw(cx);
+    let week = cx.debug_bounds("gantt-scale-Week").expect("Week");
+    cx.simulate_click(week.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let today = jiff::Zoned::now().date();
+        assert_eq!(view.state.gantt.scale, GanttScale::Week);
+        assert!(
+            view.state.gantt.keep_today,
+            "Today then Week must keep Today-follow"
+        );
+        let today_x = view.state.gantt.x_for_date(today);
+        let aligned = view.state.gantt.timeline_width.max(1.0) * TODAY_ALIGN;
+        assert!(
+            (today_x - aligned).abs() < 8.0,
+            "Today then Week with Cart selected must stay on Today, x={today_x} aligned={aligned}"
+        );
+        let cart = Date::new(2026, 7, 6).unwrap();
+        let cart_x = view.state.gantt.x_for_date(cart);
+        assert!(
+            (cart_x - aligned).abs() > 50.0,
+            "must not jump onto Cart's start, cart_x={cart_x} aligned={aligned}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn cart_selected_month_year_month_keeps_the_range_title(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 0.6;
+    state.gantt.selected_id = Some(1002);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let (title, jul_x) = view.update(cx, |view, _| {
+        (
+            view.state.gantt.viewport_range_title(),
+            view.state.gantt.x_for_date(Date::new(2026, 7, 1).unwrap()),
+        )
+    });
+    let year = cx.debug_bounds("gantt-scale-Year").expect("Year");
+    cx.simulate_click(year.center(), Modifiers::default());
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.scale, GanttScale::Month);
+        assert_eq!(
+            view.state.gantt.viewport_range_title(),
+            title,
+            "with Cart selected, Month→Year→Month must restore {title}, got {}",
+            view.state.gantt.viewport_range_title()
+        );
+        let after = view.state.gantt.x_for_date(Date::new(2026, 7, 1).unwrap());
+        assert!(
+            (after - jul_x).abs() < 1.0,
+            "Jul must stay at the same screen x, {jul_x} vs {after}"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn open_ended_cart_ui_tooltip_follows_the_pointer_on_the_cue(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();

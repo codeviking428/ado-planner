@@ -1331,11 +1331,21 @@ impl GanttView {
     /// Day/Week/Month keep one focus date (selection start, or viewport
     /// centre) at its screen x so Month→Week→Day→Month restores the
     /// identical range. Year/Quarter still hold the left-edge date.
+    /// Re-clicking the current scale is a no-op: leftover snap and a
+    /// selection pin must not pan. After Today, skip leftover/gutter snap
+    /// so a selection cannot pull the camera off Today.
     pub fn apply_toolbar_scale(&mut self, scale: GanttScale, today: Date, keep: Option<Date>) {
+        if self.scale == scale {
+            return;
+        }
+        if self.keep_today {
+            self.set_scale_from_toolbar_keeping(scale, today, keep);
+            return;
+        }
         let from = self.scale;
         let focus = keep.unwrap_or_else(|| self.viewport_center_date());
         let keep_x = self.focus_keep_x(focus);
-        let pin = Self::day_week_month(from) && Self::day_week_month(scale) && !self.keep_today;
+        let pin = Self::day_week_month(from) && Self::day_week_month(scale);
         self.retarget_year_gutter(|gantt| {
             gantt.set_scale_from_toolbar_keeping(scale, today, keep);
         });
@@ -13714,6 +13724,129 @@ mod tests {
             "a second round trip must keep the selection at its screen x, not centre it, x={x} was {keep_x}"
         );
         assert_eq!(gantt.scale, GanttScale::Month);
+    }
+
+    #[test]
+    fn toolbar_reclick_of_current_scale_does_not_pan() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let keep = Date::new(2026, 7, 6).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            scroll_x: 40.0,
+            ..Default::default()
+        };
+        let scroll = gantt.scroll_x;
+        let keep_x = gantt.x_for_date(keep);
+        let range = gantt.viewport_range_title();
+        let centre_x = gantt.timeline_width * 0.5;
+        assert!(
+            (0.0..=gantt.timeline_width).contains(&keep_x),
+            "precondition: selection must be on-screen, x={keep_x}"
+        );
+        assert!(
+            (keep_x - centre_x).abs() > 8.0,
+            "precondition: selection is not already centred, keep_x={keep_x} centre={centre_x}"
+        );
+        gantt.apply_toolbar_scale(GanttScale::Month, today, Some(keep));
+        assert_eq!(gantt.scale, GanttScale::Month);
+        assert!(
+            (gantt.scroll_x - scroll).abs() < 0.5,
+            "re-clicking Month must not pan, scroll {} vs {scroll}",
+            gantt.scroll_x
+        );
+        let after = gantt.x_for_date(keep);
+        assert!(
+            (after - keep_x).abs() < 0.5,
+            "re-clicking Month must not move the selection, x={after} was {keep_x}"
+        );
+        assert_eq!(gantt.viewport_range_title(), range);
+    }
+
+    #[test]
+    fn toolbar_today_then_scale_with_selection_stays_on_today() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let keep = Date::new(2026, 7, 6).unwrap();
+        for scale in [GanttScale::Week, GanttScale::Day, GanttScale::Month] {
+            let mut gantt = GanttView {
+                origin: Date::new(2026, 7, 1).unwrap(),
+                scale: GanttScale::Month,
+                zoom: 1.0,
+                timeline_width: 800.0,
+                ..Default::default()
+            };
+            gantt.go_today(today);
+            let aligned = gantt.timeline_width.max(1.0) * TODAY_ALIGN;
+            assert!(
+                (gantt.x_for_date(today) - aligned).abs() < 2.0,
+                "precondition: Today must be centred"
+            );
+            gantt.apply_toolbar_scale(scale, today, Some(keep));
+            assert_eq!(gantt.scale, scale);
+            assert!(
+                gantt.keep_today,
+                "{scale:?} after Today must keep Today-follow"
+            );
+            let after = gantt.x_for_date(today);
+            assert!(
+                (after - aligned).abs() < 2.0,
+                "Today then {scale:?} with a July selection must stay on Today, after={after} aligned={aligned}"
+            );
+            let keep_x = gantt.x_for_date(keep);
+            assert!(
+                (keep_x - aligned).abs() > 50.0,
+                "must not jump onto the selected start, keep_x={keep_x} aligned={aligned}"
+            );
+        }
+    }
+
+    #[test]
+    fn toolbar_month_year_month_with_selection_round_trips() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let keep = Date::new(2026, 7, 6).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 0.6,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let range = gantt.viewport_range_title();
+        let left = gantt.date_for_x(0.0);
+        let jul = Date::new(2026, 7, 1).unwrap();
+        let jul_x = gantt.x_for_date(jul);
+        let keep_x = gantt.x_for_date(keep);
+        assert!(
+            (0.0..=gantt.timeline_width).contains(&keep_x),
+            "precondition: selection must be on-screen, x={keep_x}"
+        );
+        gantt.apply_toolbar_scale(GanttScale::Year, today, Some(keep));
+        gantt.apply_toolbar_scale(GanttScale::Month, today, Some(keep));
+        assert_eq!(gantt.scale, GanttScale::Month);
+        assert_eq!(
+            gantt.viewport_range_title(),
+            range,
+            "Month→Year→Month with a selection must restore {range}, got {}",
+            gantt.viewport_range_title()
+        );
+        assert_eq!(
+            gantt.date_for_x(0.0),
+            left,
+            "left-edge date must round-trip, got {}",
+            gantt.date_for_x(0.0)
+        );
+        assert!(
+            (gantt.x_for_date(jul) - jul_x).abs() < 1.0,
+            "Jul must stay at the same screen x, {} vs {jul_x}",
+            gantt.x_for_date(jul)
+        );
+        let after_keep = gantt.x_for_date(keep);
+        assert!(
+            (after_keep - keep_x).abs() < 2.0,
+            "selection must not be recentred, x={after_keep} was {keep_x}"
+        );
     }
 
     #[test]
