@@ -446,6 +446,12 @@ impl BarLayout {
             && self.width > HANDLE_WIDTH * 2.0
     }
 
+    /// Dated sliver whose last pixels cannot resize: the right link handle
+    /// covers them. Diamonds and start-only bars keep Move on that edge.
+    pub fn link_handle_insets_into_bar(&self) -> bool {
+        !self.can_resize() && !self.milestone && !self.open_ended && !self.marker
+    }
+
     /// Inner 8px of each end, split at the midpoint on bars shorter than 16px.
     pub fn inner_grip_width(&self) -> f32 {
         HANDLE_WIDTH.min(self.width / 2.0).max(1.0)
@@ -5336,6 +5342,10 @@ mod tests {
             !bars[0].can_resize(),
             "a {YEAR_MIN_BAR_WIDTH}px Year bar must stay all-Move, not two grips with no body"
         );
+        assert!(
+            bars[0].link_handle_insets_into_bar(),
+            "a dated Year sliver's last pixels must start a link"
+        );
         let left = bars[0].x;
         let right = bars[0].x + bars[0].width;
         assert_eq!(
@@ -5368,6 +5378,10 @@ mod tests {
             open_ended: true,
             overflow_badge: false,
         };
+        assert!(
+            !bar.link_handle_insets_into_bar(),
+            "a wide start-only bar must not overlay an inset link handle"
+        );
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&bar), 176.0, 4.0).map(|(_, kind)| kind),
             Some(GestureKind::Link),

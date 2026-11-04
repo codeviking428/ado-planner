@@ -1633,7 +1633,21 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
         if let Some(persist_label) = cx.debug_bounds("gantt-bar-label-1003") {
             assert!(
                 !painted_overlap(tip, persist_label),
-                "link tooltip must not cover the Persist cart label"
+                "link tooltip must not cover the Persist cart label, tip=({:.1},{:.1})+{:.1}x{:.1} label=({:.1},{:.1})+{:.1}x{:.1}",
+                f32::from(tip.origin.x),
+                f32::from(tip.origin.y),
+                f32::from(tip.size.width),
+                f32::from(tip.size.height),
+                f32::from(persist_label.origin.x),
+                f32::from(persist_label.origin.y),
+                f32::from(persist_label.size.width),
+                f32::from(persist_label.size.height)
+            );
+        }
+        if let Some(cart) = cx.debug_bounds("gantt-bar-1005") {
+            assert!(
+                !painted_overlap(tip, cart),
+                "link tooltip must not cover the next row's bar"
             );
         }
     }
@@ -4163,10 +4177,49 @@ fn pressing_the_last_pixels_of_a_bar_starts_a_link(cx: &mut gpui_kit::TestAppCon
             "a press on a sliver's last pixels must start a link"
         );
     });
+    let preview = cx
+        .debug_bounds("gantt-link-preview")
+        .expect("pressing the link handle must show a ghost line");
+    let preview_left = f32::from(preview.origin.x);
     assert!(
-        cx.debug_bounds("gantt-link-preview").is_some(),
-        "pressing the link handle must show a ghost line"
+        preview_left + 1.0 >= bar_right,
+        "ghost must not run left through the bar, preview_left={preview_left} bar_right={bar_right}"
     );
+}
+
+#[gpui_kit::test]
+fn last_pixels_of_a_milestone_still_move(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-1013").expect("Go-live diamond");
+    let on_end = point(
+        bar.origin.x + bar.size.width - px(4.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(on_end, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let kind = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .map(|gesture| gesture.kind);
+        assert_ne!(
+            kind,
+            Some(GestureKind::Link),
+            "a diamond's last pixels must stay Move, got {kind:?}"
+        );
+    });
 }
 
 #[gpui_kit::test]

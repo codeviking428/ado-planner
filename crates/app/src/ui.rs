@@ -50,10 +50,9 @@ use crate::gantt::{
     OVERFLOW_BADGE_GAP, PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH,
     SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView,
     TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
-    bar_outside_label_frame, bar_title_is_inside, bar_title_paint_px, dependency_link_tooltip,
-    header_label_px, offscreen_edge_chip, outside_title_right_gap, parent_date_overflow,
-    parent_overflow_tip, timeline_is_empty_of_scheduled, today_line_chip_skips,
-    today_line_segments, today_pill_left,
+    bar_outside_label_frame, bar_title_is_inside, bar_title_paint_px, header_label_px,
+    offscreen_edge_chip, outside_title_right_gap, parent_date_overflow, parent_overflow_tip,
+    timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -4438,7 +4437,7 @@ impl PlannerView {
                         let arrows = self.state.gantt.layout_dependency_arrows(bars);
                         arrows
                             .into_iter()
-                            .map(|arrow| self.render_dependency_arrow(&arrow, cx))
+                            .map(|arrow| self.render_dependency_arrow(&arrow, bars, cx))
                     })
                     .children(bars.iter().filter_map(|bar| {
                         self.render_open_ended_cue(bar, cx)
@@ -4499,11 +4498,11 @@ impl PlannerView {
                             let bar = bars.iter().find(|bar| bar.id == gesture.id)?;
                             let x1 = bar.x + bar.width + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
                             let y1 = bar.y + ROW_HEIGHT / 2.0;
-                            let mut x2 = gesture.live_x;
                             let y2 = gesture.live_y;
-                            if (gesture.live_x - gesture.origin_x).abs() < 2.0
-                                && (y2 - y1).abs() < 2.0
-                            {
+                            // Never draw left of the handle: an inset press
+                            // maps live_x inside the bar.
+                            let mut x2 = gesture.live_x.max(x1);
+                            if x2 <= x1 + 2.0 && (y2 - y1).abs() < 2.0 {
                                 x2 = x1 + 12.0;
                             }
                             Some((x1, y1, x2, y2))
@@ -5383,14 +5382,15 @@ impl PlannerView {
         let selected = self.state.gantt.selected_id == Some(id);
         let show_dot = hovered && !dragging;
         let (local_left, local_right) = self.painted_timeline_edges(bar);
-        // Inner 8px grips resize a wide bar. A sliver that cannot resize
-        // extends the right handle 8px into the bar so a press on the last
-        // pixels starts a link instead of a no-op Move. The visual dot stays
+        // Inner 8px grips resize a wide bar. A dated sliver that cannot
+        // resize extends the right handle 8px into the bar so a press on
+        // the last pixels starts a link instead of a no-op Move. Diamonds
+        // and start-only bars keep Move on that edge. The visual dot stays
         // outside; the overflow ! is painted past this hit box.
-        let inset = if bar.can_resize() {
-            0.0
-        } else {
+        let inset = if bar.link_handle_insets_into_bar() {
             LINK_HANDLE_INSET
+        } else {
+            0.0
         };
         let start_x = local_left - LINK_HANDLE_HIT - 2.0;
         // Inset is measured from the bar end, not from the outside gap, so
@@ -5859,7 +5859,12 @@ impl PlannerView {
         )
     }
 
-    fn render_dependency_arrow(&self, arrow: &DependencyArrow, cx: &Context<Self>) -> AnyElement {
+    fn render_dependency_arrow(
+        &self,
+        arrow: &DependencyArrow,
+        bars: &[crate::gantt::BarLayout],
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let selected = self.state.gantt.selected_link == Some((arrow.from_id, arrow.to_id));
         let hovered = self.state.gantt.hovered_link == Some((arrow.from_id, arrow.to_id));
         let color = if selected || hovered {
@@ -5958,7 +5963,7 @@ impl PlannerView {
             ))
             .child(self.arrow_head_hit(arrow, min_x, min_y, color, cx))
             .when(hovered, |el| {
-                el.child(self.link_hover_chip(arrow, min_x, min_y, cx))
+                el.child(self.link_hover_chip(arrow, bars, min_x, min_y, cx))
             })
             .when(selected, |el| {
                 el.child(self.link_remove_button(arrow, min_x, min_y, cx))
@@ -5969,18 +5974,44 @@ impl PlannerView {
     fn link_hover_chip(
         &self,
         arrow: &DependencyArrow,
+        bars: &[crate::gantt::BarLayout],
         min_x: f32,
         min_y: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let tip = self.link_hover_tooltip(arrow.from_id, arrow.to_id);
-        // Sit on the source-row lane, just below the stroke. The lane is
-        // already below the source title (source_row_gap). GPUI's element
-        // tooltip centred on the inbound vertical and covered the
-        // Unparented spike letters; placing above the lane sat on Persist
-        // cart. Keep the chip on the wire, right of the outgoing stub.
-        let wire_left = arrow.x1.min(arrow.x2);
-        let left = wire_left + 8.0;
+        let tip = self.link_hover_chip_text(arrow.from_id, arrow.to_id);
+        let tip_w = (tip.chars().count() as f32 * 7.0 + 24.0).max(80.0);
+        // Source-row midline. Prefer the wire past the outgoing stub so the
+        // inbound vertical (Unparented spike) and the next row stay clear.
+        // Flip around the source bar / outside title when the box hits them.
+        let mut left = arrow.x1 + 8.0;
+        if let Some(pred) = bars.iter().find(|bar| bar.id == arrow.from_id) {
+            let timeline_w = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
+            let today = jiff::Zoned::now().date();
+            let today_px = self.state.gantt.x_for_date(today);
+            let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
+            let painted_w = if pred.milestone || pred.marker {
+                MILESTONE_SIZE
+            } else {
+                pred.width.max(8.0)
+            };
+            let mut union_left = pred.x;
+            let mut union_right = pred.x + painted_w;
+            if let Some((label_x, label_w)) =
+                bar_outside_label_frame(pred, timeline_w, true, today_x, pred.overflow_badge)
+            {
+                union_left = union_left.min(label_x);
+                union_right = union_right.max(label_x + label_w);
+            }
+            if left < union_right && left + tip_w > union_left {
+                let right_slot = union_right + 8.0;
+                left = if right_slot + tip_w <= timeline_w - 4.0 {
+                    right_slot
+                } else {
+                    (union_left - 8.0 - tip_w).max(4.0)
+                };
+            }
+        }
         let from_id = arrow.from_id;
         let to_id = arrow.to_id;
         div()
@@ -5990,11 +6021,10 @@ impl PlannerView {
             .debug_selector(|| "gantt-link-tooltip".into())
             .absolute()
             .left(px(left - min_x))
-            .top(px(arrow.lane_y - min_y + 4.0))
+            .top(px(arrow.y1 - min_y - 10.0))
             .h(px(20.))
             .px_2()
             .rounded_md()
-            .occlude()
             .bg(cx.theme().popover)
             .border_1()
             .border_color(cx.theme().border)
@@ -6258,17 +6288,18 @@ impl PlannerView {
         el.into_any_element()
     }
 
-    fn link_hover_tooltip(&self, from_id: i64, to_id: i64) -> String {
-        let title = |id: i64| {
-            self.state
+    fn link_hover_chip_text(&self, from_id: i64, to_id: i64) -> String {
+        let short = |id: i64| {
+            let raw = self
+                .state
                 .nodes
                 .iter()
                 .find(|node| node.id == id)
                 .map(|node| node.title.as_str())
-                .unwrap_or("Work item")
-                .to_string()
+                .unwrap_or("Work item");
+            raw.split_whitespace().next().unwrap_or(raw).to_string()
         };
-        dependency_link_tooltip(&title(from_id), &title(to_id))
+        format!("{} → {}", short(from_id), short(to_id))
     }
 
     fn arrow_head_hit(
