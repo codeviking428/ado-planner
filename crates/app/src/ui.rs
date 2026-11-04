@@ -43,16 +43,17 @@ use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
-    ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH,
-    DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
-    LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE,
-    MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OUTER_LINK_HIT, OVERFLOW_BADGE,
-    OVERFLOW_BADGE_GAP, PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH,
-    SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView,
-    TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
-    bar_outside_label_frame, bar_title_is_inside, bar_title_paint_px, header_label_px,
-    offscreen_edge_chip, outside_title_right_gap, parent_date_overflow, parent_overflow_tip,
-    timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
+    ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, CriticalPath, DATES_COL_WIDTH,
+    DETAILS_PILL_WIDTH, DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind,
+    HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT,
+    LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS,
+    NudgeAxis, OUTER_LINK_HIT, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP, PARALLEL_LANE_MIN,
+    PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT,
+    SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH,
+    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_outside_label_frame, bar_title_is_inside,
+    bar_title_paint_px, header_label_px, offscreen_edge_chip, outside_title_right_gap,
+    parent_date_overflow, parent_overflow_tip, timeline_is_empty_of_scheduled,
+    today_line_chip_skips, today_line_segments, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -3284,6 +3285,41 @@ impl PlannerView {
                             })),
                     )
             })
+            .child({
+                let has_dated = self.state.visible_nodes().iter().any(|node| {
+                    parse_iso_date(node.start_date.as_deref()).is_some()
+                        && parse_iso_date(node.target_date.as_deref()).is_some()
+                });
+                let selected = self.state.gantt.show_critical_path;
+                div()
+                    .id("gantt-critical-path")
+                    .debug_selector(|| "gantt-critical-path".into())
+                    .child(
+                        Button::new("critical-path")
+                            .label("Critical path")
+                            .compact()
+                            .selected(selected)
+                            .when(selected, |btn| btn.primary())
+                            .when(!selected, |btn| btn.ghost())
+                            .disabled(!has_dated)
+                            .tooltip(if has_dated {
+                                "Highlight the finish-to-start chain with the latest Target Date."
+                            } else {
+                                "No dated finish-to-start chain to highlight."
+                            })
+                            .tooltip_placement(Placement::Bottom)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.state.visible_nodes().iter().any(|node| {
+                                    parse_iso_date(node.start_date.as_deref()).is_some()
+                                        && parse_iso_date(node.target_date.as_deref()).is_some()
+                                }) {
+                                    this.state.gantt.show_critical_path =
+                                        !this.state.gantt.show_critical_path;
+                                    cx.notify();
+                                }
+                            })),
+                    )
+            })
             .child(
                 Button::new("prev-period")
                     .ghost()
@@ -4407,6 +4443,25 @@ impl PlannerView {
         let today_color = cx.theme().primary;
         let selected_id = self.state.gantt.selected_id;
         let hovered_id = self.state.gantt.hovered_id;
+        let path = if self.state.gantt.show_critical_path {
+            crate::gantt::critical_path(&self.state.visible_nodes())
+        } else {
+            CriticalPath::default()
+        };
+        let related_ids: HashSet<i64> = if let Some(hid) = hovered_id {
+            let mut set = HashSet::from([hid]);
+            for bar in bars {
+                if bar.id == hid {
+                    set.extend(bar.predecessors.iter().copied());
+                }
+                if bar.predecessors.contains(&hid) {
+                    set.insert(bar.id);
+                }
+            }
+            set
+        } else {
+            HashSet::new()
+        };
         let dragging = self.state.gantt.gesture.is_some();
         let show_weekends = self.state.gantt.scale.shows_weekend_bands();
         let weekend_w = self.state.gantt.scale.pixels_per_day(self.state.gantt.zoom);
@@ -4646,6 +4701,8 @@ impl PlannerView {
                                             dragging,
                                             bar_label_fg,
                                             muted_fg,
+                                            path.ids.contains(&bar.id),
+                                            related_ids.contains(&bar.id) && hovered_id != Some(bar.id),
                                             cx,
                                         )
                                     }))
@@ -4679,9 +4736,9 @@ impl PlannerView {
                     }))
                     .children({
                         let arrows = self.state.gantt.layout_dependency_arrows(bars);
-                        arrows
-                            .into_iter()
-                            .map(|arrow| self.render_dependency_arrow(&arrow, bars, cx))
+                        arrows.into_iter().map(|arrow| {
+                            self.render_dependency_arrow(&arrow, bars, &path, cx)
+                        })
                     })
                     .children({
                         // After arrows/cues so the line stays continuous
@@ -5105,12 +5162,15 @@ impl PlannerView {
             )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_gantt_bar(
         &self,
         bar: &crate::gantt::BarLayout,
         dragging: bool,
         bar_label_fg: gpui_kit::Hsla,
         muted_fg: gpui_kit::Hsla,
+        on_critical_path: bool,
+        related_hover: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let layout = bar.clone();
@@ -5234,7 +5294,8 @@ impl PlannerView {
                             div()
                                 .text_lg()
                                 .line_height(gpui_kit::relative(1.))
-                                .text_color(rgb(bar.color))
+                                .when(on_critical_path, |el| el.text_color(cx.theme().danger))
+                                .when(!on_critical_path, |el| el.text_color(rgb(bar.color)))
                                 .child("◆"),
                         )
                 })
@@ -5267,7 +5328,8 @@ impl PlannerView {
                     el.bg(rgb(bar.color).opacity(0.22))
                         .border_1()
                         .border_dashed()
-                        .border_color(rgb(bar.color))
+                        .when(on_critical_path, |el| el.border_color(cx.theme().danger))
+                        .when(!on_critical_path, |el| el.border_color(rgb(bar.color)))
                         .child(
                             div()
                                 .absolute()
@@ -5326,17 +5388,21 @@ impl PlannerView {
                     bar_label_fg
                 })
                 .when(!milestone && !marker && !unscheduled && !open_ended, |el| {
-                    el.border_color(if selected {
+                    el.border_color(if on_critical_path {
+                        cx.theme().danger
+                    } else if selected {
                         cx.theme().primary.opacity(0.8)
                     } else if summary {
                         cx.theme().border.opacity(0.6)
                     } else if hovered && !dragging {
                         cx.theme().primary.opacity(0.55)
+                    } else if related_hover && !dragging {
+                        cx.theme().primary.opacity(0.4)
                     } else {
                         cx.theme().border
                     })
-                    .when(selected, |el| el.border_2())
-                    .when(!selected, |el| el.border_1())
+                    .when(selected || on_critical_path, |el| el.border_2())
+                    .when(!selected && !on_critical_path, |el| el.border_1())
                 })
                 .when(!milestone && !marker, |el| el.overflow_hidden())
                 .when(show_progress, |el| {
@@ -6466,16 +6532,28 @@ impl PlannerView {
         &self,
         arrow: &DependencyArrow,
         bars: &[crate::gantt::BarLayout],
+        path: &CriticalPath,
         cx: &Context<Self>,
     ) -> AnyElement {
         let selected = self.state.gantt.selected_link == Some((arrow.from_id, arrow.to_id));
         let hovered = self.state.gantt.hovered_link == Some((arrow.from_id, arrow.to_id));
-        let color = if selected || hovered {
+        let related = self.state.gantt.hovered_id == Some(arrow.from_id)
+            || self.state.gantt.hovered_id == Some(arrow.to_id);
+        let on_critical = path.links.contains(&(arrow.from_id, arrow.to_id));
+        let color = if on_critical {
+            cx.theme().danger
+        } else if selected || hovered || related {
             cx.theme().primary
+        } else if self.state.gantt.show_critical_path {
+            cx.theme().primary.opacity(0.28)
         } else {
             cx.theme().primary.opacity(0.7)
         };
-        let stroke = if selected || hovered { 3.0 } else { 2.0 };
+        let stroke = if selected || hovered || on_critical {
+            3.0
+        } else {
+            2.0
+        };
         let stub_start = arrow.stub_start();
         let gutter_y = arrow.gutter_y();
         let wrap = arrow.wraps_around_successor();
@@ -8282,6 +8360,7 @@ impl PlannerView {
         self.timeline_local_x(window_x)
     }
 
+    #[allow(dead_code)]
     fn pointer_on_bar(&self, id: i64, window_x: f32, window_y: f32) -> Option<bool> {
         let painted = self.painted_bar_bounds.borrow().get(&id).copied()?;
         const SLOP: f32 = 8.0;
@@ -8536,8 +8615,8 @@ impl PlannerView {
 
     fn commit_gesture(
         &mut self,
-        window_x: f32,
-        window_y: f32,
+        _window_x: f32,
+        _window_y: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8579,17 +8658,12 @@ impl PlannerView {
             if shift_children {
                 pending.cascade = self.state.shift_children_with_committed_move(&pending);
             }
-            let id = pending.id;
             self.enqueue_date_save(cx, pending);
             self.note_toasts_changed(cx);
-            // Pin a live tooltip only while the pointer is still on the bar
-            // so a drop on the tree/header/outside cannot stick. Row hover
-            // stays cleared so a finished drag does not keep handles.
-            if self.pointer_on_bar(id, window_x, window_y) == Some(true) {
-                self.state.gantt.pin_bar_tooltip = Some(id);
-            } else {
-                self.state.gantt.pin_bar_tooltip = None;
-            }
+            // Hide the dates chip and hover tooltip on drop so they do not
+            // sit beside the Moved toast. A later pointer move restores hover.
+            self.state.gantt.pin_bar_tooltip = None;
+            self.suppress_bar_tooltip = true;
         }
         // Every drop path (commit, no-op release, missed mouse-up) must
         // request a paint so a resize at x=604 does not keep the preview
@@ -9201,6 +9275,10 @@ impl PlannerView {
 
     pub fn suppress_bar_tooltip_for_test(&self) -> bool {
         self.suppress_bar_tooltip
+    }
+
+    pub fn set_suppress_bar_tooltip_for_test(&mut self, suppress: bool) {
+        self.suppress_bar_tooltip = suppress;
     }
 
     pub fn toast_pointer_for_test(&self) -> bool {

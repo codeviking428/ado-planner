@@ -657,11 +657,12 @@ impl DependencyArrow {
     const WRAP_STUB: f32 = 12.0;
 
     /// Wrap-around routing drops at the source stub, then runs on the
-    /// successor row into a short inbound. Used for overlap/backward FS so
-    /// the path does not detour left of the source start. A forward run
-    /// whose inbound was shoved past `x_head` is not a wrap — painting it
-    /// as one puts the long horizontal on the successor row (Day-view
-    /// Persist cart → Go-live through the Go-live band).
+    /// successor row into a short inbound. Used for a true backward FS
+    /// (successor start left of the source) so the path does not detour
+    /// across the chart. Overlap — source end past the target start, with
+    /// a left inbound still on/after the source — is a back-jog that
+    /// enters from the left, not a wrap through the target bar. A forward
+    /// run whose inbound was shoved past `x_head` is not a wrap either.
     pub fn wraps_around_successor(&self) -> bool {
         self.x2 > self.x_head + Self::WRAP_STUB && self.x1 + 1.0 >= self.x_head
     }
@@ -766,10 +767,11 @@ pub struct GanttView {
     pub bar_hovered_id: Option<i64>,
     pub selected_link: Option<(i64, i64)>,
     pub hovered_link: Option<(i64, i64)>,
-    /// After a date drop, keep that bar's tooltip mounted without waiting for
-    /// a new mouse-enter. Tied to this bar id; cleared when the pointer
-    /// leaves that bar's row (or on `clear_hover`).
+    /// Optional dates chip for a bar (tests / a later hover). Date drops
+    /// do not pin this — the chip would sit beside the Moved toast.
     pub pin_bar_tooltip: Option<i64>,
+    /// Highlight the finish-to-start chain whose last Target Date is latest.
+    pub show_critical_path: bool,
     pub collapsed: HashSet<i64>,
     pub gesture: Option<Gesture>,
     pub pending_nudge: Option<PendingNudge>,
@@ -817,6 +819,7 @@ impl Default for GanttView {
             selected_link: None,
             hovered_link: None,
             pin_bar_tooltip: None,
+            show_critical_path: false,
             collapsed: HashSet::new(),
             gesture: None,
             pending_nudge: None,
@@ -2363,12 +2366,16 @@ impl GanttView {
                 let x_out = pred_end + STUB;
                 // Finish-to-start always enters the successor start. Gutter
                 // pills keep inbound_right so the head is not a cramped stub
-                // on "No dates". Overlap/backward wraps at the source stub
-                // and runs back on the successor row into that start — never
-                // flip the head to the bar's right end.
+                // on "No dates". Overlap (source end past target start) back-
+                // jogs on the source lane and enters from the left. Wrap only
+                // when a left inbound would sit left of the source *and* the
+                // wrap drop would miss the target bar.
                 let inbound_right = succ_gutter;
                 let x_head = if inbound_right { succ_right } else { bar.x };
-                let wrap_around = !succ_gutter && pred_end > bar.x + STUB;
+                let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
+                let clip_right = self.timeline_width.max(1.0);
+                let natural_in = x_head - STUB;
+                let wrap_around = !succ_gutter && pred_end > bar.x + STUB && natural_in < pred_left;
                 let mut x_in = if wrap_around {
                     x_out
                 } else if inbound_right {
@@ -2387,12 +2394,6 @@ impl GanttView {
                             && mid.y < hi - 1.0
                     })
                     .collect();
-                // Year/Quarter bars are slivers; their titles still paint at
-                // full glyph width and would shove the inbound vertical
-                // tens of days away (stray line at x≈532). Occupy the
-                // body only at those zooms.
-                let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
-                let clip_right = self.timeline_width.max(1.0);
                 if wrap_around {
                     // Day/Week/Month include outside titles so a Persist cart
                     // → spike wrap does not drop through the Go-live pill.
@@ -2431,11 +2432,13 @@ impl GanttView {
                         today_x,
                     );
                 }
-                if !succ_gutter && x_in < pred_left {
-                    // Dodging shoved the vertical left of the source. Drop at
-                    // the source stub and keep the head on the start instead
-                    // of overshooting to a right-edge inbound — unless that
-                    // stub sits inside an intervening bar or its open-ended cue.
+                if !succ_gutter && x_in < pred_left && natural_in >= pred_left {
+                    // Dodging shoved a forward inbound left of the source.
+                    // Drop at the source stub and keep the head on the start
+                    // instead of overshooting to a right-edge inbound — unless
+                    // that stub sits inside an intervening bar or its cue.
+                    // A true back-jog may sit slightly left of the source
+                    // (`natural_in < pred_left`); do not pull that to x_out.
                     let fallback = x_out.max(pred_left + STUB);
                     let hits_intervening = intervening.iter().any(|mid| {
                         let (left, right) =
@@ -4448,6 +4451,70 @@ pub enum NudgeAxis {
     Both,
     Start,
     Target,
+}
+
+/// Finish-to-start chain whose last Target Date is latest. Only work items
+/// with both Start Date and Target Date are vertices.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CriticalPath {
+    pub ids: HashSet<i64>,
+    pub links: HashSet<(i64, i64)>,
+}
+
+/// Derived highlight, not a stored field. Walks back from every dated item
+/// that shares the latest Target Date, preferring the predecessor that
+/// itself finishes latest.
+pub fn critical_path(nodes: &[WorkItemNode]) -> CriticalPath {
+    let dated: HashMap<i64, Date> = nodes
+        .iter()
+        .filter_map(|node| {
+            parse_iso_date(node.start_date.as_deref())?;
+            let target = parse_iso_date(node.target_date.as_deref())?;
+            Some((node.id, target))
+        })
+        .collect();
+    if dated.is_empty() {
+        return CriticalPath::default();
+    }
+    let mut pred: HashMap<i64, Vec<i64>> = HashMap::new();
+    for node in nodes {
+        if !dated.contains_key(&node.id) {
+            continue;
+        }
+        for &from in &node.predecessors {
+            if dated.contains_key(&from) {
+                pred.entry(node.id).or_default().push(from);
+            }
+        }
+    }
+    let latest = dated.values().copied().max().expect("dated is non-empty");
+    let ends: Vec<i64> = dated
+        .iter()
+        .filter(|(_, target)| **target == latest)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut ids = HashSet::new();
+    let mut links = HashSet::new();
+    for end in ends {
+        let mut cur = end;
+        let mut seen = HashSet::new();
+        ids.insert(cur);
+        while seen.insert(cur) {
+            let Some(next) = pred.get(&cur).and_then(|preds| {
+                preds
+                    .iter()
+                    .copied()
+                    .filter(|id| dated.contains_key(id))
+                    .max_by_key(|id| (dated[id], *id))
+            }) else {
+                break;
+            };
+            links.insert((next, cur));
+            ids.insert(next);
+            cur = next;
+        }
+    }
+    CriticalPath { ids, links }
 }
 
 pub fn is_completed_state(state: &str) -> bool {
@@ -8676,6 +8743,146 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_fs_link_back_jogs_into_the_target_from_the_left() {
+        // Persist cart resized to Jul 25 overlaps Cart UI (Jul 21, start-only).
+        // A wrap drop at persist_end+12 runs through Cart UI's body/cue.
+        // Back-jog on the source lane and enter Cart UI from the left.
+        let mut persist = node(1003, Some(1002));
+        persist.title = "Persist cart".into();
+        persist.start_date = Some("2026-07-06T00:00:00Z".into());
+        persist.target_date = Some("2026-07-25T00:00:00Z".into());
+        let mut cart_ui = node(1005, Some(1003));
+        cart_ui.title = "Cart UI".into();
+        cart_ui.start_date = Some("2026-07-21T00:00:00Z".into());
+        cart_ui.target_date = None;
+        cart_ui.predecessors = vec![1003];
+        let nodes = vec![node(1001, None), node(1002, Some(1001)), persist, cart_ui];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        assert!(
+            pred.x + pred.width > succ.x + 12.0,
+            "fixture: Persist cart end must sit past Cart UI start, pred_end={} succ.x={}",
+            pred.x + pred.width,
+            succ.x
+        );
+        let arrow = gantt
+            .layout_dependency_arrows(&bars)
+            .into_iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1005)
+            .expect("Persist cart → Cart UI");
+        assert!(
+            !arrow.wraps_around_successor(),
+            "overlap must not wrap through the target, x1={} x2={} x_head={}",
+            arrow.x1,
+            arrow.x2,
+            arrow.x_head
+        );
+        assert!(
+            (arrow.x_head - succ.x).abs() < 0.5,
+            "must still enter Cart UI from the start, x_head={} succ.x={}",
+            arrow.x_head,
+            succ.x
+        );
+        assert!(
+            arrow.x2 < succ.x,
+            "back-jog inbound must sit left of Cart UI, x2={} succ.x={}",
+            arrow.x2,
+            succ.x
+        );
+        let today = jiff::Zoned::now().date();
+        let today_px = gantt.x_for_date(today);
+        let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+        let (left, right) = bar_occupied_x(succ, true, Some(gantt.timeline_width), today_x);
+        assert!(
+            !x_hits_span(arrow.x2, left, right),
+            "inbound vertical must not run through Cart UI, x2={} occupied={left}..{right}",
+            arrow.x2
+        );
+        assert!(
+            arrow.x1 + 0.5 >= pred.x + pred.width,
+            "outgoing must leave the source end, x1={} pred_end={}",
+            arrow.x1,
+            pred.x + pred.width
+        );
+        assert!(
+            arrow.x1 > arrow.x2,
+            "overlap route is a leftward jog, x1={} x2={}",
+            arrow.x1,
+            arrow.x2
+        );
+        assert!(
+            arrow.lane_y >= pred.y && arrow.lane_y < pred.y + ROW_HEIGHT,
+            "back-jog must stay on the source row, not drop through Cart UI, lane={} persist={}..{}",
+            arrow.lane_y,
+            pred.y,
+            pred.y + ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn critical_path_is_the_dated_fs_chain_that_finishes_latest() {
+        let mut a = node(1, None);
+        a.start_date = Some("2026-07-06T00:00:00Z".into());
+        a.target_date = Some("2026-07-10T00:00:00Z".into());
+        let mut b = node(2, None);
+        b.start_date = Some("2026-07-11T00:00:00Z".into());
+        b.target_date = Some("2026-07-20T00:00:00Z".into());
+        b.predecessors = vec![1];
+        let mut c = node(3, None);
+        c.start_date = Some("2026-07-11T00:00:00Z".into());
+        c.target_date = Some("2026-07-25T00:00:00Z".into());
+        c.predecessors = vec![1];
+        let mut undated = node(4, None);
+        undated.start_date = Some("2026-07-21T00:00:00Z".into());
+        undated.target_date = None;
+        undated.predecessors = vec![3];
+        let path = critical_path(&[a, b, c, undated]);
+        assert_eq!(
+            path.ids,
+            HashSet::from([1, 3]),
+            "the chain ending on the latest Target Date is A→C, not A→B, got {:?}",
+            path.ids
+        );
+        assert_eq!(path.links, HashSet::from([(1, 3)]));
+        assert!(
+            !path.ids.contains(&4),
+            "start-only items are not critical-path vertices"
+        );
+        assert!(
+            !path.ids.contains(&2),
+            "the earlier-finishing branch is not on the critical path"
+        );
+    }
+
+    #[test]
+    fn critical_path_walks_back_through_the_latest_predecessor() {
+        let mut a = node(1, None);
+        a.target_date = Some("2026-07-10T00:00:00Z".into());
+        let mut b = node(2, None);
+        b.start_date = Some("2026-07-11T00:00:00Z".into());
+        b.target_date = Some("2026-07-18T00:00:00Z".into());
+        b.predecessors = vec![1];
+        let mut c = node(3, None);
+        c.start_date = Some("2026-07-11T00:00:00Z".into());
+        c.target_date = Some("2026-07-22T00:00:00Z".into());
+        c.predecessors = vec![1];
+        let mut d = node(4, None);
+        d.start_date = Some("2026-07-23T00:00:00Z".into());
+        d.target_date = Some("2026-07-30T00:00:00Z".into());
+        d.predecessors = vec![2, 3];
+        let path = critical_path(&[a, b, c, d]);
+        assert_eq!(path.ids, HashSet::from([1, 3, 4]));
+        assert_eq!(path.links, HashSet::from([(1, 3), (3, 4)]));
+    }
+
+    #[test]
     fn link_drop_at_a_bar_edge_still_hits() {
         let bar = BarLayout {
             id: 2,
@@ -9947,8 +10154,8 @@ mod tests {
     fn left_dot_resize_of_successor_keeps_the_backward_loop_short() {
         // After dragging #1012's start from Jul 21 back to Jul 6, #1003
         // (Jul 6→20) still ends after the successor starts. The inbound
-        // column at succ.x-12 is a gap, but routing there is a long left
-        // run on the predecessor gutter. Keep the wrap at the source stub.
+        // column at succ.x-12 sits left of the source. Keep the wrap at
+        // the source stub.
         let mut pred = node(1003, Some(1002));
         pred.title = "Persist cart".into();
         pred.start_date = Some("2026-07-06T00:00:00Z".into());
@@ -10402,7 +10609,7 @@ mod tests {
         );
         assert!(
             arrow.wraps_around_successor(),
-            "overlap must use the short backward loop, x1={} x2={} x_head={}",
+            "same-start overlap must keep the short backward loop, x1={} x2={} x_head={}",
             arrow.x1,
             arrow.x2,
             arrow.x_head

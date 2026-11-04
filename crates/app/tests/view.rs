@@ -2610,6 +2610,10 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
         cx.debug_bounds("gantt-auto-fit").is_some(),
         "toolbar must expose monday.com Auto fit next to Today"
     );
+    assert!(
+        cx.debug_bounds("gantt-critical-path").is_some(),
+        "toolbar must expose a Critical path toggle"
+    );
     let today_btn = cx.debug_bounds("gantt-today-btn").expect("Today button");
     cx.simulate_click(today_btn.center(), Modifiers::default());
     draw(cx);
@@ -2638,6 +2642,44 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
         assert!(
             (today_x - expected).abs() < 8.0,
             "Today line at {today_x} should sit near the timeline center, expected {expected}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn critical_path_toolbar_toggles_the_highlight(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let btn = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path button");
+    view.update(cx, |view, _| {
+        assert!(
+            !view.state.gantt.show_critical_path,
+            "critical path is off until toggled"
+        );
+    });
+    cx.simulate_click(btn.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.gantt.show_critical_path,
+            "toolbar click must turn the critical-path highlight on"
+        );
+    });
+    cx.simulate_click(btn.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            !view.state.gantt.show_critical_path,
+            "a second click must turn the highlight off"
         );
     });
 }
@@ -9014,6 +9056,7 @@ fn ctrl_z_clears_the_hover_chip_so_the_next_press_moves(cx: &mut gpui_kit::TestA
     draw(cx);
     view.update(cx, |view, _| {
         view.state.gantt.pin_bar_tooltip = Some(2);
+        view.set_suppress_bar_tooltip_for_test(false);
     });
     draw(cx);
     assert!(
@@ -9165,7 +9208,7 @@ fn dates_chip_press_starts_a_bar_move(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
+fn drop_hides_the_bar_tooltip_beside_the_moved_toast(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let state = idle_state(&dir);
@@ -9204,9 +9247,12 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
     cx.simulate_mouse_up(dest, MouseButton::Left, Modifiers::default());
     view.update(cx, |view, _| {
         assert_eq!(
-            view.state.gantt.pin_bar_tooltip,
-            Some(2),
-            "after a resize the live tooltip must stay pinned while the cursor is on the bar"
+            view.state.gantt.pin_bar_tooltip, None,
+            "drop must not pin a dates chip beside the Moved toast"
+        );
+        assert!(
+            view.suppress_bar_tooltip_for_test(),
+            "drop must hide the hover tooltip until the pointer moves"
         );
         assert!(
             !view.state.gantt.hover_locked,
@@ -9217,113 +9263,12 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
             committed.is_some_and(|day| day > Date::new(2026, 7, 20).unwrap()),
             "resize must commit a later Target Date, got {committed:?}"
         );
-        let node = view
-            .state
-            .nodes
-            .iter()
-            .find(|node| node.id == 2)
-            .expect("leaf node");
-        let rows = view.state.gantt.flatten(&view.state.nodes);
-        let bars = view
-            .state
-            .gantt
-            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
-        let bar = bars.iter().find(|bar| bar.id == 2).expect("leaf");
-        let tip = bar_hover_tooltip(bar, &view.state.nodes);
-        if node
-            .target_date
-            .as_deref()
-            .is_none_or(|value| !value.contains("2026-07-20"))
-        {
-            assert!(
-                !tip.contains("Jul 20"),
-                "after a resize the tooltip must follow the live node dates while the cursor stays, got {tip:?} node={:?}",
-                node.target_date
-            );
-        }
     });
     draw(cx);
     assert!(
-        cx.debug_bounds("gantt-bar-tooltip").is_some(),
-        "the live bar tooltip must paint after a resize while the cursor stays on the bar"
+        cx.debug_bounds("gantt-bar-tooltip").is_none(),
+        "the bar tooltip must not sit beside the Moved toast after drop"
     );
-    let tip = cx
-        .debug_bounds("gantt-bar-tooltip")
-        .expect("pinned tooltip");
-    let bar_after = cx.debug_bounds("gantt-bar-2").expect("leaf bar after drop");
-    let tip_top = f32::from(tip.origin.y);
-    let tip_bottom = tip_top + f32::from(tip.size.height);
-    let bar_top = f32::from(bar_after.origin.y);
-    let bar_bottom = bar_top + f32::from(bar_after.size.height);
-    let bar_left = f32::from(bar_after.origin.x);
-    let bar_right = bar_left + f32::from(bar_after.size.width);
-    let tip_left = f32::from(tip.origin.x);
-    let tip_right = tip_left + f32::from(tip.size.width);
-    assert!(
-        tip_top < bar_bottom + 2.0 && tip_bottom > bar_top - 2.0,
-        "pinned move/resize tooltip must stay in the bar's row, tip={tip_top}..{tip_bottom} bar={bar_top}..{bar_bottom}"
-    );
-    let beside = tip_left + 1.0 >= bar_right - 4.0 || tip_right <= bar_left + 4.0;
-    assert!(
-        beside,
-        "pinned tooltip must sit in empty row space beside the bar, tip={tip_left}..{tip_right} bar={bar_left}..{bar_right}"
-    );
-    if let Some(label) = cx.debug_bounds("gantt-bar-label-2") {
-        let label_left = f32::from(label.origin.x);
-        let label_right = label_left + f32::from(label.size.width);
-        let overlaps = tip_left < label_right && tip_right > label_left;
-        assert!(
-            !overlaps,
-            "pinned dates chip must not sit under the bar title, tip={tip_left}..{tip_right} title={label_left}..{label_right}"
-        );
-    }
-    if let Some(parent) = cx.debug_bounds("gantt-bar-1") {
-        let parent_top = f32::from(parent.origin.y);
-        let parent_bottom = parent_top + f32::from(parent.size.height);
-        let overlaps_parent = tip_top < parent_bottom && tip_bottom > parent_top;
-        assert!(
-            !overlaps_parent,
-            "pinned tooltip must not cover the neighbouring parent title, tip={tip_top}..{tip_bottom} parent={parent_top}..{parent_bottom}"
-        );
-    }
-    if let Some(next) = cx.debug_bounds("gantt-bar-3") {
-        let next_top = f32::from(next.origin.y);
-        let next_bottom = next_top + f32::from(next.size.height);
-        let overlaps_next = tip_top < next_bottom && tip_bottom > next_top;
-        assert!(
-            !overlaps_next,
-            "pinned tooltip must not cover the next row, tip={tip_top}..{tip_bottom} next={next_top}..{next_bottom}"
-        );
-    }
-    cx.simulate_mouse_move(bar_after.center(), None, Modifiers::default());
-    draw(cx);
-    view.update(cx, |view, _| {
-        assert_eq!(
-            view.state.gantt.pin_bar_tooltip,
-            Some(2),
-            "an on-bar mouse-move after drop must not consume the pin, or a remount leave would hide the new dates"
-        );
-    });
-    let tip_after = cx
-        .debug_bounds("gantt-bar-tooltip")
-        .expect("pinned tooltip after on-bar move");
-    cx.simulate_mouse_move(tip_after.center(), None, Modifiers::default());
-    draw(cx);
-    view.update(cx, |view, _| {
-        assert_eq!(
-            view.state.gantt.pin_bar_tooltip,
-            Some(2),
-            "moving onto the same-row dates chip must not unpin"
-        );
-    });
-    cx.simulate_mouse_move(point(px(8.), px(8.)), None, Modifiers::default());
-    draw(cx);
-    view.update(cx, |view, _| {
-        assert_eq!(
-            view.state.gantt.pin_bar_tooltip, None,
-            "leaving the bar must unpin the live tooltip"
-        );
-    });
 }
 
 #[gpui_kit::test]
@@ -9432,11 +9377,7 @@ fn pinned_tooltip_unpins_when_the_pointer_leaves_the_row(cx: &mut gpui_kit::Test
     cx.simulate_mouse_up(dest, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
-        assert_eq!(
-            view.state.gantt.pin_bar_tooltip,
-            Some(2),
-            "a drop on the bar must pin the live tooltip"
-        );
+        view.state.gantt.pin_bar_tooltip = Some(2);
         view.state.gantt.clear_row_hover();
         assert_eq!(
             view.state.gantt.pin_bar_tooltip,
