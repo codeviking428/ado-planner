@@ -40,6 +40,8 @@ pub const SELECTED_ROW_TINT: f32 = 0.65;
 pub const SELECTED_ACCENT_W: f32 = 3.0;
 /// Year-scale bars shorter than this still paint a hittable body, not a sliver.
 pub const YEAR_MIN_BAR_WIDTH: f32 = 16.0;
+/// Year/Quarter summary bars read as slivers at 14px; keep a thicker body.
+pub const YEAR_MIN_BAR_H: f32 = 20.0;
 /// Floor so a zero-width day still paints on Month/Week/Quarter.
 const MIN_BAR_WIDTH: f32 = 6.0;
 /// Pixels per tree depth. A spacer child, not padding, so painted x matches depth.
@@ -453,11 +455,18 @@ impl BarLayout {
         if self.milestone || self.marker {
             MILESTONE_SIZE
         } else if self.summary {
-            SUMMARY_BAR_H
+            // Year slivers (`YEAR_MIN_BAR_WIDTH`) need a thicker body so
+            // the Today line and labels do not swallow them. Wide summaries
+            // stay `SUMMARY_BAR_H` so the row still has a connector gap.
+            if self.width <= YEAR_MIN_BAR_WIDTH + 0.5 {
+                YEAR_MIN_BAR_H.max(SUMMARY_BAR_H)
+            } else {
+                SUMMARY_BAR_H
+            }
         } else if self.kind == GanttBarKind::Unscheduled || self.kind == GanttBarKind::NoFields {
             PLACEHOLDER_BAR_H
         } else {
-            LEAF_BAR_H
+            LEAF_BAR_H.max(YEAR_MIN_BAR_H)
         }
     }
 
@@ -1265,12 +1274,13 @@ impl GanttView {
             return;
         }
         self.keep_today = false;
+        // Finer than a whole period: Month ‹ used to jump a full month.
         let span = match self.scale {
             GanttScale::Day => direction.days(),
-            GanttScale::Week => (direction * 7).days(),
-            GanttScale::Month => direction.months(),
-            GanttScale::Quarter => (direction * 3).months(),
-            GanttScale::Year => direction.years(),
+            GanttScale::Week => (direction * 3).days(),
+            GanttScale::Month => (direction * 7).days(),
+            GanttScale::Quarter => direction.months(),
+            GanttScale::Year => (direction * 3).months(),
         };
         self.origin = self.origin.saturating_add(span);
     }
@@ -4107,64 +4117,17 @@ pub fn outside_label_is_beside_bar(
         || (label_x - left_x).abs() <= MAX_LABEL_BAR_SHIFT
 }
 
-/// Body-relative Y ranges where the Today line should break so it does
-/// not paint through an outside-title chip that stays beside its bar.
+/// Body-relative Y ranges where the Today line should break.
 ///
-/// Year uses a full-row hole so the stroke breaks around the pill instead
-/// of threading the 12px pad above/below a 16px chip (R78). Quarter/Month/
-/// Week stay continuous: occupancy over-width false-gapped Go-live and
-/// spike (R75, R82). Labels still paint on top of the stroke.
+/// Year/Quarter/Month/Week stay a continuous stroke. Labels paint on top
+/// of the line (behind the chips) instead of punching holes through it.
 pub fn today_line_chip_skips(
-    bars: &[BarLayout],
-    today_x: f32,
-    timeline_w: f32,
-    scale: GanttScale,
+    _bars: &[BarLayout],
+    _today_x: f32,
+    _timeline_w: f32,
+    _scale: GanttScale,
 ) -> Vec<(f32, f32)> {
-    if !matches!(scale, GanttScale::Year) {
-        return Vec::new();
-    }
-    let line_right = today_x + 3.0;
-    let mut skips: Vec<(f32, f32)> = bars
-        .iter()
-        .filter_map(|bar| {
-            let (x, w) =
-                bar_outside_label_frame(bar, timeline_w, true, Some(today_x), bar.overflow_badge)?;
-            // Year graze counts: a chip whose left edge sits on the 3px stroke
-            // (Checkout at today+3) still paints through the line.
-            let miss_right = line_right + TODAY_LABEL_CLEARANCE;
-            if x >= miss_right || x + w <= today_x - 2.0 {
-                return None;
-            }
-            Some(year_or_chip_skip(bar, true))
-        })
-        .collect();
-    for bar in bars {
-        if !bar.open_ended || bar.milestone || bar.marker {
-            continue;
-        }
-        if today_x + 3.0 < bar.x - 2.0 {
-            continue;
-        }
-        let skip = year_or_chip_skip(bar, true);
-        if skips
-            .iter()
-            .any(|&(top, bottom)| top <= skip.0 && bottom >= skip.1)
-        {
-            continue;
-        }
-        skips.push(skip);
-    }
-    skips.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut merged: Vec<(f32, f32)> = Vec::new();
-    for skip in skips {
-        match merged.last_mut() {
-            // Year full-row holes must not fuse into one blank band across
-            // consecutive labeled rows; leave a 2px tick between pills.
-            Some(prev) if skip.0 <= prev.1 => prev.1 = prev.1.max(skip.1),
-            _ => merged.push(skip),
-        }
-    }
-    merged
+    Vec::new()
 }
 
 /// Painted Today-line segments `(top, height)` in `y0..y1`, skipping `skips`.
@@ -4595,15 +4558,6 @@ fn stub_recrosses_intervening(stub: f32, intervening: &[&BarLayout], clip_right:
         let (left, right) = bar_occupied_x(mid, false, Some(clip_right), None);
         x_hits_span(stub, left, right)
     })
-}
-
-fn year_or_chip_skip(bar: &BarLayout, year: bool) -> (f32, f32) {
-    let top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-    if year {
-        (bar.y + 1.0, bar.y + ROW_HEIGHT - 1.0)
-    } else {
-        (top, top + OUTSIDE_LABEL_H)
-    }
 }
 
 /// Body, and optionally an external title, so a vertical drop misses the row.
@@ -6361,6 +6315,11 @@ mod tests {
             bars[0].width
         );
         assert!(
+            bars[0].paint_h() + 0.1 >= YEAR_MIN_BAR_H,
+            "Year-view bars must keep a {YEAR_MIN_BAR_H}px body, height={}",
+            bars[0].paint_h()
+        );
+        assert!(
             !bars[0].can_resize(),
             "a {YEAR_MIN_BAR_WIDTH}px Year bar must stay all-Move, not two grips with no body"
         );
@@ -7402,6 +7361,28 @@ mod tests {
                 tick.x
             );
         }
+    }
+
+    #[test]
+    fn step_period_in_month_pans_a_week_not_a_month() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 8, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let before = gantt.origin;
+        gantt.step_period(-1);
+        assert_eq!(
+            gantt.origin,
+            before.saturating_sub(7.days()),
+            "Month ‹ must pan a week, not a whole month, {} vs {}",
+            gantt.origin,
+            before
+        );
+        gantt.step_period(1);
+        assert_eq!(gantt.origin, before, "a matching › must restore the origin");
     }
 
     #[test]
@@ -8515,31 +8496,10 @@ mod tests {
             return;
         };
         let skips = today_line_chip_skips(&bars, today_x, gantt.timeline_width, GanttScale::Year);
-        let miss_right = today_x + 3.0 + TODAY_LABEL_CLEARANCE;
-        for id in [1001_i64, 1003, 1005, 1012, 1013] {
-            let bar = bars.iter().find(|bar| bar.id == id).unwrap();
-            let Some((x, w)) = bar_outside_label_frame(
-                bar,
-                gantt.timeline_width,
-                true,
-                Some(today_x),
-                bar.overflow_badge,
-            ) else {
-                continue;
-            };
-            if x >= miss_right || x + w <= today_x - 2.0 {
-                continue;
-            }
-            let gapped = skips.iter().any(|&(top, bottom)| {
-                top <= bar.y + 2.0 && bottom + 0.5 >= bar.y + ROW_HEIGHT - 2.0
-            });
-            assert!(
-                gapped,
-                "Year before Today: {} occupancy {x}..{} overlaps Today {today_x} so the line must skip the row, skips={skips:?}",
-                bar.title,
-                x + w
-            );
-        }
+        assert!(
+            skips.is_empty(),
+            "Year Today stays a continuous stroke behind labels, skips={skips:?}"
+        );
     }
 
     #[test]
@@ -9177,23 +9137,15 @@ mod tests {
         let skips =
             today_line_chip_skips(std::slice::from_ref(&bar), today_x, 800.0, GanttScale::Year);
         assert!(
-            !skips.is_empty(),
-            "Today must skip the Persist cart chip y-range, skips={skips:?}"
+            skips.is_empty(),
+            "Year Today stays a continuous stroke behind labels, skips={skips:?}"
         );
         let segments = today_line_segments(0.0, 400.0, &skips);
-        assert!(
-            segments.len() >= 2,
-            "Today must break around the chip, segments={segments:?} skips={skips:?}"
+        assert_eq!(
+            segments.len(),
+            1,
+            "Today must run behind the chip as one stroke, segments={segments:?}"
         );
-        let chip_top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-        let chip_bottom = chip_top + OUTSIDE_LABEL_H;
-        for (top, height) in &segments {
-            let bottom = top + height;
-            assert!(
-                bottom <= chip_top + 2.0 || *top >= chip_bottom - 2.0,
-                "a Today segment must not paint through the chip, segment={top}..{bottom} chip={chip_top}..{chip_bottom}"
-            );
-        }
     }
 
     #[test]
@@ -9264,20 +9216,11 @@ mod tests {
             else {
                 continue;
             };
-            let line_right = today_x + 3.0;
-            let gap_left = today_x - (x + w);
-            let gap_right = x - line_right;
-            let clears = gap_left >= 2.0 || gap_right >= 2.0;
             let skips =
                 today_line_chip_skips(&bars, today_x, gantt.timeline_width, GanttScale::Year);
-            let chip_top = cart.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-            let chip_bottom = chip_top + OUTSIDE_LABEL_H;
-            let gapped = skips
-                .iter()
-                .any(|&(top, bottom)| top <= chip_top + 1.0 && bottom >= chip_bottom - 1.0);
             assert!(
-                clears || gapped,
-                "{tag}: Year Cart UI label {x}..{} must sit ≥2px off Today {today_x}..{line_right} or the line must skip the chip, skips={skips:?}",
+                skips.is_empty(),
+                "{tag}: Year Today stays a continuous stroke behind the Cart UI label {x}..{}, skips={skips:?}",
                 x + w
             );
         }

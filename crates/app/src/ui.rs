@@ -50,12 +50,12 @@ use crate::gantt::{
     LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS,
     NudgeAxis, OUTER_LINK_HIT, OUTSIDE_LABEL_H, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
     PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, RESIZE_HALO_END_OUTSIDE, RESIZE_HALO_OUTSIDE, ROW_HEIGHT,
-    SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H,
-    SavedGanttView, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT,
-    bar_hover_tooltip, bar_label_right, bar_outside_label_frame, bar_title_is_inside,
-    bar_title_paint_px, header_label_px, offscreen_edge_chip, outside_title_right_gap,
-    parent_date_overflow, parent_overflow_tip, related_dependency_ids,
-    timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
+    SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SavedGanttView,
+    TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
+    bar_label_right, bar_outside_label_frame, bar_title_is_inside, bar_title_paint_px,
+    header_label_px, offscreen_edge_chip, outside_title_right_gap, parent_date_overflow,
+    parent_overflow_tip, related_dependency_ids, timeline_is_empty_of_scheduled,
+    today_line_chip_skips, today_line_segments, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -146,6 +146,7 @@ pub struct PlannerView {
     open_filter: Option<&'static str>,
     open_scope: Option<&'static str>,
     open_flavor: bool,
+    toolbar_more_open: bool,
     inline_edit: Option<InlineEdit>,
     inline_dates: Option<Entity<CalendarState>>,
     /// Typed ISO text at picker open; used so a later calendar pick is not
@@ -481,6 +482,7 @@ impl PlannerView {
             open_filter: None,
             open_scope: None,
             open_flavor: false,
+            toolbar_more_open: false,
             inline_edit: None,
             inline_dates: None,
             inline_dates_typed_seed: String::new(),
@@ -659,6 +661,7 @@ impl PlannerView {
     pub fn open_scope_menu(&mut self, id: &'static str, cx: &mut Context<Self>) {
         self.open_filter = None;
         self.open_flavor = false;
+        self.toolbar_more_open = false;
         self.state.gantt.context_menu = None;
         self.dismiss_empty_timeline_hint();
         self.open_scope = Some(id);
@@ -668,6 +671,7 @@ impl PlannerView {
     pub fn set_open_flavor(&mut self, open: bool) {
         self.open_filter = None;
         self.open_scope = None;
+        self.toolbar_more_open = false;
         self.state.gantt.context_menu = None;
         self.dismiss_empty_timeline_hint();
         self.open_flavor = open;
@@ -1297,6 +1301,7 @@ impl PlannerView {
         self.open_filter = None;
         self.open_scope = None;
         self.open_flavor = false;
+        self.toolbar_more_open = false;
         self.inline_edit = None;
         self.inline_dates = None;
         self.inline_dates_typed_seed.clear();
@@ -1886,6 +1891,7 @@ impl PlannerView {
     pub fn set_open_filter(&mut self, id: Option<&'static str>) {
         self.open_scope = None;
         self.open_flavor = false;
+        self.toolbar_more_open = false;
         self.state.gantt.context_menu = None;
         self.dismiss_empty_timeline_hint();
         self.open_filter = id;
@@ -1896,7 +1902,10 @@ impl PlannerView {
     }
 
     fn popup_open(&self) -> bool {
-        self.open_filter.is_some() || self.open_scope.is_some() || self.open_flavor
+        self.open_filter.is_some()
+            || self.open_scope.is_some()
+            || self.open_flavor
+            || self.toolbar_more_open
     }
 
     fn popup_panel(
@@ -2696,6 +2705,7 @@ impl PlannerView {
                     .on_click(cx.listener(move |this, event, window, cx| {
                         this.open_filter = None;
                         this.open_flavor = false;
+                        this.toolbar_more_open = false;
                         this.state.gantt.context_menu = None;
                         this.dismiss_empty_timeline_hint();
                         this.open_scope = if this.open_scope == Some(id) {
@@ -2923,6 +2933,7 @@ impl PlannerView {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_scope = None;
                     this.open_flavor = false;
+                    this.toolbar_more_open = false;
                     this.state.gantt.context_menu = None;
                     this.dismiss_empty_timeline_hint();
                     this.open_filter = if this.open_filter == Some(id) {
@@ -3039,6 +3050,7 @@ impl PlannerView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_filter = None;
                         this.open_scope = None;
+                        this.toolbar_more_open = false;
                         this.state.gantt.context_menu = None;
                         this.dismiss_empty_timeline_hint();
                         this.open_flavor = !this.open_flavor;
@@ -3341,30 +3353,13 @@ impl PlannerView {
                             .primary()
                             .label("Today")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.toolbar_more_open = false;
                                 this.animate_gantt(cx, |gantt| {
                                     gantt.retarget_year_gutter(|gantt| {
                                         gantt.go_today(jiff::Zoned::now().date());
                                     });
                                 });
                                 cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("gantt-add-item")
-                    .debug_selector(|| "gantt-add-item".into())
-                    .child(
-                        Button::new("add-item")
-                            .primary()
-                            .label("+ Add item")
-                            .tooltip("Add a child work item under the selected row.")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.gantt.clear_hover();
-                                this.spawn_state(cx, |mut state| async move {
-                                    let result = state.add_item().await;
-                                    (state, result)
-                                });
                             })),
                     ),
             )
@@ -3387,6 +3382,7 @@ impl PlannerView {
                             })
                             .tooltip_placement(Placement::Bottom)
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.toolbar_more_open = false;
                                 let nodes = this.state.visible_nodes();
                                 let iterations = this.state.iterations.clone();
                                 if GanttView::scheduled_span(&nodes, &iterations).is_none() {
@@ -3402,68 +3398,47 @@ impl PlannerView {
                             })),
                     )
             })
-            .child({
-                let has_dated = self.state.visible_nodes().iter().any(|node| {
-                    parse_iso_date(node.start_date.as_deref()).is_some()
-                        && parse_iso_date(node.target_date.as_deref()).is_some()
-                });
-                let selected = self.state.gantt.show_critical_path;
-                div()
-                    .id("gantt-critical-path")
-                    .debug_selector(|| "gantt-critical-path".into())
-                    .child(
-                        Button::new("critical-path")
-                            .label("Critical path")
-                            .compact()
-                            .selected(selected)
-                            .when(selected, |btn| btn.primary())
-                            .when(!selected, |btn| btn.ghost())
-                            .disabled(!has_dated)
-                            .tooltip(if has_dated {
-                                "Highlight the finish-to-start chain with the latest Target Date."
-                            } else {
-                                "No dated finish-to-start chain to highlight."
-                            })
-                            .tooltip_placement(Placement::Bottom)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if this.state.visible_nodes().iter().any(|node| {
-                                    parse_iso_date(node.start_date.as_deref()).is_some()
-                                        && parse_iso_date(node.target_date.as_deref()).is_some()
-                                }) {
-                                    this.state.gantt.show_critical_path =
-                                        !this.state.gantt.show_critical_path;
-                                    cx.notify();
-                                }
-                            })),
-                    )
-            })
             .child(
-                Button::new("prev-period")
-                    .ghost()
-                    .compact()
-                    .label("‹")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.animate_gantt(cx, |gantt| {
-                            gantt.retarget_year_gutter(|gantt| {
-                                gantt.step_period(-1);
-                            });
-                        });
-                        cx.notify();
-                    })),
+                div()
+                    .id("gantt-prev-period")
+                    .debug_selector(|| "gantt-prev-period".into())
+                    .child(
+                        Button::new("prev-period")
+                            .ghost()
+                            .compact()
+                            .label("‹")
+                            .tooltip("Pan earlier")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toolbar_more_open = false;
+                                this.animate_gantt(cx, |gantt| {
+                                    gantt.retarget_year_gutter(|gantt| {
+                                        gantt.step_period(-1);
+                                    });
+                                });
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
-                Button::new("next-period")
-                    .ghost()
-                    .compact()
-                    .label("›")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.animate_gantt(cx, |gantt| {
-                            gantt.retarget_year_gutter(|gantt| {
-                                gantt.step_period(1);
-                            });
-                        });
-                        cx.notify();
-                    })),
+                div()
+                    .id("gantt-next-period")
+                    .debug_selector(|| "gantt-next-period".into())
+                    .child(
+                        Button::new("next-period")
+                            .ghost()
+                            .compact()
+                            .label("›")
+                            .tooltip("Pan later")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toolbar_more_open = false;
+                                this.animate_gantt(cx, |gantt| {
+                                    gantt.retarget_year_gutter(|gantt| {
+                                        gantt.step_period(1);
+                                    });
+                                });
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -3480,7 +3455,11 @@ impl PlannerView {
                     .id("gantt-scale-group")
                     .debug_selector(|| "gantt-scale-group".into())
                     .flex_shrink_0()
-                    .gap_1()
+                    .gap_0()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .overflow_hidden()
                     .children(GanttScale::ALL.iter().map(|scale| {
                         let scale = *scale;
                         let selected = self.state.gantt.scale == scale;
@@ -3496,6 +3475,7 @@ impl PlannerView {
                                     .label(label)
                                     .compact()
                                     .w(px(SCALE_BUTTON_WIDTH))
+                                    .rounded(px(0.))
                                     .selected(selected)
                                     .when(selected, |btn| btn.primary())
                                     .when(!selected, |btn| btn.ghost())
@@ -3525,6 +3505,7 @@ impl PlannerView {
                             .label("−")
                             .tooltip("Zoom out")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.toolbar_more_open = false;
                                 this.animate_gantt(cx, |gantt| {
                                     gantt.retarget_year_gutter(|gantt| {
                                         let today = jiff::Zoned::now().date();
@@ -3558,6 +3539,7 @@ impl PlannerView {
                             .label("+")
                             .tooltip("Zoom in")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.toolbar_more_open = false;
                                 this.animate_gantt(cx, |gantt| {
                                     gantt.retarget_year_gutter(|gantt| {
                                         let today = jiff::Zoned::now().date();
@@ -3569,28 +3551,7 @@ impl PlannerView {
                             })),
                     ),
             )
-            .child(
-                Button::new("scroll-up")
-                    .ghost()
-                    .compact()
-                    .label("▲")
-                    .tooltip("Scroll up")
-                    .tooltip_placement(Placement::Bottom)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.scroll_or_select(-3, cx);
-                    })),
-            )
-            .child(
-                Button::new("scroll-down")
-                    .ghost()
-                    .compact()
-                    .label("▼")
-                    .tooltip("Scroll down")
-                    .tooltip_placement(Placement::Bottom)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.scroll_or_select(3, cx);
-                    })),
-            )
+            .child(self.render_gantt_overflow(cx))
             .child(
                 div()
                     .id("gantt-sync-status")
@@ -3624,6 +3585,140 @@ impl PlannerView {
                             .child(sync_label),
                     ),
             )
+    }
+
+    fn render_gantt_overflow(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.toolbar_more_open;
+        let has_dated = self.state.visible_nodes().iter().any(|node| {
+            parse_iso_date(node.start_date.as_deref()).is_some()
+                && parse_iso_date(node.target_date.as_deref()).is_some()
+        });
+        let selected = self.state.gantt.show_critical_path;
+        let trigger = div()
+            .id("gantt-toolbar-more")
+            .debug_selector(|| "gantt-toolbar-more".into())
+            .child(
+                Button::new("toolbar-more")
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Ellipsis)
+                    .tooltip("More")
+                    .tooltip_placement(Placement::Bottom)
+                    .selected(open)
+                    .when(open, |btn| btn.primary())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_filter = None;
+                        this.open_scope = None;
+                        this.open_flavor = false;
+                        this.state.gantt.context_menu = None;
+                        this.dismiss_empty_timeline_hint();
+                        this.toolbar_more_open = !this.toolbar_more_open;
+                        cx.notify();
+                    })),
+            );
+        let mut popup = Popup::new("gantt-toolbar-more-popup", trigger).offset(px(8.));
+        if open {
+            popup = popup.content(
+                self.popup_panel("gantt-toolbar-more-panel", cx)
+                    .debug_selector(|| "gantt-toolbar-more-panel".into())
+                    .w(px(220.))
+                    .min_w(px(200.))
+                    .min_h(px(0.))
+                    .child(
+                        div()
+                            .id("gantt-add-item")
+                            .debug_selector(|| "gantt-add-item".into())
+                            .w_full()
+                            .child(
+                                Button::new("add-item")
+                                    .ghost()
+                                    .label("+ Add item")
+                                    .tooltip("Add a child work item under the selected row.")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toolbar_more_open = false;
+                                        this.state.gantt.clear_hover();
+                                        this.spawn_state(cx, |mut state| async move {
+                                            let result = state.add_item().await;
+                                            (state, result)
+                                        });
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("gantt-critical-path")
+                            .debug_selector(|| "gantt-critical-path".into())
+                            .w_full()
+                            .child(
+                                Button::new("critical-path")
+                                    .label("Critical path")
+                                    .compact()
+                                    .selected(selected)
+                                    .when(selected, |btn| btn.primary())
+                                    .when(!selected, |btn| btn.ghost())
+                                    .disabled(!has_dated)
+                                    .tooltip(if has_dated {
+                                        "Highlight the finish-to-start chain with the latest Target Date."
+                                    } else {
+                                        "No dated finish-to-start chain to highlight."
+                                    })
+                                    .tooltip_placement(Placement::Bottom)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toolbar_more_open = false;
+                                        if this.state.visible_nodes().iter().any(|node| {
+                                            parse_iso_date(node.start_date.as_deref()).is_some()
+                                                && parse_iso_date(node.target_date.as_deref())
+                                                    .is_some()
+                                        }) {
+                                            this.state.gantt.show_critical_path =
+                                                !this.state.gantt.show_critical_path;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("gantt-scroll-up")
+                            .debug_selector(|| "gantt-scroll-up".into())
+                            .w_full()
+                            .child(
+                                Button::new("scroll-up")
+                                    .ghost()
+                                    .compact()
+                                    .label("▲ Scroll up")
+                                    .tooltip("Scroll up")
+                                    .tooltip_placement(Placement::Bottom)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toolbar_more_open = false;
+                                        this.scroll_or_select(-3, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("gantt-scroll-down")
+                            .debug_selector(|| "gantt-scroll-down".into())
+                            .w_full()
+                            .child(
+                                Button::new("scroll-down")
+                                    .ghost()
+                                    .compact()
+                                    .label("▼ Scroll down")
+                                    .tooltip("Scroll down")
+                                    .tooltip_placement(Placement::Bottom)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toolbar_more_open = false;
+                                        this.scroll_or_select(3, cx);
+                                    })),
+                            ),
+                    ),
+            );
+        }
+        div()
+            .id("gantt-toolbar-overflow")
+            .debug_selector(|| "gantt-toolbar-overflow".into())
+            .child(popup)
     }
 
     fn io_saving(&self) -> bool {
@@ -3855,6 +3950,7 @@ impl PlannerView {
                                             this.open_filter = None;
                                             this.open_scope = None;
                                             this.open_flavor = false;
+                                            this.toolbar_more_open = false;
                                             this.state.gantt.context_menu = None;
                                             if this
                                                 .state
@@ -4872,11 +4968,10 @@ impl PlannerView {
                     })
                     .children({
                         // After arrows/cues so the line stays continuous
-                        // through links; before labels so chips still cover
-                        // it. Year `today_line_chip_skips` gaps those bands;
-                        // Quarter stays a continuous stroke.
-                        // Hide when Today is off the clip so Month does not
-                        // paint a stray 3px at the chart's left edge.
+                        // through links; before labels so chips cover it.
+                        // Year keeps one stroke behind the pills instead of
+                        // punching holes. Hide when Today is off the clip
+                        // so Month does not paint a stray 3px at the left.
                         if !today_on_screen {
                             Vec::new()
                         } else {
@@ -5432,16 +5527,8 @@ impl PlannerView {
                 .as_ref()
                 .is_some_and(|gesture| gesture.id == id && gesture.kind != GestureKind::Link);
         let can_resize = bar.can_resize();
-        let bar_h = if milestone || marker {
-            MILESTONE_SIZE
-        } else if summary {
-            SUMMARY_BAR_H
-        } else if unscheduled || no_fields {
-            PLACEHOLDER_BAR_H
-        } else {
-            LEAF_BAR_H
-        };
-        let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
+        let bar_h = bar.paint_h();
+        let bar_top = bar.paint_top();
         let label_pad = if can_resize { HANDLE_WIDTH + 4.0 } else { 6.0 };
         let open_ended_link_origin = bar.x + bar.width;
         let progress_value = bar.progress.unwrap_or(0.0);
@@ -6617,14 +6704,6 @@ impl PlannerView {
                 .h(px(bar_h.max(16.0)))
                 .flex()
                 .items_center()
-                .px_1()
-                .gap_1()
-                .rounded_sm()
-                .bg(cx.theme().background.opacity(0.92))
-                .border_1()
-                .border_color(rgb(bar.color).opacity(0.7))
-                .text_color(rgb(bar.color))
-                .text_xs()
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_bar_hovered(Some(id), cx);
@@ -6636,13 +6715,7 @@ impl PlannerView {
                     let y: f32 = event.position.y.into();
                     this.note_pointer(x, y);
                 }))
-                .child(
-                    div()
-                        .w_full()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .child(label),
-                )
+                .child(bar_title_chip(label, rgb(bar.color).into(), true))
                 .when(hovered, |el| {
                     el.child(
                         div()
@@ -6782,18 +6855,7 @@ impl PlannerView {
         } else {
             bar.width.max(8.0)
         };
-        let bar_h = if bar.milestone || bar.marker {
-            MILESTONE_SIZE
-        } else if bar.summary {
-            SUMMARY_BAR_H
-        } else if bar.kind == ado_core::GanttBarKind::Unscheduled
-            || bar.kind == ado_core::GanttBarKind::NoFields
-        {
-            PLACEHOLDER_BAR_H
-        } else {
-            LEAF_BAR_H
-        };
-        let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
+        let bar_top = bar.paint_top();
         let tip_w = (tip.chars().count() as f32 * 7.0 + 24.0).max(48.0);
         let overflow = parent_date_overflow(&self.state.nodes, id);
         let extra = if bar.open_ended {
@@ -6893,18 +6955,7 @@ impl PlannerView {
         } else {
             bar.width.max(8.0)
         };
-        let bar_h = if bar.milestone || bar.marker {
-            MILESTONE_SIZE
-        } else if bar.summary {
-            SUMMARY_BAR_H
-        } else if bar.kind == ado_core::GanttBarKind::Unscheduled
-            || bar.kind == ado_core::GanttBarKind::NoFields
-        {
-            PLACEHOLDER_BAR_H
-        } else {
-            LEAF_BAR_H
-        };
-        let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
+        let bar_top = bar.paint_top();
         let tip_w = (tip.chars().count() as f32 * 7.0 + 24.0).max(48.0);
         let timeline_w = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
         if offscreen_edge_chip(bar, timeline_w).is_some() {
@@ -9001,18 +9052,8 @@ impl PlannerView {
         } else {
             layout.width.max(8.0)
         };
-        let bar_h = if layout.milestone || layout.marker {
-            MILESTONE_SIZE
-        } else if layout.summary {
-            SUMMARY_BAR_H
-        } else if layout.kind == ado_core::GanttBarKind::Unscheduled
-            || layout.kind == ado_core::GanttBarKind::NoFields
-        {
-            PLACEHOLDER_BAR_H
-        } else {
-            LEAF_BAR_H
-        };
-        let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
+        let bar_h = layout.paint_h();
+        let bar_top = layout.paint_top();
         let body_y = self.timeline_body_origin_y.get();
         let row_top = if body_y > 0.0 {
             body_y + layout.y
@@ -10696,6 +10737,8 @@ const HOVER_TOOLTIP_H: f32 = 16.0;
 /// Lift hover chips just above the bar so they stay in the row padding
 /// instead of covering the previous row's bar or label.
 const HOVER_TOOLTIP_GAP: f32 = 2.0;
+/// Minimum gap from hover chips to neighbouring bars, labels, and diamonds.
+const OVERLAY_CLEARANCE: f32 = 8.0;
 /// Connector fillet. Filled elbow discs read as a node at the bend.
 const ARROW_CORNER_R: f32 = 5.0;
 /// Gap from a milestone diamond to the tooltip on either side.
@@ -10758,26 +10801,64 @@ fn overlay_overlap(a: OverlayRect, b: OverlayRect) -> bool {
     a.x < b.x + b.w - 1.0 && a.x + a.w > b.x + 1.0 && a.y < b.y + b.h - 1.0 && a.y + a.h > b.y + 1.0
 }
 
+fn inflate_overlay(rect: OverlayRect, pad: f32) -> OverlayRect {
+    OverlayRect {
+        x: rect.x - pad,
+        y: rect.y - pad,
+        w: (rect.w + pad * 2.0).max(0.0),
+        h: (rect.h + pad * 2.0).max(0.0),
+    }
+}
+
+fn overlay_too_close(a: OverlayRect, b: OverlayRect, clearance: f32) -> bool {
+    if clearance <= 0.0 {
+        overlay_overlap(a, b)
+    } else {
+        overlay_overlap(a, inflate_overlay(b, clearance))
+    }
+}
+
 fn nudge_overlay_off(
+    rect: OverlayRect,
+    obstacles: &[OverlayRect],
+    timeline_w: f32,
+    row_y: f32,
+    viewport_h: f32,
+    toast_band: f32,
+) -> (f32, f32) {
+    nudge_overlay_off_by(
+        rect,
+        obstacles,
+        timeline_w,
+        row_y,
+        viewport_h,
+        toast_band,
+        OVERLAY_CLEARANCE,
+    )
+}
+
+fn nudge_overlay_off_by(
     mut rect: OverlayRect,
     obstacles: &[OverlayRect],
     timeline_w: f32,
     _row_y: f32,
     viewport_h: f32,
     toast_band: f32,
+    clearance: f32,
 ) -> (f32, f32) {
+    let pad = clearance.max(0.0);
     for _ in 0..4 {
         let Some(hit) = obstacles
             .iter()
             .copied()
-            .find(|obstacle| overlay_overlap(rect, *obstacle))
+            .find(|obstacle| overlay_too_close(rect, *obstacle, clearance))
         else {
             break;
         };
-        let right = hit.x + hit.w + 4.0;
-        let left = hit.x - rect.w - 4.0;
-        let up = hit.y - rect.h - 4.0;
-        let down = hit.y + hit.h + 4.0;
+        let right = hit.x + hit.w + pad;
+        let left = hit.x - rect.w - pad;
+        let up = hit.y - rect.h - pad;
+        let down = hit.y + hit.h + pad;
         if right + rect.w <= timeline_w - 4.0 {
             rect.x = right;
         } else if left >= 0.0 {
@@ -10830,24 +10911,37 @@ fn hover_bar_tooltip_origin(place: TooltipPlace, pills: &[OverlayRect]) -> (f32,
     if place.milestone {
         let (x, _, _) =
             milestone_tooltip_place(place.bar_x, place.painted_w, place.tip_w, place.timeline_w);
-        let mut obstacles = pills.to_vec();
-        obstacles.extend(milestone_handle_obstacles(
-            place.bar_x,
-            place.painted_w,
-            place.bar_top,
-        ));
+        let handles = milestone_handle_obstacles(place.bar_x, place.painted_w, place.bar_top);
+        let rect = OverlayRect {
+            x,
+            y,
+            w: place.tip_w,
+            h: HOVER_TOOLTIP_H,
+        };
+        // Neighbour labels/milestones keep an 8px gap. Own handle dots
+        // sit on this diamond — only dodge when the chip actually covers
+        // them, so prefer-right chips stay flush.
         let (nudged_x, nudged_y) = nudge_overlay_off(
-            OverlayRect {
-                x,
-                y,
-                w: place.tip_w,
-                h: HOVER_TOOLTIP_H,
-            },
-            &obstacles,
+            rect,
+            pills,
             place.timeline_w,
             place.row_y,
             place.viewport_h,
             place.toast_band,
+        );
+        let (nudged_x, nudged_y) = nudge_overlay_off_by(
+            OverlayRect {
+                x: nudged_x,
+                y: nudged_y,
+                w: place.tip_w,
+                h: HOVER_TOOLTIP_H,
+            },
+            &handles,
+            place.timeline_w,
+            place.row_y,
+            place.viewport_h,
+            place.toast_band,
+            0.0,
         );
         // Prefer-right chips may overflow the clip (the chart clips them).
         // Do not squeeze left of the diamond onto the handle dots.
@@ -12946,6 +13040,60 @@ mod bar_label_tests {
         assert!(
             !super::overlay_overlap(chip, cart) && !super::overlay_overlap(tip, cart),
             "overlays must add row clearance from the Cart bar above, y={y}"
+        );
+    }
+
+    #[test]
+    fn overlay_nudge_keeps_eight_px_from_a_neighbour_label() {
+        let label = super::OverlayRect {
+            x: 200.0,
+            y: 80.0,
+            w: 120.0,
+            h: 16.0,
+        };
+        let chip = super::OverlayRect {
+            x: 200.0 + 120.0 + 5.0,
+            y: 80.0,
+            w: 48.0,
+            h: super::DATE_PILL_H,
+        };
+        assert!(
+            super::overlay_too_close(chip, label, super::OVERLAY_CLEARANCE),
+            "5px from a neighbour label must count as too close"
+        );
+        let (x, _) = super::nudge_overlay_off(chip, &[label], 800.0, 80.0, 400.0, 0.0);
+        assert!(
+            x >= label.x + label.w + super::OVERLAY_CLEARANCE - 0.1
+                || x + chip.w <= label.x - super::OVERLAY_CLEARANCE + 0.1,
+            "nudged chip x={x} must sit ≥8px from the label {}..{}",
+            label.x,
+            label.x + label.w
+        );
+    }
+
+    #[test]
+    fn overlay_nudge_keeps_eight_px_from_a_milestone() {
+        let diamond = super::OverlayRect {
+            x: 400.0,
+            y: 120.0,
+            w: 16.0,
+            h: 16.0,
+        };
+        let chip = super::OverlayRect {
+            x: 400.0 + 16.0 + 4.0,
+            y: 120.0,
+            w: 72.0,
+            h: super::HOVER_TOOLTIP_H,
+        };
+        assert!(
+            super::overlay_too_close(chip, diamond, super::OVERLAY_CLEARANCE),
+            "4px from a milestone must count as too close"
+        );
+        let (x, _) = super::nudge_overlay_off(chip, &[diamond], 800.0, 120.0, 400.0, 0.0);
+        assert!(
+            x >= diamond.x + diamond.w + super::OVERLAY_CLEARANCE - 0.1,
+            "nudged chip x={x} must sit ≥8px right of the diamond {}",
+            diamond.x + diamond.w
         );
     }
 }

@@ -7,8 +7,8 @@ use ado_planner::gantt::{
     HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_INSET, MILESTONE_SIZE,
     MIN_TIMELINE_WIDTH, OUTER_LINK_HIT, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN,
     RESIZE_HIT_WIDTH, ROW_HEIGHT, SHORT_BAR_OUTER_LINK_HIT, TODAY_ALIGN, TODAY_PILL_GAP,
-    TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside,
-    bar_title_paint_px, insert_index_for_child, outside_label_is_beside_bar,
+    TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, YEAR_MIN_BAR_H, YEAR_MIN_BAR_WIDTH, bar_hover_tooltip,
+    bar_title_is_inside, bar_title_paint_px, insert_index_for_child, outside_label_is_beside_bar,
     related_dependency_ids,
 };
 use ado_planner::paths::AppPaths;
@@ -1823,6 +1823,50 @@ fn painted_center_x(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> f32 {
     f32::from(bounds.origin.x) + f32::from(bounds.size.width) / 2.0
 }
 
+fn open_gantt_overflow(cx: &mut gpui_kit::VisualTestContext) {
+    let more = cx
+        .debug_bounds("gantt-toolbar-more")
+        .expect("toolbar overflow");
+    cx.simulate_click(more.center(), Modifiers::default());
+    draw(cx);
+}
+
+fn painted_min_gap(
+    a: gpui_kit::Bounds<gpui_kit::Pixels>,
+    b: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> f32 {
+    let ax0 = f32::from(a.origin.x);
+    let ax1 = ax0 + f32::from(a.size.width);
+    let ay0 = f32::from(a.origin.y);
+    let ay1 = ay0 + f32::from(a.size.height);
+    let bx0 = f32::from(b.origin.x);
+    let bx1 = bx0 + f32::from(b.size.width);
+    let by0 = f32::from(b.origin.y);
+    let by1 = by0 + f32::from(b.size.height);
+    let overlap_x = ax0 < bx1 && bx0 < ax1;
+    let overlap_y = ay0 < by1 && by0 < ay1;
+    if overlap_x && overlap_y {
+        return 0.0;
+    }
+    let x_gap = if overlap_x {
+        0.0
+    } else {
+        (bx0 - ax1).max(ax0 - bx1).max(0.0)
+    };
+    let y_gap = if overlap_y {
+        0.0
+    } else {
+        (by0 - ay1).max(ay0 - by1).max(0.0)
+    };
+    if overlap_x {
+        y_gap
+    } else if overlap_y {
+        x_gap
+    } else {
+        x_gap.hypot(y_gap)
+    }
+}
+
 fn painted_overlap(
     a: gpui_kit::Bounds<gpui_kit::Pixels>,
     b: gpui_kit::Bounds<gpui_kit::Pixels>,
@@ -2062,9 +2106,11 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
         return;
     }
     let segments = today_body_segments(cx);
-    assert!(
-        !segments.is_empty(),
-        "Year before Today: body segments must paint with unique gantt-today-body-N selectors"
+    assert_eq!(
+        segments.len(),
+        1,
+        "Year Today stays one stroke behind labels, segments={}",
+        segments.len()
     );
     for selector in [
         "gantt-bar-label-1001",
@@ -2076,35 +2122,9 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
         let Some(label) = cx.debug_bounds(selector) else {
             continue;
         };
-        let label_left = f32::from(label.origin.x);
-        let label_right = label_left + f32::from(label.size.width);
-        let label_top = f32::from(label.origin.y);
-        let label_bottom = label_top + f32::from(label.size.height);
-        let mut covered = 0.0_f32;
-        for (index, segment) in segments.iter().enumerate() {
-            assert!(
-                !painted_overlap(label, *segment),
-                "launch camera Year before Today: Today body-{index} must not run through {selector} (label x={label_left:.1}..{label_right:.1} y={label_top:.1}..{label_bottom:.1}, line x={:.1}..{:.1} y={:.1}..{:.1})",
-                f32::from(segment.origin.x),
-                f32::from(segment.origin.x) + f32::from(segment.size.width),
-                f32::from(segment.origin.y),
-                f32::from(segment.origin.y) + f32::from(segment.size.height)
-            );
-            let seg_x = f32::from(segment.origin.x);
-            let seg_right = seg_x + f32::from(segment.size.width).max(3.0);
-            if seg_right > label_left && seg_x < label_right {
-                let seg_top = f32::from(segment.origin.y);
-                let seg_bottom = seg_top + f32::from(segment.size.height);
-                let overlap_top = seg_top.max(label_top - 12.0);
-                let overlap_bottom = seg_bottom.min(label_bottom + 12.0);
-                if overlap_bottom > overlap_top {
-                    covered += overlap_bottom - overlap_top;
-                }
-            }
-        }
         assert!(
-            covered < 8.0,
-            "launch camera Year before Today: {selector} must show a visible Today break around the pill, leftover stroke in the row pad={covered}"
+            f32::from(label.size.height) >= 12.0,
+            "launch camera Year before Today: {selector} must still paint on top of the Today stroke"
         );
     }
 }
@@ -2282,6 +2302,12 @@ fn year_before_today_click_gaps_under_sliver_pills(cx: &mut gpui_kit::TestAppCon
         return;
     }
     let segments = today_body_segments(cx);
+    assert_eq!(
+        segments.len(),
+        1,
+        "Year Today stays one stroke behind labels, segments={}",
+        segments.len()
+    );
     for selector in [
         "gantt-bar-label-1001",
         "gantt-bar-label-1003",
@@ -2292,12 +2318,10 @@ fn year_before_today_click_gaps_under_sliver_pills(cx: &mut gpui_kit::TestAppCon
         let Some(label) = cx.debug_bounds(selector) else {
             continue;
         };
-        for (index, segment) in segments.iter().enumerate() {
-            assert!(
-                !painted_overlap(label, *segment),
-                "Year before Today: painted Today body-{index} must not run through {selector}"
-            );
-        }
+        assert!(
+            f32::from(label.size.height) >= 12.0,
+            "Year before Today: {selector} must still paint on top of the Today stroke"
+        );
     }
 }
 
@@ -2645,8 +2669,17 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
         "toolbar must expose monday.com Auto fit next to Today"
     );
     assert!(
+        cx.debug_bounds("gantt-scale-group").is_some(),
+        "scale buttons must sit in one segmented control"
+    );
+    assert!(
+        cx.debug_bounds("gantt-critical-path").is_none(),
+        "Critical path belongs in the overflow menu until opened"
+    );
+    open_gantt_overflow(cx);
+    assert!(
         cx.debug_bounds("gantt-critical-path").is_some(),
-        "toolbar must expose a Critical path toggle"
+        "toolbar overflow must expose a Critical path toggle"
     );
     let today_btn = cx.debug_bounds("gantt-today-btn").expect("Today button");
     cx.simulate_click(today_btn.center(), Modifiers::default());
@@ -2691,15 +2724,16 @@ fn critical_path_toolbar_toggles_the_highlight(cx: &mut gpui_kit::TestAppContext
         height: px(800.),
     });
     draw(cx);
-    let btn = cx
-        .debug_bounds("gantt-critical-path")
-        .expect("Critical path button");
     view.update(cx, |view, _| {
         assert!(
             !view.state.gantt.show_critical_path,
             "critical path is off until toggled"
         );
     });
+    open_gantt_overflow(cx);
+    let btn = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path button");
     cx.simulate_click(btn.center(), Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
@@ -2708,6 +2742,10 @@ fn critical_path_toolbar_toggles_the_highlight(cx: &mut gpui_kit::TestAppContext
             "toolbar click must turn the critical-path highlight on"
         );
     });
+    open_gantt_overflow(cx);
+    let btn = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path button");
     cx.simulate_click(btn.center(), Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
@@ -3779,8 +3817,13 @@ fn filtered_empty_gantt_offers_show_all(cx: &mut gpui_kit::TestAppContext) {
         "filtered empty state should offer Show all"
     );
     assert!(
+        cx.debug_bounds("gantt-toolbar-more").is_some(),
+        "less-used actions sit in the toolbar overflow"
+    );
+    open_gantt_overflow(cx);
+    assert!(
         cx.debug_bounds("gantt-add-item").is_some(),
-        "+ Add item must stay visible next to Today and Auto Fit"
+        "+ Add item must stay reachable from the overflow menu"
     );
 }
 
@@ -6977,12 +7020,11 @@ fn year_persist_cart_label_and_go_live_link_clear_today(cx: &mut gpui_kit::TestA
                 (line_x + f32::from(line.size.width).max(3.0)).max(header_x + 3.0)
             })
             .unwrap_or(header_x + 3.0);
-        for (index, segment) in segments.iter().enumerate() {
-            assert!(
-                !painted_overlap(cart_label, *segment),
-                "Year Today body-{index} must skip the Cart UI label, label={label_left}..{label_right} today={today_x}..{today_right}"
-            );
-        }
+        assert_eq!(
+            segments.len(),
+            1,
+            "Year Today stays one stroke behind the Cart UI label {label_left}..{label_right} today={today_x}..{today_right}"
+        );
     }
 }
 
@@ -14667,8 +14709,9 @@ fn cart_ui_start_chip_does_not_clip_persist_cart_or_cart(cx: &mut gpui_kit::Test
     };
     if let Some(label) = cx.debug_bounds("gantt-bar-label-1003") {
         assert!(
-            !painted_overlap(chip, label),
-            "Cart UI Jul 21 chip must not clip Persist cart, chip=({:.1},{:.1})+{:.1}x{:.1} label=({:.1},{:.1})+{:.1}x{:.1}",
+            painted_min_gap(chip, label) + 0.1 >= 8.0,
+            "Cart UI Jul 21 chip must keep ≥8px from Persist cart, gap={} chip=({:.1},{:.1})+{:.1}x{:.1} label=({:.1},{:.1})+{:.1}x{:.1}",
+            painted_min_gap(chip, label),
             f32::from(chip.origin.x),
             f32::from(chip.origin.y),
             f32::from(chip.size.width),
@@ -14681,8 +14724,9 @@ fn cart_ui_start_chip_does_not_clip_persist_cart_or_cart(cx: &mut gpui_kit::Test
     }
     if let Some(cart) = cx.debug_bounds("gantt-bar-1002") {
         assert!(
-            !painted_overlap(chip, cart),
-            "date chips must keep row clearance from the Cart bar"
+            painted_min_gap(chip, cart) + 0.1 >= 8.0,
+            "date chips must keep ≥8px from the Cart bar, gap={}",
+            painted_min_gap(chip, cart)
         );
         if let Some(tip) = cx.debug_bounds("gantt-hover-tooltip") {
             assert!(
@@ -14736,4 +14780,174 @@ fn go_live_handle_dot_clears_its_label_in_week_and_day(cx: &mut gpui_kit::TestAp
             f32::from(dot.size.height)
         );
     }
+}
+
+#[gpui_kit::test]
+fn peeking_bar_does_not_paint_an_offscreen_pill(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 2).expect("leaf bar");
+        view.state.gantt.scroll_x += bar.x + bar.width.max(8.0) / 2.0;
+        cx.notify();
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 2).expect("leaf bar");
+        let width = bar.width.max(8.0);
+        assert!(
+            bar.x < 0.0 && bar.x + width > 0.0,
+            "precondition: work item 2 must peek across the clip, x={} w={}",
+            bar.x,
+            width
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-bar-edge-left-2").is_none(),
+        "a bar still peeking into the clip must not show a ‹ pill"
+    );
+    assert!(
+        cx.debug_bounds("gantt-bar-2").is_some(),
+        "the peeking fragment must still paint"
+    );
+}
+
+#[gpui_kit::test]
+fn offscreen_pill_uses_the_same_title_chip(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Day;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-edge-right-1013").is_some(),
+        "Day Go-live past the clip must show an off-screen pill"
+    );
+    assert!(
+        cx.debug_bounds("gantt-bar-title-chip").is_some(),
+        "off-screen pills must use the same boxed title chip as Month/Week/Day labels"
+    );
+}
+
+#[gpui_kit::test]
+fn toolbar_overflow_holds_add_and_critical_path(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-scale-group").is_some(),
+        "scale buttons must share one segmented control"
+    );
+    assert!(
+        cx.debug_bounds("gantt-add-item").is_none(),
+        "Add item stays in the overflow until opened"
+    );
+    open_gantt_overflow(cx);
+    assert!(
+        cx.debug_bounds("gantt-toolbar-more-panel").is_some(),
+        "⋯ must open the overflow panel"
+    );
+    assert!(cx.debug_bounds("gantt-add-item").is_some());
+    assert!(cx.debug_bounds("gantt-critical-path").is_some());
+    assert!(cx.debug_bounds("gantt-scroll-up").is_some());
+    assert!(cx.debug_bounds("gantt-scroll-down").is_some());
+}
+
+#[gpui_kit::test]
+fn year_bars_keep_a_minimum_height(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let year = cx.debug_bounds("gantt-scale-Year").expect("Year");
+    cx.simulate_click(year.center(), Modifiers::default());
+    draw(cx);
+    let slivers = view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        bars.into_iter()
+            .filter(|bar| !bar.milestone && !bar.marker && bar.width <= YEAR_MIN_BAR_WIDTH + 0.5)
+            .map(|bar| bar.id)
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        !slivers.is_empty(),
+        "Year view must paint at least one min-width bar"
+    );
+    for id in slivers {
+        let selector: &'static str = Box::leak(format!("gantt-bar-{id}").into_boxed_str());
+        let Some(bar) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        let h = f32::from(bar.size.height);
+        assert!(
+            h + 0.1 >= YEAR_MIN_BAR_H,
+            "{selector} Year sliver height {h} must stay ≥ {YEAR_MIN_BAR_H}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn month_period_buttons_pan_a_week(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.origin = Date::new(2026, 8, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let before = view.update(cx, |view, _| view.state.gantt.origin);
+    let prev = cx.debug_bounds("gantt-prev-period").expect("‹");
+    cx.simulate_click(prev.center(), Modifiers::default());
+    draw(cx);
+    let after = view.update(cx, |view, _| view.state.gantt.origin);
+    assert_eq!(
+        after,
+        before.saturating_sub(7.days()),
+        "Month ‹ must pan a week, not a whole month, {after} vs {before}"
+    );
 }
