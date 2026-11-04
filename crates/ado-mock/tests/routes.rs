@@ -166,7 +166,10 @@ async fn snapshots_each_route() {
             { "id": 1012 },
             { "id": 1013 },
             { "id": 1014 },
-            { "id": 1020 }
+            { "id": 1020 },
+            { "id": 2001 },
+            { "id": 2002 },
+            { "id": 2003 }
         ])
     );
 
@@ -181,6 +184,7 @@ async fn snapshots_each_route() {
     assert!(names.contains(&"Platform"));
     assert!(names.contains(&"Growth"));
     assert!(names.contains(&"Empty"));
+    assert!(names.contains(&"Amego"));
 
     let (status, body) = get(
         &client,
@@ -202,6 +206,36 @@ async fn snapshots_each_route() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(body["workItems"], json!([]));
+
+    let (status, body) = get(
+        &client,
+        url,
+        "/contoso/Shop/Amego/_apis/work/teamsettings/teamfieldvalues",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, fixtures("team-field-values.json")["Amego"]);
+
+    let (status, body) = post(
+        &client,
+        url,
+        "/contoso/Shop/_apis/wit/wiql",
+        json!({
+            "query": "SELECT [System.Id] FROM WorkItems WHERE [System.AreaPath] UNDER 'Shop\\Amego'"
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let amego_ids: Vec<i64> = body["workItems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_i64))
+        .collect();
+    assert!(
+        amego_ids.contains(&2001) && amego_ids.contains(&2002) && amego_ids.contains(&2003),
+        "Amego WIQL must return the all-unscheduled team, got {amego_ids:?}"
+    );
 
     let (status, body) = get(
         &client,

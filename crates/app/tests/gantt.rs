@@ -1260,6 +1260,52 @@ async fn growth_team_loads_its_epic_and_empty_team_has_no_items() {
 }
 
 #[tokio::test]
+async fn amego_team_is_all_unscheduled() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state
+        .set_team("Amego".into())
+        .await
+        .expect("switch to Amego");
+    let nodes = state.visible_nodes();
+    assert!(
+        !nodes.is_empty(),
+        "Amego must load unscheduled work items, got none"
+    );
+    assert!(
+        nodes
+            .iter()
+            .all(|node| node.start_date.is_none() && node.target_date.is_none()),
+        "every Amego item must be unscheduled, got {:?}",
+        nodes
+            .iter()
+            .map(|node| (node.id, node.start_date.clone(), node.target_date.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        nodes.iter().any(|node| node
+            .assigned_to
+            .as_ref()
+            .is_some_and(|identity| identity.display_name == "Kevin Mccloskey")),
+        "Amego must include Kevin Mccloskey"
+    );
+    assert!(
+        GanttView::scheduled_span(&nodes, &state.iterations).is_none(),
+        "Auto fit must have nothing to span on Amego"
+    );
+    let gantt = GanttView {
+        origin: Date::new(2026, 11, 2).unwrap(),
+        timeline_width: 800.0,
+        ..Default::default()
+    };
+    let rows = gantt.flatten(&nodes);
+    let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+    assert!(
+        gantt.layout_dependency_arrows(&bars).is_empty(),
+        "undated predecessor links must not paint connectors"
+    );
+}
+
+#[tokio::test]
 async fn switching_to_growth_keeps_the_camera() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.timeline_width = 800.0;

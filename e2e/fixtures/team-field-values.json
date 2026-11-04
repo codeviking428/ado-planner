@@ -8,6 +8,9 @@
   "Empty": {
     "values": [{ "value": "Shop\\Empty", "includeChildren": true }]
   },
+  "Amego": {
+    "values": [{ "value": "Shop\\Amego", "includeChildren": true }]
+  },
   "Delivery": {
     "values": [{ "value": "Roadmap\\Delivery", "includeChildren": true }]
   }

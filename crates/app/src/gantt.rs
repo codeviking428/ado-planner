@@ -40,6 +40,9 @@ pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// ~6px starts a link, not a resize (wide bars) or a no-op Move (slivers).
 /// Kept at 6 so the 8px end-resize grip stays a full 6–8px unique zone.
 pub const LINK_HANDLE_INSET: f32 = 6.0;
+/// Floor for the Move body when a short bar still resizes. 1px was
+/// covered by the occluding grips and unhittable on 16–24px slivers.
+const MIN_MOVE_ZONE: f32 = 4.0;
 /// Parallel dependency lanes stay at least this far apart (stroke is 2px).
 pub const PARALLEL_LANE_MIN: f32 = 10.0;
 /// Inbound/wrap verticals. 16px centre-to-centre so the 2px stroke still
@@ -96,7 +99,8 @@ pub const NO_FIELDS_HINT_W: f32 = 88.0;
 pub const DETAILS_PILL_WIDTH: f32 = 36.0;
 pub const ID_COL_WIDTH: f32 = 64.0;
 pub const TYPE_COL_WIDTH: f32 = 88.0;
-pub const ASSIGNEE_COL_WIDTH: f32 = 88.0;
+/// Wide enough for "Kevin Mccloskey" at text-xs without clipping to "Kevin Mc…".
+pub const ASSIGNEE_COL_WIDTH: f32 = 128.0;
 pub const EXPANDER_SLOT: f32 = 18.0;
 pub const TODAY_PILL_W: f32 = 44.0;
 pub const TODAY_PILL_GAP: f32 = 6.0;
@@ -442,11 +446,10 @@ impl BarLayout {
             && !self.milestone
             && !self.marker
             && !self.open_ended
-            // Strictly wider than two grips so a YEAR_MIN_BAR_WIDTH (16px)
-            // bar keeps a Move body. `>= 16` would cover the whole bar.
-            // Parents with their own dates resize too; rollup-only bars
-            // (unscheduled / no-fields) never reach this path.
-            && self.width > HANDLE_WIDTH * 2.0
+            // 16–24px Year/Quarter slivers stay all-Move. Two 8px grips plus
+            // a 6px link sliver leave no hittable body on that width.
+            // Parents with their own dates resize once they clear 24px.
+            && self.width > HANDLE_WIDTH * 2.0 + LINK_HANDLE_INSET + 2.0
     }
 
     /// Dated bar whose last pixels start a link. Wide bars keep an inner
@@ -479,11 +482,10 @@ impl BarLayout {
             return (0.0, 0.0, 0.0);
         }
         let preferred = HANDLE_WIDTH * 2.0 + LINK_HANDLE_INSET;
-        let min_move = 1.0;
-        if width >= preferred + min_move {
+        if width >= preferred + MIN_MOVE_ZONE {
             return (HANDLE_WIDTH, HANDLE_WIDTH, LINK_HANDLE_INSET);
         }
-        let available = (width - min_move).max(3.0);
+        let available = (width - MIN_MOVE_ZONE).max(3.0);
         let scale = available / preferred;
         (
             (HANDLE_WIDTH * scale).max(1.0),
@@ -2010,16 +2012,12 @@ impl GanttView {
     }
 
     /// Year ticks are months on the row *below* the Today pill. Thin every
-    /// other month from the first painted tick so leftover Jul yields
-    /// Jul, Sep, Nov, Jan, Mar — not calendar-odd names that skip Jan.
-    /// Day/Week ticks sit on that same lower row (pill at y=2, ticks at
-    /// y=22), so they keep their column x. Shifting the Today number used
-    /// to hide Day "4" and shove "3".
-    pub fn header_tick_labels_except(
-        &self,
-        width: f32,
-        _hide_x: Option<f32>,
-    ) -> Vec<(f32, String)> {
+    /// other month from a phase that keeps January so leftover Feb does
+    /// not yield Feb, Apr, Jun… with no Jan.
+    /// Day ticks sit on that same lower row (pill at y=2, ticks at y=22)
+    /// and keep their column x. Week labels are `"Nov 2"` (~43px) at 24px
+    /// per day, so they skip a tick that would sit on the Today line.
+    pub fn header_tick_labels_except(&self, width: f32, hide_x: Option<f32>) -> Vec<(f32, String)> {
         let mut ticks: Vec<(f32, String)> = self
             .timeline_ticks(width)
             .into_iter()
@@ -2044,7 +2042,13 @@ impl GanttView {
             min_gap,
             true,
         );
-        Self::fit_labels_to_width(labels, width)
+        let labels = Self::fit_labels_to_width(labels, width);
+        if matches!(self.scale, GanttScale::Week)
+            && let Some(today) = hide_x
+        {
+            return dodge_week_ticks_off_today(labels, today);
+        }
+        labels
     }
 
     fn fit_labels_to_width(mut labels: Vec<(f32, String)>, width: f32) -> Vec<(f32, String)> {
@@ -2139,9 +2143,12 @@ impl GanttView {
         out
     }
 
-    /// Fit every laid-out bar into `width` pixels, matching monday.com Auto Fit.
-    pub fn auto_fit(&mut self, nodes: &[WorkItemNode], iterations: &[IterationNode], width: f32) {
-        self.keep_today = false;
+    /// Earliest/latest dates Auto Fit would use, or `None` when every item
+    /// is unscheduled / has no fields. The toolbar disables itself then.
+    pub fn scheduled_span(
+        nodes: &[WorkItemNode],
+        iterations: &[IterationNode],
+    ) -> Option<(Date, Date)> {
         let mut earliest: Option<Date> = None;
         let mut latest: Option<Date> = None;
         for node in nodes {
@@ -2167,15 +2174,21 @@ impl GanttView {
                 });
             }
         }
+        let earliest = earliest?;
+        Some((earliest, latest.unwrap_or(earliest)))
+    }
+
+    /// Fit every laid-out bar into `width` pixels, matching monday.com Auto Fit.
+    pub fn auto_fit(&mut self, nodes: &[WorkItemNode], iterations: &[IterationNode], width: f32) {
+        self.keep_today = false;
         let today = jiff::Zoned::now().date();
-        let Some(earliest) = earliest else {
+        let Some((earliest, end)) = Self::scheduled_span(nodes, iterations) else {
             self.go_today(today);
             self.zoom = 1.0;
             return;
         };
         // Fit the item span only. Pulling Today into a July cluster in November
         // squeezed bars into slivers against the left edge.
-        let end = latest.unwrap_or(earliest);
         self.origin = earliest.saturating_sub(2.days());
         self.scroll_x = 0.0;
         let days = end
@@ -2314,6 +2327,11 @@ impl GanttView {
                 let Some(pred) = by_id.get(pred_id) else {
                     continue;
                 };
+                // Gutter pills have no dates. A connector from/to "No dates"
+                // looks scheduled and stacks on the left-edge hint.
+                if bar_is_gutter(pred) || bar_is_gutter(bar) {
+                    continue;
+                }
                 // Both ends past the clip would clamp to one edge and paint a
                 // stray vertical stub. Edge chevrons already mark those rows.
                 if bar_offscreen_edge(pred, timeline_w).is_some()
@@ -3492,23 +3510,44 @@ pub(crate) fn today_pill_left(today_x: f32, width: f32) -> f32 {
     }
 }
 
-/// Keep every other Year month, phased from the leftover (last x≤0) tick so
-/// leftover Jul yields Jul, Sep, Nov, Jan, Mar. Thinning before sticky
-/// means the next kept month is two months out and the leftover is not
-/// dropped for sitting on the skipped in-view month.
+/// Keep every other Year month. Prefer a phase that keeps January so
+/// leftover Feb (go-today in November) does not paint Feb, Apr, Jun with
+/// no Jan. Leftover Jul still yields Jul, Sep, Nov, Jan, Mar because Jul
+/// and Jan share parity. Thinning before sticky means the next kept month
+/// is two months out and the leftover is not dropped for sitting on the
+/// skipped in-view month.
 fn thin_year_month_labels(labels: Vec<(f32, String)>) -> Vec<(f32, String)> {
-    let phase = labels
+    let leftover_phase = labels
         .iter()
         .enumerate()
         .rev()
         .find(|(_, (x, _))| *x <= 0.0)
         .map(|(index, _)| index)
         .unwrap_or(0);
+    let jan_phase = labels
+        .iter()
+        .enumerate()
+        .find(|(_, (_, label))| label == "Jan")
+        .map(|(index, _)| index);
+    let phase = jan_phase.unwrap_or(leftover_phase);
     labels
         .into_iter()
         .enumerate()
         .filter(|(index, _)| index % 2 == phase % 2)
         .map(|(_, item)| item)
+        .collect()
+}
+
+/// Week `"Nov 2"` labels are ~43px at 24px/day, so a Monday tick sits on
+/// Tuesday's Today line. Drop ticks whose text box crosses the stroke.
+fn dodge_week_ticks_off_today(labels: Vec<(f32, String)>, today_x: f32) -> Vec<(f32, String)> {
+    const LINE_PAD: f32 = 6.0;
+    labels
+        .into_iter()
+        .filter(|(x, label)| {
+            let right = *x + header_label_px(label);
+            right < today_x - LINE_PAD || *x > today_x + LINE_PAD
+        })
         .collect()
 }
 
@@ -3935,7 +3974,11 @@ pub fn bar_title_is_inside(bar: &BarLayout) -> bool {
     } else {
         0.0
     };
-    let inner = (visible_w - grip * 2.0 - h_pad - cue).max(0.0);
+    // Paint insets the inner label by the end-link sliver (`right(grip +
+    // resize_end_link_inset)`). Ignore that and a title that "fits" is
+    // clipped by the last 6px.
+    let link_inset = bar.resize_end_link_inset();
+    let inner = (visible_w - grip * 2.0 - h_pad - cue - link_inset).max(0.0);
     if inner < BAR_LABEL_INSIDE_MIN {
         // Short Quarter/Year slivers ("Cart", "Checkout rewrite") must not
         // clip to "Ur" / "ut rewrite" inside the bar.
@@ -5177,6 +5220,33 @@ mod tests {
     }
 
     #[test]
+    fn undated_dependency_does_not_draw_a_connector() {
+        let mut pred = node(1, None);
+        pred.start_date = None;
+        pred.target_date = None;
+        let mut succ = node(2, None);
+        succ.start_date = None;
+        succ.target_date = None;
+        succ.predecessors = vec![1];
+        let gantt = GanttView {
+            origin: Date::new(2026, 11, 2).unwrap(),
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&[pred.clone(), succ.clone()]);
+        let bars = gantt.layout_bars(&[pred, succ], &rows, &[], 720.0);
+        assert!(
+            bars.iter().all(bar_is_gutter),
+            "precondition: both ends must be gutter pills, got {bars:?}"
+        );
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert!(
+            arrows.is_empty(),
+            "a predecessor with no dates must not paint a connector, got {arrows:?}"
+        );
+    }
+
+    #[test]
     fn bar_offscreen_edge_flags_fully_outside_bars() {
         let on_screen = BarLayout {
             id: 2,
@@ -5539,28 +5609,74 @@ mod tests {
             bar.hit_zone_at_window_x(bar.x + bar.width / 2.0, bar.x, right),
             BarHitZone::Move
         );
-        let tight = BarLayout { width: 20.0, ..bar };
-        let (start, end, link) = tight.edge_zones();
+        for width in [16.0, 20.0, 24.0] {
+            let short = BarLayout {
+                width,
+                ..bar.clone()
+            };
+            assert!(
+                !short.can_resize(),
+                "{width}px must stay all-Move so grips cannot eat the body"
+            );
+            let right = short.x + width;
+            assert_eq!(
+                short.hit_zone_at_window_x(short.x + width / 2.0, short.x, right),
+                BarHitZone::Move,
+                "{width}px center must move"
+            );
+        }
+        let resizable = BarLayout { width: 32.0, ..bar };
+        assert!(resizable.can_resize(), "25px+ dated bars still resize");
+        let (start, end, link) = resizable.edge_zones();
         assert!(
             start >= 1.0 && end >= 1.0 && link >= 1.0,
-            "a 20px bar must keep all three zones, got start={start} end={end} link={link}"
+            "a 32px bar must keep all three zones, got start={start} end={end} link={link}"
         );
         assert!(
-            start + end + link < tight.width,
-            "short-bar zones must leave a Move body, start={start} end={end} link={link}"
+            start + end + link + 3.5 < resizable.width,
+            "short-bar zones must leave a hittable Move body, start={start} end={end} link={link}"
         );
-        let right = tight.x + tight.width;
+        let right = resizable.x + resizable.width;
         assert_eq!(
-            tight.hit_zone_at_window_x(right - link / 2.0, tight.x, right),
+            resizable.hit_zone_at_window_x(right - link / 2.0, resizable.x, right),
             BarHitZone::Link
         );
         assert_eq!(
-            tight.hit_zone_at_window_x(right - link - end / 2.0, tight.x, right),
+            resizable.hit_zone_at_window_x(right - link - end / 2.0, resizable.x, right),
             BarHitZone::ResizeEnd
         );
         assert_eq!(
-            tight.hit_zone_at_window_x(tight.x + start + 0.5, tight.x, right),
+            resizable.hit_zone_at_window_x(resizable.x + start + 0.5, resizable.x, right),
             BarHitZone::Move
+        );
+    }
+
+    #[test]
+    fn bar_title_fit_subtracts_the_end_link_inset() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 100.0,
+            width: 100.0,
+            y: 0.0,
+            summary: false,
+            milestone: false,
+            label: "Cart".into(),
+            title: "Cart".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        assert!(bar.can_resize());
+        assert!(bar.resize_end_link_inset() > 0.0);
+        // 100 - 2*8 grip - 8 pad = 76, which clears BAR_LABEL_INSIDE_MIN.
+        // Paint also insets the last 6px link sliver, so the true inner is 70.
+        assert!(
+            !bar_title_is_inside(&bar),
+            "title fit must count the 6px link inset, not claim Cart fits in 70px"
         );
     }
 
@@ -8750,6 +8866,42 @@ mod tests {
     }
 
     #[test]
+    fn week_tick_does_not_sit_on_the_today_line() {
+        let monday = Date::new(2026, 11, 2).unwrap();
+        let mut gantt = GanttView {
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.go_today(monday);
+        let today_x = gantt.today_x(monday);
+        let labels = gantt.header_tick_labels_except(800.0, Some(today_x));
+        for (x, label) in &labels {
+            let right = *x + header_label_px(label);
+            assert!(
+                right < today_x - 5.0 || *x > today_x + 5.0,
+                "Week tick {label:?} at {x}..{right} must miss Today at {today_x}, labels={labels:?}"
+            );
+        }
+        let tuesday = Date::new(2026, 11, 3).unwrap();
+        gantt.go_today(tuesday);
+        let today_x = gantt.today_x(tuesday);
+        let labels = gantt.header_tick_labels_except(800.0, Some(today_x));
+        assert!(
+            labels.iter().all(|(_, label)| label != "Nov 2"),
+            "Monday 'Nov 2' must not collide with Tuesday's Today line, got {labels:?}"
+        );
+        for (x, label) in &labels {
+            let right = *x + header_label_px(label);
+            assert!(
+                right < today_x - 5.0 || *x > today_x + 5.0,
+                "Week tick {label:?} at {x}..{right} must miss Today at {today_x}, labels={labels:?}"
+            );
+        }
+    }
+
+    #[test]
     fn week_tick_labels_stay_inside_the_timeline() {
         let gantt = GanttView {
             origin: Date::new(2026, 10, 12).unwrap(),
@@ -10436,6 +10588,16 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_span_ignores_unscheduled_items() {
+        let mut item = node(1, None);
+        item.start_date = None;
+        item.target_date = None;
+        assert!(GanttView::scheduled_span(std::slice::from_ref(&item), &[]).is_none());
+        let dated = node(2, None);
+        assert!(GanttView::scheduled_span(std::slice::from_ref(&dated), &[]).is_some());
+    }
+
+    #[test]
     fn unscheduled_bars_count_as_an_empty_timeline() {
         let mut dated = node(1, None);
         dated.start_date = None;
@@ -10862,6 +11024,25 @@ mod tests {
                 "Year ticks must keep Jan two months after Nov, got {ticks:?}"
             );
         }
+    }
+
+    #[test]
+    fn year_go_today_in_november_keeps_january() {
+        let today = Date::new(2026, 11, 2).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.go_today(today);
+        let ticks = gantt.header_tick_labels(800.0);
+        let names: Vec<&str> = ticks.iter().map(|(_, label)| label.as_str()).collect();
+        assert!(
+            names.contains(&"Jan"),
+            "Year axis centered on Nov must still paint January, got {names:?}"
+        );
     }
 
     #[test]

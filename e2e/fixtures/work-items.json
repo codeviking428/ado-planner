@@ -125,5 +125,58 @@
       "Microsoft.VSTS.Scheduling.StartDate": "2026-08-01T00:00:00Z",
       "Microsoft.VSTS.Scheduling.TargetDate": "2026-09-15T00:00:00Z"
     }
+  },
+  {
+    "id": 2001,
+    "rev": 1,
+    "fields": {
+      "System.Title": "Amego backlog",
+      "System.WorkItemType": "Epic",
+      "System.State": "New",
+      "System.AssignedTo": {
+        "displayName": "Kevin Mccloskey",
+        "uniqueName": "kevin@contoso.com"
+      },
+      "System.AreaPath": "Shop\\Amego",
+      "System.IterationPath": "Shop\\FY26"
+    }
+  },
+  {
+    "id": 2002,
+    "rev": 1,
+    "fields": {
+      "System.Title": "Stakeholder review",
+      "System.WorkItemType": "Feature",
+      "System.State": "New",
+      "System.Parent": 2001,
+      "System.AssignedTo": {
+        "displayName": "Kevin Mccloskey",
+        "uniqueName": "kevin@contoso.com"
+      },
+      "System.AreaPath": "Shop\\Amego",
+      "System.IterationPath": "Shop\\FY26"
+    }
+  },
+  {
+    "id": 2003,
+    "rev": 1,
+    "fields": {
+      "System.Title": "Onboard tenant",
+      "System.WorkItemType": "User Story",
+      "System.State": "New",
+      "System.Parent": 2002,
+      "System.AssignedTo": {
+        "displayName": "Kevin Mccloskey",
+        "uniqueName": "kevin@contoso.com"
+      },
+      "System.AreaPath": "Shop\\Amego",
+      "System.IterationPath": "Shop\\FY26"
+    },
+    "relations": [
+      {
+        "rel": "System.LinkTypes.Dependency-Reverse",
+        "url": "https://dev.azure.com/contoso/Shop/_apis/wit/workItems/2002"
+      }
+    ]
   }
 ]

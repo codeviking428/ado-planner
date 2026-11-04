@@ -139,6 +139,9 @@ pub struct PlannerView {
     inline_enter_guard: bool,
     dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
+    /// Click/scroll/scale dismissed the "No scheduled dates" chip. Reset
+    /// when switching teams so a new empty backlog shows the hint again.
+    empty_timeline_hint_dismissed: bool,
     form_loading: Option<(i64, String)>,
     io_busy: bool,
     saving_shown_at: Option<Instant>,
@@ -444,6 +447,7 @@ impl PlannerView {
             inline_enter_guard: false,
             dates_anchor: None,
             banner_dismissed: false,
+            empty_timeline_hint_dismissed: false,
             form_loading: None,
             io_busy: false,
             saving_shown_at: None,
@@ -1237,6 +1241,7 @@ impl PlannerView {
         self.pending_delete = None;
         self.state.gantt.context_menu = None;
         self.state.gantt.selected_link = None;
+        self.empty_timeline_hint_dismissed = true;
     }
 
     /// Undo/redo remounts bars under a still pointer. Drop the dates chip
@@ -2173,6 +2178,7 @@ impl PlannerView {
         // invert so the content moves the same way as the wheel.
         let dy = -f32::from(delta.y);
         let dx = -f32::from(delta.x);
+        self.empty_timeline_hint_dismissed = true;
         let rows = self.state.visible_rows().len();
         let viewport_h = self.state.gantt.viewport_h;
         if mods.control || mods.platform {
@@ -2568,6 +2574,7 @@ impl PlannerView {
         self.state.begin_team_switch(team.clone());
         self.loading_shown_at = Some(std::time::Instant::now());
         self.banner_dismissed = false;
+        self.empty_timeline_hint_dismissed = false;
         self.spawn_state(cx, move |mut state| async move {
             let result = state.set_team(team).await;
             (state, result)
@@ -3113,7 +3120,10 @@ impl PlannerView {
                             })),
                     ),
             )
-            .child(
+            .child({
+                let nodes = self.state.visible_nodes();
+                let can_auto_fit =
+                    GanttView::scheduled_span(&nodes, &self.state.iterations).is_some();
                 div()
                     .id("gantt-auto-fit")
                     .debug_selector(|| "gantt-auto-fit".into())
@@ -3121,11 +3131,19 @@ impl PlannerView {
                         Button::new("auto-fit")
                             .primary()
                             .label("Auto fit")
-                            .tooltip("Fit scheduled items into the visible timeline.")
+                            .disabled(!can_auto_fit)
+                            .tooltip(if can_auto_fit {
+                                "Fit scheduled items into the visible timeline."
+                            } else {
+                                "No scheduled dates to fit."
+                            })
                             .tooltip_placement(Placement::Bottom)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let nodes = this.state.visible_nodes();
                                 let iterations = this.state.iterations.clone();
+                                if GanttView::scheduled_span(&nodes, &iterations).is_none() {
+                                    return;
+                                }
                                 let width = this.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
                                 this.animate_gantt(cx, |gantt| {
                                     gantt.retarget_year_gutter(|gantt| {
@@ -3134,8 +3152,8 @@ impl PlannerView {
                                 });
                                 cx.notify();
                             })),
-                    ),
-            )
+                    )
+            })
             .child(
                 Button::new("prev-period")
                     .ghost()
@@ -3860,7 +3878,7 @@ impl PlannerView {
             return div()
                 .id(("inline-assignee-wrap", id as u64))
                 .debug_selector(|| "gantt-inline-assignee".into())
-                .w(px(120.))
+                .w(px(ASSIGNEE_COL_WIDTH))
                 .flex_shrink_0()
                 .child(Input::new(&self.inline_input).id(("inline-assignee", id as u64)))
                 .into_any_element();
@@ -3869,6 +3887,7 @@ impl PlannerView {
         let tip = assigned_owned.clone();
         div()
             .id(("assignee", id as u64))
+            .debug_selector(move || format!("gantt-assignee-{id}"))
             .w(px(ASSIGNEE_COL_WIDTH))
             .flex_shrink_0()
             .truncate()
@@ -4662,17 +4681,16 @@ impl PlannerView {
                     .when(
                         timeline_is_empty_of_scheduled(bars)
                             && !self.state.nodes.is_empty()
-                            && !self.state.filters_hide_work_items(),
+                            && !self.state.filters_hide_work_items()
+                            && !self.empty_timeline_hint_dismissed,
                         |el| {
                         el.child(
                             div()
                                 .absolute()
                                 .left(px(NO_FIELDS_HINT_W + 36.0))
                                 .right_0()
-                                .top(px(TIMELINE_HEADER_H))
-                                .bottom_0()
+                                .top(px(TIMELINE_HEADER_H + 12.0))
                                 .flex()
-                                .items_center()
                                 .justify_center()
                                 .px_6()
                                 .child(
@@ -4684,9 +4702,22 @@ impl PlannerView {
                                         .py_2()
                                         .rounded_md()
                                         .bg(cx.theme().background)
-                                        .occlude()
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .cursor(CursorStyle::PointingHand)
                                         .text_sm()
                                         .text_color(header_fg)
+                                        .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                                            this.empty_timeline_hint_dismissed = true;
+                                            this.apply_scroll(event, cx);
+                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.empty_timeline_hint_dismissed = true;
+                                                cx.notify();
+                                            }),
+                                        )
                                         .child(
                                             "No scheduled dates. Drag a work item onto the timeline to set Start and Target.",
                                         ),
@@ -5467,6 +5498,9 @@ impl PlannerView {
                 .occlude()
                 .bg(gpui_kit::hsla(0., 0., 0., 0.01))
                 .cursor(CursorStyle::DragLink)
+                .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                    this.apply_scroll(event, cx);
+                }))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_bar_hovered(Some(id), cx);

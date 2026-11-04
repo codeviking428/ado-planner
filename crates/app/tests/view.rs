@@ -3,11 +3,11 @@
 use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
-    BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
-    LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP,
-    PARALLEL_LANE_MIN, PARALLEL_VERT_MIN, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
-    UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px,
-    insert_index_for_child, outside_label_is_beside_bar,
+    ASSIGNEE_COL_WIDTH, BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind,
+    HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE,
+    MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN, ROW_HEIGHT,
+    TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
+    bar_title_is_inside, bar_title_paint_px, insert_index_for_child, outside_label_is_beside_bar,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -981,6 +981,171 @@ fn unscheduled_only_grid_paints_today_markers(cx: &mut gpui_kit::TestAppContext)
         cx.debug_bounds("unscheduled-empty-hint").is_some(),
         "an all-unscheduled grid must still hint that the timeline is empty"
     );
+}
+
+fn amego_unscheduled_state(dir: &tempfile::TempDir) -> PlannerState {
+    let mut state = idle_state(dir);
+    state.prefs.planner.team = "Amego".into();
+    let kevin = IdentityValue {
+        display_name: "Kevin Mccloskey".into(),
+        unique_name: "kevin@contoso.com".into(),
+        id: Some("k2".into()),
+    };
+    fn undated(
+        id: i64,
+        parent: Option<i64>,
+        ty: &str,
+        title: &str,
+        kevin: &IdentityValue,
+    ) -> WorkItemNode {
+        WorkItemNode {
+            id,
+            rev: 1,
+            title: title.into(),
+            work_item_type: ty.into(),
+            state: "New".into(),
+            assigned_to: Some(kevin.clone()),
+            parent_id: parent,
+            area_path: "Shop\\Amego".into(),
+            iteration_path: "Shop\\FY26".into(),
+            start_date: None,
+            target_date: None,
+            has_date_fields: true,
+            predecessors: Vec::new(),
+            fields: serde_json::Map::new(),
+        }
+    }
+    let mut onboard = undated(2003, Some(2002), "User Story", "Onboard tenant", &kevin);
+    onboard.predecessors = vec![2002];
+    state.nodes = vec![
+        undated(2001, None, "Epic", "Amego backlog", &kevin),
+        undated(2002, Some(2001), "Feature", "Stakeholder review", &kevin),
+        onboard,
+    ];
+    state
+}
+
+#[gpui_kit::test]
+fn unscheduled_empty_hint_dismisses_on_click(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = amego_unscheduled_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let hint = cx
+        .debug_bounds("unscheduled-empty-hint")
+        .expect("all-unscheduled Amego must show the empty-timeline hint");
+    cx.simulate_click(hint.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "clicking the hint must dismiss it so it cannot stay pinned"
+    );
+}
+
+#[gpui_kit::test]
+fn unscheduled_empty_hint_dismisses_on_scroll(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = amego_unscheduled_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("unscheduled-empty-hint").is_some());
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    cx.simulate_event(ScrollEvent {
+        position: timeline.center(),
+        delta: ScrollDelta::Pixels(point(px(80.), px(0.))),
+        ..Default::default()
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "scrolling the timeline must dismiss the empty hint"
+    );
+}
+
+#[gpui_kit::test]
+fn auto_fit_is_disabled_when_nothing_is_scheduled(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = amego_unscheduled_state(&dir);
+    let origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.origin = origin;
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit button");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.origin, origin,
+            "Auto fit must not jump to Today when every item is unscheduled"
+        );
+        assert_eq!(view.state.gantt.scale, GanttScale::Month);
+        assert!(
+            GanttView::scheduled_span(&view.state.visible_nodes(), &view.state.iterations)
+                .is_none()
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn assignee_column_fits_kevin_mccloskey(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = amego_unscheduled_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let cell = cx
+        .debug_bounds("gantt-assignee-2001")
+        .expect("Amego assignee cell");
+    assert!(
+        f32::from(cell.size.width) + 0.5 >= ASSIGNEE_COL_WIDTH,
+        "assignee column must be wide enough for Kevin Mccloskey, got {:?}",
+        cell.size.width
+    );
+}
+
+#[gpui_kit::test]
+fn amego_unscheduled_team_paints_no_dependency_connectors(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = amego_unscheduled_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let nodes = view.state.visible_nodes();
+        let rows = view.state.gantt.flatten(&nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&nodes, &rows, &view.state.iterations, 720.0);
+        assert!(
+            view.state.gantt.layout_dependency_arrows(&bars).is_empty(),
+            "Amego's undated predecessor link must not draw a connector"
+        );
+    });
 }
 
 #[gpui_kit::test]
@@ -4408,6 +4573,39 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn inset_link_sliver_forwards_wheel_pan(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let sliver = cx
+        .debug_bounds("gantt-link-handle-1003-link-end-inset")
+        .expect("Persist cart inset sliver");
+    let before = view.update(cx, |view, _| view.state.gantt.scroll_x);
+    cx.simulate_event(ScrollEvent {
+        position: sliver.center(),
+        delta: ScrollDelta::Pixels(point(px(120.), px(0.))),
+        ..Default::default()
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_ne!(
+            view.state.gantt.scroll_x, before,
+            "wheel over the inner link sliver must pan the timeline, not drop the event"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn quarter_today_stays_continuous_across_go_live_and_spike(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -4656,8 +4854,8 @@ fn clicking_a_tree_row_clears_link_selection(cx: &mut gpui_kit::TestAppContext) 
         height: px(800.),
     });
     draw(cx);
-    let row = cx.debug_bounds("gantt-tree-row-1").expect("tree row");
-    cx.simulate_click(row.center(), Modifiers::default());
+    let title = cx.debug_bounds("gantt-title-1").expect("tree title");
+    cx.simulate_click(title.center(), Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
         assert_eq!(view.state.gantt.selected_id, Some(1));

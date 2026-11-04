@@ -43,6 +43,17 @@
     ]
   },
   "Empty": { "value": [] },
+  "Amego": {
+    "value": [
+      {
+        "identity": {
+          "displayName": "Kevin Mccloskey",
+          "uniqueName": "kevin@contoso.com",
+          "id": "k2"
+        }
+      }
+    ]
+  },
   "Delivery": {
     "value": [
       {

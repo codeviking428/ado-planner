@@ -3,7 +3,8 @@
     "value": [
       { "id": "t1", "name": "Platform" },
       { "id": "t3", "name": "Growth" },
-      { "id": "t4", "name": "Empty" }
+      { "id": "t4", "name": "Empty" },
+      { "id": "t5", "name": "Amego" }
     ]
   },
   "Roadmap": { "value": [{ "id": "t2", "name": "Delivery" }] }
