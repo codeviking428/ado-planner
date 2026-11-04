@@ -1311,6 +1311,40 @@ impl PlannerState {
         {
             live.predecessors.push(predecessor_id);
         }
+        self.ensure_link_undo(successor_id, predecessor_id);
+    }
+
+    /// `adopt_spawned` replaces live history with a clone taken before the
+    /// drop. Re-record the undo entry and toast if that clone wiped them.
+    fn ensure_link_undo(&mut self, successor_id: i64, predecessor_id: i64) {
+        if !self.history_recording {
+            return;
+        }
+        let already = self.history.undo.iter().any(|entry| {
+            matches!(
+                entry,
+                HistoryEntry::Link {
+                    successor_id: succ,
+                    predecessor_id: pred,
+                    linked: true,
+                } if *succ == successor_id && *pred == predecessor_id
+            )
+        });
+        if already {
+            return;
+        }
+        self.record(HistoryEntry::Link {
+            successor_id,
+            predecessor_id,
+            linked: true,
+        });
+        self.toasts.push_undo(
+            self.link_changed_message("Added", predecessor_id, successor_id),
+            UndoAction::RemoveLink {
+                successor_id,
+                predecessor_id,
+            },
+        );
     }
 
     pub fn discard_last_link(&mut self, successor_id: i64, predecessor_id: i64) {

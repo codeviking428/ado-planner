@@ -2076,6 +2076,7 @@ impl PlannerView {
         }
         self.state.gantt.context_menu = None;
         self.clear_hover_after_history(cx);
+        self.dequeue_undone_link_save(&action);
         let original = self.state.history_action_message_for_undo(&action);
         let undid = undone_toast_message(&original);
         if matches!(
@@ -2211,6 +2212,7 @@ impl PlannerView {
             self.request_repaint(None, cx);
             return;
         }
+        self.dequeue_history_link_undo();
         self.skip_saving_hold = true;
         self.spawn_state(cx, |mut state| async move {
             let result = state.undo().await;
@@ -8530,6 +8532,32 @@ impl PlannerView {
         .detach();
     }
 
+    fn dequeue_link_save(&mut self, successor_id: i64, predecessor_id: i64) {
+        self.link_save_queue
+            .retain(|&(succ, pred)| succ != successor_id || pred != predecessor_id);
+    }
+
+    fn dequeue_undone_link_save(&mut self, action: &UndoAction) {
+        if let UndoAction::RemoveLink {
+            successor_id,
+            predecessor_id,
+        } = action
+        {
+            self.dequeue_link_save(*successor_id, *predecessor_id);
+        }
+    }
+
+    fn dequeue_history_link_undo(&mut self) {
+        if let Some(HistoryEntry::Link {
+            successor_id,
+            predecessor_id,
+            linked: true,
+        }) = self.state.history.undo.last()
+        {
+            self.dequeue_link_save(*successor_id, *predecessor_id);
+        }
+    }
+
     fn enqueue_link_save(
         &mut self,
         successor_id: i64,
@@ -8987,6 +9015,7 @@ impl PlannerView {
         self.skip_saving_hold = true;
         self.finish_or_hold_saving_status(cx);
         self.restore_queued_links();
+        self.replay_pending_toast_undo(cx);
         self.drain_link_saves(cx);
     }
 

@@ -5157,9 +5157,13 @@ fn busy_io_still_persists_an_optimistic_link(cx: &mut gpui_kit::TestAppContext) 
             1,
             "io_busy must queue the persist instead of dropping it"
         );
+        // adopt_spawned of a clone taken before the drop wipes nodes, history,
+        // and the Added-link toast. Restore must put all three back.
         if let Some(node) = view.state.nodes.iter_mut().find(|node| node.id == 1005) {
             node.predecessors.retain(|id| *id != 1003);
         }
+        view.state.history.undo.clear();
+        view.state.toasts.items.clear();
         view.complete_undo_io_for_test(cx);
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
@@ -5184,7 +5188,72 @@ fn busy_io_still_persists_an_optimistic_link(cx: &mut gpui_kit::TestAppContext) 
                 .is_some_and(|node| node.predecessors.contains(&1003)),
             "adopt_spawned of the in-flight clone must not wipe the queued link"
         );
+        assert!(
+            view.state.history.undo.iter().any(|entry| matches!(
+                entry,
+                HistoryEntry::Link {
+                    successor_id: 1005,
+                    predecessor_id: 1003,
+                    linked: true,
+                }
+            )),
+            "queued link must keep an undo entry after adopt_spawned"
+        );
+        let message = view.state.toasts.last_message().unwrap_or_default();
+        assert!(
+            message.starts_with("Added link:"),
+            "queued link must keep its undo toast after adopt_spawned, got {message:?}"
+        );
     });
+}
+
+#[gpui_kit::test]
+fn undoing_a_queued_link_does_not_persist_later(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, mut state, _dir) = signed_in_with_mock();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.viewport_h = 720.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.set_busy_for_test(true);
+        assert!(view.state.apply_link_now(1005, 1003));
+        view.enqueue_link_save_for_test(1005, 1003, cx);
+        assert_eq!(view.link_save_queue_len_for_test(), 1);
+        let toast_id = view.state.toasts.items.last().expect("Added link toast").id;
+        view.apply_toast_undo(
+            toast_id,
+            UndoAction::RemoveLink {
+                successor_id: 1005,
+                predecessor_id: 1003,
+            },
+            cx,
+        );
+        assert_eq!(
+            view.link_save_queue_len_for_test(),
+            0,
+            "toast Undo must dequeue the persist so a later drain cannot PATCH"
+        );
+        view.complete_undo_io_for_test(cx);
+    });
+    let deadline = std::time::Instant::now() + Duration::from_millis(800);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        if mock_has_predecessor(&runtime, &mock, 1005, 1003) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !mock_has_predecessor(&runtime, &mock, 1005, 1003),
+        "Undo of a queued link must not PATCH it after I/O frees"
+    );
 }
 
 #[gpui_kit::test]
