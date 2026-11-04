@@ -1,7 +1,7 @@
 use ado_core::UpdaterPrompt;
 
 const DEFAULT_ENDPOINT: &str =
-    "https://github.com/codeviking428/ado-planner/releases/download/rust-latest/latest.json";
+    "https://github.com/codeviking428/ado-planner/releases/latest/download/latest.json";
 
 const COMPILED_PUBKEY: &str = match option_env!("ADO_PLANNER_UPDATER_PUBKEY") {
     Some(value) => value,

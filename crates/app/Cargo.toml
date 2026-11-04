@@ -54,15 +54,12 @@ before-packaging-command = "cargo build --release -p ado-planner"
 formats = ["nsis", "appimage", "dmg"]
 out-dir = "../../release/rust"
 binaries = [{ path = "ado-planner", main = true }]
+icons = ["../../build/icon.png", "../../build/icon.ico"]
 
 [package.metadata.packager.nsis]
 installer-mode = "currentUser"
 
-[package.metadata.packager.updater]
-endpoints = [
-    "https://github.com/codeviking428/ado-planner/releases/download/rust-latest/latest.json",
-]
-# Public minisign key is baked into the binary at pack time via
-# ADO_PLANNER_UPDATER_PUBKEY (see release-rust.yml). Leave empty here so
-# unsigned local packages stay inert.
-pubkey = ""
+# cargo-packager has no updater table. src/updater.rs compiles in the feed URL
+# and the minisign public key from ADO_PLANNER_UPDATER_ENDPOINT and
+# ADO_PLANNER_UPDATER_PUBKEY at build time (see .github/workflows/release.yml).
+# Without a key, local packages never check for updates.
