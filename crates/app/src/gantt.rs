@@ -34,6 +34,9 @@ pub const TREE_INDENT: f32 = 20.0;
 /// circle is not mistaken for an edge handle.
 pub const LINK_HANDLE: f32 = 8.0;
 pub const LINK_HANDLE_HIT: f32 = 16.0;
+/// Inclusive 8px radius around the gap connector. `LINK_HANDLE_HIT` (16) is
+/// half-open, so a press at center+8 (reviewer ~624) missed the plate.
+pub const OUTER_LINK_HIT: f32 = 18.0;
 /// Gap between the painted bar end and the outside link handle.
 pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// Right-handle hit reaches this far into the bar so a press on the last
@@ -2391,10 +2394,13 @@ impl GanttView {
                 let include_labels = !matches!(self.scale, GanttScale::Year | GanttScale::Quarter);
                 let clip_right = self.timeline_width.max(1.0);
                 if wrap_around {
+                    // Day/Week/Month include outside titles so a Persist cart
+                    // → spike wrap does not drop through the Go-live pill.
+                    // Year/Quarter stay body-only (`include_labels` is false).
                     x_in = clear_wrap_drop_x(
                         x_out,
                         &intervening,
-                        false,
+                        include_labels,
                         x_head,
                         pred_left + STUB,
                         clip_right,
@@ -2609,6 +2615,26 @@ impl GanttView {
         straighten_forward_backtracks(&mut out, bars, timeline_w, today_x);
         separate_shared_source_outgoing_off_labels(
             &mut out, bars, clip_left, clip_right, timeline_w, today_x,
+        );
+        // Later fans can park a wrap drop back on an intervening chip
+        // (Day Persist cart → spike through the Go-live pill). Re-clear
+        // after the last x-move, same occupancy Month uses for inbounds.
+        dodge_wraps_off_intervening(
+            &mut out,
+            bars,
+            include_labels,
+            clip_left,
+            clip_right,
+            today_x,
+        );
+        dodge_verticals_off_intervening_pills(
+            &mut out,
+            bars,
+            include_labels,
+            clip_left,
+            clip_right,
+            today_x,
+            timeline_w,
         );
         // Shared-source Y fan can lift the new Persist cart → Go-live run
         // into the outside chip; put it back ≥6px below, still in-row.
@@ -4193,6 +4219,135 @@ fn clear_vertical_x(
         return around;
     }
     pref.max(x_head + 4.0)
+}
+
+/// Re-apply wrap-drop clearance after later fans so a Day Persist cart →
+/// spike loop cannot restack through the Go-live outside title.
+fn dodge_wraps_off_intervening(
+    arrows: &mut [DependencyArrow],
+    bars: &[BarLayout],
+    include_labels: bool,
+    clip_left: f32,
+    clip_right: f32,
+    today_x: Option<f32>,
+) {
+    let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
+    for arrow in arrows.iter_mut() {
+        if !arrow.wraps_around_successor() {
+            continue;
+        }
+        let Some(pred) = by_id.get(&arrow.from_id) else {
+            continue;
+        };
+        let Some(succ) = by_id.get(&arrow.to_id) else {
+            continue;
+        };
+        let lo = pred.y.min(succ.y);
+        let hi = pred.y.max(succ.y);
+        let intervening: Vec<&BarLayout> = bars
+            .iter()
+            .filter(|mid| {
+                mid.id != pred.id && mid.id != succ.id && mid.y > lo + 1.0 && mid.y < hi - 1.0
+            })
+            .collect();
+        if intervening.is_empty() {
+            continue;
+        }
+        let next = clear_wrap_drop_x(
+            arrow.x2,
+            &intervening,
+            include_labels,
+            arrow.x_head,
+            pred.x + 12.0,
+            clip_right,
+            today_x,
+        );
+        arrow.x2 = next.clamp(clip_left, clip_right);
+    }
+}
+
+/// Slide a long vertical (outgoing or inbound) off an intervening chip so
+/// Persist cart → spike does not run through the Go-live pill at Day.
+fn dodge_verticals_off_intervening_pills(
+    arrows: &mut [DependencyArrow],
+    bars: &[BarLayout],
+    include_labels: bool,
+    clip_left: f32,
+    clip_right: f32,
+    today_x: Option<f32>,
+    timeline_w: f32,
+) {
+    if !include_labels {
+        return;
+    }
+    let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
+    for arrow in arrows.iter_mut() {
+        if arrow.wraps_around_successor() || arrow.inbound_right {
+            continue;
+        }
+        let Some(pred) = by_id.get(&arrow.from_id) else {
+            continue;
+        };
+        let Some(succ) = by_id.get(&arrow.to_id) else {
+            continue;
+        };
+        let lo = pred.y.min(succ.y);
+        let hi = pred.y.max(succ.y);
+        let intervening: Vec<&BarLayout> = bars
+            .iter()
+            .filter(|mid| {
+                mid.id != pred.id && mid.id != succ.id && mid.y > lo + 1.0 && mid.y < hi - 1.0
+            })
+            .collect();
+        if intervening.is_empty() {
+            continue;
+        }
+        let blocked: Vec<(f32, f32)> = intervening
+            .iter()
+            .map(|bar| bar_occupied_x_on(bar, true, Some(clip_right), today_x, Some(timeline_w)))
+            .collect();
+        let x_head = arrow.x_head;
+        let wrap_limit = x_head + DependencyArrow::WRAP_STUB;
+        let slide_off = |x: f32| -> f32 {
+            let mut x = x.clamp(clip_left, clip_right);
+            for _ in 0..=blocked.len() {
+                let hit = blocked
+                    .iter()
+                    .copied()
+                    .find(|&(left, right)| x_hits_span(x, left, right));
+                let Some((left, right)) = hit else {
+                    return x;
+                };
+                let left_cand = (left - 8.0).max(clip_left);
+                if left_cand < x - 0.5 && !x_hits_span(left_cand, left, right) {
+                    x = left_cand;
+                    continue;
+                }
+                let right_cand = (right + 8.0).min(clip_right);
+                if right_cand > x + 0.5
+                    && right_cand < x_head - 2.0
+                    && !x_hits_span(right_cand, left, right)
+                {
+                    x = right_cand;
+                    continue;
+                }
+                return x;
+            }
+            x
+        };
+        let next2 = slide_off(arrow.x2);
+        if (next2 - arrow.x2).abs() > 0.5 && next2 <= wrap_limit {
+            arrow.x2 = next2;
+        }
+        let out_spans_intervening =
+            arrow.y1.min(arrow.lane_y) < hi - 1.0 && arrow.y1.max(arrow.lane_y) > lo + ROW_HEIGHT;
+        if out_spans_intervening {
+            let next1 = slide_off(arrow.x1);
+            if (next1 - arrow.x1).abs() > 0.5 {
+                arrow.x1 = next1;
+            }
+        }
+    }
 }
 
 /// Slide a wrap-around drop just past intervening bars so the long vertical
@@ -10029,6 +10184,124 @@ mod tests {
             pred.y,
             pred.y + ROW_HEIGHT
         );
+    }
+
+    fn assert_arrow_misses_go_live_pill(
+        arrow: &DependencyArrow,
+        go_live: &BarLayout,
+        timeline_w: f32,
+        today_x: Option<f32>,
+        clip_right: f32,
+        label: &str,
+    ) {
+        let (left, right) =
+            bar_occupied_x_on(go_live, true, Some(clip_right), today_x, Some(timeline_w));
+        let pill_top = go_live.y;
+        let pill_bottom = go_live.y + ROW_HEIGHT;
+        let out_spans = arrow.y1.min(arrow.lane_y) < pill_bottom - 1.0
+            && arrow.y1.max(arrow.lane_y) > pill_top + 1.0;
+        let inv_spans = arrow.lane_y.min(arrow.y2) < pill_bottom - 1.0
+            && arrow.lane_y.max(arrow.y2) > pill_top + 1.0;
+        if out_spans {
+            assert!(
+                !x_hits_span(arrow.x1, left, right),
+                "{label}: outgoing vertical must miss the Go-live pill, x1={} occupied={left}..{right} go-live y={}..{}",
+                arrow.x1,
+                pill_top,
+                pill_bottom
+            );
+        }
+        if inv_spans || arrow.wraps_around_successor() {
+            assert!(
+                !x_hits_span(arrow.x2, left, right),
+                "{label}: inbound/wrap vertical must miss the Go-live pill, x2={} occupied={left}..{right} wrap={} go-live y={}..{}",
+                arrow.x2,
+                arrow.wraps_around_successor(),
+                pill_top,
+                pill_bottom
+            );
+        }
+        if arrow.lane_y > pill_top + 1.0 && arrow.lane_y < pill_bottom - 1.0 {
+            let span = arrow_horizontal_span(arrow);
+            assert!(
+                span.1 < left - 4.0 || span.0 > right + 4.0,
+                "{label}: horizontal on the Go-live row must route around the pill, span={:?} occupied={left}..{right} lane={}",
+                span,
+                arrow.lane_y
+            );
+        }
+    }
+
+    #[test]
+    fn day_persist_to_spike_misses_the_go_live_pill() {
+        let nodes = live_fixture_nodes();
+        for (label, width, auto_fit) in [
+            ("day-2400", 2400.0, false),
+            ("day-auto-800", 800.0, true),
+            ("day-auto-512", 512.0, true),
+        ] {
+            let mut gantt = GanttView {
+                origin: Date::new(2026, 7, 1).unwrap(),
+                scale: GanttScale::Day,
+                timeline_width: width,
+                ..Default::default()
+            };
+            if auto_fit {
+                gantt.auto_fit(&nodes, &[], width);
+                gantt.timeline_width = width;
+            }
+            let rows = gantt.flatten(&nodes);
+            let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+            let arrows = gantt.layout_dependency_arrows(&bars);
+            let arrow = arrows
+                .iter()
+                .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+                .expect("Persist cart → spike");
+            let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
+            let today = jiff::Zoned::now().date();
+            let today_px = gantt.x_for_date(today);
+            let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+            assert_arrow_misses_go_live_pill(
+                arrow,
+                go_live,
+                gantt.timeline_width,
+                today_x,
+                (gantt.timeline_width - 10.0).max(24.0),
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn month_persist_to_spike_still_misses_the_go_live_pill() {
+        let nodes = live_fixture_nodes();
+        for width in [512.0, 800.0] {
+            let gantt = GanttView {
+                origin: Date::new(2026, 7, 1).unwrap(),
+                scale: GanttScale::Month,
+                timeline_width: width,
+                ..Default::default()
+            };
+            let rows = gantt.flatten(&nodes);
+            let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+            let arrows = gantt.layout_dependency_arrows(&bars);
+            let arrow = arrows
+                .iter()
+                .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+                .expect("Persist cart → spike");
+            let go_live = bars.iter().find(|bar| bar.id == 1013).unwrap();
+            let today = jiff::Zoned::now().date();
+            let today_px = gantt.x_for_date(today);
+            let today_x = (today_px >= 0.0 && today_px <= gantt.timeline_width).then_some(today_px);
+            assert_arrow_misses_go_live_pill(
+                arrow,
+                go_live,
+                gantt.timeline_width,
+                today_x,
+                (gantt.timeline_width - 10.0).max(24.0),
+                &format!("month-{width}"),
+            );
+        }
     }
 
     #[test]

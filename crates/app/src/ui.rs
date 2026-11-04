@@ -46,7 +46,7 @@ use crate::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, DATES_COL_WIDTH, DETAILS_PILL_WIDTH,
     DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH,
     LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE,
-    MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OVERFLOW_BADGE,
+    MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS, NudgeAxis, OUTER_LINK_HIT, OVERFLOW_BADGE,
     OVERFLOW_BADGE_GAP, PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, ROW_HEIGHT, SCALE_BUTTON_WIDTH,
     SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SUMMARY_BAR_H, SavedGanttView,
     TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
@@ -5848,26 +5848,29 @@ impl PlannerView {
         // connector at `bar.right + GAP + HANDLE/2` (~x=616 on Persist cart).
         let split_inset = inset > 0.0 && bar.can_resize();
         let end_origin = layout_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
+        // Inclusive ±8px around the connector (18px plate). A 16px box is
+        // half-open, so the reviewer's x=624 (center+8) sat on the edge.
         let end_x = if inset > 0.0 && !split_inset {
             local_right - inset
         } else {
-            end_origin - LINK_HANDLE_HIT / 2.0
+            end_origin - OUTER_LINK_HIT / 2.0
         };
         let end_hit_w = if inset > 0.0 && !split_inset {
-            inset + LINK_HANDLE_GAP + LINK_HANDLE_HIT
+            inset + LINK_HANDLE_GAP + OUTER_LINK_HIT
         } else {
-            LINK_HANDLE_HIT
+            OUTER_LINK_HIT
         };
-        let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
+        let start_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
+        let end_top = bar.y + ((ROW_HEIGHT - OUTER_LINK_HIT) / 2.0).max(0.0);
         let handle_specs = vec![
             (
                 "link-start",
                 start_x,
                 LINK_HANDLE_HIT,
-                handle_top,
+                start_top,
                 start_x + LINK_HANDLE_HIT / 2.0,
             ),
-            ("link-end", end_x, end_hit_w, handle_top, end_origin),
+            ("link-end", end_x, end_hit_w, end_top, end_origin),
         ];
         let handles = handle_specs
             .into_iter()
@@ -5878,7 +5881,12 @@ impl PlannerView {
                 } else {
                     ((hit_w - LINK_HANDLE) / 2.0).max(0.0)
                 };
-                let dot_top = ((LINK_HANDLE_HIT - LINK_HANDLE) / 2.0).max(0.0);
+                let plate_h = if handle_id == "link-end" {
+                    OUTER_LINK_HIT
+                } else {
+                    LINK_HANDLE_HIT
+                };
+                let dot_top = ((plate_h - LINK_HANDLE) / 2.0).max(0.0);
                 div()
                     .id((handle_id, id as u64))
                     .debug_selector(move || selector.clone())
@@ -5886,7 +5894,14 @@ impl PlannerView {
                     .left(px(handle_x))
                     .top(px(top))
                     .w(px(hit_w))
-                    .h(px(LINK_HANDLE_HIT))
+                    .h(px(if handle_id == "link-end" {
+                        OUTER_LINK_HIT
+                    } else {
+                        LINK_HANDLE_HIT
+                    }))
+                    .when(handle_id == "link-end" && split_inset, |el| {
+                        el.rounded_full()
+                    })
                     .when(
                         // Always occlude the outer end handle so a press on
                         // the gap connector (~8px radius) starts a link
@@ -5899,7 +5914,11 @@ impl PlannerView {
                             || linking_from_this,
                         |el| el.occlude(),
                     )
-                    .bg(gpui_kit::hsla(0., 0., 0., 0.01))
+                    .bg(if handle_id == "link-end" {
+                        gpui_kit::hsla(0., 0., 0., 0.04)
+                    } else {
+                        gpui_kit::hsla(0., 0., 0., 0.01)
+                    })
                     .cursor(CursorStyle::DragLink)
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         this.apply_scroll(event, cx);
@@ -6730,12 +6749,18 @@ impl PlannerView {
         // boxes. Horizontals cap at PARALLEL_LANE_MIN — a 14px-tall hit on
         // 10px centres overlapped by 4px and stole hover via occlude().
         let vertical = matches!(role, "out" | "inv" | "drop");
-        let hit_w = if vertical {
+        // The outgoing stub shares x with the 18px link handle. Keep its
+        // hit as the 2px stroke so a press at center+8 starts a link.
+        let hit_w = if role == "out" {
+            width
+        } else if vertical {
             width.max(VERTICAL_HIT)
         } else {
             width.max(HIT)
         };
-        let hit_h = if vertical {
+        let hit_h = if role == "out" {
+            height
+        } else if vertical {
             height.max(HIT)
         } else {
             height.clamp(VERTICAL_HIT, PARALLEL_LANE_MIN)
@@ -6756,7 +6781,7 @@ impl PlannerView {
             .flex()
             .items_center()
             .justify_center()
-            .occlude()
+            .when(role != "out", |el| el.occlude())
             .cursor_pointer()
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 if *hovered {

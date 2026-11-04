@@ -4,10 +4,11 @@ use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind,
-    HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE,
-    MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN, ROW_HEIGHT,
-    TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
-    bar_title_is_inside, bar_title_paint_px, insert_index_for_child, outside_label_is_beside_bar,
+    HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_INSET, MILESTONE_SIZE,
+    MIN_TIMELINE_WIDTH, OUTER_LINK_HIT, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN,
+    ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT,
+    bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px, insert_index_for_child,
+    outside_label_is_beside_bar,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -4801,8 +4802,8 @@ fn month_persist_outer_link_handle_starts_a_link_on_bar_hover(cx: &mut gpui_kit:
     let handle_w = f32::from(handle.size.width);
     let handle_h = f32::from(handle.size.height);
     assert!(
-        (handle_w - LINK_HANDLE_HIT).abs() < 0.5 && (handle_h - LINK_HANDLE_HIT).abs() < 0.5,
-        "outer handle must be an ~8px-radius hit, got {handle_w}×{handle_h}"
+        (handle_w - OUTER_LINK_HIT).abs() < 0.5 && (handle_h - OUTER_LINK_HIT).abs() < 0.5,
+        "outer handle must be an inclusive 8px-radius hit, got {handle_w}×{handle_h}"
     );
     assert!(
         handle_left + 0.5 >= bar_right,
@@ -4971,13 +4972,12 @@ fn month_persist_edge_presses_have_no_dead_zone(cx: &mut gpui_kit::TestAppContex
         (handle_center - (bar_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0)).abs() < 1.5,
         "handle center must sit on the gap connector, center={handle_center:.1} bar_right={bar_right:.1}"
     );
-    // 16px hit is half-open: center-8 is the inclusive left edge, center+8
-    // is the exclusive right. Probe the last inside pixel on the right so
-    // the reviewer's x=622 (center+6) still starts a link.
+    // 18px plate: center±8 are inside so a press at the reviewer's ~624
+    // (center+8) starts a link. The outgoing stub no longer occludes +4..+8.
     for (label, x) in [
         ("center-8", handle_center - 8.0),
-        ("center+6", handle_center + 6.0),
-        ("center+8", handle_left + handle_w - 0.5),
+        ("center+4", handle_center + 4.0),
+        ("center+8", handle_center + 8.0),
     ] {
         cx.simulate_mouse_down(point(px(x), mid_y), MouseButton::Left, Modifiers::default());
         draw(cx);
@@ -4992,9 +4992,68 @@ fn month_persist_edge_presses_have_no_dead_zone(cx: &mut gpui_kit::TestAppContex
                 "symmetric 8px radius must start a link at {label}={x:.1}, handle={handle_left:.1}..{:.1} center={handle_center:.1}",
                 handle_left + handle_w
             );
+            assert!(
+                view.state.gantt.selected_link.is_none(),
+                "handle press at {label}={x:.1} must not select the outgoing stub"
+            );
             view.state.cancel_gesture();
         });
         draw(cx);
+    }
+}
+
+#[gpui_kit::test]
+fn day_persist_to_spike_paints_around_the_go_live_pill(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    if let Some(spike) = state.nodes.iter_mut().find(|node| node.id == 1012) {
+        spike.predecessors = vec![1003];
+    }
+    if let Some(go_live) = state.nodes.iter_mut().find(|node| node.id == 1013) {
+        go_live.predecessors = vec![1003];
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Day;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let day = cx.debug_bounds("gantt-scale-Day").expect("Day");
+    cx.simulate_click(day.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let pill = cx
+        .debug_bounds("gantt-bar-label-1013")
+        .or_else(|| cx.debug_bounds("gantt-bar-1013"))
+        .expect("Go-live pill");
+    for selector in [
+        "gantt-dep-inv-1003-1012",
+        "gantt-dep-out-1003-1012",
+        "gantt-dep-arrow-1003-1012",
+        "gantt-dep-drop-1003-1012",
+    ] {
+        let Some(seg) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        assert!(
+            !painted_overlap(seg, pill),
+            "Day Persist cart → spike {selector} must route around the Go-live pill, seg=({:.1},{:.1})+{:.1}x{:.1} pill=({:.1},{:.1})+{:.1}x{:.1}",
+            f32::from(seg.origin.x),
+            f32::from(seg.origin.y),
+            f32::from(seg.size.width),
+            f32::from(seg.size.height),
+            f32::from(pill.origin.x),
+            f32::from(pill.origin.y),
+            f32::from(pill.size.width),
+            f32::from(pill.size.height)
+        );
     }
 }
 
@@ -6847,9 +6906,9 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
         "the ! must sit clear of the link handle, badge_left={badge_left} handle={handle_left}..{handle_right}"
     );
     assert!(
-        (handle_right - handle_left - LINK_HANDLE_HIT).abs() < 1.0,
+        (handle_right - handle_left - OUTER_LINK_HIT).abs() < 1.0,
         "link handle hit box must stay {}px on a resizable bar, got {}",
-        LINK_HANDLE_HIT,
+        OUTER_LINK_HIT,
         handle_right - handle_left
     );
     assert!(
