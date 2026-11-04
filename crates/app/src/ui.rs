@@ -206,6 +206,8 @@ pub struct PlannerView {
     timeline_body_origin_x: Rc<Cell<Option<f32>>>,
     /// Painted bar left/right in window coordinates, filled from on_prepaint.
     painted_bar_bounds: Rc<RefCell<HashMap<i64, PaintedBar>>>,
+    /// Window box of the "No scheduled dates" chip, filled from on_prepaint.
+    empty_hint_bounds: Rc<RefCell<Option<PaintedHint>>>,
     /// Window box of the pinned post-drop tooltip, filled from on_prepaint.
     pinned_tooltip_bounds: Rc<RefCell<Option<PaintedTooltip>>>,
     /// Last bar mouse-down classification (window x vs painted bounds).
@@ -239,6 +241,14 @@ struct PaintedBar {
 #[derive(Clone, Copy, Debug)]
 struct PaintedTooltip {
     id: i64,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PaintedHint {
     left: f32,
     right: f32,
     top: f32,
@@ -484,6 +494,7 @@ impl PlannerView {
             timeline_body_origin_y: Rc::new(Cell::new(0.0)),
             timeline_body_origin_x: Rc::new(Cell::new(None)),
             painted_bar_bounds: Rc::new(RefCell::new(HashMap::new())),
+            empty_hint_bounds: Rc::new(RefCell::new(None)),
             pinned_tooltip_bounds: Rc::new(RefCell::new(None)),
             last_bar_hit: None,
             hover_bar_zone: None,
@@ -1248,6 +1259,23 @@ impl PlannerView {
 
     fn dismiss_empty_timeline_hint(&mut self) {
         self.empty_timeline_hint_dismissed = true;
+        self.empty_hint_bounds.borrow_mut().take();
+    }
+
+    /// Any pointer move outside the chip rect dismisses it. Hover-leave is
+    /// not enough: the chip can appear under a still cursor, and a later
+    /// move onto empty space or an open picker never entered the chip.
+    fn dismiss_empty_hint_if_pointer_outside(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        if self.empty_timeline_hint_dismissed {
+            return;
+        }
+        let Some(hint) = *self.empty_hint_bounds.borrow() else {
+            return;
+        };
+        if x < hint.left || x > hint.right || y < hint.top || y > hint.bottom {
+            self.dismiss_empty_timeline_hint();
+            cx.notify();
+        }
     }
 
     /// Undo/redo remounts bars under a still pointer. Drop the dates chip
@@ -2253,8 +2281,8 @@ impl PlannerView {
             .as_ref()
             .is_some_and(|gesture| gesture.kind == GestureKind::Link)
         {
-            self.state.gantt.clear_link_target();
-            cx.notify();
+            // Remount / canvas-leave during a link drag must not drop the
+            // armed successor. `arm_link_target_from_pointer` owns that.
             return;
         }
         if self.state.gantt.pin_bar_tooltip.is_some() {
@@ -2487,6 +2515,7 @@ impl PlannerView {
                         this.open_filter = None;
                         this.open_flavor = false;
                         this.state.gantt.context_menu = None;
+                        this.dismiss_empty_timeline_hint();
                         this.open_scope = if this.open_scope == Some(id) {
                             None
                         } else {
@@ -2829,6 +2858,7 @@ impl PlannerView {
                         this.open_filter = None;
                         this.open_scope = None;
                         this.state.gantt.context_menu = None;
+                        this.dismiss_empty_timeline_hint();
                         this.open_flavor = !this.open_flavor;
                         cx.notify();
                     })),
@@ -4757,6 +4787,19 @@ impl PlannerView {
                                         .cursor(CursorStyle::PointingHand)
                                         .text_sm()
                                         .text_color(header_fg)
+                                        .on_prepaint({
+                                            let hint_bounds = self.empty_hint_bounds.clone();
+                                            move |bounds, _, _| {
+                                                let left = f32::from(bounds.origin.x);
+                                                let top = f32::from(bounds.origin.y);
+                                                *hint_bounds.borrow_mut() = Some(PaintedHint {
+                                                    left,
+                                                    right: left + f32::from(bounds.size.width),
+                                                    top,
+                                                    bottom: top + f32::from(bounds.size.height),
+                                                });
+                                            }
+                                        })
                                         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                                             if !*hovered {
                                                 this.dismiss_empty_timeline_hint();
@@ -5194,7 +5237,7 @@ impl PlannerView {
                     .when(selected, |el| el.border_2())
                     .when(!selected, |el| el.border_1())
                 })
-                .overflow_hidden()
+                .when(!milestone && !marker, |el| el.overflow_hidden())
                 .when(show_progress, |el| {
                     el.child(
                         div()
@@ -7802,12 +7845,23 @@ impl PlannerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.state.gantt.gesture.is_none() {
-            return;
-        }
         let x: f32 = event.position.x.into();
         let y: f32 = event.position.y.into();
-        if event.dragging() || event.pressed_button.is_some() {
+        if self.state.gantt.gesture.is_none() {
+            self.dismiss_empty_hint_if_pointer_outside(x, y, cx);
+            return;
+        }
+        let linking = self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link);
+        // Link drags must survive remount-lost capture: Xvfb/xdotool
+        // mousemove after the sliver remounts looks like a hover
+        // (`pressed_button` is None, `dragging()` is false). Committing
+        // here clears the preview line and drops the successor.
+        if linking || event.dragging() || event.pressed_button.is_some() {
             self.bar_last_window_x = Some(x);
             if event.modifiers.shift {
                 self.bar_press_shift = true;
@@ -9828,6 +9882,7 @@ impl Render for PlannerView {
                 }
                 let x: f32 = event.position.x.into();
                 let y: f32 = event.position.y.into();
+                this.dismiss_empty_hint_if_pointer_outside(x, y, cx);
                 this.clear_pinned_tooltip_if_pointer_left(x, y, cx);
                 if let Some((origin_x, origin_w)) = this.state.gantt.splitter_drag {
                     this.state.gantt.set_tree_width_for_pane(

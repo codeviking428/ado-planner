@@ -28,6 +28,67 @@ use jiff::ToSpan;
 use jiff::civil::Date;
 use std::time::Duration;
 
+fn signed_in_with_mock() -> (
+    tokio::runtime::Runtime,
+    ado_mock::AdoMock,
+    PlannerState,
+    tempfile::TempDir,
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("ado-mock-visual")
+        .build()
+        .expect("ado-mock visual runtime");
+    let (mock, state, dir) = runtime.block_on(async {
+        let mock = ado_mock::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(dir.path().to_path_buf());
+        let store = EncryptedStore::new(Box::new(MemoryStore::new(true)), Some([3u8; 32]));
+        let session = PlannerSession::pat(store).with_bases(&mock.url, &mock.url);
+        let mut state = PlannerState::new(
+            paths,
+            session,
+            Some(mock.url.clone()),
+            Some(mock.url.clone()),
+        );
+        state.sign_in_org = "https://dev.azure.com/contoso".into();
+        state.sign_in_pat = "pat-secret-value".into();
+        state.login_pat().await.expect("login");
+        state.session_loading = false;
+        (mock, state, dir)
+    });
+    (runtime, mock, state, dir)
+}
+
+fn mock_has_predecessor(
+    runtime: &tokio::runtime::Runtime,
+    mock: &ado_mock::AdoMock,
+    successor_id: i64,
+    predecessor_id: i64,
+) -> bool {
+    runtime.block_on(async {
+        let Some(item) = mock.work_item(successor_id).await else {
+            return false;
+        };
+        item.get("relations")
+            .and_then(|rels| rels.as_array())
+            .is_some_and(|rels| {
+                rels.iter().any(|rel| {
+                    rel.get("rel").and_then(|value| value.as_str())
+                        == Some("System.LinkTypes.Dependency-Reverse")
+                        && rel
+                            .get("url")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|url| {
+                                url.ends_with(&format!("/{predecessor_id}"))
+                                    || url.contains(&format!("/workItems/{predecessor_id}"))
+                                    || url.contains(&format!("/workitems/{predecessor_id}"))
+                            })
+                })
+            })
+    })
+}
+
 fn idle_state(dir: &tempfile::TempDir) -> PlannerState {
     let paths = AppPaths::new(dir.path().to_path_buf());
     let store = EncryptedStore::new(Box::new(MemoryStore::new(false)), None);
@@ -1133,6 +1194,56 @@ fn unscheduled_empty_hint_dismisses_when_the_picker_opens(cx: &mut gpui_kit::Tes
     assert!(
         cx.debug_bounds("unscheduled-empty-hint").is_none(),
         "opening the dates picker must dismiss the empty-timeline hint"
+    );
+}
+
+#[gpui_kit::test]
+fn unscheduled_empty_hint_dismisses_on_move_outside_its_rect(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = amego_unscheduled_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let hint = cx
+        .debug_bounds("unscheduled-empty-hint")
+        .expect("all-unscheduled Amego must show the empty-timeline hint");
+    let outside = point(
+        hint.origin.x - px(48.),
+        hint.origin.y + hint.size.height / 2.0,
+    );
+    cx.simulate_mouse_move(outside, None, Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "a mouse-move outside the chip, without ever entering it, must dismiss the hint"
+    );
+}
+
+#[gpui_kit::test]
+fn unscheduled_empty_hint_dismisses_when_the_team_picker_opens(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = amego_unscheduled_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_some(),
+        "precondition: all-unscheduled Amego shows the empty-timeline hint"
+    );
+    let team = cx.debug_bounds("team-trigger").expect("team picker");
+    cx.simulate_click(team.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "opening the team picker must dismiss the empty-timeline hint"
     );
 }
 
@@ -4746,6 +4857,134 @@ fn month_persist_edge_drag_adds_a_link_toast(cx: &mut gpui_kit::TestAppContext) 
     );
 }
 
+/// Xvfb/xdotool mousedown → several mousemoves → mouseup does not keep the
+/// left button on later moves (capture is lost after a remount). The drop
+/// must still persist Persist cart → Cart UI on the mock.
+#[gpui_kit::test]
+fn month_persist_xdotool_style_drag_persists_link_in_the_mock(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, mut state, _dir) = signed_in_with_mock();
+    assert!(
+        state.nodes.iter().any(|node| node.id == 1003),
+        "login must load Persist cart from the mock"
+    );
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1005)
+            .is_some_and(|node| !node.predecessors.contains(&1003)),
+        "precondition: Cart UI must not already depend on Persist cart"
+    );
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = None;
+    state.gantt.viewport_h = 720.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let at_edge = grab_bar_from_right(bar, 1.0);
+    cx.simulate_mouse_move(at_edge, None, Modifiers::default());
+    cx.simulate_mouse_down(at_edge, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "a press on the last painted pixel must start a link"
+        );
+    });
+    let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
+    let start = at_edge;
+    let end = cart.center();
+    for step in 1..=6 {
+        let t = step as f32 / 6.0;
+        let mid = point(
+            start.x + (end.x - start.x) * t,
+            start.y + (end.y - start.y) * t,
+        );
+        // xdotool `mousemove` does not report a pressed button.
+        cx.simulate_mouse_move(mid, None, Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.state
+                    .gantt
+                    .gesture
+                    .as_ref()
+                    .map(|gesture| gesture.kind),
+                Some(GestureKind::Link),
+                "button-less move {step} must keep the link drag, not commit"
+            );
+        });
+    }
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .and_then(|gesture| gesture.link_to),
+            Some(1005),
+            "the last hover-move over Cart UI must still arm the drop target"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-preview").is_some(),
+        "the rubber-band must survive button-less moves"
+    );
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let message = view.state.toasts.last_message().unwrap_or_default();
+        assert!(
+            message.starts_with("Added link:")
+                && message.contains("Persist cart")
+                && message.contains("Cart UI"),
+            "mouse-up after hover-moves must toast, got {message:?}"
+        );
+        assert!(
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.id == 1005)
+                .is_some_and(|node| node.predecessors.contains(&1003)),
+            "the drop must add Persist cart as a predecessor of Cart UI"
+        );
+        assert!(view.state.gantt.gesture.is_none());
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        if mock_has_predecessor(&runtime, &mock, 1005, 1003) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        mock_has_predecessor(&runtime, &mock, 1005, 1003),
+        "PATCH must persist Persist cart as a predecessor of Cart UI on the mock"
+    );
+}
+
 #[gpui_kit::test]
 fn leaving_a_bar_clears_the_hover_resize_cursor(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
@@ -6500,6 +6739,33 @@ fn day_offscreen_milestone_cue_includes_the_title(cx: &mut gpui_kit::TestAppCont
         f32::from(cue.size.width) >= 64.0,
         "Day off-screen Go-live cue must include the diamond and title, not a bare ›, width={}",
         f32::from(cue.size.width)
+    );
+}
+
+#[gpui_kit::test]
+fn day_selected_milestone_paints_a_diamond_not_a_day_box(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 8, 10).unwrap();
+    state.gantt.scale = GanttScale::Day;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = Some(1013);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let go_live = cx
+        .debug_bounds("gantt-bar-1013")
+        .expect("on-screen Day Go-live");
+    let width = f32::from(go_live.size.width);
+    let day_px = GanttScale::Day.pixels_per_day(1.0);
+    assert!(
+        (width - MILESTONE_SIZE).abs() < 4.0,
+        "a selected Day milestone must stay a {MILESTONE_SIZE}px diamond, not a {day_px}px day box, width={width}"
     );
 }
 
