@@ -61,6 +61,12 @@ fn signed_in_with_mock() -> (
     (runtime, mock, state, dir)
 }
 
+/// ado-client completing a oneshot otherwise panics the GPUI test scheduler
+/// ("activity on thread ado-client"). Real HTTP waits must allow parking.
+fn allow_ado_client_wake(cx: &gpui_kit::VisualTestContext) {
+    cx.background_executor.allow_parking();
+}
+
 fn mock_has_predecessor(
     runtime: &tokio::runtime::Runtime,
     mock: &ado_mock::AdoMock,
@@ -5489,6 +5495,7 @@ fn month_persist_xdotool_style_drag_persists_link_in_the_mock(cx: &mut gpui_kit:
         );
         assert!(view.state.gantt.gesture.is_none());
     });
+    allow_ado_client_wake(cx);
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     while std::time::Instant::now() < deadline {
         cx.run_until_parked();
@@ -5635,6 +5642,7 @@ fn month_xdotool_mouseup_over_cart_ui_commits_link_in_the_mock(cx: &mut gpui_kit
         cx.debug_bounds("toast-title").is_some() || cx.debug_bounds("planner-toast").is_some(),
         "the Added link toast must paint on drop, not on the next mouse-move"
     );
+    allow_ado_client_wake(cx);
     cx.background_executor
         .advance_clock(Duration::from_millis(20));
     cx.run_until_parked();
@@ -5685,6 +5693,7 @@ fn busy_io_still_persists_an_optimistic_link(cx: &mut gpui_kit::TestAppContext) 
         view.state.toasts.items.clear();
         view.complete_undo_io_for_test(cx);
     });
+    allow_ado_client_wake(cx);
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     while std::time::Instant::now() < deadline {
         cx.run_until_parked();
@@ -5760,6 +5769,7 @@ fn undoing_a_queued_link_does_not_persist_later(cx: &mut gpui_kit::TestAppContex
         );
         view.complete_undo_io_for_test(cx);
     });
+    allow_ado_client_wake(cx);
     let deadline = std::time::Instant::now() + Duration::from_millis(800);
     while std::time::Instant::now() < deadline {
         cx.run_until_parked();

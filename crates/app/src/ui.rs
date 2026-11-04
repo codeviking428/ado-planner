@@ -75,6 +75,23 @@ const SAVING_HOLD_MS: u64 = 400;
 const PROGRESS_ROLLUP_TIP: &str =
     "Progress is rolled up from child work-item states. Active counts as half done.";
 const DATES_ROLLUP_TIP: &str = "Dates roll up from children";
+const DRAG_DATE_PILL_GAP: f32 = 4.0;
+
+fn drag_date_pill_text_width(text: &str) -> f32 {
+    (text.chars().count() as f32 * 7.0 + 16.0).max(36.0)
+}
+
+/// Start pill at the bar's left; end pill at the trailing edge unless that
+/// would sit on/left of the start pill (Year/Quarter slivers, short Month
+/// bars). Then park the end immediately to the right of the start.
+fn drag_date_pill_lefts(bar_x: f32, painted_w: f32, start_w: f32, end_w: f32) -> (f32, f32) {
+    let start_x = bar_x.max(0.0);
+    let trailing = bar_x + painted_w - end_w;
+    let end_x = trailing
+        .max(start_x + start_w + DRAG_DATE_PILL_GAP)
+        .max(0.0);
+    (start_x, end_x)
+}
 
 fn debug_hit_enabled() -> bool {
     std::env::var("ADO_PLANNER_DEBUG_HIT")
@@ -5136,13 +5153,11 @@ impl PlannerView {
                             let y = TIMELINE_HEADER_H
                                 + bar.y
                                 + ((ROW_HEIGHT - 22.0) / 2.0).max(2.0);
-                            let end_w = (end_text.chars().count() as f32 * 7.0 + 16.0).max(36.0);
-                            (
-                                chip_x,
-                                y,
-                                bar.x.max(0.0),
-                                (bar.x + painted_w - end_w).max(0.0),
-                            )
+                            let start_w = drag_date_pill_text_width(&start_text);
+                            let end_w = drag_date_pill_text_width(&end_text);
+                            let (start_x, end_x) =
+                                drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
+                            (chip_x, y, start_x, end_x)
                         }
                         None => (gesture.live_x.max(4.0), 4.0, gesture.live_x.max(4.0), 4.0),
                     };
@@ -11604,5 +11619,32 @@ mod bar_label_tests {
                 "Day-view Cart UI must not crush to a letter at the clip, label_x={label_x} max_w={max_w}"
             );
         }
+    }
+
+    #[test]
+    fn drag_date_pills_keep_end_right_of_start_on_short_bars() {
+        let start_w = drag_date_pill_text_width("Jul 20");
+        let end_w = drag_date_pill_text_width("Aug 3");
+        let (start_x, end_x) = drag_date_pill_lefts(40.0, 200.0, start_w, end_w);
+        assert!(
+            (end_x - (40.0 + 200.0 - end_w)).abs() < 0.5,
+            "a wide bar keeps the end pill on the trailing edge, end_x={end_x} trailing={}",
+            40.0 + 200.0 - end_w
+        );
+        assert!(
+            end_x >= start_x + start_w + DRAG_DATE_PILL_GAP - 0.5,
+            "wide-bar end must still sit right of start, start_x={start_x} end_x={end_x}"
+        );
+
+        let (start_x, end_x) = drag_date_pill_lefts(80.0, 16.0, start_w, end_w);
+        assert_eq!(start_x, 80.0);
+        assert!(
+            end_x >= start_x + start_w + DRAG_DATE_PILL_GAP - 0.5,
+            "a 16px Year sliver must not invert the pills, start_x={start_x} end_x={end_x} start_w={start_w}"
+        );
+        assert!(
+            end_x > start_x,
+            "end pill must stay to the right of start, start_x={start_x} end_x={end_x}"
+        );
     }
 }

@@ -4139,15 +4139,17 @@ fn painted_pred_end(pred: &BarLayout) -> f32 {
     }
 }
 
-/// Source starts at/before the target and its end sits past the target start.
-/// A left inbound (`succ.x - 12`) is still on/after the source, so a wrap
-/// drop at `pred_end + 12` would run through the target (Cart UI body/cue).
-/// Scale-independent: pixel spans grow with Day/Week, but the 12px stub
-/// does not, so Week is the view that used to flip this into a wrap.
+/// Source starts at/before the target and its painted end sits past the
+/// target start. A left inbound (`succ.x - 12`) is still on/after the
+/// source, so a wrap drop at `pred_end + 12` would run through the target
+/// (Cart UI body/cue). Any pixel of overlap counts: Year at 1.5 px/day
+/// only overlaps Persist cart → Cart UI by ~6px, which used to miss a
+/// 12px-past check and let `separate_parallel_verticals` shove the inbound
+/// onto the successor body.
 fn overlap_enters_from_the_left(pred: &BarLayout, succ: &BarLayout) -> bool {
     let pred_end = painted_pred_end(pred);
     let natural_in = succ.x - DependencyArrow::WRAP_STUB;
-    pred_end > succ.x + DependencyArrow::WRAP_STUB && natural_in + 0.5 >= pred.x
+    pred_end > succ.x && natural_in + 0.5 >= pred.x
 }
 
 /// Keep overlapping finish-to-start inbounds left of the successor after
@@ -9199,7 +9201,7 @@ mod tests {
         let bars = gantt.layout_bars(nodes, &rows, &[], 720.0);
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 1005).unwrap();
-        if pred.x + pred.width <= succ.x + 12.0 {
+        if pred.x + pred.width <= succ.x {
             return;
         }
         let arrow = gantt
@@ -9249,6 +9251,7 @@ mod tests {
             (GanttScale::Week, 1.0),
             (GanttScale::Month, 1.0),
             (GanttScale::Quarter, 2.0),
+            (GanttScale::Year, 1.0),
             (GanttScale::Year, 4.0),
         ] {
             let gantt = GanttView {
@@ -9260,6 +9263,30 @@ mod tests {
             };
             assert_overlap_back_jog(&gantt, &nodes);
         }
+    }
+
+    #[test]
+    fn year_default_zoom_overlap_still_back_jogs() {
+        let nodes = overlap_persist_cart_ui_nodes();
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            timeline_width: 1100.0,
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let overlap = pred.x + pred.width - succ.x;
+        assert!(
+            overlap > 0.0 && overlap <= DependencyArrow::WRAP_STUB,
+            "fixture: Year zoom 1 must overlap by less than the 12px stub, overlap={overlap} pred_end={} succ.x={}",
+            pred.x + pred.width,
+            succ.x
+        );
+        assert_overlap_back_jog(&gantt, &nodes);
     }
 
     #[test]
