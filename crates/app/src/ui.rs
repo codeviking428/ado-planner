@@ -240,8 +240,9 @@ pub struct PlannerView {
     last_bar_hit: Option<BarHitDebug>,
     /// Hover hit-zone used to show ew-resize / link cursors before press.
     hover_bar_zone: Option<(i64, BarHitZone)>,
-    /// After undo/redo, skip the dates chip and GPUI tooltip until the
-    /// pointer moves so a resting cursor cannot swallow the next press.
+    /// Skip the dates chip and GPUI tooltip while a press/drag is in
+    /// flight. Mouse-up and undo re-hit the pointer so the overlay
+    /// tooltip and cursor match the bar under a still mouse.
     suppress_bar_tooltip: bool,
     /// Window position where hover tooltips were last suppressed. A
     /// same-spot mouse-move after drop (GPUI's synthetic hover) must not
@@ -1326,7 +1327,8 @@ impl PlannerView {
         self.state.gantt.hover_locked = false;
         self.pinned_tooltip_bounds.borrow_mut().take();
         self.hover_bar_zone = None;
-        self.arm_tooltip_suppress_at_last_pointer();
+        self.suppress_bar_tooltip = false;
+        self.tooltip_suppress_at = None;
         self.painted_bar_bounds.borrow_mut().clear();
         self.recompute_hover_at_last_pointer(cx);
         self.request_repaint(None, cx);
@@ -1343,16 +1345,6 @@ impl PlannerView {
         self.suppress_bar_tooltip = true;
         self.tooltip_suppress_at = Some((x, y));
         self.last_pointer_window = Some((x, y));
-    }
-
-    fn arm_tooltip_suppress_at_last_pointer(&mut self) {
-        match self.last_pointer_window {
-            Some((x, y)) => self.arm_tooltip_suppress(x, y),
-            None => {
-                self.suppress_bar_tooltip = true;
-                self.tooltip_suppress_at = None;
-            }
-        }
     }
 
     fn release_tooltip_suppress_if_moved(&mut self, x: f32, y: f32) {
@@ -4845,13 +4837,19 @@ impl PlannerView {
                         self.render_pinned_bar_tooltip(bar, dragging, cx)
                     }))
                     .children(bars.iter().filter_map(|bar| {
+                        self.render_hover_bar_tooltip(bar, dragging, cx)
+                    }))
+                    .children(bars.iter().filter_map(|bar| {
+                        self.render_hover_date_pills(bar, dragging, cx)
+                    }))
+                    .children(bars.iter().filter_map(|bar| {
                         // After arrows/labels so a connector or dates tooltip
                         // cannot steal the last ~6px that start a link.
                         self.render_gantt_inset_link_sliver(bar, dragging, cx)
                     }))
                     .children(bars.iter().flat_map(|bar| {
                         // Sibling of the bar so overflow:hidden cannot clip
-                        // the 6px-outside / 4px-inside resize halo.
+                        // the 6px-outside / 6px-inside resize halo.
                         self.render_resize_halos(bar, dragging, cx)
                     }))
                     .children({
@@ -5839,10 +5837,11 @@ impl PlannerView {
             .collect()
     }
 
-    /// Last ~6px of a resizable dated bar, painted above arrows and titles
-    /// so a connector or dates tooltip cannot steal the link zone.
-    /// Kept mounted while this bar is the link source so capture, cursor,
-    /// and the ghost line survive the drag.
+    /// Last ~6px of a resizable dated bar, painted above arrows and titles.
+    /// The end resize halo sits on top of this sliver so 2–6px inside
+    /// resizes; a press here only starts a link when the halo is gone
+    /// (this bar is already the link source). The outer handle is the
+    /// idle link target.
     fn render_gantt_inset_link_sliver(
         &self,
         bar: &crate::gantt::BarLayout,
@@ -5955,10 +5954,9 @@ impl PlannerView {
         )
     }
 
-    /// Sibling overlay covering roughly edge−6..+4 so overflow:hidden on
-    /// the bar cannot clip the last 2–4px inside the painted edge. Last
-    /// children of the timeline so they win those pixels over the inset
-    /// link sliver; the leftover ~2px of the 6px sliver still starts a link.
+    /// Sibling overlay covering edge−6..+1 so overflow:hidden cannot clip
+    /// the last 2–6px inside the painted edge. Last children of the
+    /// timeline so they win those pixels over the inset link sliver.
     fn render_resize_halos(
         &self,
         bar: &crate::gantt::BarLayout,
@@ -6698,6 +6696,163 @@ impl PlannerView {
         )
     }
 
+    /// Overlay tooltip that does not need a GPUI hover-enter after remount.
+    /// Pinned `gantt-bar-tooltip` stays absent beside the Moved toast; this
+    /// chip is the post-drop / still-pointer hover copy.
+    fn render_hover_bar_tooltip(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        dragging: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let id = bar.id;
+        let hovered = self
+            .state
+            .gantt
+            .bar_hovered_id
+            .or(self.state.gantt.hovered_id);
+        if hovered != Some(id)
+            || dragging
+            || self.details_overlay()
+            || self.suppress_bar_tooltip
+            || self.state.gantt.pin_bar_tooltip == Some(id)
+            || self.state.gantt.gesture.is_some()
+        {
+            return None;
+        }
+        let tip = bar_hover_tooltip(bar, &self.state.nodes);
+        let painted_w = if bar.milestone || bar.marker {
+            MILESTONE_SIZE
+        } else {
+            bar.width.max(8.0)
+        };
+        let bar_h = if bar.milestone || bar.marker {
+            MILESTONE_SIZE
+        } else if bar.summary {
+            SUMMARY_BAR_H
+        } else if bar.kind == ado_core::GanttBarKind::Unscheduled
+            || bar.kind == ado_core::GanttBarKind::NoFields
+        {
+            PLACEHOLDER_BAR_H
+        } else {
+            LEAF_BAR_H
+        };
+        let bar_top = ((ROW_HEIGHT - bar_h) / 2.0).max(2.0);
+        let tip_w = (tip.chars().count() as f32 * 7.0 + 24.0).max(48.0);
+        let overflow = parent_date_overflow(&self.state.nodes, id);
+        let extra = if bar.open_ended {
+            LINK_HANDLE_INSET + 2.0
+        } else if overflow {
+            LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 8.0
+        } else {
+            LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0
+        };
+        let timeline_w = self.state.gantt.timeline_width.max(1.0);
+        let tip_x = row_side_tooltip_left(bar.x, painted_w, extra, tip_w, timeline_w);
+        Some(
+            div()
+                .id(("gantt-hover-tooltip", id as u64))
+                .debug_selector(|| "gantt-hover-tooltip".into())
+                .absolute()
+                .left(px(tip_x))
+                .top(px(bar.y + bar_top))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(cx.theme().popover)
+                .text_color(cx.theme().popover_foreground)
+                .text_xs()
+                .whitespace_nowrap()
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(tip)
+                .into_any_element(),
+        )
+    }
+
+    /// Start/Target pills on hover (and after drop, once hover is recomputed).
+    /// Parked above the bar so they do not cover the resize halo or outer
+    /// link handle.
+    fn render_hover_date_pills(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        dragging: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let id = bar.id;
+        let hovered = self
+            .state
+            .gantt
+            .bar_hovered_id
+            .or(self.state.gantt.hovered_id);
+        if hovered != Some(id)
+            || dragging
+            || self.details_overlay()
+            || self.suppress_bar_tooltip
+            || self.state.gantt.gesture.is_some()
+            || bar.milestone
+            || bar.marker
+            || bar.kind == ado_core::GanttBarKind::Unscheduled
+            || bar.kind == ado_core::GanttBarKind::NoFields
+        {
+            return None;
+        }
+        let node = self.state.nodes.iter().find(|node| node.id == id)?;
+        let start = parse_iso_date(node.start_date.as_deref())?;
+        let start_text = compact_date(start);
+        let end_text = parse_iso_date(node.target_date.as_deref()).map(compact_date);
+        let painted_w = bar.width.max(8.0);
+        let start_w = drag_date_pill_text_width(&start_text);
+        let end_w = end_text
+            .as_ref()
+            .map(|text| drag_date_pill_text_width(text))
+            .unwrap_or(0.0);
+        let (start_x, end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
+        let y = (bar.y + bar.paint_top() - 18.0).max(0.0);
+        let date_pill = |text: String| {
+            div()
+                .px_2()
+                .py(px(2.))
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().popover)
+                .text_color(cx.theme().popover_foreground)
+                .text_xs()
+                .whitespace_nowrap()
+                .child(text)
+        };
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .w(px(0.))
+                .h(px(0.))
+                .child(
+                    div()
+                        .id("gantt-hover-date-start")
+                        .debug_selector(|| "gantt-hover-date-start".into())
+                        .absolute()
+                        .left(px(start_x))
+                        .top(px(y))
+                        .child(date_pill(start_text)),
+                )
+                .when_some(end_text, |el, text| {
+                    el.child(
+                        div()
+                            .id("gantt-hover-date-end")
+                            .debug_selector(|| "gantt-hover-date-end".into())
+                            .absolute()
+                            .left(px(end_x))
+                            .top(px(y))
+                            .child(date_pill(text)),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_gantt_bar_label(
         &self,
         bar: &crate::gantt::BarLayout,
@@ -6922,44 +7077,18 @@ impl PlannerView {
     fn link_hover_chip(
         &self,
         arrow: &DependencyArrow,
-        bars: &[crate::gantt::BarLayout],
+        _bars: &[crate::gantt::BarLayout],
         min_x: f32,
         min_y: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
         let tip = self.link_hover_chip_text(arrow.from_id, arrow.to_id);
         let tip_w = (tip.chars().count() as f32 * 7.0 + 24.0).max(80.0);
-        // Source-row midline. Prefer the wire past the outgoing stub so the
-        // inbound vertical (Unparented spike) and the next row stay clear.
-        // Flip around the source bar / outside title when the box hits them.
-        let mut left = arrow.x1 + 8.0;
-        if let Some(pred) = bars.iter().find(|bar| bar.id == arrow.from_id) {
-            let timeline_w = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
-            let today = jiff::Zoned::now().date();
-            let today_px = self.state.gantt.x_for_date(today);
-            let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
-            let painted_w = if pred.milestone || pred.marker {
-                MILESTONE_SIZE
-            } else {
-                pred.width.max(8.0)
-            };
-            let mut union_left = pred.x;
-            let mut union_right = pred.x + painted_w;
-            if let Some((label_x, label_w)) =
-                bar_outside_label_frame(pred, timeline_w, true, today_x, pred.overflow_badge)
-            {
-                union_left = union_left.min(label_x);
-                union_right = union_right.max(label_x + label_w);
-            }
-            if left < union_right && left + tip_w > union_left {
-                let right_slot = union_right + 8.0;
-                left = if right_slot + tip_w <= timeline_w - 4.0 {
-                    right_slot
-                } else {
-                    (union_left - 8.0 - tip_w).max(4.0)
-                };
-            }
-        }
+        let timeline_w = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
+        // Sit on the polyline so a wrap stub at x≈683 cannot leave a
+        // floating "Unparented → Go-live" chip at the source union (~875).
+        let (mid_x, mid_y) = arrow.midpoint();
+        let left = (mid_x - tip_w / 2.0).clamp(4.0, (timeline_w - tip_w - 4.0).max(4.0));
         let from_id = arrow.from_id;
         let to_id = arrow.to_id;
         div()
@@ -6969,7 +7098,7 @@ impl PlannerView {
             .debug_selector(|| "gantt-link-tooltip".into())
             .absolute()
             .left(px(left - min_x))
-            .top(px(arrow.y1 - min_y - 10.0))
+            .top(px(mid_y - min_y - 10.0))
             .h(px(20.))
             .px_2()
             .rounded_md()
@@ -8917,6 +9046,12 @@ impl PlannerView {
             {
                 self.enqueue_link_save(to_id, from_id, cx);
             }
+            self.painted_bar_bounds.borrow_mut().clear();
+            self.suppress_bar_tooltip = false;
+            self.tooltip_suppress_at = None;
+            self.note_pointer(window_x, window_y);
+            self.hover_bar_zone = None;
+            self.recompute_hover_at_last_pointer(cx);
             // Drop must paint the arrow and toast without waiting for the
             // next pointer move. `request_repaint` notifies now and again
             // on the following frame — `Window.refresh` is a no-op while
@@ -8935,12 +9070,15 @@ impl PlannerView {
             self.note_toasts_changed(cx);
         }
         // Hide the pinned dates chip so it does not sit beside the Moved
-        // toast. Recompute hover at the release point so the tooltip and
-        // cursor match the bar under the still pointer — including a no-op
-        // drop that still had a leftover ↔ from the resize grip.
+        // toast. Drop stale painted bounds so a leftover ↔ from the grip
+        // is not classified against pre-drop geometry. Recompute hover at
+        // the release point so the tooltip and cursor match the bar under
+        // the still pointer.
         self.state.gantt.pin_bar_tooltip = None;
         self.suppress_bar_tooltip = false;
         self.tooltip_suppress_at = None;
+        self.state.gantt.hover_locked = false;
+        self.painted_bar_bounds.borrow_mut().clear();
         self.note_pointer(window_x, window_y);
         self.hover_bar_zone = None;
         self.recompute_hover_at_last_pointer(cx);

@@ -230,15 +230,14 @@ fn grab_link_handle(
     )
 }
 
-/// Leftover ~2px of the 6px inset link sliver, just left of the 4px
-/// resize halo. 2–4px inside the painted end is resize, not link.
+/// 5.5px inside the painted end — still the 6px resize halo.
 fn grab_bar_link_sliver(
     bar: gpui_kit::Bounds<gpui_kit::Pixels>,
 ) -> gpui_kit::Point<gpui_kit::Pixels> {
     grab_bar_from_right(bar, 5.5)
 }
 
-/// 3px inside the painted end — the resize halo, not the leftover sliver.
+/// 3px inside the painted end — the resize halo.
 fn grab_end_resize_halo(
     bar: gpui_kit::Bounds<gpui_kit::Pixels>,
 ) -> gpui_kit::Point<gpui_kit::Pixels> {
@@ -4659,8 +4658,8 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
     let halo_left = f32::from(halo.origin.x);
     let halo_right = halo_left + f32::from(halo.size.width);
     assert!(
-        halo_left <= bar_right - 3.5 && halo_right >= bar_right + 0.5,
-        "end halo must cover edge−4..+1, halo={halo_left}..{halo_right} bar_right={bar_right}"
+        halo_left <= bar_right - 5.5 && halo_right >= bar_right + 0.5,
+        "end halo must cover edge−6..+1, halo={halo_left}..{halo_right} bar_right={bar_right}"
     );
     let resize = cx
         .debug_bounds("gantt-resize-handle-1003-end")
@@ -4681,7 +4680,7 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
         "end resize must sit just left of the link sliver, resize_right={resize_right} sliver_left={sliver_left}"
     );
     cx.simulate_mouse_down(
-        grab_bar_link_sliver(bar),
+        grab_outer_link_handle(bar),
         MouseButton::Left,
         Modifiers::default(),
     );
@@ -4694,7 +4693,7 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::Link),
-            "pressing Auto-fit Month Persist cart's last pixels must start a link, not a move"
+            "pressing Auto-fit Month Persist cart's outer handle must start a link, not a move"
         );
         assert_eq!(
             view.state.gantt.selected_id,
@@ -4831,13 +4830,26 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
     view.update(cx, |view, _| {
         assert_eq!(
             view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::ResizeEnd),
+            "hovering 5.5px inside the end edge must classify resize (halo covers edge−6)"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("ew-resize"),
+            "5.5px inside the end edge must show the resize cursor"
+        );
+    });
+    cx.simulate_mouse_move(grab_outer_link_handle(bar), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
             Some(BarHitZone::Link),
-            "hovering the leftover sliver past the 4px halo must classify link"
+            "hovering the outer handle must classify link"
         );
         assert_eq!(
             view.hover_cursor_for_test(),
             Some("drag-link"),
-            "the leftover sliver must show a link cursor"
+            "the outer handle must show a link cursor"
         );
     });
 }
@@ -5290,7 +5302,7 @@ fn month_persist_edge_drag_adds_a_link_toast(cx: &mut gpui_kit::TestAppContext) 
         (bar_right - bar_left - 64.0).abs() < 40.0,
         "Auto-fit Month Persist cart should be a short bar around x=545-609, got {bar_left}..{bar_right}"
     );
-    for inset in [3.0, 1.0] {
+    for inset in [2.0, 4.0, 6.0, 3.0, 1.0] {
         cx.simulate_mouse_move(grab_bar_from_right(bar, inset), None, Modifiers::default());
         view.update(cx, |view, _| {
             assert_eq!(
@@ -5301,30 +5313,22 @@ fn month_persist_edge_drag_adds_a_link_toast(cx: &mut gpui_kit::TestAppContext) 
             assert_eq!(
                 view.hover_cursor_for_test(),
                 Some("ew-resize"),
-                "2–4px inside the end edge must show the resize cursor, inset={inset}"
+                "2–6px inside the end edge must show the resize cursor, inset={inset}"
             );
         });
     }
-    cx.simulate_mouse_move(grab_bar_link_sliver(bar), None, Modifiers::default());
-    view.update(cx, |view, _| {
-        assert_eq!(
-            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
-            Some(BarHitZone::Link),
-            "the leftover sliver past the 4px halo must still be the link zone"
-        );
-        assert_eq!(
-            view.hover_cursor_for_test(),
-            Some("drag-link"),
-            "the leftover sliver must show a distinct link cursor"
-        );
-    });
-    let at_edge = grab_bar_link_sliver(bar);
+    let at_edge = grab_outer_link_handle(bar);
     cx.simulate_mouse_move(at_edge, None, Modifiers::default());
     cx.background_executor
         .advance_clock(Duration::from_millis(200));
     cx.run_until_parked();
     draw(cx);
     view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::Link),
+            "the outer handle must still be the link zone"
+        );
         assert_eq!(
             view.hover_cursor_for_test(),
             Some("drag-link"),
@@ -5341,7 +5345,7 @@ fn month_persist_edge_drag_adds_a_link_toast(cx: &mut gpui_kit::TestAppContext) 
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::Link),
-            "a press on the leftover sliver must start a link, not a no-op"
+            "a press on the outer handle must start a link, not a no-op"
         );
     });
     let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
@@ -5421,7 +5425,7 @@ fn month_persist_xdotool_style_drag_persists_link_in_the_mock(cx: &mut gpui_kit:
     let bar = cx
         .debug_bounds("gantt-bar-1003")
         .expect("Month Persist cart");
-    let at_edge = grab_bar_link_sliver(bar);
+    let at_edge = grab_outer_link_handle(bar);
     cx.simulate_mouse_move(at_edge, None, Modifiers::default());
     cx.simulate_mouse_down(at_edge, MouseButton::Left, Modifiers::default());
     draw(cx);
@@ -5433,7 +5437,7 @@ fn month_persist_xdotool_style_drag_persists_link_in_the_mock(cx: &mut gpui_kit:
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::Link),
-            "a press on the leftover sliver must start a link"
+            "a press on the outer handle must start a link"
         );
     });
     let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
@@ -5547,7 +5551,7 @@ fn month_xdotool_mouseup_over_cart_ui_commits_link_in_the_mock(cx: &mut gpui_kit
     let bar = cx
         .debug_bounds("gantt-bar-1003")
         .expect("Month Persist cart");
-    let at_edge = grab_bar_link_sliver(bar);
+    let at_edge = grab_outer_link_handle(bar);
     cx.simulate_mouse_move(at_edge, None, Modifiers::default());
     cx.simulate_mouse_down(at_edge, MouseButton::Left, Modifiers::default());
     draw(cx);
@@ -5559,7 +5563,7 @@ fn month_xdotool_mouseup_over_cart_ui_commits_link_in_the_mock(cx: &mut gpui_kit
                 .as_ref()
                 .map(|gesture| gesture.kind),
             Some(GestureKind::Link),
-            "a press on the leftover sliver must start a link"
+            "a press on the outer handle must start a link"
         );
     });
     let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
@@ -9138,8 +9142,8 @@ fn ctrl_z_clears_the_hover_chip_so_the_next_press_moves(cx: &mut gpui_kit::TestA
         view.handle_key(&undo, cx);
         assert_eq!(view.state.gantt.pin_bar_tooltip, None);
         assert!(
-            view.suppress_bar_tooltip_for_test(),
-            "undo must suppress the hover chip until the pointer moves"
+            !view.suppress_bar_tooltip_for_test(),
+            "undo must recompute hover at the resting pointer, not suppress the tooltip"
         );
     });
     draw(cx);
@@ -9410,6 +9414,18 @@ fn drop_hides_the_bar_tooltip_beside_the_moved_toast(cx: &mut gpui_kit::TestAppC
         cx.debug_bounds("gantt-bar-tooltip").is_none(),
         "the pinned dates chip must not sit beside the Moved toast after drop"
     );
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_some(),
+        "drop must show the hover tooltip at the still pointer without a hover-enter"
+    );
+    assert!(
+        cx.debug_bounds("gantt-hover-date-start").is_some(),
+        "drop / hover must show the Start Date pill"
+    );
+    assert!(
+        cx.debug_bounds("gantt-hover-date-end").is_some(),
+        "drop / hover must show the Target Date pill"
+    );
 }
 
 #[gpui_kit::test]
@@ -9424,20 +9440,23 @@ fn two_to_four_px_inside_the_end_edge_resizes(cx: &mut gpui_kit::TestAppContext)
     });
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
-    let halo = grab_end_resize_halo(bar);
+    for inset in [2.0, 4.0, 6.0] {
+        cx.simulate_mouse_move(grab_bar_from_right(bar, inset), None, Modifiers::default());
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+                Some(BarHitZone::ResizeEnd),
+                "{inset}px inside the painted end must be the resize halo"
+            );
+            assert_eq!(
+                view.hover_cursor_for_test(),
+                Some("ew-resize"),
+                "{inset}px inside the painted end must show the resize cursor"
+            );
+        });
+    }
+    let halo = grab_bar_from_right(bar, 4.0);
     cx.simulate_mouse_move(halo, None, Modifiers::default());
-    view.update(cx, |view, _| {
-        assert_eq!(
-            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
-            Some(BarHitZone::ResizeEnd),
-            "2–4px inside the painted end must be the resize halo"
-        );
-        assert_eq!(
-            view.hover_cursor_for_test(),
-            Some("ew-resize"),
-            "the halo must show the resize cursor"
-        );
-    });
     cx.simulate_mouse_down(halo, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
