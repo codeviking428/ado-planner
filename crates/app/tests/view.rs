@@ -4,8 +4,8 @@ use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind, HANDLE_WIDTH, LINK_HANDLE,
-    LINK_HANDLE_HIT, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN,
-    PARALLEL_VERT_MIN, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
+    LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, OUTSIDE_LABEL_GAP,
+    PARALLEL_LANE_MIN, PARALLEL_VERT_MIN, ROW_HEIGHT, TODAY_ALIGN, TODAY_PILL_GAP, TREE_INDENT,
     UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px,
     insert_index_for_child, outside_label_is_beside_bar,
 };
@@ -158,6 +158,24 @@ fn grab_link_handle(
     point(
         handle.origin.x + handle.size.width - px(1.),
         handle.origin.y + handle.size.height / 2.0,
+    )
+}
+
+/// Last 4px of a dated bar — the inset link sliver, not the end grip.
+fn grab_bar_link_sliver(
+    bar: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> gpui_kit::Point<gpui_kit::Pixels> {
+    point(
+        bar.origin.x + bar.size.width - px(4.),
+        bar.origin.y + bar.size.height / 2.0,
+    )
+}
+
+/// Shifted end-resize grip, just left of the 8px link sliver.
+fn grab_end_resize(bar: gpui_kit::Bounds<gpui_kit::Pixels>) -> gpui_kit::Point<gpui_kit::Pixels> {
+    point(
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
+        bar.origin.y + bar.size.height / 2.0,
     )
 }
 
@@ -4188,6 +4206,154 @@ fn pressing_the_last_pixels_of_a_bar_starts_a_link(cx: &mut gpui_kit::TestAppCon
 }
 
 #[gpui_kit::test]
+fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+    assert!(
+        f32::from(bar.size.width) > HANDLE_WIDTH * 2.0 + 1.0,
+        "precondition: Month Persist cart must be wide enough to resize, width={}",
+        f32::from(bar.size.width)
+    );
+    let sliver = cx
+        .debug_bounds("gantt-link-handle-1003-link-end-inset")
+        .expect("wide dated bar must expose an inset link sliver");
+    let sliver_left = f32::from(sliver.origin.x);
+    assert!(
+        sliver_left <= bar_right - 6.0,
+        "inset sliver must cover the last 6–8px, sliver_left={sliver_left} bar_right={bar_right}"
+    );
+    cx.simulate_mouse_down(
+        grab_bar_link_sliver(bar),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "pressing Month Persist cart's last pixels must start a link, not a resize"
+        );
+        assert_eq!(
+            view.state.gantt.selected_id,
+            Some(1003),
+            "a Persist cart link press must not select Cart UI"
+        );
+    });
+    let preview = cx
+        .debug_bounds("gantt-link-preview")
+        .expect("a real drag from the sliver must show a ghost line");
+    let preview_left = f32::from(preview.origin.x);
+    assert!(
+        preview_left + 1.0 >= bar_right,
+        "ghost must not run left through the bar, preview_left={preview_left} bar_right={bar_right}"
+    );
+    let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
+    cx.simulate_mouse_move(cart.center(), Some(MouseButton::Left), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-link-preview").is_some(),
+        "dragging the Persist cart sliver to Cart UI must keep the ghost line"
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link)
+        );
+        assert_eq!(
+            view.state.gantt.selected_id,
+            Some(1003),
+            "dragging a Persist cart link must not select Cart UI"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-row-accent-1005").is_none(),
+        "Cart UI must not show a selected-row accent during a Persist cart link drag"
+    );
+    view.update(cx, |view, _| {
+        view.state.cancel_gesture();
+    });
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart after cancel");
+    cx.simulate_mouse_down(
+        grab_end_resize(bar),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::ResizeEnd),
+            "the 8px just left of the Persist cart sliver must still resize"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn quarter_today_stays_continuous_across_go_live_and_spike(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.scale = GanttScale::Quarter;
+    state.gantt.zoom = 1.0;
+    state.gantt.go_today(jiff::Zoned::now().date());
+    state.gantt.selected_id = None;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let segments = today_body_segments(cx);
+    assert!(
+        !segments.is_empty(),
+        "Quarter Today must paint when Today is on screen"
+    );
+    assert_eq!(
+        segments.len(),
+        1,
+        "Quarter Today must be one continuous stroke, not chip-gapped, segments={}",
+        segments.len()
+    );
+    assert!(
+        cx.debug_bounds("gantt-row-accent-1005").is_none(),
+        "Quarter must not paint a leftover Cart UI selected-row accent"
+    );
+}
+
+#[gpui_kit::test]
 fn last_pixels_of_a_milestone_still_move(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -5295,7 +5461,7 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
         "the right edge must stay on-screen so the grip can receive the click, bar_right={bar_right}"
     );
     let on_end = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(on_end, MouseButton::Left, Modifiers::default());
@@ -6131,8 +6297,9 @@ fn hovered_bar_shows_round_link_handles_not_resize_bars(cx: &mut gpui_kit::TestA
         "end resize grip must overlap the bar's right interior, handle x {handle_left} vs bar right {bar_right}"
     );
     assert!(
-        handle_right <= bar_right + 0.5 && handle_right + 4.0 >= bar_right,
-        "end resize grip must stay inside the painted bar, handle right {handle_right} vs bar right {bar_right}"
+        handle_right <= bar_right - LINK_HANDLE_INSET + 0.5
+            && handle_right + 4.0 >= bar_right - LINK_HANDLE_INSET,
+        "end resize grip must sit just left of the 8px link sliver, handle right {handle_right} vs bar right {bar_right}"
     );
     let grip = cx
         .debug_bounds("gantt-resize-grip-2-end")
@@ -6664,7 +6831,7 @@ fn parent_summary_bar_resizes_without_the_link_dot_stealing(cx: &mut gpui_kit::T
         );
     }
     let grip = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
@@ -6699,7 +6866,7 @@ fn summary_edge_does_not_silently_move(cx: &mut gpui_kit::TestAppContext) {
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-1").expect("summary bar");
     let edge = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(edge, MouseButton::Left, Modifiers::default());
@@ -6804,7 +6971,7 @@ fn resize_starts_on_mouse_down_without_hover(cx: &mut gpui_kit::TestAppContext) 
     );
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
     let grip = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
@@ -6988,7 +7155,7 @@ fn end_grip_wins_hit_test_over_bar_body_and_link_handle(cx: &mut gpui_kit::TestA
         "end grip must stay inside the bar, grip {handle_left}..{handle_right} link {link_left}"
     );
     let on_bar = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(on_bar, MouseButton::Left, Modifiers::default());
@@ -7025,7 +7192,7 @@ fn mouse_down_3px_inside_the_right_end_resizes_end_only(cx: &mut gpui_kit::TestA
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
     let grip = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
@@ -7132,7 +7299,7 @@ fn drop_undo_and_pointer_leave_clear_the_bar_tooltip(cx: &mut gpui_kit::TestAppC
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
     let grip = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
@@ -7192,7 +7359,7 @@ fn drop_tooltip_shows_the_new_dates(cx: &mut gpui_kit::TestAppContext) {
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
     let grip = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
@@ -7354,7 +7521,7 @@ fn drop_off_the_bar_does_not_pin_a_tooltip(cx: &mut gpui_kit::TestAppContext) {
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
     let grip = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
@@ -7398,7 +7565,7 @@ fn drop_on_another_row_does_not_pin_a_tooltip(cx: &mut gpui_kit::TestAppContext)
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
     let parent = cx.debug_bounds("gantt-bar-1").expect("parent row");
     let grip = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
@@ -7433,7 +7600,7 @@ fn pinned_tooltip_unpins_when_the_pointer_leaves_the_row(cx: &mut gpui_kit::Test
     draw(cx);
     let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
     let grip = point(
-        bar.origin.x + bar.size.width - px(3.),
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
         bar.origin.y + bar.size.height / 2.0,
     );
     cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
@@ -7694,7 +7861,10 @@ fn start_handle_dot_is_part_of_the_resize_hit_zone(cx: &mut gpui_kit::TestAppCon
         view.state.gantt.hovered_id = Some(2);
     });
     draw(cx);
-    let end = point(bar.origin.x + bar.size.width - px(3.), mid_y);
+    let end = point(
+        bar.origin.x + bar.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
+        mid_y,
+    );
     cx.simulate_mouse_down(end, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
@@ -8237,7 +8407,7 @@ fn click_painted_bar_inset(
     let x = if at_start {
         bar.origin.x + px(inset)
     } else {
-        bar.origin.x + bar.size.width - px(inset)
+        bar.origin.x + bar.size.width - px(inset + LINK_HANDLE_INSET)
     };
     let y = bar.origin.y + bar.size.height / 2.0;
     cx.simulate_mouse_down(point(x, y), MouseButton::Left, Modifiers::default());

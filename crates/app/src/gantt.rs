@@ -16,7 +16,8 @@ pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
 pub const SPLITTER_WIDTH: f32 = 8.0;
 pub const SPLITTER_STEP: f32 = 16.0;
 /// Inner grip on each painted end. Hits stay inside the bar on a resizable
-/// body; a sliver that cannot resize uses its last 8px as a link handle.
+/// body; the last `LINK_HANDLE_INSET` pixels of a dated bar start a link,
+/// so the end grip sits just left of that sliver.
 pub const HANDLE_WIDTH: f32 = 8.0;
 /// Selected tree/timeline row tint. Stronger than zebra stripes so the row reads.
 pub const SELECTED_ROW_TINT: f32 = 0.65;
@@ -35,7 +36,7 @@ pub const LINK_HANDLE_HIT: f32 = 16.0;
 /// Gap between the painted bar end and the outside link handle.
 pub const LINK_HANDLE_GAP: f32 = 6.0;
 /// Right-handle hit reaches this far into the bar so a press on the last
-/// 8px starts a link, not a no-op on a sliver that cannot resize.
+/// 8px starts a link, not a resize (wide bars) or a no-op Move (slivers).
 pub const LINK_HANDLE_INSET: f32 = 8.0;
 /// Parallel dependency lanes stay at least this far apart (stroke is 2px).
 pub const PARALLEL_LANE_MIN: f32 = 10.0;
@@ -446,10 +447,21 @@ impl BarLayout {
             && self.width > HANDLE_WIDTH * 2.0
     }
 
-    /// Dated sliver whose last pixels cannot resize: the right link handle
-    /// covers them. Diamonds and start-only bars keep Move on that edge.
+    /// Dated bar whose last pixels start a link. Wide bars keep an inner
+    /// end-resize grip just left of this sliver. Diamonds and start-only
+    /// bars keep Move on that edge.
     pub fn link_handle_insets_into_bar(&self) -> bool {
-        !self.can_resize() && !self.milestone && !self.open_ended && !self.marker
+        self.kind == GanttBarKind::Scheduled && !self.milestone && !self.open_ended && !self.marker
+    }
+
+    /// Shift the end resize grip left by this much so the last
+    /// `LINK_HANDLE_INSET` pixels can be the link sliver.
+    pub fn resize_end_link_inset(&self) -> f32 {
+        if self.can_resize() && self.link_handle_insets_into_bar() {
+            LINK_HANDLE_INSET
+        } else {
+            0.0
+        }
     }
 
     /// Inner 8px of each end, split at the midpoint on bars shorter than 16px.
@@ -490,8 +502,10 @@ impl BarLayout {
         }
         let width = (painted_right - painted_left).max(1.0);
         let grip = HANDLE_WIDTH.min(width / 2.0).max(1.0);
+        let link_inset = self.resize_end_link_inset().min(width / 2.0);
         let on_start = window_x <= painted_left + grip;
-        let on_end = window_x >= painted_right - grip;
+        let on_end =
+            window_x >= painted_right - grip - link_inset && window_x < painted_right - link_inset;
         if self.summary && !self.can_resize() {
             // Two 8px edges meet on a 16px bar; skip them so a short parent
             // (diamond, year sliver) still has a Move body.
@@ -550,10 +564,12 @@ pub fn resize_start_handle(bar: &BarLayout) -> (f32, f32) {
     (bar.x, width)
 }
 
-/// Inner end grip: the last `HANDLE_WIDTH` of the painted bar.
+/// Inner end grip: `HANDLE_WIDTH` ending `resize_end_link_inset` before
+/// the painted right, so the last 8px of a dated bar can start a link.
 pub fn resize_end_handle(bar: &BarLayout) -> (f32, f32) {
     let width = bar.inner_grip_width();
-    (bar.x + bar.width - width, width)
+    let inset = bar.resize_end_link_inset();
+    (bar.x + bar.width - width - inset, width)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2192,6 +2208,8 @@ impl GanttView {
             } else {
                 GestureKind::Move
             }
+        } else if bar.link_handle_insets_into_bar() && x >= bar.x + bar.width - LINK_HANDLE_INSET {
+            GestureKind::Link
         } else {
             bar.resize_kind_at(x).unwrap_or(GestureKind::Move)
         };
@@ -3695,58 +3713,48 @@ pub fn outside_label_is_beside_bar(
 /// not paint through an outside-title chip that stays beside its bar.
 ///
 /// Year uses a full-row hole so the stroke breaks around the pill instead
-/// of threading the 12px pad above/below a 16px chip (R78). Other scales
-/// use glyph width and an exact 16px chip so Quarter occupancy over-width
-/// cannot false-gap Go-live/spike (R75).
+/// of threading the 12px pad above/below a 16px chip (R78). Quarter/Month/
+/// Week stay continuous: occupancy over-width false-gapped Go-live and
+/// spike (R75, R82). Labels still paint on top of the stroke.
 pub fn today_line_chip_skips(
     bars: &[BarLayout],
     today_x: f32,
     timeline_w: f32,
     scale: GanttScale,
 ) -> Vec<(f32, f32)> {
+    if !matches!(scale, GanttScale::Year) {
+        return Vec::new();
+    }
     let line_right = today_x + 3.0;
-    let year = matches!(scale, GanttScale::Year);
     let mut skips: Vec<(f32, f32)> = bars
         .iter()
         .filter_map(|bar| {
             let (x, w) =
                 bar_outside_label_frame(bar, timeline_w, true, Some(today_x), bar.overflow_badge)?;
-            let skip_w = if year {
-                w
-            } else {
-                bar_title_px(&bar.title).min(w)
-            };
             // Year graze counts: a chip whose left edge sits on the 3px stroke
-            // (Checkout at today+3) still paints through the line. Other
-            // scales keep a 2px miss so Quarter occupancy cannot false-gap.
-            let miss_right = if year {
-                line_right + TODAY_LABEL_CLEARANCE
-            } else {
-                line_right + 2.0
-            };
-            if x >= miss_right || x + skip_w <= today_x - 2.0 {
+            // (Checkout at today+3) still paints through the line.
+            let miss_right = line_right + TODAY_LABEL_CLEARANCE;
+            if x >= miss_right || x + w <= today_x - 2.0 {
                 return None;
             }
-            Some(year_or_chip_skip(bar, year))
+            Some(year_or_chip_skip(bar, true))
         })
         .collect();
-    if year {
-        for bar in bars {
-            if !bar.open_ended || bar.milestone || bar.marker {
-                continue;
-            }
-            if today_x + 3.0 < bar.x - 2.0 {
-                continue;
-            }
-            let skip = year_or_chip_skip(bar, true);
-            if skips
-                .iter()
-                .any(|&(top, bottom)| top <= skip.0 && bottom >= skip.1)
-            {
-                continue;
-            }
-            skips.push(skip);
+    for bar in bars {
+        if !bar.open_ended || bar.milestone || bar.marker {
+            continue;
         }
+        if today_x + 3.0 < bar.x - 2.0 {
+            continue;
+        }
+        let skip = year_or_chip_skip(bar, true);
+        if skips
+            .iter()
+            .any(|&(top, bottom)| top <= skip.0 && bottom >= skip.1)
+        {
+            continue;
+        }
+        skips.push(skip);
     }
     skips.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut merged: Vec<(f32, f32)> = Vec::new();
@@ -4545,7 +4553,13 @@ mod tests {
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 176.0, 4.0).map(|(_, kind)| kind),
-            Some(GestureKind::ResizeEnd)
+            Some(GestureKind::Link),
+            "the last 8px of a dated bar must start a link"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(&bars, 168.0, 4.0).map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "the 8px just left of the link sliver must still resize"
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 140.0, 4.0).map(|(_, kind)| kind),
@@ -4563,13 +4577,13 @@ mod tests {
         );
         assert_eq!(
             GanttView::hit_test_bar(&bars, 100.0 + 80.0 - 3.0, 4.0).map(|(_, kind)| kind),
-            Some(GestureKind::ResizeEnd),
-            "3px inside the right end must resize, not move"
+            Some(GestureKind::Link),
+            "3px inside the right end must start a link"
         );
         let (end_x, end_w) = resize_end_handle(&bar);
         assert!(
-            (end_x - (bar.x + bar.width - HANDLE_WIDTH)).abs() < 0.1,
-            "end grip must start 8px inside the painted bar, got {end_x}"
+            (end_x - (bar.x + bar.width - HANDLE_WIDTH - LINK_HANDLE_INSET)).abs() < 0.1,
+            "end grip must sit just left of the 8px link sliver, got {end_x}"
         );
         assert!(
             (end_w - HANDLE_WIDTH).abs() < 0.1,
@@ -4611,17 +4625,23 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&summary), 176.0, 4.0)
                 .map(|(_, kind)| kind),
-            Some(GestureKind::ResizeEnd),
-            "a parent with its own dates resizes at the right edge"
+            Some(GestureKind::Link),
+            "a parent with its own dates starts a link on the last 8px"
         );
         assert_eq!(
-            summary.hit_zone_at_window_x(176.0, summary.x, summary.x + summary.width),
+            GanttView::hit_test_bar(std::slice::from_ref(&summary), 168.0, 4.0)
+                .map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "a parent with its own dates still resizes just left of the link sliver"
+        );
+        assert_eq!(
+            summary.hit_zone_at_window_x(168.0, summary.x, summary.x + summary.width),
             BarHitZone::ResizeEnd
         );
         assert_eq!(
             summary.hit_zone_at_window_x(177.0, summary.x, summary.x + summary.width),
-            BarHitZone::ResizeEnd,
-            "3px inside a summary end must resize, not sit under a link dot"
+            BarHitZone::Move,
+            "3px inside a summary end is the link sliver, not resize"
         );
         let diamond = BarLayout {
             summary: true,
@@ -4696,17 +4716,18 @@ mod tests {
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width - 1.0, 4.0)
                 .map(|(_, kind)| kind),
-            Some(GestureKind::ResizeEnd),
-            "the last pixel of a Week-scale bar must resize, not move"
+            Some(GestureKind::Link),
+            "the last pixel of a Week-scale bar must start a link"
         );
         assert_eq!(
             GanttView::hit_test_bar(
                 std::slice::from_ref(&bar),
-                bar.x + bar.width - HANDLE_WIDTH + 1.0,
+                bar.x + bar.width - LINK_HANDLE_INSET - HANDLE_WIDTH / 2.0,
                 4.0
             )
             .map(|(_, kind)| kind),
-            Some(GestureKind::ResizeEnd)
+            Some(GestureKind::ResizeEnd),
+            "the 8px just left of the link sliver must still resize"
         );
         assert_eq!(
             GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width / 2.0, 4.0)
@@ -4715,15 +4736,21 @@ mod tests {
             "the body of a wide bar must still move"
         );
         assert_eq!(
-            GanttView::hit_test_bar(std::slice::from_ref(&bar), end_x + end_w + 2.0, 4.0)
+            GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width + 2.0, 4.0)
                 .map(|(_, kind)| kind),
             None,
             "the link-handle gap past the bar must not be a resize"
         );
         assert_eq!(
-            bar.resize_kind_at(bar.x + bar.width - 3.0),
+            bar.resize_kind_at(bar.x + bar.width - LINK_HANDLE_INSET - 3.0),
             Some(GestureKind::ResizeEnd),
-            "3px inside the right end must be ResizeEnd"
+            "3px inside the shifted end grip must be ResizeEnd"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width - 3.0, 4.0)
+                .map(|(_, kind)| kind),
+            Some(GestureKind::Link),
+            "3px inside the painted end must start a link"
         );
         // Painted window edges can sit far from layout.x (tree, gutter, label).
         // Classification must use those edges, not layout-local x.
@@ -4736,9 +4763,13 @@ mod tests {
                 "{inset}px inside the painted start must resize, not move"
             );
             assert_eq!(
-                bar.hit_zone_at_window_x(painted_right - inset, painted_left, painted_right),
+                bar.hit_zone_at_window_x(
+                    painted_right - LINK_HANDLE_INSET - inset,
+                    painted_left,
+                    painted_right
+                ),
                 BarHitZone::ResizeEnd,
-                "{inset}px inside the painted end must resize, not move"
+                "{inset}px inside the shifted end grip must resize, not move"
             );
             assert_eq!(
                 bar.resize_kind_at(painted_left + inset),
@@ -5356,6 +5387,47 @@ mod tests {
         assert_eq!(
             bars[0].hit_zone_at_window_x((left + right) / 2.0, left, right),
             BarHitZone::Move
+        );
+    }
+
+    #[test]
+    fn wide_dated_bar_last_pixels_start_a_link() {
+        let bar = BarLayout {
+            id: 1003,
+            kind: GanttBarKind::Scheduled,
+            x: 100.0,
+            width: 168.0,
+            y: 0.0,
+            summary: true,
+            milestone: false,
+            label: "Persist cart".into(),
+            title: "Persist cart".into(),
+            color: 0x89b4fa,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        assert!(bar.can_resize(), "Month Persist cart must still resize");
+        assert!(
+            bar.link_handle_insets_into_bar(),
+            "a wide dated bar's last pixels must start a link"
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(std::slice::from_ref(&bar), bar.x + bar.width - 4.0, 4.0)
+                .map(|(_, kind)| kind),
+            Some(GestureKind::Link)
+        );
+        assert_eq!(
+            GanttView::hit_test_bar(
+                std::slice::from_ref(&bar),
+                bar.x + bar.width - LINK_HANDLE_INSET - 4.0,
+                4.0
+            )
+            .map(|(_, kind)| kind),
+            Some(GestureKind::ResizeEnd),
+            "the inner 8px left of the sliver must still resize"
         );
     }
 
@@ -7740,35 +7812,10 @@ mod tests {
         };
         let skips =
             today_line_chip_skips(&bars, today_x, gantt.timeline_width, GanttScale::Quarter);
-        for id in [1012_i64, 1013] {
-            let bar = bars.iter().find(|bar| bar.id == id).unwrap();
-            let Some((x, w)) =
-                bar_outside_label_frame(bar, gantt.timeline_width, true, Some(today_x), false)
-            else {
-                continue;
-            };
-            let glyph_w = bar_title_px(&bar.title).min(w);
-            let glyphs_hit_line = x < today_x + 3.0 + 2.0 && x + glyph_w > today_x - 2.0;
-            let chip_top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
-            let chip_bottom = chip_top + OUTSIDE_LABEL_H;
-            let skipped = skips
-                .iter()
-                .any(|&(top, bottom)| top <= chip_top + 1.0 && bottom >= chip_bottom - 1.0);
-            assert_eq!(
-                skipped,
-                glyphs_hit_line,
-                "Quarter Today skip for {} must match glyph overlap, glyphs={x}..{} today={today_x} skips={skips:?}",
-                bar.title,
-                x + glyph_w
-            );
-        }
-        for &(top, bottom) in &skips {
-            assert!(
-                (bottom - top - OUTSIDE_LABEL_H).abs() <= 1.0
-                    || skips.iter().any(|&(a, b)| a < top && b > bottom),
-                "Today skips must match the 16px chip, not extra pad, skip={top}..{bottom}"
-            );
-        }
+        assert!(
+            skips.is_empty(),
+            "Quarter Today must stay a continuous line, skips={skips:?} today={today_x}"
+        );
     }
 
     #[test]

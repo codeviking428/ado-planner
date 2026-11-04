@@ -3124,6 +3124,8 @@ impl PlannerView {
                                     .when(!selected, |btn| btn.ghost())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.dismiss_overlays();
+                                        this.state.gantt.clear_row_hover();
+                                        this.state.gantt.hover_locked = false;
                                         this.animate_gantt(cx, |gantt| {
                                             gantt.retarget_year_gutter(|gantt| {
                                                 let today = jiff::Zoned::now().date();
@@ -4445,7 +4447,8 @@ impl PlannerView {
                     .children({
                         // After arrows/cues so the line stays continuous
                         // through links; before labels so chips still cover
-                        // it. `today_line_chip_skips` already gaps those bands.
+                        // it. Year `today_line_chip_skips` gaps those bands;
+                        // Quarter stays a continuous stroke.
                         // Hide when Today is off the clip so Month does not
                         // paint a stray 3px at the chart's left edge.
                         if !today_on_screen {
@@ -4837,6 +4840,7 @@ impl PlannerView {
         let painted_bars = self.painted_bar_bounds.clone();
         let layout_x = bar.x;
         let grip_w = bar.inner_grip_width();
+        let end_link_inset = bar.resize_end_link_inset();
         // on_prepaint reports the content box; hits use the visible border box.
         let paint_border = if milestone || marker || unscheduled || no_fields || open_ended {
             0.0
@@ -5033,7 +5037,11 @@ impl PlannerView {
                                 .top_0()
                                 .bottom_0()
                                 .left(px(if can_resize || summary { grip_w } else { 0.0 }))
-                                .right(px(if can_resize || summary { grip_w } else { 0.0 }))
+                                .right(px(if can_resize || summary {
+                                    grip_w + end_link_inset
+                                } else {
+                                    0.0
+                                }))
                                 .pl(px(if can_resize || summary {
                                     4.0 + clip_pad
                                 } else {
@@ -5201,6 +5209,7 @@ impl PlannerView {
             .as_ref()
             .is_some_and(|gesture| gesture.kind == GestureKind::Link);
         let grip_w = bar.inner_grip_width();
+        let end_link_inset = bar.resize_end_link_inset();
         let layout = bar.clone();
         let grips = if bar.open_ended && !bar.can_resize() {
             vec![("start", "resize-start", "resize-grip-start", true)]
@@ -5220,7 +5229,7 @@ impl PlannerView {
                     .debug_selector(move || selector.clone())
                     .absolute()
                     .when(at_start, |el| el.left_0())
-                    .when(!at_start, |el| el.right_0())
+                    .when(!at_start, |el| el.right(px(end_link_inset)))
                     .top_0()
                     .bottom_0()
                     .w(px(grip_w))
@@ -5382,128 +5391,148 @@ impl PlannerView {
         let selected = self.state.gantt.selected_id == Some(id);
         let show_dot = hovered && !dragging;
         let (local_left, local_right) = self.painted_timeline_edges(bar);
-        // Inner 8px grips resize a wide bar. A dated sliver that cannot
-        // resize extends the right handle 8px into the bar so a press on
-        // the last pixels starts a link instead of a no-op Move. Diamonds
-        // and start-only bars keep Move on that edge. The visual dot stays
-        // outside; the overflow ! is painted past this hit box.
+        // Inner 8px grips resize a wide bar, shifted left of a full-row
+        // inset sliver so the last 8px starts a link. A dated sliver that
+        // cannot resize keeps one combined hit box covering those pixels.
+        // Diamonds and start-only bars keep Move on that edge. The visual
+        // dot stays outside; the overflow ! is painted past this hit box.
         let inset = if bar.link_handle_insets_into_bar() {
             LINK_HANDLE_INSET
         } else {
             0.0
         };
         let start_x = local_left - LINK_HANDLE_HIT - 2.0;
-        // Inset is measured from the bar end, not from the outside gap, so
-        // the hit covers the last 8px plus the connector sitting past it.
-        let end_x = if inset > 0.0 {
+        // Wide bars keep the named `link-end` handle in the gap (wheel pan,
+        // overflow-badge tests). The inset sliver is a separate overlay so
+        // it can occlude the end grip without stealing pan past the bar.
+        let split_inset = inset > 0.0 && bar.can_resize();
+        let end_x = if inset > 0.0 && !split_inset {
             local_right - inset
         } else {
             local_right + LINK_HANDLE_GAP
         };
-        let end_hit_w = if inset > 0.0 {
+        let end_hit_w = if inset > 0.0 && !split_inset {
             inset + LINK_HANDLE_GAP + LINK_HANDLE_HIT
         } else {
             LINK_HANDLE_HIT
         };
         let handle_top = bar.y + ((ROW_HEIGHT - LINK_HANDLE_HIT) / 2.0).max(0.0);
-        let handles = [
+        let end_origin = local_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT / 2.0;
+        let mut handle_specs = vec![
             (
                 "link-start",
                 start_x,
                 LINK_HANDLE_HIT,
+                handle_top,
                 start_x + LINK_HANDLE_HIT / 2.0,
             ),
-            (
-                "link-end",
-                end_x,
-                end_hit_w,
-                local_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT / 2.0,
-            ),
-        ]
-        .map(|(handle_id, handle_x, hit_w, origin)| {
-            let selector = format!("gantt-link-handle-{id}-{handle_id}");
-            div()
-                .id((handle_id, id as u64))
-                .debug_selector(move || selector.clone())
-                .absolute()
-                .left(px(handle_x))
-                .top(px(handle_top))
-                .w(px(hit_w))
-                .h(px(LINK_HANDLE_HIT))
-                .flex()
-                .items_center()
-                .when(handle_id == "link-end", |el| el.justify_end())
-                .when(handle_id != "link-end", |el| el.justify_center())
-                .when(
-                    show_dot || selected || dragging || (handle_id == "link-end" && inset > 0.0),
-                    |el| el.occlude(),
-                )
-                .bg(gpui_kit::hsla(0., 0., 0., 0.01))
-                .cursor(CursorStyle::DragLink)
-                .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
-                    this.apply_scroll(event, cx);
-                }))
-                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    if *hovered {
-                        this.set_bar_hovered(Some(id), cx);
-                    }
-                }))
-                .on_mouse_move(
-                    cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                        if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
-                            gesture.kind == GestureKind::Link && gesture.id != id
-                        }) {
-                            this.state.gantt.set_link_target(id);
+            ("link-end", end_x, end_hit_w, handle_top, end_origin),
+        ];
+        if split_inset {
+            handle_specs.push((
+                "link-end-inset",
+                local_right - inset,
+                inset,
+                bar.y,
+                end_origin,
+            ));
+        }
+        let handles = handle_specs
+            .into_iter()
+            .map(|(handle_id, handle_x, hit_w, top, origin)| {
+                let selector = format!("gantt-link-handle-{id}-{handle_id}");
+                let inset_sliver = handle_id == "link-end-inset";
+                let hit_h = if inset_sliver {
+                    ROW_HEIGHT
+                } else {
+                    LINK_HANDLE_HIT
+                };
+                div()
+                    .id((handle_id, id as u64))
+                    .debug_selector(move || selector.clone())
+                    .absolute()
+                    .left(px(handle_x))
+                    .top(px(top))
+                    .w(px(hit_w))
+                    .h(px(hit_h))
+                    .flex()
+                    .items_center()
+                    .when(handle_id == "link-end", |el| el.justify_end())
+                    .when(handle_id != "link-end", |el| el.justify_center())
+                    .when(
+                        show_dot
+                            || selected
+                            || dragging
+                            || inset_sliver
+                            || (handle_id == "link-end" && inset > 0.0 && !split_inset),
+                        |el| el.occlude(),
+                    )
+                    .bg(gpui_kit::hsla(0., 0., 0., 0.01))
+                    .cursor(CursorStyle::DragLink)
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                        this.apply_scroll(event, cx);
+                    }))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.set_bar_hovered(Some(id), cx);
                         }
-                        this.on_bar_drag_move(event, window, cx);
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        let x: f32 = event.position.x.into();
-                        this.bar_press_shift = event.modifiers.shift;
-                        this.continue_or_begin_bar_gesture(
-                            id,
-                            GestureKind::Link,
-                            origin,
-                            x,
-                            window,
-                            cx,
-                        );
-                    }),
-                )
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                        let x: f32 = event.position.x.into();
-                        let y: f32 = event.position.y.into();
-                        this.release_bar_gesture(x, y, window, cx);
-                    }),
-                )
-                .child(
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .when(handle_id == "link-end", |el| el.justify_end().pr(px(4.)))
-                        .when(handle_id != "link-end", |el| el.justify_center())
-                        .when(show_dot, |el| {
-                            el.child(
-                                div()
-                                    .debug_selector(move || {
-                                        format!("gantt-link-dot-{id}-{handle_id}")
-                                    })
-                                    .size(px(LINK_HANDLE))
-                                    .rounded_full()
-                                    .bg(cx.theme().background)
-                                    .border_2()
-                                    .border_color(cx.theme().primary),
-                            )
+                    }))
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                            if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+                                gesture.kind == GestureKind::Link && gesture.id != id
+                            }) {
+                                this.state.gantt.set_link_target(id);
+                            }
+                            this.on_bar_drag_move(event, window, cx);
                         }),
-                )
-        });
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            let x: f32 = event.position.x.into();
+                            this.bar_press_shift = event.modifiers.shift;
+                            this.continue_or_begin_bar_gesture(
+                                id,
+                                GestureKind::Link,
+                                origin,
+                                x,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            this.release_bar_gesture(x, y, window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .when(handle_id == "link-end", |el| el.justify_end().pr(px(4.)))
+                            .when(handle_id != "link-end", |el| el.justify_center())
+                            .when(show_dot && !inset_sliver, |el| {
+                                el.child(
+                                    div()
+                                        .debug_selector(move || {
+                                            format!("gantt-link-dot-{id}-{handle_id}")
+                                        })
+                                        .size(px(LINK_HANDLE))
+                                        .rounded_full()
+                                        .bg(cx.theme().background)
+                                        .border_2()
+                                        .border_color(cx.theme().primary),
+                                )
+                            }),
+                    )
+            });
         Some(
             div()
                 .absolute()
