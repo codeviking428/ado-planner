@@ -39,7 +39,7 @@ pub const SELECTED_ROW_TINT: f32 = 0.65;
 /// Left accent on the selected tree/timeline row.
 pub const SELECTED_ACCENT_W: f32 = 3.0;
 /// Year-scale bars shorter than this still paint a hittable body, not a sliver.
-pub const YEAR_MIN_BAR_WIDTH: f32 = 16.0;
+pub const YEAR_MIN_BAR_WIDTH: f32 = 24.0;
 /// Year/Quarter summary bars read as slivers at 14px; keep a thicker body.
 pub const YEAR_MIN_BAR_H: f32 = 20.0;
 /// Floor so a zero-width day still paints on Month/Week/Quarter.
@@ -82,8 +82,9 @@ pub const OUTSIDE_LABEL_GAP: f32 =
 /// Outside title chip height, matching `render_gantt_bar_label`.
 pub const OUTSIDE_LABEL_H: f32 = 16.0;
 /// Gap from a diamond to its outside title, past the handle dot so Week/Day
-/// "Go-live" is not covered by the outbound connector.
-pub const MILESTONE_LABEL_GAP: f32 = LINK_HANDLE_GAP + LINK_HANDLE + 4.0;
+/// "Go-live" keeps ≥8px from the outbound connector (handle occupies
+/// `LINK_HANDLE_GAP..LINK_HANDLE_GAP+LINK_HANDLE`).
+pub const MILESTONE_LABEL_GAP: f32 = LINK_HANDLE_GAP + LINK_HANDLE + 8.0;
 /// Gap from a flipped outside title's right edge to the bar's left edge.
 /// The inbound handle sits at `local_left - LINK_HANDLE_HIT - 2`.
 pub const OUTSIDE_TITLE_LEFT_GAP: f32 = LINK_HANDLE_HIT + LINK_HANDLE_GAP;
@@ -101,7 +102,7 @@ pub const BAR_LABEL_INSIDE_MIN: f32 = 72.0;
 pub const TODAY_MARGIN_PX: f32 = 80.0;
 /// Place the Today line in the middle of the timeline.
 pub const TODAY_ALIGN: f32 = 0.5;
-pub const SCALE_BUTTON_WIDTH: f32 = 132.0;
+pub const SCALE_BUTTON_WIDTH: f32 = 80.0;
 /// Toolbar zoom, Today, scale, period, Auto Fit, and team-switch camera easing.
 pub const CAMERA_EASE_MS: u64 = 150;
 pub const PLACEHOLDER_MIN_WIDTH: f32 = 48.0;
@@ -455,10 +456,10 @@ impl BarLayout {
         if self.milestone || self.marker {
             MILESTONE_SIZE
         } else if self.summary {
-            // Year slivers (`YEAR_MIN_BAR_WIDTH`) need a thicker body so
-            // the Today line and labels do not swallow them. Wide summaries
-            // stay `SUMMARY_BAR_H` so the row still has a connector gap.
-            if self.width <= YEAR_MIN_BAR_WIDTH + 0.5 {
+            // Year start-only slivers are floored to `YEAR_MIN_BAR_WIDTH`.
+            // Thicken those, not a 24px Persist cart, so connector lanes
+            // still have a gap under the 14px summary body.
+            if self.open_ended && self.width <= YEAR_MIN_BAR_WIDTH + 0.5 {
                 YEAR_MIN_BAR_H.max(SUMMARY_BAR_H)
             } else {
                 SUMMARY_BAR_H
@@ -1269,20 +1270,21 @@ impl GanttView {
         x >= 0.0 && x <= right && y >= top && y <= bottom
     }
 
+    /// ‹ / › pan, as days. A quarter of the visible span at the current
+    /// scale and zoom so Day/Week/Month/Quarter/Year move the same fraction.
+    pub fn pan_step_days(&self) -> i32 {
+        let ppd = self.scale.pixels_per_day(self.zoom).max(0.4);
+        let viewport_days = (self.timeline_width.max(MIN_TIMELINE_WIDTH) / ppd).max(1.0);
+        (viewport_days * 0.25).round().max(1.0) as i32
+    }
+
     pub fn step_period(&mut self, direction: i32) {
         if direction == 0 {
             return;
         }
         self.keep_today = false;
-        // Finer than a whole period: Month ‹ used to jump a full month.
-        let span = match self.scale {
-            GanttScale::Day => direction.days(),
-            GanttScale::Week => (direction * 3).days(),
-            GanttScale::Month => (direction * 7).days(),
-            GanttScale::Quarter => direction.months(),
-            GanttScale::Year => (direction * 3).months(),
-        };
-        self.origin = self.origin.saturating_add(span);
+        let days = direction * self.pan_step_days();
+        self.origin = self.origin.saturating_add(days.days());
     }
 
     /// Keep the viewport-centre date still when switching Day/Week/Month/…
@@ -1834,8 +1836,6 @@ impl GanttView {
                     x -= MILESTONE_SIZE / 2.0;
                 } else if display.kind == GanttBarKind::Unscheduled {
                     width = width.max(PLACEHOLDER_MIN_WIDTH);
-                } else if matches!(self.scale, GanttScale::Year) {
-                    width = width.max(YEAR_MIN_BAR_WIDTH);
                 }
                 let start_only = parse_iso_date(node.target_date.as_deref()).is_none()
                     && parse_iso_date(node.start_date.as_deref()).is_some()
@@ -1856,6 +1856,9 @@ impl GanttView {
                     let visible = (x + width).max(HANDLE_WIDTH * 2.0).max(8.0);
                     width = visible.min(width.max(HANDLE_WIDTH * 2.0));
                     x = 0.0;
+                }
+                if matches!(self.scale, GanttScale::Year) && !marker && !display.milestone {
+                    width = width.max(YEAR_MIN_BAR_WIDTH);
                 }
                 Some(BarLayout {
                     id: node.id,
@@ -2393,34 +2396,20 @@ impl GanttView {
         Some((earliest, latest.unwrap_or(earliest)))
     }
 
-    /// Fit every laid-out bar into `width` pixels, matching monday.com Auto Fit.
-    pub fn auto_fit(&mut self, nodes: &[WorkItemNode], iterations: &[IterationNode], width: f32) {
+    /// Pan so scheduled items start on screen. Scale and zoom stay put so
+    /// Auto Fit does not change Month column width.
+    pub fn auto_fit(&mut self, nodes: &[WorkItemNode], iterations: &[IterationNode], _width: f32) {
         self.keep_today = false;
         let today = jiff::Zoned::now().date();
-        let Some((earliest, end)) = Self::scheduled_span(nodes, iterations) else {
+        let Some((earliest, _)) = Self::scheduled_span(nodes, iterations) else {
             self.go_today(today);
-            self.zoom = 1.0;
             return;
         };
         // Fit the item span only. Pulling Today into a July cluster in November
-        // squeezed bars into slivers against the left edge.
+        // squeezed bars into slivers against the left edge. Keep scale/zoom so
+        // a Month camera does not suddenly change column width.
         self.origin = earliest.saturating_sub(2.days());
         self.scroll_x = 0.0;
-        let days = end
-            .since((Unit::Day, self.origin))
-            .map(|span| span.get_days())
-            .unwrap_or(1)
-            .max(7) as f32
-            + 4.0;
-        let target_ppd = ((width * 0.78) / days).clamp(0.4, 96.0);
-        // Pick the finest scale whose 40% zoom floor can still show the span.
-        // Staying on Day at 40% leaves a Jul–Nov cluster hanging off the right.
-        let chosen = GanttScale::ALL
-            .into_iter()
-            .find(|scale| days * scale.base_pixels_per_day() * 0.4 <= width)
-            .unwrap_or(GanttScale::Year);
-        self.scale = chosen;
-        self.zoom = (target_ppd / chosen.base_pixels_per_day()).clamp(0.4, 4.0);
     }
 
     pub fn apply_nudge(
@@ -3925,7 +3914,21 @@ pub fn bar_hover_tooltip(bar: &BarLayout, nodes: &[WorkItemNode]) -> String {
     } else {
         "No dates".into()
     };
-    format!("{} · {} · {assignee}", bar.title, dates)
+    let mut tip = format!("{} · {} · {assignee}", bar.title, dates);
+    if let Some(overflow) = parent_overflow_tip(nodes, bar.id) {
+        let parent_name = node
+            .and_then(|item| item.parent_id)
+            .and_then(|parent_id| nodes.iter().find(|item| item.id == parent_id))
+            .map(|item| item.title.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("its parent");
+        tip.push_str(" · ! ");
+        tip.push_str(&overflow);
+        tip.push_str(". The ! means this item extends outside ");
+        tip.push_str(parent_name);
+        tip.push_str(" after that parent moved.");
+    }
+    tip
 }
 
 /// True when the timeline has no dated bars — only gutter pills, or nothing.
@@ -5886,36 +5889,45 @@ mod tests {
     }
 
     #[test]
-    fn auto_fit_switches_scale_when_day_cannot_fit() {
+    fn auto_fit_keeps_the_current_scale_and_month_width() {
         let mut item = node(1, None);
         item.start_date = Some("2026-07-06T00:00:00Z".into());
         item.target_date = Some("2026-11-20T00:00:00Z".into());
         let nodes = vec![item];
         let mut gantt = GanttView {
             origin: Date::new(2026, 11, 1).unwrap(),
-            scale: GanttScale::Day,
+            scale: GanttScale::Month,
             zoom: 1.0,
             timeline_width: 800.0,
             ..Default::default()
         };
+        let before = gantt.period_width(Date::new(2026, 7, 1).unwrap());
         gantt.auto_fit(&nodes, &[], 800.0);
-        assert_ne!(
+        assert_eq!(
             gantt.scale,
-            GanttScale::Day,
-            "a Jul–Nov span must leave Day so 40% zoom is not the only lever, got {:?} @ {:.2}",
-            gantt.scale,
+            GanttScale::Month,
+            "Auto fit must keep Month so column width does not jump, got {:?}",
+            gantt.scale
+        );
+        assert!(
+            (gantt.zoom - 1.0).abs() < f32::EPSILON,
+            "Auto fit must not retune zoom, zoom={}",
             gantt.zoom
         );
+        let after = gantt.period_width(Date::new(2026, 7, 1).unwrap());
+        assert!(
+            (after - before).abs() < 0.5,
+            "Auto fit must not change month width, {before} vs {after}"
+        );
+        assert_eq!(gantt.origin, Date::new(2026, 7, 4).unwrap());
         let rows = gantt.flatten(&nodes);
         let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
         assert!(!bars.is_empty());
         assert!(
-            bars[0].x + bars[0].width <= 800.0 + 1.0,
-            "fitted bar must stay on screen, x={} width={} scale={:?} zoom={}",
+            bars[0].x >= -1.0,
+            "fitted bar must start on screen, x={} width={}",
             bars[0].x,
-            bars[0].width,
-            gantt.scale,
-            gantt.zoom
+            bars[0].width
         );
     }
 
@@ -5930,11 +5942,16 @@ mod tests {
         gantt.auto_fit(&nodes, &[], 800.0);
         let today = jiff::Zoned::now().date();
         let latest = Date::new(2026, 7, 20).unwrap();
+        assert_eq!(gantt.origin, Date::new(2026, 7, 4).unwrap());
+        assert!(
+            (gantt.zoom - 0.4).abs() < f32::EPSILON,
+            "Auto fit must keep zoom so month columns stay put, zoom={}",
+            gantt.zoom
+        );
         if today > latest {
-            let today_x = gantt.x_for_date(today);
-            assert!(
-                today_x > 800.0,
-                "Today outside the item span must not be pulled into the viewport, today_x={today_x}"
+            assert_ne!(
+                gantt.origin, today,
+                "Today outside the item span must not steal the Auto fit origin"
             );
         }
         let rows = gantt.flatten(&nodes);
@@ -7094,7 +7111,11 @@ mod tests {
             (today_x - expected).abs() < 1.5,
             "Today line at {today_x} should sit near {expected}"
         );
-        assert!((gantt.zoom - 1.0).abs() < f32::EPSILON);
+        assert!(
+            (gantt.zoom - 0.4).abs() < f32::EPSILON,
+            "Auto fit must not reset zoom when there is nothing to fit, zoom={}",
+            gantt.zoom
+        );
     }
 
     #[test]
@@ -7364,25 +7385,37 @@ mod tests {
     }
 
     #[test]
-    fn step_period_in_month_pans_a_week_not_a_month() {
-        let mut gantt = GanttView {
-            origin: Date::new(2026, 8, 1).unwrap(),
-            scale: GanttScale::Month,
-            zoom: 1.0,
-            timeline_width: 800.0,
-            ..Default::default()
-        };
-        let before = gantt.origin;
-        gantt.step_period(-1);
-        assert_eq!(
-            gantt.origin,
-            before.saturating_sub(7.days()),
-            "Month ‹ must pan a week, not a whole month, {} vs {}",
-            gantt.origin,
-            before
-        );
-        gantt.step_period(1);
-        assert_eq!(gantt.origin, before, "a matching › must restore the origin");
+    fn step_period_is_a_quarter_of_the_visible_span() {
+        for scale in GanttScale::ALL {
+            let mut gantt = GanttView {
+                origin: Date::new(2026, 8, 1).unwrap(),
+                scale,
+                zoom: 1.0,
+                timeline_width: 800.0,
+                ..Default::default()
+            };
+            let viewport_days = 800.0 / scale.pixels_per_day(1.0);
+            let expected = (viewport_days * 0.25).round().max(1.0) as i32;
+            assert_eq!(
+                gantt.pan_step_days(),
+                expected,
+                "{scale:?} pan must be ¼ of the visible span, viewport_days={viewport_days}"
+            );
+            let before = gantt.origin;
+            gantt.step_period(-1);
+            assert_eq!(
+                gantt.origin,
+                before.saturating_sub(expected.days()),
+                "{scale:?} ‹ must pan {expected} days, {} vs {}",
+                gantt.origin,
+                before
+            );
+            gantt.step_period(1);
+            assert_eq!(
+                gantt.origin, before,
+                "{scale:?} a matching › must restore the origin"
+            );
+        }
     }
 
     #[test]
@@ -9333,6 +9366,7 @@ mod tests {
         }
         let mut gantt = GanttView {
             timeline_width: 800.0,
+            zoom: 0.4,
             ..Default::default()
         };
         gantt.auto_fit(&nodes, &[], 800.0);
@@ -13091,6 +13125,34 @@ mod tests {
         );
         child.target_date = Some("2026-07-25T00:00:00Z".into());
         assert!(!parent_date_overflow(&[parent, child], 2));
+    }
+
+    #[test]
+    fn bar_hover_tooltip_explains_the_overflow_bang() {
+        let mut parent = node(1, None);
+        parent.title = "Cart".into();
+        parent.start_date = Some("2026-07-01T00:00:00Z".into());
+        parent.target_date = Some("2026-07-10T00:00:00Z".into());
+        let mut child = node(2, Some(1));
+        child.title = "Persist cart".into();
+        child.start_date = Some("2026-07-06T00:00:00Z".into());
+        child.target_date = Some("2026-07-20T00:00:00Z".into());
+        let nodes = vec![parent, child];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let persist = bars.iter().find(|bar| bar.id == 2).expect("Persist cart");
+        let tip = bar_hover_tooltip(persist, &nodes);
+        assert!(
+            tip.contains('!')
+                && tip.contains("Outside parent's dates")
+                && tip.contains("Cart")
+                && tip.contains("extends outside"),
+            "Persist cart tooltip must explain the ! after Cart moved, got {tip:?}"
+        );
     }
 
     #[test]

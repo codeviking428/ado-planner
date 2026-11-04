@@ -3398,6 +3398,7 @@ impl PlannerView {
                             })),
                     )
             })
+            .child(self.render_gantt_overflow(cx))
             .child(
                 div()
                     .id("gantt-prev-period")
@@ -3551,7 +3552,6 @@ impl PlannerView {
                             })),
                     ),
             )
-            .child(self.render_gantt_overflow(cx))
             .child(
                 div()
                     .id("gantt-sync-status")
@@ -3597,11 +3597,13 @@ impl PlannerView {
         let trigger = div()
             .id("gantt-toolbar-more")
             .debug_selector(|| "gantt-toolbar-more".into())
+            .flex_shrink_0()
+            .min_w(px(32.))
             .child(
                 Button::new("toolbar-more")
                     .ghost()
                     .compact()
-                    .icon(IconName::Ellipsis)
+                    .label("⋯")
                     .tooltip("More")
                     .tooltip_placement(Placement::Bottom)
                     .selected(open)
@@ -3718,6 +3720,7 @@ impl PlannerView {
         div()
             .id("gantt-toolbar-overflow")
             .debug_selector(|| "gantt-toolbar-overflow".into())
+            .flex_shrink_0()
             .child(popup)
     }
 
@@ -5345,19 +5348,22 @@ impl PlannerView {
                     let bar = bars.iter().find(|bar| bar.id == gesture.id);
                     let date_pill = |text: String, cx: &Context<Self>| {
                         div()
+                            .h(px(DATE_PILL_H))
                             .px_2()
-                            .py(px(2.))
+                            .flex()
+                            .items_center()
                             .rounded_sm()
                             .border_1()
                             .border_color(cx.theme().border)
                             .bg(cx.theme().popover)
                             .text_color(cx.theme().popover_foreground)
                             .text_xs()
+                            .line_height(px(14.))
                             .whitespace_nowrap()
                             .shadow_md()
                             .child(text)
                     };
-                    let (chip_x, y, start_x, end_x) = match bar {
+                    let (chip_x, y, start_x, end_x, pill_y) = match bar {
                         Some(bar) => {
                             let painted_w = if bar.milestone || bar.marker {
                                 MILESTONE_SIZE
@@ -5381,11 +5387,33 @@ impl PlannerView {
                                 + ((ROW_HEIGHT - 22.0) / 2.0).max(2.0);
                             let start_w = drag_date_pill_text_width(&start_text);
                             let end_w = drag_date_pill_text_width(&end_text);
-                            let (start_x, end_x) =
-                                drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
-                            (chip_x, y, start_x, end_x)
+                            let today = jiff::Zoned::now().date();
+                            let today_px = self.state.gantt.x_for_date(today);
+                            let today_x = (today_px >= 0.0 && today_px <= width).then_some(today_px);
+                            let (start_x, end_x, pill_y) = layout_date_pills(
+                                bar,
+                                start_w,
+                                end_w,
+                                bars,
+                                width,
+                                today_x,
+                                self.state.gantt.viewport_h,
+                            );
+                            (
+                                chip_x,
+                                y,
+                                start_x,
+                                end_x,
+                                pill_y + TIMELINE_HEADER_H,
+                            )
                         }
-                        None => (gesture.live_x.max(4.0), 4.0, gesture.live_x.max(4.0), 4.0),
+                        None => (
+                            gesture.live_x.max(4.0),
+                            4.0,
+                            gesture.live_x.max(4.0),
+                            4.0,
+                            4.0,
+                        ),
                     };
                     Some(
                         div()
@@ -5433,7 +5461,7 @@ impl PlannerView {
                                     .debug_selector(|| "gantt-drag-date-start".into())
                                     .absolute()
                                     .left(px(start_x))
-                                    .top(px(y))
+                                    .top(px(pill_y))
                                     .child(date_pill(start_text, cx)),
                             )
                             .child(
@@ -5442,7 +5470,7 @@ impl PlannerView {
                                     .debug_selector(|| "gantt-drag-date-end".into())
                                     .absolute()
                                     .left(px(end_x))
-                                    .top(px(y))
+                                    .top(px(pill_y))
                                     .child(date_pill(end_text, cx)),
                             ),
                     )
@@ -6681,8 +6709,6 @@ impl PlannerView {
         let timeline_w = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
         let (x, chip_w, label, side) = offscreen_edge_chip(bar, timeline_w)?;
         let id = bar.id;
-        let bar_h = bar.paint_h();
-        let bar_top = bar.paint_top();
         let selector = format!("gantt-bar-edge-{side}-{id}");
         let tip = bar_hover_tooltip(bar, &self.state.nodes);
         let hovered =
@@ -6693,17 +6719,19 @@ impl PlannerView {
         } else {
             -tip_w - 4.0
         };
+        let chip_top = bar.y + ((ROW_HEIGHT - OUTSIDE_LABEL_H) / 2.0).max(2.0);
         Some(
             div()
                 .id(("gantt-bar-edge", id as u64))
                 .debug_selector(move || selector)
                 .absolute()
                 .left(px(x))
-                .top(px(bar.y + bar_top))
+                .top(px(chip_top))
                 .w(px(chip_w))
-                .h(px(bar_h.max(16.0)))
+                .h(px(OUTSIDE_LABEL_H))
                 .flex()
                 .items_center()
+                .text_xs()
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_bar_hovered(Some(id), cx);
@@ -7092,50 +7120,24 @@ impl PlannerView {
         let start = parse_iso_date(node.start_date.as_deref())?;
         let start_text = compact_date(start);
         let end_text = parse_iso_date(node.target_date.as_deref()).map(compact_date);
-        let painted_w = bar.width.max(8.0);
         let start_w = drag_date_pill_text_width(&start_text);
         let end_w = end_text
             .as_ref()
             .map(|text| drag_date_pill_text_width(text))
             .unwrap_or(0.0);
-        let (mut start_x, mut end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
-        let mut y = hover_date_pill_y(bar.y, bar.paint_top());
         let timeline_w = self.state.gantt.timeline_width.max(MIN_TIMELINE_WIDTH);
         let today = jiff::Zoned::now().date();
         let today_px = self.state.gantt.x_for_date(today);
         let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
-        let neighbors = overlay_neighbor_obstacles(bars, id, timeline_w, today_x);
-        let (nudged_start, nudged_y) = nudge_overlay_off(
-            OverlayRect {
-                x: start_x,
-                y,
-                w: start_w,
-                h: DATE_PILL_H,
-            },
-            &neighbors,
+        let (start_x, end_x, y) = layout_date_pills(
+            bar,
+            start_w,
+            end_w,
+            bars,
             timeline_w,
-            bar.y,
+            today_x,
             self.state.gantt.viewport_h,
-            0.0,
         );
-        start_x = nudged_start;
-        y = nudged_y;
-        if end_w > 0.0 {
-            let (nudged_end, _) = nudge_overlay_off(
-                OverlayRect {
-                    x: end_x,
-                    y,
-                    w: end_w,
-                    h: DATE_PILL_H,
-                },
-                &neighbors,
-                timeline_w,
-                bar.y,
-                self.state.gantt.viewport_h,
-                0.0,
-            );
-            end_x = nudged_end;
-        }
         let y = y + TIMELINE_HEADER_H;
         let date_pill = |text: String| {
             div()
@@ -10814,7 +10816,9 @@ fn overlay_too_close(a: OverlayRect, b: OverlayRect, clearance: f32) -> bool {
     if clearance <= 0.0 {
         overlay_overlap(a, b)
     } else {
-        overlay_overlap(a, inflate_overlay(b, clearance))
+        // `overlay_overlap`'s 1px slack would treat an 8px gap as clear.
+        let b = inflate_overlay(b, clearance);
+        a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
     }
 }
 
@@ -10859,7 +10863,21 @@ fn nudge_overlay_off_by(
         let left = hit.x - rect.w - pad;
         let up = hit.y - rect.h - pad;
         let down = hit.y + hit.h + pad;
-        if right + rect.w <= timeline_w - 4.0 {
+        let x_overlap = rect.x < hit.x + hit.w && rect.x + rect.w > hit.x;
+        // Date chips that share a column with a neighbour bar (Cart above
+        // Persist cart) must step vertically. Sliding right off a wide
+        // parent left them ~4px from that bar.
+        if x_overlap {
+            if down + rect.h <= (viewport_h - toast_band).max(0.0) {
+                rect.y = down;
+            } else if up >= 0.0 {
+                rect.y = up;
+            } else if right + rect.w <= timeline_w - 4.0 {
+                rect.x = right;
+            } else {
+                rect.x = left.max(0.0);
+            }
+        } else if right + rect.w <= timeline_w - 4.0 {
             rect.x = right;
         } else if left >= 0.0 {
             rect.x = left;
@@ -10968,6 +10986,57 @@ fn hover_bar_tooltip_origin(place: TooltipPlace, pills: &[OverlayRect]) -> (f32,
 /// body) instead of covering the title.
 fn hover_date_pill_y(bar_y: f32, paint_top: f32) -> f32 {
     bar_y + paint_top - DATE_PILL_H.max(HOVER_TOOLTIP_H) - HOVER_TOOLTIP_GAP
+}
+
+fn layout_date_pills(
+    bar: &crate::gantt::BarLayout,
+    start_w: f32,
+    end_w: f32,
+    bars: &[crate::gantt::BarLayout],
+    timeline_w: f32,
+    today_x: Option<f32>,
+    viewport_h: f32,
+) -> (f32, f32, f32) {
+    let painted_w = if bar.milestone || bar.marker {
+        MILESTONE_SIZE
+    } else {
+        bar.width.max(8.0)
+    };
+    let (mut start_x, mut end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
+    let mut y = hover_date_pill_y(bar.y, bar.paint_top());
+    let neighbors = overlay_neighbor_obstacles(bars, bar.id, timeline_w, today_x);
+    let (nudged_start, nudged_y) = nudge_overlay_off(
+        OverlayRect {
+            x: start_x,
+            y,
+            w: start_w,
+            h: DATE_PILL_H,
+        },
+        &neighbors,
+        timeline_w,
+        bar.y,
+        viewport_h,
+        0.0,
+    );
+    start_x = nudged_start;
+    y = nudged_y;
+    if end_w > 0.0 {
+        let (nudged_end, _) = nudge_overlay_off(
+            OverlayRect {
+                x: end_x,
+                y,
+                w: end_w,
+                h: DATE_PILL_H,
+            },
+            &neighbors,
+            timeline_w,
+            bar.y,
+            viewport_h,
+            0.0,
+        );
+        end_x = nudged_end;
+    }
+    (start_x, end_x, y)
 }
 
 fn hover_date_pill_rects(
@@ -11232,7 +11301,8 @@ fn link_preview_head(
 fn bar_title_chip(title: String, _ink: gpui_kit::Hsla, truncate: bool) -> gpui_kit::Div {
     // Same boxed chip at every scale: a light fill and dark ink, whether the
     // title sits inside the bar or beside it. Per-scale invert/plain mixes
-    // read as three different label styles.
+    // read as three different label styles. `text_xs` + `px_1` match the
+    // Month/Week/Day outside label so off-screen ‹ › pills don't grow.
     div()
         .debug_selector(|| "gantt-bar-title-chip".into())
         .px_1()
@@ -11240,6 +11310,7 @@ fn bar_title_chip(title: String, _ink: gpui_kit::Hsla, truncate: bool) -> gpui_k
         .border_1()
         .border_color(gpui_kit::hsla(0., 0., 0., 0.12))
         .bg(gpui_kit::hsla(0., 0., 1., 1.))
+        .text_xs()
         .text_color(gpui_kit::hsla(240. / 360., 0.21, 0.16, 1.))
         .when(truncate, |el| el.truncate())
         .when(!truncate, |el| el.whitespace_nowrap())
@@ -13094,6 +13165,36 @@ mod bar_label_tests {
             x >= diamond.x + diamond.w + super::OVERLAY_CLEARANCE - 0.1,
             "nudged chip x={x} must sit ≥8px right of the diamond {}",
             diamond.x + diamond.w
+        );
+    }
+
+    #[test]
+    fn overlay_nudge_steps_down_from_a_parent_bar() {
+        let cart = super::OverlayRect {
+            x: 40.0,
+            y: 40.0 + 13.0,
+            w: 400.0,
+            h: 14.0,
+        };
+        let chip = super::OverlayRect {
+            x: 80.0,
+            y: cart.y + cart.h + 1.0,
+            w: 40.0,
+            h: super::DATE_PILL_H,
+        };
+        assert!(
+            super::overlay_too_close(chip, cart, super::OVERLAY_CLEARANCE),
+            "1px below Cart must count as too close"
+        );
+        let (x, y) = super::nudge_overlay_off(chip, &[cart], 800.0, 80.0, 400.0, 0.0);
+        assert!(
+            (x - chip.x).abs() < 1.0,
+            "chips must stay on the bar edge instead of sliding off a wide parent, x={x}"
+        );
+        assert!(
+            y + 0.1 >= cart.y + cart.h + super::OVERLAY_CLEARANCE,
+            "nudged chip y={y} must sit ≥8px below Cart {}",
+            cart.y + cart.h
         );
     }
 }

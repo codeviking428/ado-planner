@@ -1925,8 +1925,14 @@ fn live_launch_camera_nodes() -> Vec<WorkItemNode> {
     nodes
 }
 
+/// Zoom Auto Fit used to pick for the mock Jul–Nov span at 800px Month.
+/// Tests that need that short-bar camera set this; Auto Fit itself no
+/// longer changes zoom (month columns stay put).
+const FITTED_MONTH_ZOOM: f32 = 0.4;
+
 /// 1280×800 launch camera: `apply_hierarchy` auto_fit at 800, then clamp.
 fn apply_launch_camera(state: &mut PlannerState) {
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     let nodes = state.nodes.clone();
     state.gantt.auto_fit(&nodes, &[], 800.0);
 }
@@ -2143,6 +2149,7 @@ fn runtime_drag_persist_cart_to_go_live_stays_eight_apart(cx: &mut gpui_kit::Tes
     }
     let nodes = state.nodes.clone();
     // Running-app camera: apply_hierarchy auto_fit at 800, then a 1280 window.
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     state.gantt.auto_fit(&nodes, &[], 800.0);
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
@@ -2773,17 +2780,31 @@ fn auto_fit_toolbar_button_fits_the_span(cx: &mut gpui_kit::TestAppContext) {
     });
     draw(cx);
     let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit button");
-    view.update(cx, |view, _| {
+    let (before_zoom, before_ppd) = view.update(cx, |view, _| {
         assert_eq!(view.state.gantt.scale, GanttScale::Day);
+        (
+            view.state.gantt.zoom,
+            view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom),
+        )
     });
     cx.simulate_click(fit.center(), Modifiers::default());
     draw(cx);
     view.update(cx, |view, _| {
-        assert_ne!(
+        assert_eq!(
             view.state.gantt.scale,
             GanttScale::Day,
-            "Auto fit must pick a scale that holds the scheduled span, got {:?}",
+            "Auto fit must keep Day so column width does not jump, got {:?}",
             view.state.gantt.scale
+        );
+        assert!(
+            (view.state.gantt.zoom - before_zoom).abs() < f32::EPSILON,
+            "Auto fit must not retune zoom, {} vs {before_zoom}",
+            view.state.gantt.zoom
+        );
+        let after_ppd = view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom);
+        assert!(
+            (after_ppd - before_ppd).abs() < 0.01,
+            "Auto fit must not change the Day column width, {before_ppd} vs {after_ppd}"
         );
     });
 }
@@ -4684,7 +4705,7 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
     state.nodes = mock_fixture_nodes();
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
     state.gantt.scale = GanttScale::Month;
-    state.gantt.zoom = 1.0;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     state.gantt.selected_id = None;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
@@ -4926,7 +4947,7 @@ fn month_persist_outer_link_handle_starts_a_link_on_bar_hover(cx: &mut gpui_kit:
     state.nodes = mock_fixture_nodes();
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
     state.gantt.scale = GanttScale::Month;
-    state.gantt.zoom = 1.0;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     state.gantt.selected_id = None;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
@@ -5346,7 +5367,7 @@ fn month_persist_edge_drag_adds_a_link_toast(cx: &mut gpui_kit::TestAppContext) 
     state.nodes = mock_fixture_nodes();
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
     state.gantt.scale = GanttScale::Month;
-    state.gantt.zoom = 1.0;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     state.gantt.selected_id = None;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
@@ -9336,7 +9357,7 @@ fn ctrl_z_recomputes_hover_against_filtered_rows(cx: &mut gpui_kit::TestAppConte
     state.toggle_hidden_type("Task");
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
     state.gantt.scale = GanttScale::Month;
-    state.gantt.zoom = 1.0;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
@@ -9564,6 +9585,7 @@ fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
     state.nodes = mock_fixture_nodes();
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
     state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
@@ -13514,6 +13536,7 @@ fn cart_both_edges_resize_and_noop_release_clears_preview(cx: &mut gpui_kit::Tes
     state.nodes = mock_fixture_nodes();
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
     state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
@@ -13775,6 +13798,7 @@ fn cart_end_edge_hit_every_offset_from_minus_8_to_plus_2(cx: &mut gpui_kit::Test
     state.nodes = mock_fixture_nodes();
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
     state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
@@ -14356,6 +14380,7 @@ fn short_bar_end_handle_grabs_in_the_gap(cx: &mut gpui_kit::TestAppContext) {
     state.nodes = mock_fixture_nodes();
     state.gantt.origin = Date::new(2026, 7, 1).unwrap();
     state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     cx.simulate_resize(gpui_kit::Size {
         width: px(1280.),
@@ -14869,6 +14894,21 @@ fn toolbar_overflow_holds_add_and_critical_path(cx: &mut gpui_kit::TestAppContex
         cx.debug_bounds("gantt-scale-group").is_some(),
         "scale buttons must share one segmented control"
     );
+    let more = cx
+        .debug_bounds("gantt-toolbar-more")
+        .expect("⋯ overflow must paint");
+    let today = cx.debug_bounds("gantt-today-btn").expect("Today");
+    assert!(
+        f32::from(more.size.width) > 8.0 && f32::from(more.size.height) > 8.0,
+        "⋯ must be a visible control, not an empty icon, {:?}",
+        more.size
+    );
+    assert!(
+        (f32::from(more.origin.y) - f32::from(today.origin.y)).abs() < 24.0,
+        "⋯ must sit on the toolbar row with Today, more={:?} today={:?}",
+        more.origin,
+        today.origin
+    );
     assert!(
         cx.debug_bounds("gantt-add-item").is_none(),
         "Add item stays in the overflow until opened"
@@ -14905,15 +14945,31 @@ fn year_bars_keep_a_minimum_height(cx: &mut gpui_kit::TestAppContext) {
             .state
             .gantt
             .layout_bars(&view.state.nodes, &rows, &[], 720.0);
-        bars.into_iter()
-            .filter(|bar| !bar.milestone && !bar.marker && bar.width <= YEAR_MIN_BAR_WIDTH + 0.5)
+        let dated: Vec<_> = bars
+            .iter()
+            .filter(|bar| !bar.milestone && !bar.marker)
+            .cloned()
+            .collect();
+        assert!(
+            dated
+                .iter()
+                .any(|bar| bar.width <= YEAR_MIN_BAR_WIDTH + 0.5),
+            "Year view must paint at least one min-width bar"
+        );
+        for bar in &dated {
+            assert!(
+                bar.width + 0.1 >= YEAR_MIN_BAR_WIDTH,
+                "Year {} must keep a {YEAR_MIN_BAR_WIDTH}px body, width={}",
+                bar.title,
+                bar.width
+            );
+        }
+        dated
+            .into_iter()
+            .filter(|bar| !bar.summary || bar.open_ended)
             .map(|bar| bar.id)
             .collect::<Vec<_>>()
     });
-    assert!(
-        !slivers.is_empty(),
-        "Year view must paint at least one min-width bar"
-    );
     for id in slivers {
         let selector: &'static str = Box::leak(format!("gantt-bar-{id}").into_boxed_str());
         let Some(bar) = cx.debug_bounds(selector) else {
@@ -14940,14 +14996,16 @@ fn month_period_buttons_pan_a_week(cx: &mut gpui_kit::TestAppContext) {
         height: px(800.),
     });
     draw(cx);
-    let before = view.update(cx, |view, _| view.state.gantt.origin);
+    let (before, step) = view.update(cx, |view, _| {
+        (view.state.gantt.origin, view.state.gantt.pan_step_days())
+    });
     let prev = cx.debug_bounds("gantt-prev-period").expect("‹");
     cx.simulate_click(prev.center(), Modifiers::default());
     draw(cx);
     let after = view.update(cx, |view, _| view.state.gantt.origin);
     assert_eq!(
         after,
-        before.saturating_sub(7.days()),
-        "Month ‹ must pan a week, not a whole month, {after} vs {before}"
+        before.saturating_sub(step.days()),
+        "Month ‹ must pan ¼ of the visible span ({step} days), {after} vs {before}"
     );
 }
