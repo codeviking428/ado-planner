@@ -4605,7 +4605,12 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
         "end resize must be a 6–8px unique zone, width={resize_w}"
     );
     assert!(
-        resize_right <= sliver_left + 0.5,
+        sliver_left <= resize_right + 0.5,
+        "resize and link must be contiguous (no dead zone), gap={} resize_right={resize_right} sliver_left={sliver_left}",
+        sliver_left - resize_right
+    );
+    assert!(
+        resize_right <= sliver_left + 2.5,
         "end resize must sit just left of the link sliver, resize_right={resize_right} sliver_left={sliver_left}"
     );
     cx.simulate_mouse_down(
@@ -4885,6 +4890,112 @@ fn month_persist_outer_link_handle_starts_a_link_without_hover(cx: &mut gpui_kit
             "the outer handle must start a link without hovering the bar first"
         );
     });
+}
+
+#[gpui_kit::test]
+fn month_persist_edge_presses_have_no_dead_zone(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = None;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+    let mid_y = bar.origin.y + bar.size.height / 2.0;
+    let resize = cx
+        .debug_bounds("gantt-resize-handle-1003-end")
+        .expect("end resize");
+    let sliver = cx
+        .debug_bounds("gantt-link-handle-1003-link-end-inset")
+        .expect("inset sliver");
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1003-link-end")
+        .expect("outer handle");
+    let resize_left = f32::from(resize.origin.x);
+    let resize_right = resize_left + f32::from(resize.size.width);
+    let sliver_left = f32::from(sliver.origin.x);
+    let sliver_right = sliver_left + f32::from(sliver.size.width);
+    let handle_left = f32::from(handle.origin.x);
+    let handle_w = f32::from(handle.size.width);
+    let handle_center = handle_left + handle_w / 2.0;
+    assert!(
+        sliver_left <= resize_right + 0.5,
+        "resize and link must meet, gap={:.1} resize={resize_left:.1}..{resize_right:.1} sliver={sliver_left:.1}..{sliver_right:.1} bar_right={bar_right:.1} handle={handle_left:.1}+{handle_w:.1} center={handle_center:.1}",
+        sliver_left - resize_right
+    );
+    let mut dead = Vec::new();
+    let mut kinds = Vec::new();
+    for dx in -12i32..=16 {
+        let x = bar_right + dx as f32;
+        cx.simulate_mouse_down(point(px(x), mid_y), MouseButton::Left, Modifiers::default());
+        draw(cx);
+        let kind = view.update(cx, |view, _| {
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| format!("{:?}", gesture.kind))
+        });
+        if kind.is_none() && x <= bar_right + 0.5 && x >= resize_left - 0.5 {
+            dead.push(x);
+        }
+        kinds.push((x, kind.clone()));
+        view.update(cx, |view, _| {
+            view.state.cancel_gesture();
+        });
+        draw(cx);
+    }
+    assert!(
+        dead.is_empty(),
+        "dead presses on Persist cart edge {dead:?}; probes={kinds:?}; resize={resize_left:.1}..{resize_right:.1} sliver={sliver_left:.1}..{sliver_right:.1} handle={handle_left:.1}..{:.1} center={handle_center:.1} bar_right={bar_right:.1}",
+        handle_left + handle_w
+    );
+    assert!(
+        (handle_center - (bar_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0)).abs() < 1.5,
+        "handle center must sit on the gap connector, center={handle_center:.1} bar_right={bar_right:.1}"
+    );
+    // 16px hit is half-open: center-8 is the inclusive left edge, center+8
+    // is the exclusive right. Probe the last inside pixel on the right so
+    // the reviewer's x=622 (center+6) still starts a link.
+    for (label, x) in [
+        ("center-8", handle_center - 8.0),
+        ("center+6", handle_center + 6.0),
+        ("center+8", handle_left + handle_w - 0.5),
+    ] {
+        cx.simulate_mouse_down(point(px(x), mid_y), MouseButton::Left, Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.state
+                    .gantt
+                    .gesture
+                    .as_ref()
+                    .map(|gesture| gesture.kind),
+                Some(GestureKind::Link),
+                "symmetric 8px radius must start a link at {label}={x:.1}, handle={handle_left:.1}..{:.1} center={handle_center:.1}",
+                handle_left + handle_w
+            );
+            view.state.cancel_gesture();
+        });
+        draw(cx);
+    }
 }
 
 #[gpui_kit::test]

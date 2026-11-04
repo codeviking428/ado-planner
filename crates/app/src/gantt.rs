@@ -655,9 +655,12 @@ impl DependencyArrow {
 
     /// Wrap-around routing drops at the source stub, then runs on the
     /// successor row into a short inbound. Used for overlap/backward FS so
-    /// the path does not detour left of the source start.
+    /// the path does not detour left of the source start. A forward run
+    /// whose inbound was shoved past `x_head` is not a wrap — painting it
+    /// as one puts the long horizontal on the successor row (Day-view
+    /// Persist cart → Go-live through the Go-live band).
     pub fn wraps_around_successor(&self) -> bool {
-        self.x2 > self.x_head + Self::WRAP_STUB
+        self.x2 > self.x_head + Self::WRAP_STUB && self.x1 + 1.0 >= self.x_head
     }
 
     pub fn stub_start(&self) -> f32 {
@@ -3407,10 +3410,11 @@ fn separate_shared_source_outgoing_off_labels(
     }
 }
 
-/// Keep a long outgoing horizontal ≥6px below the source's outside title
-/// after shared-source Y fan. Stay in the source row (Cart UI is the next
-/// row under Persist cart). The in-row band is only a few pixels, so
-/// re-spread shared-source runs inside it instead of collapsing onto one y.
+/// Keep a long outgoing horizontal in the source row gap after parallel-lane
+/// pushes. Outside-title sources sit ≥6px below the chip; inside-title Day
+/// bars use the same in-row band so Persist cart → Go-live cannot ride the
+/// Go-live row. Shared-source re-spread below still only fans outside-title
+/// sources — the inside-title gap is too tight to split two lanes.
 fn clamp_lanes_off_source_titles(arrows: &mut [DependencyArrow], bars: &[BarLayout]) {
     const CLEAR: f32 = 6.0;
     const STROKE: f32 = 2.0;
@@ -3419,16 +3423,34 @@ fn clamp_lanes_off_source_titles(arrows: &mut [DependencyArrow], bars: &[BarLayo
         let Some(pred) = by_id.get(&arrow.from_id) else {
             continue;
         };
-        if bar_title_is_inside(pred) || bar_is_gutter(pred) {
+        if bar_is_gutter(pred) {
             continue;
         }
         if arrow.y2 <= arrow.y1 {
             continue;
         }
         let (gap_top, gap_bottom) = source_row_gap(pred);
-        let min_lane = (gap_top + CLEAR).min(gap_bottom - STROKE - 1.0);
+        let clear = if bar_title_is_inside(pred) {
+            1.0
+        } else {
+            CLEAR
+        };
+        let min_lane = (gap_top + clear).min(gap_bottom - STROKE - 1.0);
         let max_lane = (gap_bottom - STROKE - 1.0).max(min_lane);
-        arrow.lane_y = ((min_lane + max_lane) / 2.0).clamp(min_lane, max_lane);
+        if bar_title_is_inside(pred) {
+            // Parallel-lane pushes can park a Day-scale inside-title run on
+            // a later row. Pull it back; do not snap to the midpoint or two
+            // in-gap lanes collapse.
+            arrow.lane_y = arrow.lane_y.clamp(min_lane, max_lane);
+        } else {
+            arrow.lane_y = ((min_lane + max_lane) / 2.0).clamp(min_lane, max_lane);
+        }
+        if let Some(succ) = by_id.get(&arrow.to_id)
+            && arrow.lane_y >= succ.y
+            && arrow.lane_y < succ.y + ROW_HEIGHT
+        {
+            arrow.lane_y = max_lane.min(succ.y - STROKE - 1.0).max(min_lane);
+        }
     }
     let mut by_from: HashMap<i64, Vec<usize>> = HashMap::new();
     for (index, arrow) in arrows.iter().enumerate() {
@@ -7141,6 +7163,14 @@ mod tests {
             persist_live.lane_y,
             cart.y
         );
+        if let Some(go_live) = bars.iter().find(|bar| bar.id == 1013) {
+            assert!(
+                persist_live.lane_y < go_live.y || persist_live.lane_y >= go_live.y + ROW_HEIGHT,
+                "{scale:?}: Persist cart → Go-live must not run through the Go-live row, lane {} go-live {}",
+                persist_live.lane_y,
+                go_live.y
+            );
+        }
         assert!(
             cart_spike.lane_y >= cue_bottom && cart_spike.lane_y <= cart.y + ROW_HEIGHT,
             "{scale:?}: Cart UI → spike must sit in the gap below the Cart UI cue, lane {} cue_bottom {} row {}",
@@ -7156,6 +7186,7 @@ mod tests {
             assert_mock_fixture_parallel_verticals(GanttScale::Month, width);
             assert_mock_fixture_parallel_verticals(GanttScale::Week, width);
         }
+        assert_mock_fixture_parallel_verticals(GanttScale::Day, 2400.0);
     }
 
     #[test]
@@ -9930,6 +9961,74 @@ mod tests {
         let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
         let succ = bars.iter().find(|bar| bar.id == 1013).unwrap();
         assert_exits_right_without_left_detour(arrow, pred, succ, gantt.timeline_width);
+        assert!(
+            !arrow.wraps_around_successor(),
+            "Day Persist cart → Go-live must stay a forward elbow, not a wrap on the Go-live row, x1={} x2={} x_head={}",
+            arrow.x1,
+            arrow.x2,
+            arrow.x_head
+        );
+        assert!(
+            arrow.lane_y < succ.y || arrow.lane_y >= succ.y + ROW_HEIGHT,
+            "Day Persist cart → Go-live must not run through the Go-live row, lane={} go-live={}..{}",
+            arrow.lane_y,
+            succ.y,
+            succ.y + ROW_HEIGHT
+        );
+        assert!(
+            arrow.lane_y >= pred.y && arrow.lane_y < pred.y + ROW_HEIGHT,
+            "Day Persist cart → Go-live must stay in the Persist cart row gap, lane={} persist={}..{}",
+            arrow.lane_y,
+            pred.y,
+            pred.y + ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn day_view_mock_fixture_link_skips_the_go_live_row() {
+        let nodes = mock_fixture_nodes();
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Day,
+            timeline_width: 2400.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let arrow = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("#1003→#1013");
+        let pred = bars.iter().find(|bar| bar.id == 1003).unwrap();
+        let succ = bars.iter().find(|bar| bar.id == 1013).unwrap();
+        assert!(
+            bar_title_is_inside(pred),
+            "precondition: Day Persist cart paints an inside title, width={}",
+            pred.width
+        );
+        assert!(
+            !arrow.wraps_around_successor(),
+            "forward Day Persist cart → Go-live must not wrap onto the Go-live row, x1={} x2={} x_head={} lane={}",
+            arrow.x1,
+            arrow.x2,
+            arrow.x_head,
+            arrow.lane_y
+        );
+        assert!(
+            arrow.lane_y < succ.y || arrow.lane_y >= succ.y + ROW_HEIGHT,
+            "Day Persist cart → Go-live must not run through the Go-live row, lane={} go-live={}..{}",
+            arrow.lane_y,
+            succ.y,
+            succ.y + ROW_HEIGHT
+        );
+        assert!(
+            arrow.lane_y >= pred.y && arrow.lane_y < pred.y + ROW_HEIGHT,
+            "Day Persist cart → Go-live must stay in the Persist cart row, lane={} persist={}..{}",
+            arrow.lane_y,
+            pred.y,
+            pred.y + ROW_HEIGHT
+        );
     }
 
     #[test]

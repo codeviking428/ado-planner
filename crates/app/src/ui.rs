@@ -5644,9 +5644,16 @@ impl PlannerView {
             .unwrap_or(self.state.gantt.timeline_origin_x);
         let content_right = painted.content_right - origin_x;
         let border = (painted.right - painted.content_right).max(0.0);
-        let sliver_x = content_right - link_w;
-        let sliver_w = link_w + border + 1.0;
-        let handle_origin = content_right + LINK_HANDLE_GAP + LINK_HANDLE_HIT / 2.0;
+        // Same parent as the bar (`.left(bar.x).w(bar.width)`). Using only
+        // `content_right - origin` drifted ~3px right of the end grip when
+        // the content box sat inside the 1px border (dead zone at 603–605
+        // on Persist cart). Layout-right minus the inset meets the grip;
+        // a 2px left pad covers the border inset so the zones touch.
+        let layout_right = bar.x + bar.width.max(8.0);
+        let sliver_x = (layout_right - link_w - border).min(content_right - link_w);
+        let sliver_right = layout_right.max(content_right) + border + 1.0;
+        let sliver_w = (sliver_right - sliver_x).max(link_w);
+        let handle_origin = layout_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
         let layout = bar.clone();
         let selector = format!("gantt-link-handle-{id}-link-end-inset");
         Some(
@@ -5816,7 +5823,17 @@ impl PlannerView {
         let hovered = self.state.gantt.bar_hovered_id == Some(id);
         let selected = self.state.gantt.selected_id == Some(id);
         let show_dot = hovered && !dragging;
-        let (local_left, local_right) = self.painted_timeline_edges(bar);
+        let (local_left, painted_right) = self.painted_timeline_edges(bar);
+        // Layout-right matches the bar's `.left(bar.x).w(bar.width)` parent.
+        // Painted right includes the 1–2px border and shifted the 16px hit
+        // left of the visual connector (x=614 linked, x=622 missed).
+        let layout_right = bar.x
+            + if bar.milestone || bar.marker {
+                MILESTONE_SIZE
+            } else {
+                bar.width.max(8.0)
+            };
+        let local_right = layout_right.max(painted_right);
         // Inner 8px grips resize a wide bar, shifted left of a full-row
         // inset sliver so the last 6px starts a link. A dated sliver that
         // cannot resize keeps one combined hit box covering those pixels.
@@ -5827,15 +5844,14 @@ impl PlannerView {
         // Wide bars keep the named `link-end` handle in the gap (wheel pan,
         // overflow-badge tests). The last pixels of a resizable bar are a
         // bar-child sliver so they win over the progress fill and body.
-        // The outer handle is an 8px-radius hit around the 8px connector
-        // at `bar.right + GAP + HANDLE/2` (~x=618 on Persist cart) so a
-        // press past the ~3–6px inset sliver still starts a link.
+        // The outer handle is a symmetric 8px-radius hit around the 8px
+        // connector at `bar.right + GAP + HANDLE/2` (~x=616 on Persist cart).
         let split_inset = inset > 0.0 && bar.can_resize();
-        let end_origin = local_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
+        let end_origin = layout_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
         let end_x = if inset > 0.0 && !split_inset {
             local_right - inset
         } else {
-            (end_origin - LINK_HANDLE_HIT / 2.0).max(local_right)
+            end_origin - LINK_HANDLE_HIT / 2.0
         };
         let end_hit_w = if inset > 0.0 && !split_inset {
             inset + LINK_HANDLE_GAP + LINK_HANDLE_HIT
@@ -5857,6 +5873,12 @@ impl PlannerView {
             .into_iter()
             .map(|(handle_id, handle_x, hit_w, top, origin)| {
                 let selector = format!("gantt-link-handle-{id}-{handle_id}");
+                let dot_left = if handle_id == "link-end" && !split_inset {
+                    (hit_w - LINK_HANDLE - 4.0).max(0.0)
+                } else {
+                    ((hit_w - LINK_HANDLE) / 2.0).max(0.0)
+                };
+                let dot_top = ((LINK_HANDLE_HIT - LINK_HANDLE) / 2.0).max(0.0);
                 div()
                     .id((handle_id, id as u64))
                     .debug_selector(move || selector.clone())
@@ -5865,15 +5887,6 @@ impl PlannerView {
                     .top(px(top))
                     .w(px(hit_w))
                     .h(px(LINK_HANDLE_HIT))
-                    .flex()
-                    .items_center()
-                    .when(handle_id == "link-end" && !split_inset, |el| {
-                        el.justify_end()
-                    })
-                    .when(handle_id == "link-end" && split_inset, |el| {
-                        el.justify_center()
-                    })
-                    .when(handle_id != "link-end", |el| el.justify_center())
                     .when(
                         // Always occlude the outer end handle so a press on
                         // the gap connector (~8px radius) starts a link
@@ -5933,32 +5946,20 @@ impl PlannerView {
                             this.release_bar_gesture(x, y, window, cx);
                         }),
                     )
-                    .child(
-                        div()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .when(handle_id == "link-end" && !split_inset, |el| {
-                                el.justify_end().pr(px(4.))
-                            })
-                            .when(handle_id == "link-end" && split_inset, |el| {
-                                el.justify_center()
-                            })
-                            .when(handle_id != "link-end", |el| el.justify_center())
-                            .when(show_dot, |el| {
-                                el.child(
-                                    div()
-                                        .debug_selector(move || {
-                                            format!("gantt-link-dot-{id}-{handle_id}")
-                                        })
-                                        .size(px(LINK_HANDLE))
-                                        .rounded_full()
-                                        .bg(cx.theme().background)
-                                        .border_2()
-                                        .border_color(cx.theme().primary),
-                                )
-                            }),
-                    )
+                    .when(show_dot, |el| {
+                        el.child(
+                            div()
+                                .debug_selector(move || format!("gantt-link-dot-{id}-{handle_id}"))
+                                .absolute()
+                                .left(px(dot_left))
+                                .top(px(dot_top))
+                                .size(px(LINK_HANDLE))
+                                .rounded_full()
+                                .bg(cx.theme().background)
+                                .border_2()
+                                .border_color(cx.theme().primary),
+                        )
+                    })
             });
         Some(
             div()
