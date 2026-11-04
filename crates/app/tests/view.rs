@@ -13251,6 +13251,75 @@ fn new_link_preview_uses_a_lane_offset_below_the_source_bar(cx: &mut gpui_kit::T
 }
 
 #[gpui_kit::test]
+fn new_link_preview_originates_at_the_source_handle(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx.debug_bounds("gantt-bar-2").expect("leaf bar");
+    cx.simulate_mouse_down(
+        grab_outer_link_handle(bar),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(cx);
+    let out = cx
+        .debug_bounds("gantt-link-preview-out")
+        .expect("outgoing stub from the source handle");
+    let preview = cx
+        .debug_bounds("gantt-link-preview")
+        .expect("rubber-band horizontal");
+    let bar_top = f32::from(bar.origin.y);
+    let bar_bottom = bar_top + f32::from(bar.size.height);
+    let bar_mid = bar_top + f32::from(bar.size.height) / 2.0;
+    let out_top = f32::from(out.origin.y);
+    let out_bottom = out_top + f32::from(out.size.height);
+    let preview_top = f32::from(preview.origin.y);
+    assert!(
+        (out_top - bar_mid).abs() < 6.0,
+        "outgoing stub must start at the source connector, out_top={out_top} bar_mid={bar_mid}"
+    );
+    assert!(
+        out_bottom + 2.0 >= preview_top,
+        "outgoing stub must meet the lane horizontal, out_bottom={out_bottom} preview_top={preview_top}"
+    );
+    if let Some(inbound) = cx.debug_bounds("gantt-link-preview-v") {
+        let inbound_top = f32::from(inbound.origin.y);
+        let inbound_h = f32::from(inbound.size.height);
+        let inbound_bottom = inbound_top + inbound_h;
+        let overlaps_bar = inbound_top < bar_bottom - 1.0 && inbound_bottom > bar_top + 1.0;
+        assert!(
+            !overlaps_bar || inbound_h <= 4.0,
+            "on press the inbound vertical must not run back through the source bar, inbound_top={inbound_top} inbound_h={inbound_h} bar_top={bar_top} bar_bottom={bar_bottom}"
+        );
+    }
+    let target = cx.debug_bounds("gantt-bar-3").expect("successor bar");
+    cx.simulate_mouse_move(
+        target.center(),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    let inbound = cx
+        .debug_bounds("gantt-link-preview-v")
+        .expect("inbound drop once the pointer leaves the source row");
+    let inbound_top = f32::from(inbound.origin.y);
+    assert!(
+        inbound_top + 2.0 >= preview_top - 4.0,
+        "inbound must drop from the lane, not from inside the source bar, inbound_top={inbound_top} lane={preview_top}"
+    );
+    assert!(
+        cx.debug_bounds("gantt-link-preview-out").is_some(),
+        "outgoing stub must stay attached to the source handle while dragging"
+    );
+}
+
+#[gpui_kit::test]
 fn start_halo_does_not_steal_inbound_link_hits(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();

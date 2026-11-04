@@ -454,6 +454,20 @@ impl BarLayout {
         ((ROW_HEIGHT - self.paint_h()) / 2.0).max(2.0)
     }
 
+    /// Vertical center of the painted bar, where the link connector sits.
+    pub fn paint_mid_y(&self) -> f32 {
+        self.y + self.paint_top() + self.paint_h() / 2.0
+    }
+
+    /// Rubber-band horizontal: a lane under the painted bar, still inside
+    /// the row gap so it does not jump onto the next bar.
+    pub fn link_preview_lane_y(&self) -> f32 {
+        let bar_bottom = self.y + self.paint_top() + self.paint_h();
+        (bar_bottom + 8.0)
+            .min(self.y + ROW_HEIGHT - 4.0)
+            .max(bar_bottom + 4.0)
+    }
+
     pub fn can_resize(&self) -> bool {
         self.kind != GanttBarKind::Unscheduled
             && self.kind != GanttBarKind::NoFields
@@ -1751,7 +1765,10 @@ impl GanttView {
                 live_start: start,
                 live_target: target,
                 live_x: origin_x,
-                live_y: bar.y + ROW_HEIGHT / 2.0,
+                // Lane under the bar, not row center: the preview drops from
+                // the handle to this y, so a press does not draw a reverse
+                // vertical back through the source bar.
+                live_y: bar.link_preview_lane_y(),
                 link_to: None,
                 had_start,
                 had_target,
@@ -7047,6 +7064,37 @@ mod tests {
         assert!(
             (bars[0].y).abs() < f32::EPSILON,
             "first bar y should be 0, not TIMELINE_HEADER_H"
+        );
+    }
+
+    #[test]
+    fn link_gesture_seeds_live_y_on_the_lane_under_the_bar() {
+        let nodes = crate::state::fake_hierarchy(3);
+        let mut gantt = GanttView::default();
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let bar = bars
+            .iter()
+            .find(|bar| !bar.milestone && !bar.summary && bar.width > 8.0)
+            .expect("dated leaf");
+        gantt
+            .begin_gesture(bar, GestureKind::Link, bar.x + bar.width, &nodes, &[])
+            .expect("link");
+        let live_y = gantt.gesture.as_ref().unwrap().live_y;
+        let lane = bar.link_preview_lane_y();
+        assert!(
+            (live_y - lane).abs() < 0.5,
+            "link live_y {live_y} must start on the preview lane {lane}, not row center {}",
+            bar.y + ROW_HEIGHT / 2.0
+        );
+        let bar_bottom = bar.y + bar.paint_top() + bar.paint_h();
+        assert!(
+            live_y >= bar_bottom + 2.0,
+            "lane must sit below the painted bar, live_y={live_y} bar_bottom={bar_bottom}"
+        );
+        assert!(
+            (bar.paint_mid_y() - (bar.y + ROW_HEIGHT / 2.0)).abs() < 0.5,
+            "paint_mid_y should match the connector"
         );
     }
 

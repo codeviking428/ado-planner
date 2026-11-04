@@ -4889,13 +4889,11 @@ impl PlannerView {
                             }
                             let bar = bars.iter().find(|bar| bar.id == gesture.id)?;
                             let x1 = bar.x + bar.width + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
-                            let bar_bottom = bar.y + bar.paint_top() + bar.paint_h();
                             // Lane under the painted bar, not a 2px hug of its
                             // top. Keep it in the row gap so it does not jump
                             // onto the next bar.
-                            let y1 = (bar_bottom + 8.0)
-                                .min(bar.y + ROW_HEIGHT - 4.0)
-                                .max(bar_bottom + 4.0);
+                            let y1 = bar.link_preview_lane_y();
+                            let handle_y = bar.paint_mid_y();
                             let y2 = gesture.live_y;
                             // Never draw left of the handle: an inset press
                             // maps live_x inside the bar.
@@ -4903,9 +4901,15 @@ impl PlannerView {
                             if x2 <= x1 + 2.0 && (y2 - y1).abs() < 2.0 {
                                 x2 = x1 + 12.0;
                             }
-                            Some((x1, y1, x2, y2))
+                            // Same-column inbound at row-center y would run
+                            // back through the source bar; the outgoing stub
+                            // already covers the handle → lane drop.
+                            let skip_inbound = (x2 - x1).abs() < 16.0
+                                && y2 >= bar.y
+                                && y2 <= bar.y + ROW_HEIGHT;
+                            Some((x1, y1, x2, y2, handle_y, skip_inbound))
                         });
-                        rubber.map(|(x1, y1, x2, y2)| {
+                        rubber.map(|(x1, y1, x2, y2, handle_y, skip_inbound)| {
                             let min_x = x1.min(x2);
                             let min_y = y1.min(y2);
                             div()
@@ -4916,6 +4920,16 @@ impl PlannerView {
                                 .h(px(0.))
                                 .child(
                                     div()
+                                        .debug_selector(|| "gantt-link-preview-out".into())
+                                        .absolute()
+                                        .left(px(x1 - 1.0))
+                                        .top(px(handle_y.min(y1)))
+                                        .w(px(2.))
+                                        .h(px((y1 - handle_y).abs().max(2.0)))
+                                        .bg(cx.theme().primary),
+                                )
+                                .child(
+                                    div()
                                         .debug_selector(|| "gantt-link-preview".into())
                                         .absolute()
                                         .left(px(min_x))
@@ -4924,16 +4938,18 @@ impl PlannerView {
                                         .h(px(2.))
                                         .bg(cx.theme().primary),
                                 )
-                                .child(
-                                    div()
-                                        .debug_selector(|| "gantt-link-preview-v".into())
-                                        .absolute()
-                                        .left(px(x2 - 1.0))
-                                        .top(px(min_y))
-                                        .w(px(2.))
-                                        .h(px((y2 - y1).abs().max(2.0)))
-                                        .bg(cx.theme().primary),
-                                )
+                                .when(!skip_inbound, |el| {
+                                    el.child(
+                                        div()
+                                            .debug_selector(|| "gantt-link-preview-v".into())
+                                            .absolute()
+                                            .left(px(x2 - 1.0))
+                                            .top(px(min_y))
+                                            .w(px(2.))
+                                            .h(px((y2 - y1).abs().max(2.0)))
+                                            .bg(cx.theme().primary),
+                                    )
+                                })
                         })
                     })
                     .children({
