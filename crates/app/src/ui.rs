@@ -10725,7 +10725,6 @@ fn nudge_overlay_off(
 /// source row so they do not cover the outside title or Unparented spike
 /// above. Date pills park above the bar, so the chip stays in-row.
 fn hover_bar_tooltip_origin(place: TooltipPlace, pills: &[OverlayRect]) -> (f32, f32) {
-    let conservative_w = (place.tip_w + 48.0).max(place.tip_w * 1.5);
     if place.milestone {
         // Stay in the source row, flush to the diamond. Do not use handle
         // `extra` or a 1.5× width fudge: those parked a left-flip ~90px
@@ -10746,18 +10745,21 @@ fn hover_bar_tooltip_origin(place: TooltipPlace, pills: &[OverlayRect]) -> (f32,
         return (x, place.bar_top);
     }
     let y = place.bar_top;
+    // Side choice must use the painted chip, not `tip_w + 48` / 1.5×.
+    // The inflated width flipped left while the real chip still fit on
+    // the right, parking it ~90–150px short of the bar.
     let x = row_side_tooltip_left(
         place.bar_x,
         place.painted_w,
         place.extra,
-        conservative_w,
+        place.tip_w,
         place.timeline_w,
     );
     nudge_overlay_off(
         OverlayRect {
             x,
             y,
-            w: conservative_w,
+            w: place.tip_w,
             h: HOVER_TOOLTIP_H,
         },
         pills,
@@ -11959,6 +11961,18 @@ mod bar_label_tests {
         assert!(
             label_x >= 0.0 && label_x + max_w <= 512.0 - 4.0,
             "the full title must be on-timeline, not past the clip, label={label_x}+{max_w}"
+        );
+    }
+
+    #[test]
+    fn hover_tooltip_picks_side_from_painted_width_not_a_fudge() {
+        // right = 500+80+8 = 588; 588+120 = 708 fits in 720. Inflated
+        // 1.5× (180) would be 768 and flip left to 312, ~90px short.
+        let (x, y) = tooltip_at(tip(500.0, 80.0, 8.0, 120.0, 720.0, 40.0, 40.0, false), &[]);
+        assert_eq!(y, 40.0);
+        assert!(
+            (x - 588.0).abs() < 0.1,
+            "painted 120px still fits on the right; must not flip on 1.5× width, got {x}"
         );
     }
 
