@@ -2474,6 +2474,12 @@ impl GanttView {
         nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
         separate_parallel_verticals(&mut out, clip_left, clip_right);
         separate_shared_source_inbounds(&mut out, clip_left, clip_right);
+        // Left fan can walk a Year inbound back onto Cart UI's 16px sliver.
+        // Month keeps the post-nudge fan as the last inbound move so the
+        // pair cannot collapse onto Cart UI.x−16.
+        if matches!(self.scale, GanttScale::Year) {
+            nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
+        }
         dodge_outgoing_off_source_labels(
             &mut out, bars, clip_left, clip_right, timeline_w, today_x,
         );
@@ -2994,6 +3000,10 @@ fn separate_shared_source_inbounds(
                     continue;
                 }
                 let keep_target = arrows[slide].x2 - PARALLEL_VERT_MIN;
+                let keep_next = keep_target.clamp(clip_left, clip_right);
+                if (keep_next - arrows[slide].x2).abs() < PARALLEL_VERT_MIN {
+                    continue;
+                }
                 let keep_delta = keep_target - arrows[keep].x2;
                 if shift_vertical(
                     &mut arrows[keep],
@@ -6971,6 +6981,43 @@ mod tests {
             "clamp must not collapse both Persist cart outgoings onto one stroke, dy={dy} spike={} live={}",
             spike.lane_y,
             live.lane_y
+        );
+    }
+
+    #[test]
+    fn year_shared_source_inbounds_miss_cart_ui_sliver() {
+        let nodes = live_fixture_nodes();
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let (body_left, body_right) = bar_occupied_x(cart_ui, false, None, None);
+        let spike = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+            .expect("Year Persist cart → spike");
+        let live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Year Persist cart → Go-live");
+        assert!(
+            !x_hits_span(live.x2, body_left, body_right),
+            "Year Persist cart → Go-live must miss Cart UI's sliver after the inbound fan, x2={} body={body_left}..{body_right}",
+            live.x2
+        );
+        let dx = (spike.x2 - live.x2).abs();
+        assert!(
+            dx >= 8.0,
+            "Year shared-source inbounds must stay ≥8px apart after the sliver nudge, dx={dx} spike x2={} live x2={}",
+            spike.x2,
+            live.x2
         );
     }
 
