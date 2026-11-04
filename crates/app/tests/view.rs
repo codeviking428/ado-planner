@@ -13680,13 +13680,34 @@ fn first_row_date_pills_do_not_cover_the_bar(cx: &mut gpui_kit::TestAppContext) 
     };
     let bar_top = f32::from(bar.origin.y);
     let bar_bottom = bar_top + f32::from(bar.size.height);
+    let bar_left = f32::from(bar.origin.x);
+    let bar_right = bar_left + f32::from(bar.size.width);
     let pill_top = f32::from(pill.origin.y);
     let pill_bottom = pill_top + f32::from(pill.size.height);
-    let overlaps = pill_top < bar_bottom - 1.0 && pill_bottom > bar_top + 1.0;
+    let pill_left = f32::from(pill.origin.x);
+    let pill_right = pill_left + f32::from(pill.size.width);
+    let overlaps_body = pill_top < bar_bottom - 1.0
+        && pill_bottom > bar_top + 1.0
+        && pill_left < bar_right - 1.0
+        && pill_right > bar_left + 1.0;
     assert!(
-        !overlaps,
-        "hover date pills must sit above or below the bar, not on the body, pill={pill_top}..{pill_bottom} bar={bar_top}..{bar_bottom}"
+        !overlaps_body,
+        "hover date pills must not cover the bar body, pill={pill_left}..{pill_right} y={pill_top}..{pill_bottom} bar={bar_left}..{bar_right} y={bar_top}..{bar_bottom}"
     );
+    if let Some(next) = cx.debug_bounds("gantt-bar-2") {
+        let next_top = f32::from(next.origin.y);
+        let next_bottom = next_top + f32::from(next.size.height);
+        let next_left = f32::from(next.origin.x);
+        let next_right = next_left + f32::from(next.size.width);
+        let overlaps_next = pill_top < next_bottom - 1.0
+            && pill_bottom > next_top + 1.0
+            && pill_left < next_right - 1.0
+            && pill_right > next_left + 1.0;
+        assert!(
+            !overlaps_next,
+            "first-row date pills must not spill onto the next bar, pill y={pill_top}..{pill_bottom} next={next_top}..{next_bottom}"
+        );
+    }
 }
 
 #[gpui_kit::test]

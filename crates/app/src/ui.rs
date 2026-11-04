@@ -6888,8 +6888,30 @@ impl PlannerView {
             .as_ref()
             .map(|text| drag_date_pill_text_width(text))
             .unwrap_or(0.0);
-        let (start_x, end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
-        let y = hover_date_pill_y(bar.y, bar.paint_top(), bar.paint_h());
+        let (mut start_x, mut end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
+        let (y, side) = hover_date_pill_park(bar.y, bar.paint_top());
+        if side {
+            // First row has no room above, and below spills onto the next
+            // bar. Cluster Start/Target to the side of this bar instead.
+            let cluster_w = start_w
+                + if end_w > 0.0 {
+                    DRAG_DATE_PILL_GAP + end_w
+                } else {
+                    0.0
+                };
+            let overflow = parent_date_overflow(&self.state.nodes, id);
+            let extra = if bar.open_ended {
+                LINK_HANDLE_INSET + 2.0
+            } else if overflow {
+                LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 8.0
+            } else {
+                LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0
+            };
+            let timeline_w = self.state.gantt.timeline_width.max(1.0);
+            let cluster = row_side_tooltip_left(bar.x, painted_w, extra, cluster_w, timeline_w);
+            start_x = cluster;
+            end_x = cluster + start_w + DRAG_DATE_PILL_GAP;
+        }
         let date_pill = |text: String| {
             div()
                 .px_2()
@@ -10482,14 +10504,15 @@ fn hover_bar_tooltip_origin(
     }
 }
 
-/// Park hover date pills above the bar; first-row has no room so they sit
-/// below instead of clamping onto the body and the outer link handle.
-fn hover_date_pill_y(bar_y: f32, paint_top: f32, paint_h: f32) -> f32 {
+/// Park hover date pills above the bar. First row has no room above, and
+/// below the painted body spills into the next row, so `(y, true)` means
+/// sit beside the bar at its paint top.
+fn hover_date_pill_park(bar_y: f32, paint_top: f32) -> (f32, bool) {
     let above = bar_y + paint_top - 18.0;
     if above >= 0.0 {
-        above
+        (above, false)
     } else {
-        bar_y + paint_top + paint_h + 2.0
+        (bar_y + paint_top, true)
     }
 }
 
@@ -11666,17 +11689,19 @@ mod bar_label_tests {
     }
 
     #[test]
-    fn hover_date_pills_park_below_the_first_row() {
-        assert_eq!(
-            super::hover_date_pill_y(0.0, 6.0, 28.0),
-            36.0,
-            "first-row pills must sit below the bar, not clamp onto the body"
+    fn hover_date_pills_park_beside_the_first_row() {
+        let (y, side) = super::hover_date_pill_park(0.0, 6.0);
+        assert!(
+            side,
+            "first-row pills must sit beside the bar, not below into the next row"
         );
         assert_eq!(
-            super::hover_date_pill_y(40.0, 6.0, 28.0),
-            28.0,
-            "later rows still park the pills above the bar"
+            y, 6.0,
+            "first-row side pills must align with the painted top, got {y}"
         );
+        let (y, side) = super::hover_date_pill_park(40.0, 6.0);
+        assert!(!side, "later rows still park the pills above the bar");
+        assert_eq!(y, 28.0);
     }
 
     #[test]
