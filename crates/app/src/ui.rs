@@ -1281,6 +1281,12 @@ impl PlannerView {
         }
     }
 
+    fn clear_hover_bar_zone(&mut self, cx: &mut Context<Self>) {
+        if self.hover_bar_zone.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn classify_bar_hover_zone(
         &mut self,
         id: i64,
@@ -3081,6 +3087,7 @@ impl PlannerView {
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if *hovered {
                     this.state.gantt.bar_hovered_id = None;
+                    this.clear_hover_bar_zone(cx);
                     this.clear_canvas_hover(cx);
                 }
             }))
@@ -3456,6 +3463,7 @@ impl PlannerView {
             .h_full()
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if *hovered {
+                    this.clear_hover_bar_zone(cx);
                     this.clear_canvas_hover(cx);
                 }
             }))
@@ -4518,7 +4526,7 @@ impl PlannerView {
                                     window.len(),
                                     content_h,
                                 );
-                                (0..fill).map(move |index| {
+                                (0..fill).map(|index| {
                                     div()
                                         .id(("gantt-row-fill", index as u64))
                                         .debug_selector(|| "gantt-grid-fill".into())
@@ -4527,18 +4535,25 @@ impl PlannerView {
                                         .min_h(px(ROW_HEIGHT))
                                         .flex_shrink_0()
                                         .bg(gpui_kit::hsla(0., 0., 0., 0.))
+                                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                            if *hovered {
+                                                this.clear_hover_bar_zone(cx);
+                                            }
+                                        }))
                                 })
                             }),
                     )
+                    .children(bars.iter().filter_map(|bar| {
+                        // Under arrows so the faded tail cannot steal wheel
+                        // pan or connector clicks from the row it covers.
+                        self.render_open_ended_cue(bar, cx)
+                    }))
                     .children({
                         let arrows = self.state.gantt.layout_dependency_arrows(bars);
                         arrows
                             .into_iter()
                             .map(|arrow| self.render_dependency_arrow(&arrow, bars, cx))
                     })
-                    .children(bars.iter().filter_map(|bar| {
-                        self.render_open_ended_cue(bar, cx)
-                    }))
                     .children({
                         // After arrows/cues so the line stays continuous
                         // through links; before labels so chips still cover
@@ -4735,6 +4750,11 @@ impl PlannerView {
                     .right_0()
                     .h(px(TIMELINE_HEADER_H))
                     .overflow_hidden()
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.clear_hover_bar_zone(cx);
+                        }
+                    }))
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
@@ -5837,6 +5857,9 @@ impl PlannerView {
                 .rounded_md()
                 .overflow_hidden()
                 .occlude()
+                .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                    this.apply_scroll(event, cx);
+                }))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_bar_hovered(Some(id), cx);
@@ -7886,6 +7909,23 @@ impl PlannerView {
         window_x - self.state.gantt.timeline_origin_x
     }
 
+    /// True when the pointer is still on this bar's painted body, overlay
+    /// handles, or open-ended tail. Missing layout keeps the cursor so a
+    /// stale `pointer_in_rows` check cannot drop ew-resize mid-hover.
+    fn pointer_on_bar_cursor_zone(&self, id: i64, window_x: f32, window_y: f32) -> bool {
+        let Some(painted) = self.painted_bar_bounds.borrow().get(&id).copied() else {
+            return true;
+        };
+        let left = painted.left - (LINK_HANDLE_HIT + LINK_HANDLE_GAP + 8.0);
+        let right = if painted.open_ended {
+            self.state.gantt.timeline_origin_x + self.state.gantt.timeline_width.max(1.0)
+        } else {
+            painted.right + LINK_HANDLE_HIT + LINK_HANDLE_GAP + 8.0
+        };
+        let mid_y = (painted.top + painted.bottom) * 0.5;
+        window_x >= left && window_x <= right && (window_y - mid_y).abs() <= ROW_HEIGHT * 0.5 + 4.0
+    }
+
     fn painted_bar_for(&self, id: i64, layout: &crate::gantt::BarLayout) -> PaintedBar {
         if let Some(painted) = self.painted_bar_bounds.borrow().get(&id).copied() {
             return painted;
@@ -9754,6 +9794,11 @@ impl Render for PlannerView {
                         this.saw_pressed_drag = true;
                     }
                     cx.notify();
+                }
+                if let Some((hid, _)) = this.hover_bar_zone
+                    && !this.pointer_on_bar_cursor_zone(hid, x, y)
+                {
+                    this.clear_hover_bar_zone(cx);
                 }
                 if !this.state.gantt.pointer_in_rows(x, y) {
                     this.clear_canvas_hover(cx);

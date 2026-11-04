@@ -4573,6 +4573,114 @@ fn month_persist_last_pixels_start_a_link(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn leaving_a_bar_clears_the_hover_resize_cursor(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    cx.simulate_mouse_move(grab_end_resize(bar), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("ew-resize"),
+            "hovering the end grip must show ew-resize"
+        );
+    });
+    let tree = cx.debug_bounds("gantt-tree").expect("tree");
+    cx.simulate_mouse_move(tree.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_bar_zone_for_test(),
+            None,
+            "the tree must not keep a leftover bar hit zone"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            None,
+            "ew-resize must not stick after the pointer leaves the bar for the tree"
+        );
+    });
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Persist cart after tree leave");
+    cx.simulate_mouse_move(grab_end_resize(bar), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("ew-resize"),
+            "returning to the grip must restore ew-resize"
+        );
+    });
+    let header = cx
+        .debug_bounds("gantt-scale-header")
+        .expect("timeline axis header");
+    cx.simulate_mouse_move(header.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            None,
+            "ew-resize must not stick on the timeline header"
+        );
+    });
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Persist cart after header leave");
+    cx.simulate_mouse_move(grab_end_resize(bar), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("ew-resize"),
+            "returning to the grip after the header must restore ew-resize"
+        );
+    });
+    let empty = point(px(1100.), px(760.));
+    cx.simulate_mouse_move(empty, None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            None,
+            "ew-resize must not stick on empty timeline"
+        );
+    });
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Persist cart after empty leave");
+    cx.simulate_mouse_move(grab_end_resize(bar), None, Modifiers::default());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("ew-resize"),
+            "returning to the grip after empty timeline must restore ew-resize"
+        );
+    });
+    let nav = cx.debug_bounds("gantt-nav").expect("toolbar");
+    cx.simulate_mouse_move(nav.center(), None, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            None,
+            "ew-resize must not stick on the toolbar after leaving the bar"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn inset_link_sliver_forwards_wheel_pan(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -11222,6 +11330,91 @@ fn open_ended_cart_ui_shows_a_hover_chip_near_its_right_edge(cx: &mut gpui_kit::
             view.state.gantt.bar_hovered_id,
             Some(1005),
             "hovering Cart UI's open-ended tail must keep the bar hovered so the dates chip can show"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn open_ended_cue_forwards_wheel_pan(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let cue = cx
+        .debug_bounds("gantt-open-ended-cue-1005")
+        .expect("Cart UI open-ended tail");
+    let before = view.update(cx, |view, _| view.state.gantt.scroll_x);
+    cx.simulate_event(ScrollEvent {
+        position: cue.center(),
+        delta: ScrollDelta::Pixels(point(px(120.), px(0.))),
+        ..Default::default()
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_ne!(
+            view.state.gantt.scroll_x, before,
+            "wheel over the open-ended tail must pan the timeline, not drop the event"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn clicking_an_arrow_over_an_open_ended_cue_selects_the_link(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let cue = cx
+        .debug_bounds("gantt-open-ended-cue-1005")
+        .expect("Cart UI open-ended tail");
+    let arrow = cx
+        .debug_bounds("gantt-dep-arrow-1005-1012")
+        .expect("Cart UI → spike connector");
+    let cue_left = f32::from(cue.origin.x);
+    let cue_right = cue_left + f32::from(cue.size.width);
+    let cue_top = f32::from(cue.origin.y);
+    let cue_bottom = cue_top + f32::from(cue.size.height);
+    let arrow_left = f32::from(arrow.origin.x);
+    let arrow_right = arrow_left + f32::from(arrow.size.width);
+    let arrow_top = f32::from(arrow.origin.y);
+    let arrow_bottom = arrow_top + f32::from(arrow.size.height);
+    let overlap = arrow_right > cue_left
+        && arrow_left < cue_right
+        && arrow_bottom > cue_top
+        && arrow_top < cue_bottom;
+    let click = if overlap {
+        point(
+            px(((arrow_left.max(cue_left)) + (arrow_right.min(cue_right))) / 2.0),
+            px(((arrow_top.max(cue_top)) + (arrow_bottom.min(cue_bottom))) / 2.0),
+        )
+    } else {
+        arrow.center()
+    };
+    cx.simulate_mouse_down(click, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.gantt.selected_link,
+            Some((1005, 1012)),
+            "clicking the Cart UI → spike arrow must select the link even where the open-ended tail overlaps it"
         );
     });
 }
