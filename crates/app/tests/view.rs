@@ -4985,6 +4985,156 @@ fn month_persist_xdotool_style_drag_persists_link_in_the_mock(cx: &mut gpui_kit:
     );
 }
 
+/// Xvfb/xdotool mousedown → mousemoves → mouseup over Cart UI must commit
+/// even when capture is gone and an occluding child (arrow, title, badge)
+/// is under the pointer. The canvas drop layer + window-root mouse-up must
+/// persist the link without a follow-up hover-move to trigger a repaint.
+#[gpui_kit::test]
+fn month_xdotool_mouseup_over_cart_ui_commits_link_in_the_mock(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, mut state, _dir) = signed_in_with_mock();
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1005)
+            .is_some_and(|node| !node.predecessors.contains(&1003)),
+        "precondition: Cart UI must not already depend on Persist cart"
+    );
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = None;
+    state.gantt.viewport_h = 720.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let at_edge = grab_bar_from_right(bar, 1.0);
+    cx.simulate_mouse_move(at_edge, None, Modifiers::default());
+    cx.simulate_mouse_down(at_edge, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "a press on the last painted pixel must start a link"
+        );
+    });
+    let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
+    let start = at_edge;
+    let end = cart.center();
+    for step in 1..=6 {
+        let t = step as f32 / 6.0;
+        let mid = point(
+            start.x + (end.x - start.x) * t,
+            start.y + (end.y - start.y) * t,
+        );
+        cx.simulate_mouse_move(mid, None, Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.state
+                    .gantt
+                    .gesture
+                    .as_ref()
+                    .map(|gesture| gesture.kind),
+                Some(GestureKind::Link),
+                "button-less move {step} must keep the link drag"
+            );
+        });
+    }
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .and_then(|gesture| gesture.link_to),
+            Some(1005),
+            "the last hover-move over Cart UI must still arm the drop target"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-drop-layer").is_some(),
+        "a link drag must paint a canvas drop layer so mouse-up hits even over occluding children"
+    );
+    // Prefer an occluding overlay on Cart UI (inbound arrow / title) so the
+    // drop does not rely on the bar's own mouse-up.
+    let drop_at = cx
+        .debug_bounds("gantt-dep-inv-1005-1012")
+        .or_else(|| cx.debug_bounds("gantt-bar-label-1005"))
+        .map(|bounds| bounds.center())
+        .unwrap_or(end);
+    cx.simulate_mouse_up(drop_at, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let message = view.state.toasts.last_message().unwrap_or_default();
+        assert!(
+            message.starts_with("Added link:")
+                && message.contains("Persist cart")
+                && message.contains("Cart UI"),
+            "mouse-up over Cart UI must toast without a follow-up move, got {message:?}"
+        );
+        assert!(
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.id == 1005)
+                .is_some_and(|node| node.predecessors.contains(&1003)),
+            "the drop must add Persist cart as a predecessor of Cart UI"
+        );
+        assert!(
+            view.state.gantt.gesture.is_none(),
+            "mouse-up over Cart UI must commit the link, not leave the preview following the pointer"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-preview").is_none(),
+        "the rubber-band must unmount on drop without waiting for the next pointer move"
+    );
+    assert!(
+        cx.debug_bounds("gantt-link-drop-layer").is_none(),
+        "the canvas drop layer must unmount once the link is committed"
+    );
+    assert!(
+        cx.debug_bounds("toast-title").is_some() || cx.debug_bounds("planner-toast").is_some(),
+        "the Added link toast must paint on drop, not on the next mouse-move"
+    );
+    cx.background_executor
+        .advance_clock(Duration::from_millis(20));
+    cx.run_until_parked();
+    draw(cx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        if mock_has_predecessor(&runtime, &mock, 1005, 1003) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        mock_has_predecessor(&runtime, &mock, 1005, 1003),
+        "PATCH must persist Persist cart as a predecessor of Cart UI on the mock"
+    );
+}
+
 #[gpui_kit::test]
 fn busy_io_still_persists_an_optimistic_link(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);

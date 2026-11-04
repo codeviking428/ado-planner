@@ -4529,6 +4529,12 @@ impl PlannerView {
                                             cx.notify();
                                         }
                                     }))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                                            this.release_link_drag_at(event, window, cx);
+                                        }),
+                                    )
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -4998,6 +5004,38 @@ impl PlannerView {
                     )
                 })
             })
+            .when(
+                self.state
+                    .gantt
+                    .gesture
+                    .as_ref()
+                    .is_some_and(|gesture| gesture.kind == GestureKind::Link),
+                |el| {
+                    el.child(
+                        div()
+                            .id("gantt-link-drop-layer")
+                            .debug_selector(|| "gantt-link-drop-layer".into())
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .cursor(CursorStyle::DragLink)
+                            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                                this.apply_scroll(event, cx);
+                            }))
+                            .on_mouse_move(cx.listener(
+                                |this, event: &MouseMoveEvent, window, cx| {
+                                    this.on_bar_drag_move(event, window, cx);
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                                    this.release_link_drag_at(event, window, cx);
+                                }),
+                            ),
+                    )
+                },
+            )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.on_bar_drag_move(event, window, cx);
             }))
@@ -5974,6 +6012,12 @@ impl PlannerView {
                     let x: f32 = event.position.x.into();
                     this.classify_bar_hover_zone(id, &layout, x, cx);
                 }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                        this.release_link_drag_at(event, window, cx);
+                    }),
+                )
                 .when(show_tip, |el| {
                     el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                         .tooltip_show_delay(Duration::from_millis(150))
@@ -6292,6 +6336,12 @@ impl PlannerView {
                     let y: f32 = event.position.y.into();
                     this.clear_pinned_tooltip_if_pointer_left(x, y, cx);
                 }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                        this.release_link_drag_at(event, window, cx);
+                    }),
+                )
                 .child(bar_title_chip(label, muted_fg, truncate))
                 .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                     this.apply_scroll(event, cx);
@@ -6710,6 +6760,12 @@ impl PlannerView {
                     }
                     this.state.gantt.selected_link = Some((from_id, to_id));
                     cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.release_link_drag_at(event, window, cx);
                 }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -7893,6 +7949,29 @@ impl PlannerView {
         self.release_bar_gesture(x, y, window, cx);
     }
 
+    /// Commit an active link drag from a mouse-up at any hit target — canvas
+    /// overlay, window root, or an occluding child that is not hovered as
+    /// the root. Move/resize keep their drag-preview overlay.
+    fn release_link_drag_at(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.kind == GestureKind::Link)
+        {
+            return;
+        }
+        let x: f32 = event.position.x.into();
+        let y: f32 = event.position.y.into();
+        self.release_bar_gesture(x, y, window, cx);
+    }
+
     /// Update the live gesture from the release pointer, then commit.
     fn release_bar_gesture(
         &mut self,
@@ -8378,15 +8457,16 @@ impl PlannerView {
             let pair = self.state.gantt.take_link_gesture();
             self.state.gantt.selected_link = None;
             self.state.gantt.clear_hover();
-            cx.notify();
-            window.refresh();
-            cx.refresh_windows();
             if let Some((from_id, Some(to_id))) = pair
                 && from_id != to_id
                 && self.state.apply_link_now(to_id, from_id)
             {
                 self.enqueue_link_save(to_id, from_id, cx);
             }
+            // Drop must paint the arrow and toast without waiting for the
+            // next pointer move. `request_repaint` notifies now and again
+            // on the following frame — `Window.refresh` is a no-op while
+            // GPUI is still inside this mouse-up dispatch.
             self.request_repaint(Some(window), cx);
             return;
         }
@@ -8413,12 +8493,17 @@ impl PlannerView {
 
     /// `Window.refresh` is a no-op while GPUI is drawing, so mouse-up during
     /// a frame can leave the preview chip and toast stale until the pointer
-    /// moves. Notify now, and again after a frame so a still mouse (left-end
-    /// resize under the start grip) still gets a paint.
+    /// moves. Notify now, on the next frame, and after short timers so a
+    /// still mouse (link drop, left-end resize under the start grip) still
+    /// gets a paint.
     fn request_repaint(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         cx.notify();
         if let Some(window) = window {
             window.refresh();
+            window.on_next_frame(|window, cx| {
+                window.refresh();
+                cx.refresh_windows();
+            });
         }
         cx.refresh_windows();
         // Mouse-up can land during a frame so the first refresh is a no-op;
@@ -9888,6 +9973,21 @@ impl Render for PlannerView {
                 this.arm_toast_pause_from_pointer();
                 this.suppress_bar_tooltip = false;
             }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.release_link_drag_at(event, window, cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    // Occluding children (arrows, badges, titles) set
+                    // BlockMouse, so the root hitbox is not hovered and
+                    // `capture_any_mouse_up` skips the drop. Commit anyway.
+                    this.release_link_drag_at(event, window, cx);
+                }),
+            )
             .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                 if this.toast_pointer {
                     this.toast_pointer = false;
