@@ -15,8 +15,8 @@ pub const MIN_TIMELINE_WIDTH: f32 = 240.0;
 pub const HARD_MIN_TREE_WIDTH: f32 = 80.0;
 pub const SPLITTER_WIDTH: f32 = 8.0;
 pub const SPLITTER_STEP: f32 = 16.0;
-/// Inner grip on each painted end. Hits stay inside the bar, not in the
-/// link-handle gap, so a click on the bar's last pixels resizes.
+/// Inner grip on each painted end. Hits stay inside the bar on a resizable
+/// body; a sliver that cannot resize uses its last 8px as a link handle.
 pub const HANDLE_WIDTH: f32 = 8.0;
 /// Selected tree/timeline row tint. Stronger than zebra stripes so the row reads.
 pub const SELECTED_ROW_TINT: f32 = 0.65;
@@ -34,6 +34,9 @@ pub const LINK_HANDLE: f32 = 8.0;
 pub const LINK_HANDLE_HIT: f32 = 16.0;
 /// Gap between the painted bar end and the outside link handle.
 pub const LINK_HANDLE_GAP: f32 = 6.0;
+/// Right-handle hit reaches this far into the bar so a press on the last
+/// 8px starts a link, not a no-op on a sliver that cannot resize.
+pub const LINK_HANDLE_INSET: f32 = 8.0;
 /// Parallel dependency lanes stay at least this far apart (stroke is 2px).
 pub const PARALLEL_LANE_MIN: f32 = 10.0;
 /// Inbound/wrap verticals. 16px centre-to-centre so the 2px stroke still
@@ -56,7 +59,7 @@ pub const OUTSIDE_LABEL_H: f32 = 16.0;
 pub const OUTSIDE_TITLE_LEFT_GAP: f32 = LINK_HANDLE_HIT + LINK_HANDLE_GAP;
 /// Gap from an outside title's painted right edge to a long finish-to-start
 /// outgoing vertical. Reviewer floor is 6px; 8px covers antialiasing.
-const SOURCE_LABEL_CLEARANCE: f32 = 8.0;
+const SOURCE_LABEL_CLEARANCE: f32 = 16.0;
 /// Forward finish-to-start inbound (x2 → head). Sliding this to miss an
 /// intervening open-ended cue parks a 100px+ run on the successor row
 /// (Persist cart → Go-live under Cart UI / spike). Keep the drop next to
@@ -355,6 +358,7 @@ pub struct Gesture {
     pub live_start: Date,
     pub live_target: Date,
     pub live_x: f32,
+    pub live_y: f32,
     pub link_to: Option<i64>,
     pub had_start: bool,
     pub had_target: bool,
@@ -1622,6 +1626,7 @@ impl GanttView {
                 live_start: start,
                 live_target: target,
                 live_x: origin_x,
+                live_y: bar.y + ROW_HEIGHT / 2.0,
                 link_to: None,
                 had_start,
                 had_target,
@@ -1657,6 +1662,7 @@ impl GanttView {
             live_start: start,
             live_target: target,
             live_x: origin_x,
+            live_y: bar.y + ROW_HEIGHT / 2.0,
             link_to: None,
             had_start,
             had_target,
@@ -3554,9 +3560,9 @@ pub fn outside_title_right_gap(
     } else if overflow_badge {
         OUTSIDE_LABEL_GAP
     } else if show_link_handles {
-        // 16px handle hit starts 6px past the bar; +16 slack keeps the
-        // chip off the hit box (an 8px slack still overlapped the letters).
-        LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0
+        // 16px handle hit starts 6px past the bar; +20 slack keeps the
+        // elbow stub and the chip from sharing an edge.
+        LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0
     } else {
         10.0
     }
@@ -7092,7 +7098,7 @@ mod tests {
         );
         assert!(
             live.x1 <= left - SOURCE_LABEL_CLEARANCE + 0.5,
-            "when the successor sits under the title, the stub must sit ≥8px left of the letters, x1={} label_left={left}",
+            "when the successor sits under the title, the stub must sit ≥{SOURCE_LABEL_CLEARANCE}px left of the letters, x1={} label_left={left}",
             live.x1
         );
         assert!(
@@ -7367,7 +7373,7 @@ mod tests {
             overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
         let today_x = right_x + 20.0;
         assert!(
             today_x - right_x < estimated,
@@ -7424,7 +7430,7 @@ mod tests {
             overflow_badge: true,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_plain = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
+        let right_plain = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
         let right_badge = bar.x + bar.width.max(8.0) + OUTSIDE_LABEL_GAP;
         // Room for the no-badge chip, not the `!`+title chip.
         let today_x = right_plain + estimated + TODAY_LABEL_CLEARANCE + 8.0;
@@ -7456,7 +7462,7 @@ mod tests {
         let bar = BarLayout {
             id: 1003,
             kind: GanttBarKind::Scheduled,
-            x: 588.0,
+            x: 582.0,
             width: 24.0,
             y: 80.0,
             summary: true,
@@ -7471,7 +7477,7 @@ mod tests {
             overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
         assert!(
             full_outside_title_fits(right_x, estimated, 800.0, None),
             "precondition: full title fits on the real 800px timeline"
@@ -7519,7 +7525,7 @@ mod tests {
             overflow_badge: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
-        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
         let today_x = right_x + 20.0;
         assert!(
             today_x - right_x < estimated,
@@ -7659,7 +7665,7 @@ mod tests {
             open_ended: false,
             overflow_badge: false,
         };
-        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 16.0;
+        let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = right_x + 20.0;
         assert!(
@@ -7846,7 +7852,7 @@ mod tests {
             let past_left = live.x1 <= left - SOURCE_LABEL_CLEARANCE + 0.5;
             assert!(
                 past_right || past_left,
-                "outgoing stub must sit ≥8px off the Persist cart letters, x1={} label={left}..{right}",
+                "outgoing stub must sit ≥{SOURCE_LABEL_CLEARANCE}px off the Persist cart letters, x1={} label={left}..{right}",
                 live.x1
             );
         }

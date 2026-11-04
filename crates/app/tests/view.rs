@@ -1606,8 +1606,8 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
         let left = f32::from(label.origin.x);
         let right = left + f32::from(label.size.width);
         assert!(
-            live_out_x >= right + 6.0 || live_out_x <= left - 6.0,
-            "launch camera: first stub at {live_out_x} must sit ≥6px from the Persist cart label {left}..{right}"
+            live_out_x >= right + 16.0 || live_out_x <= left - 16.0,
+            "launch camera: first stub at {live_out_x} must sit ≥16px from the Persist cart label {left}..{right}"
         );
         if let Some(handle) = cx.debug_bounds("gantt-link-handle-1003-link-end") {
             assert!(
@@ -1615,6 +1615,25 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
                 "launch camera: Persist cart right handle must not overlap the label, handle x={:.1}..{:.1} label={left}..{right}",
                 f32::from(handle.origin.x),
                 f32::from(handle.origin.x) + f32::from(handle.size.width)
+            );
+        }
+    }
+    view.update(cx, |view, cx| {
+        view.state.gantt.hovered_link = Some((1003, 1013));
+        cx.notify();
+    });
+    draw(cx);
+    if let Some(tip) = cx.debug_bounds("gantt-link-tooltip") {
+        if let Some(spike_label) = cx.debug_bounds("gantt-bar-label-1012") {
+            assert!(
+                !painted_overlap(tip, spike_label),
+                "link tooltip must not cover the Unparented spike label"
+            );
+        }
+        if let Some(persist_label) = cx.debug_bounds("gantt-bar-label-1003") {
+            assert!(
+                !painted_overlap(tip, persist_label),
+                "link tooltip must not cover the Persist cart label"
             );
         }
     }
@@ -2204,6 +2223,10 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
         height: px(800.),
     });
     draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-auto-fit").is_some(),
+        "toolbar must expose monday.com Auto fit next to Today"
+    );
     let today_btn = cx.debug_bounds("gantt-today-btn").expect("Today button");
     cx.simulate_click(today_btn.center(), Modifiers::default());
     draw(cx);
@@ -2232,6 +2255,38 @@ fn clicking_today_keeps_calendar_month_labels_and_oct_30_marker(cx: &mut gpui_ki
         assert!(
             (today_x - expected).abs() < 8.0,
             "Today line at {today_x} should sit near the timeline center, expected {expected}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn auto_fit_toolbar_button_fits_the_span(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 1) {
+        node.start_date = Some("2026-07-06T00:00:00Z".into());
+        node.target_date = Some("2026-11-20T00:00:00Z".into());
+    }
+    state.gantt.set_scale(GanttScale::Day);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit button");
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.scale, GanttScale::Day);
+    });
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_ne!(
+            view.state.gantt.scale,
+            GanttScale::Day,
+            "Auto fit must pick a scale that holds the scheduled span, got {:?}",
+            view.state.gantt.scale
         );
     });
 }
@@ -4060,6 +4115,61 @@ fn link_handle_press_works_without_hovering_first(cx: &mut gpui_kit::TestAppCont
 }
 
 #[gpui_kit::test]
+fn pressing_the_last_pixels_of_a_bar_starts_a_link(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 1003) {
+        node.target_date = node.start_date.clone();
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = 1.0;
+    state.gantt.hovered_id = Some(1003);
+    state.gantt.bar_hovered_id = Some(1003);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Persist cart sliver");
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1003-link-end")
+        .expect("right link handle");
+    let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+    let handle_left = f32::from(handle.origin.x);
+    assert!(
+        handle_left <= bar_right - 6.0,
+        "right handle must cover the last 6–8px of a sliver, handle_left={handle_left} bar_right={bar_right}"
+    );
+    let on_end = point(
+        bar.origin.x + bar.size.width - px(4.),
+        bar.origin.y + bar.size.height / 2.0,
+    );
+    cx.simulate_mouse_down(on_end, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "a press on a sliver's last pixels must start a link"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-preview").is_some(),
+        "pressing the link handle must show a ghost line"
+    );
+}
+
+#[gpui_kit::test]
 fn releasing_a_link_drag_on_empty_space_clears_the_rubber_band(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -5110,7 +5220,7 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
     );
     assert!(
         handle_left >= bar_right - 0.5,
-        "the link handle must sit just outside the bar, handle_left={handle_left} bar_right={bar_right}"
+        "the link handle must sit just outside a resizable bar, handle_left={handle_left} bar_right={bar_right}"
     );
     assert!(
         badge_left >= handle_right - 0.5,
@@ -5118,7 +5228,7 @@ fn overflow_badge_does_not_steal_the_right_edge_resize(cx: &mut gpui_kit::TestAp
     );
     assert!(
         (handle_right - handle_left - LINK_HANDLE_HIT).abs() < 1.0,
-        "link handle hit box must stay {}px, got {}",
+        "link handle hit box must stay {}px on a resizable bar, got {}",
         LINK_HANDLE_HIT,
         handle_right - handle_left
     );
