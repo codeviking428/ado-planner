@@ -2477,6 +2477,11 @@ impl GanttView {
         // move is nudge, then left-only fan if the pair restacked — never a
         // right parallel push.
         nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
+        // Fan after the last body nudge. A 16px left slide lands on a Year
+        // sliver (`YEAR_MIN_BAR_WIDTH`); a follow-up nudge pulls that drop
+        // off the body. That nudge is sibling-aware so two past-sliver
+        // inbounds do not restack onto one `past_body` x. No parallel
+        // push after this — a right shift parks the spike on Cart UI.
         separate_shared_source_inbounds(&mut out, clip_left, clip_right);
         nudge_forward_inbounds_off_solid_bodies(&mut out, bars, clip_left, clip_right);
         dodge_outgoing_off_source_labels(
@@ -2814,14 +2819,14 @@ fn nudge_forward_inbounds_off_solid_bodies(
     clip_right: f32,
 ) {
     let by_id: HashMap<i64, &BarLayout> = bars.iter().map(|bar| (bar.id, bar)).collect();
-    for arrow in arrows.iter_mut() {
-        if arrow.wraps_around_successor() || arrow.inbound_right {
+    for i in 0..arrows.len() {
+        if arrows[i].wraps_around_successor() || arrows[i].inbound_right {
             continue;
         }
-        let Some(pred) = by_id.get(&arrow.from_id) else {
+        let Some(pred) = by_id.get(&arrows[i].from_id) else {
             continue;
         };
-        let Some(succ) = by_id.get(&arrow.to_id) else {
+        let Some(succ) = by_id.get(&arrows[i].to_id) else {
             continue;
         };
         let lo = pred.y.min(succ.y);
@@ -2832,7 +2837,10 @@ fn nudge_forward_inbounds_off_solid_bodies(
                 mid.id != pred.id && mid.id != succ.id && mid.y > lo + 1.0 && mid.y < hi - 1.0
             })
             .collect();
-        let mut x = arrow.x2;
+        let mut x = arrows[i].x2;
+        let from_id = arrows[i].from_id;
+        let to_id = arrows[i].to_id;
+        let x_head = arrows[i].x_head;
         // Re-scan so dropping before bar A cannot land inside bar B.
         for _ in 0..=intervening.len() {
             let mut moved = false;
@@ -2851,12 +2859,38 @@ fn nudge_forward_inbounds_off_solid_bodies(
                 let next = if !x_hits_span(before, left, right) {
                     // Room left of the painted bar (Month Cart UI at x≈611).
                     before
-                } else if past_body < arrow.x_head - 2.0
-                    && !x_hits_span(past_body, body_left, body_right)
+                } else if past_body < x_head - 2.0 && !x_hits_span(past_body, body_left, body_right)
                 {
                     // Year sliver: the unscheduled gutter clip sits on the body,
-                    // but Go-live is just past it — use that gap.
-                    past_body
+                    // but Go-live is just past it — use that gap. Do not park
+                    // on another shared-source inbound already at past_body.
+                    // `past_body - 16` is the sliver itself (`YEAR_MIN_BAR_WIDTH`);
+                    // prefer a gap still right of the body when the successor
+                    // head allows it.
+                    let sibling_on_gap = arrows.iter().any(|other| {
+                        other.from_id == from_id
+                            && other.to_id != to_id
+                            && !other.wraps_around_successor()
+                            && !other.inbound_right
+                            && (other.x2 - past_body).abs() < 1.0
+                    });
+                    if sibling_on_gap {
+                        let left_alt = (past_body - PARALLEL_VERT_MIN).max(clip_left);
+                        if !x_hits_span(left_alt, body_left, body_right) {
+                            left_alt
+                        } else {
+                            let right_alt = past_body + PARALLEL_VERT_MIN;
+                            if right_alt < x_head - 2.0
+                                && !x_hits_span(right_alt, body_left, body_right)
+                            {
+                                right_alt
+                            } else {
+                                before
+                            }
+                        }
+                    } else {
+                        past_body
+                    }
                 } else {
                     before
                 };
@@ -2869,7 +2903,7 @@ fn nudge_forward_inbounds_off_solid_bodies(
                 break;
             }
         }
-        arrow.x2 = x;
+        arrows[i].x2 = x;
     }
 }
 
@@ -7132,6 +7166,60 @@ mod tests {
             "Year shared-source inbounds must stay ≥8px apart after the sliver nudge, dx={dx} spike x2={} live x2={}",
             spike.x2,
             live.x2
+        );
+    }
+
+    #[test]
+    fn year_shared_source_inbounds_do_not_restack_on_past_body() {
+        // Live Year Cart UI is a start-only sliver; spike's head sits on it so
+        // that inbound cannot use `past_body`. Park both successors well past
+        // the sliver (and past each other's occupancy) so extra-nudge restack
+        // is the path under test.
+        let mut nodes = live_fixture_nodes();
+        if let Some(go_live) = nodes.iter_mut().find(|node| node.id == 1013) {
+            go_live.start_date = Some("2026-09-01T00:00:00Z".into());
+            go_live.target_date = Some("2026-09-14T00:00:00Z".into());
+        }
+        if let Some(spike) = nodes.iter_mut().find(|node| node.id == 1012) {
+            spike.start_date = Some("2026-09-15T00:00:00Z".into());
+            spike.target_date = Some("2026-09-28T00:00:00Z".into());
+        }
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        let cart_ui = bars.iter().find(|bar| bar.id == 1005).unwrap();
+        let (body_left, body_right) = bar_occupied_x(cart_ui, false, None, None);
+        let live = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1013)
+            .expect("Persist cart → Go-live");
+        let spike = arrows
+            .iter()
+            .find(|arrow| arrow.from_id == 1003 && arrow.to_id == 1012)
+            .expect("Persist cart → spike");
+        assert!(
+            !x_hits_span(live.x2, body_left, body_right),
+            "Go-live inbound must miss Cart UI's sliver, x2={} body={body_left}..{body_right}",
+            live.x2
+        );
+        assert!(
+            !x_hits_span(spike.x2, body_left, body_right),
+            "spike inbound must miss Cart UI's sliver after the post-fan nudge, x2={} body={body_left}..{body_right}",
+            spike.x2
+        );
+        let dx = (live.x2 - spike.x2).abs();
+        assert!(
+            dx >= PARALLEL_VERT_MIN,
+            "Year inbounds that both clear a sliver must not restack onto one past_body x, dx={dx} live x2={} spike x2={}",
+            live.x2,
+            spike.x2
         );
     }
 

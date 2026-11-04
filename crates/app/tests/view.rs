@@ -1565,6 +1565,17 @@ fn launch_camera_painted_output_after_runtime_link_and_year(cx: &mut gpui_kit::T
         "launch camera: spike inbound box must sit ≥8px off Cart UI, spike={spike_x} cart_left={cart_left} gap={}",
         painted_x_gap(spike, cart)
     );
+    let horiz = cx
+        .debug_bounds("gantt-dep-arrow-1003-1013")
+        .expect("runtime Persist cart → Go-live horizontal");
+    let hit_h = f32::from(horiz.size.height);
+    let hit_w = f32::from(horiz.size.width);
+    if hit_w > hit_h {
+        assert!(
+            hit_h >= 14.0,
+            "launch camera: Persist cart → Go-live horizontal hit must be ≥14px tall, got {hit_h}"
+        );
+    }
 
     let year = cx.debug_bounds("gantt-scale-Year").expect("Year toolbar");
     cx.simulate_click(year.center(), Modifiers::default());

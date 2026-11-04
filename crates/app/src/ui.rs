@@ -6066,11 +6066,7 @@ impl PlannerView {
         } else {
             width.max(HIT)
         };
-        let hit_h = if vertical {
-            height.max(HIT)
-        } else {
-            height.max(8.0)
-        };
+        let hit_h = height.max(HIT);
         let segment_id = if role == "h" {
             format!("gantt-dep-arrow-{from_id}-{to_id}")
         } else {
