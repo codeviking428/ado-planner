@@ -13,3 +13,18 @@ pre-commit:
       glob: '*.{js,ts,tsx}'
       run: pnpm oxfmt {staged_files}
       stage_fixed: true
+    rustfmt:
+      glob: '*.rs'
+      run: cargo fmt -- {staged_files}
+      stage_fixed: true
+
+pre-push:
+  commands:
+    rust-fmt:
+      run: cargo fmt --check
+    rust-clippy:
+      run: cargo clippy --workspace --all-targets -- -D warnings
+    rust-nextest:
+      run: cargo nextest run --workspace
+    rust-deny:
+      run: cargo deny check

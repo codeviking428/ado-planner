@@ -1,0 +1,22 @@
+[package]
+name = "ado-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure Azure DevOps planner domain logic with no I/O"
+
+[dependencies]
+comrak.workspace = true
+html5ever.workspace = true
+htmd.workspace = true
+jiff.workspace = true
+markup5ever_rcdom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

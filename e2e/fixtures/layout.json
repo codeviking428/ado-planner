@@ -1,0 +1,79 @@
+{
+  "systemControls": [
+    {
+      "id": "System.Title",
+      "label": "Title",
+      "visible": true,
+      "controlType": "FieldControl"
+    },
+    {
+      "id": "System.State",
+      "label": "State",
+      "visible": true,
+      "controlType": "FieldControl"
+    }
+  ],
+  "pages": [
+    {
+      "id": "details",
+      "label": "Details",
+      "visible": true,
+      "pageType": "custom",
+      "sections": [
+        {
+          "groups": [
+            {
+              "id": "planning",
+              "label": "Planning",
+              "visible": true,
+              "controls": [
+                {
+                  "id": "System.AssignedTo",
+                  "label": "Assigned To",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "Microsoft.VSTS.Scheduling.StartDate",
+                  "label": "Start Date",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "Microsoft.VSTS.Scheduling.TargetDate",
+                  "label": "Target Date",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "Microsoft.VSTS.Scheduling.StoryPoints",
+                  "label": "Story Points",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "Microsoft.VSTS.Scheduling.RemainingWork",
+                  "label": "Remaining Work",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "Custom.NeedsReview",
+                  "label": "Needs Review",
+                  "visible": true,
+                  "controlType": "FieldControl"
+                },
+                {
+                  "id": "System.Description",
+                  "label": "Description",
+                  "visible": true,
+                  "controlType": "HtmlFieldControl"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

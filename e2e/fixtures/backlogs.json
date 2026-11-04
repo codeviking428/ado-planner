@@ -1,0 +1,8 @@
+{
+  "value": [
+    { "rank": 30, "workItemTypes": [{ "name": "Epic" }] },
+    { "rank": 20, "workItemTypes": [{ "name": "Feature" }] },
+    { "rank": 10, "workItemTypes": [{ "name": "User Story" }] },
+    { "rank": 5, "workItemTypes": [{ "name": "Task" }] }
+  ]
+}

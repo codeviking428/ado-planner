@@ -1,0 +1,68 @@
+{
+  "Platform": {
+    "value": [
+      {
+        "identity": {
+          "displayName": "Ada Lovelace",
+          "uniqueName": "ada@contoso.com",
+          "id": "a1"
+        }
+      },
+      {
+        "identity": {
+          "displayName": "Grace Hopper",
+          "uniqueName": "grace@contoso.com",
+          "id": "g1"
+        }
+      },
+      {
+        "identity": {
+          "displayName": "Alan Turing",
+          "uniqueName": "alan@contoso.com",
+          "id": "a2"
+        }
+      }
+    ]
+  },
+  "Growth": {
+    "value": [
+      {
+        "identity": {
+          "displayName": "Katherine Johnson",
+          "uniqueName": "katherine@contoso.com",
+          "id": "k1"
+        }
+      },
+      {
+        "identity": {
+          "displayName": "Grace Hopper",
+          "uniqueName": "grace@contoso.com",
+          "id": "g1"
+        }
+      }
+    ]
+  },
+  "Empty": { "value": [] },
+  "Amego": {
+    "value": [
+      {
+        "identity": {
+          "displayName": "Kevin Mccloskey",
+          "uniqueName": "kevin@contoso.com",
+          "id": "k2"
+        }
+      }
+    ]
+  },
+  "Delivery": {
+    "value": [
+      {
+        "identity": {
+          "displayName": "Grace Hopper",
+          "uniqueName": "grace@contoso.com",
+          "id": "g1"
+        }
+      }
+    ]
+  }
+}

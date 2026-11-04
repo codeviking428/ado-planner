@@ -1,0 +1,4 @@
+{
+  "contoso": { "value": [{ "id": "p1", "name": "Shop" }] },
+  "fabrikam": { "value": [{ "id": "p2", "name": "Roadmap" }] }
+}

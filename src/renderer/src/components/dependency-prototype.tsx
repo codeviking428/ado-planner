@@ -522,6 +522,10 @@ export function useDependencyPrototype(items: WorkItemNode[]): {
     </div>
   ) : null
 
+  if (import.meta.env.PROD) {
+    return { extraColumns: [], chrome: null }
+  }
+
   const chrome = (
     <>
       {overlay}
