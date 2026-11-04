@@ -181,6 +181,9 @@ pub struct PlannerView {
     /// Last window-x while the bar-drag button was down. A missed mouse-up
     /// commits here, not at a later hover x (Jul 28 shrink).
     bar_last_window_x: Option<f32>,
+    /// Resting pointer after the last move/press. Undo remounts bars under
+    /// a still cursor; hit state is recomputed here.
+    last_pointer_window: Option<(f32, f32)>,
     /// Shift was down when the bar press began. A parent Move then shifts
     /// descendants with it instead of offering "Move children too".
     bar_press_shift: bool,
@@ -487,6 +490,7 @@ impl PlannerView {
             pill_press_window_x: None,
             bar_press_window_x: None,
             bar_last_window_x: None,
+            last_pointer_window: None,
             bar_press_shift: false,
             schedule_live_x: None,
             toast_hover_depth: 0,
@@ -1287,13 +1291,54 @@ impl PlannerView {
 
     /// Undo/redo remounts bars under a still pointer. Drop the dates chip
     /// and the hover tooltip so the next press reaches the bar, not the chip.
+    /// Then re-hit the resting pointer against the new geometry so the
+    /// first drag is not swallowed (R92: x=620 on the handle after Ctrl+Z).
     fn clear_hover_after_history(&mut self, cx: &mut Context<Self>) {
         self.state.gantt.clear_hover();
         self.state.gantt.hover_locked = false;
         self.pinned_tooltip_bounds.borrow_mut().take();
         self.hover_bar_zone = None;
         self.suppress_bar_tooltip = true;
-        cx.notify();
+        self.painted_bar_bounds.borrow_mut().clear();
+        self.recompute_hover_at_last_pointer(cx);
+        self.request_repaint(None, cx);
+    }
+
+    fn note_pointer(&mut self, x: f32, y: f32) {
+        self.last_pointer_window = Some((x, y));
+    }
+
+    fn recompute_hover_at_last_pointer(&mut self, cx: &mut Context<Self>) {
+        let Some((x, y)) = self.last_pointer_window else {
+            return;
+        };
+        if self.state.gantt.gesture.is_some() {
+            return;
+        }
+        if !self.state.gantt.pointer_in_rows(x, y) {
+            return;
+        }
+        let rows = self.state.gantt.flatten(&self.state.nodes);
+        let bars = self.state.gantt.layout_bars(
+            &self.state.nodes,
+            &rows,
+            &self.state.iterations,
+            self.state.gantt.viewport_h.max(720.0),
+        );
+        let origin_y = self.timeline_body_origin_y.get();
+        let local_y = if origin_y > 0.0 {
+            y - origin_y
+        } else {
+            y - self.state.gantt.timeline_origin_y - TIMELINE_HEADER_H
+        };
+        let Some(bar) = bars
+            .iter()
+            .find(|bar| local_y >= bar.y && local_y < bar.y + ROW_HEIGHT)
+        else {
+            return;
+        };
+        self.set_bar_hovered(Some(bar.id), cx);
+        self.classify_bar_hover_zone(bar.id, bar, x, cx);
     }
 
     fn hover_cursor_style(&self) -> Option<CursorStyle> {
@@ -1359,10 +1404,19 @@ impl PlannerView {
             && window_x <= painted.right
             && window_x >= painted.content_right - link
         {
-            BarHitZone::Link
-        } else {
-            zone
+            return BarHitZone::Link;
         }
+        if zone == BarHitZone::Outside
+            && !layout.marker
+            && layout.kind != ado_core::GanttBarKind::NoFields
+            && layout.kind != ado_core::GanttBarKind::Unscheduled
+        {
+            let end_origin = painted.content_right + LINK_HANDLE_GAP + LINK_HANDLE / 2.0;
+            if (window_x - end_origin).abs() <= OUTER_LINK_HIT / 2.0 + 0.5 {
+                return BarHitZone::Link;
+            }
+        }
+        zone
     }
 
     fn dismiss_all_overlays(&mut self) {
@@ -5381,6 +5435,8 @@ impl PlannerView {
                         this.suppress_bar_tooltip = false;
                         this.set_bar_hovered(Some(id), cx);
                         let x: f32 = event.position.x.into();
+                        let y: f32 = event.position.y.into();
+                        this.note_pointer(x, y);
                         this.classify_bar_hover_zone(id, &hover_layout, x, cx);
                         // The bar captures the pointer on mouse-down. External titles
                         // occlude the timeline, so the captured bar must keep the drag.
@@ -5932,6 +5988,9 @@ impl PlannerView {
                     .on_mouse_move(
                         cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
                             this.suppress_bar_tooltip = false;
+                            let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            this.note_pointer(x, y);
                             if this.state.gantt.gesture.as_ref().is_some_and(|gesture| {
                                 gesture.kind == GestureKind::Link && gesture.id != id
                             }) {
@@ -5946,6 +6005,8 @@ impl PlannerView {
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            this.note_pointer(x, y);
                             this.bar_press_shift = event.modifiers.shift;
                             this.continue_or_begin_bar_gesture(
                                 id,
@@ -10050,7 +10111,10 @@ impl Render for PlannerView {
                     || matches!(self.hover_bar_zone, Some((_, BarHitZone::Link))),
                 |el| el.cursor(CursorStyle::DragLink),
             )
-            .on_mouse_move(cx.listener(|this, _, _, _| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
+                let x: f32 = event.position.x.into();
+                let y: f32 = event.position.y.into();
+                this.note_pointer(x, y);
                 this.arm_toast_pause_from_pointer();
                 this.suppress_bar_tooltip = false;
             }))
@@ -10125,6 +10189,7 @@ impl Render for PlannerView {
                 }
                 let x: f32 = event.position.x.into();
                 let y: f32 = event.position.y.into();
+                this.note_pointer(x, y);
                 this.dismiss_empty_hint_if_pointer_outside(x, y, cx);
                 this.clear_pinned_tooltip_if_pointer_left(x, y, cx);
                 if let Some((origin_x, origin_w)) = this.state.gantt.splitter_drag {

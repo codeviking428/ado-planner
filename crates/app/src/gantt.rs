@@ -4095,6 +4095,12 @@ fn bar_occupied_x_on(
     if bar_is_gutter(bar) {
         return (bar.x - 2.0, bar.x + bar.width + 4.0);
     }
+    let timeline_w = label_timeline_w.or(cue_right).unwrap_or(10_000.0).max(1.0);
+    // Fully off-range bars paint a ‹ / › pill at the clip, not at bar.x.
+    // Day Persist cart → spike at the clip was running through that chip.
+    if let Some((chip_x, chip_w, _, _)) = offscreen_edge_chip(bar, timeline_w) {
+        return (chip_x - 2.0, chip_x + chip_w + 2.0);
+    }
     let mut left = if bar.milestone || bar.marker {
         bar.x - 2.0
     } else {
@@ -4108,7 +4114,6 @@ fn bar_occupied_x_on(
     if include_label {
         // Label frame uses the painted timeline, not the arrow inset clip
         // (`timeline_width - 10`) passed as `cue_right` after clip.
-        let timeline_w = label_timeline_w.or(cue_right).unwrap_or(10_000.0).max(1.0);
         if let Some((x0, x1)) = bar_outside_title_span_clipped(bar, timeline_w, today_x) {
             left = left.min(x0);
             right = right.max(x1);
@@ -5510,6 +5515,17 @@ mod tests {
         assert!(
             w >= 16.0 + 16.0 + 8.0 + bar_title_paint_px("Go-live milestone").min(180.0) - 0.5,
             "cue must be wide enough for the diamond and title, w={w} x={x}"
+        );
+        let (occ_left, occ_right) = bar_occupied_x(&go_live, false, Some(512.0), None);
+        assert!(
+            occ_left < 512.0 && occ_right > x && occ_right <= 512.0 + 4.0,
+            "off-range occupancy must be the painted pill, not the off-clip diamond, occ={occ_left}..{occ_right} chip={x}..{}",
+            x + w
+        );
+        assert!(
+            (occ_left - (x - 2.0)).abs() < 1.0 && (occ_right - (x + w + 2.0)).abs() < 1.0,
+            "occupancy must match the edge chip, occ={occ_left}..{occ_right} chip={x}..{}",
+            x + w
         );
         let left = BarLayout {
             x: -200.0,
@@ -10239,6 +10255,9 @@ mod tests {
             ("day-2400", 2400.0, false),
             ("day-auto-800", 800.0, true),
             ("day-auto-512", 512.0, true),
+            // Default Day clip: Go-live is off-right and paints the wide
+            // outlined pill at the edge (reviewer ~880–1025).
+            ("day-512-off-range", 512.0, false),
         ] {
             let mut gantt = GanttView {
                 origin: Date::new(2026, 7, 1).unwrap(),

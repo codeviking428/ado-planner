@@ -5058,6 +5058,56 @@ fn day_persist_to_spike_paints_around_the_go_live_pill(cx: &mut gpui_kit::TestAp
 }
 
 #[gpui_kit::test]
+fn day_off_range_go_live_pill_is_not_crossed_by_persist_to_spike(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    if let Some(spike) = state.nodes.iter_mut().find(|node| node.id == 1012) {
+        spike.predecessors = vec![1003];
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Day;
+    state.gantt.zoom = 1.0;
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let day = cx.debug_bounds("gantt-scale-Day").expect("Day");
+    cx.simulate_click(day.center(), Modifiers::default());
+    draw(cx);
+    let pill = cx
+        .debug_bounds("gantt-bar-edge-right-1013")
+        .expect("off-range Go-live pill");
+    for selector in [
+        "gantt-dep-inv-1003-1012",
+        "gantt-dep-out-1003-1012",
+        "gantt-dep-arrow-1003-1012",
+        "gantt-dep-drop-1003-1012",
+    ] {
+        let Some(seg) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        assert!(
+            !painted_overlap(seg, pill),
+            "Day off-range Go-live pill must not be crossed by Persist cart → spike {selector}, seg=({:.1},{:.1})+{:.1}x{:.1} pill=({:.1},{:.1})+{:.1}x{:.1}",
+            f32::from(seg.origin.x),
+            f32::from(seg.origin.y),
+            f32::from(seg.size.width),
+            f32::from(seg.size.height),
+            f32::from(pill.origin.x),
+            f32::from(pill.origin.y),
+            f32::from(pill.size.width),
+            f32::from(pill.size.height)
+        );
+    }
+}
+
+#[gpui_kit::test]
 fn resize_drop_on_outside_title_paints_toast_without_another_move(
     cx: &mut gpui_kit::TestAppContext,
 ) {
@@ -8995,6 +9045,87 @@ fn ctrl_z_clears_the_hover_chip_so_the_next_press_moves(cx: &mut gpui_kit::TestA
         assert!(
             view.state.gantt.gesture.is_some(),
             "the first press after Ctrl+Z must start a bar gesture, not be swallowed"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn ctrl_z_recomputes_handle_hit_under_a_still_pointer(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    cx.simulate_mouse_move(bar.center(), None, Modifiers::default());
+    draw(cx);
+    let handle = cx
+        .debug_bounds("gantt-link-handle-1003-link-end")
+        .expect("outer handle");
+    let handle_x = f32::from(handle.origin.x) + f32::from(handle.size.width) / 2.0 + 4.0;
+    let handle_y = f32::from(handle.origin.y) + f32::from(handle.size.height) / 2.0;
+    let rest = point(px(handle_x), px(handle_y));
+    let grip = grab_end_resize(bar);
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(grip.x + px(ppd * 3.0), grip.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    cx.simulate_mouse_up(grip, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    cx.simulate_mouse_move(rest, None, Modifiers::default());
+    draw(cx);
+    let undo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| {
+        view.handle_key(&undo, cx);
+        assert_eq!(
+            view.hover_bar_zone_for_test().map(|(_, zone)| zone),
+            Some(BarHitZone::Link),
+            "undo must recompute the handle hit under a still pointer"
+        );
+    });
+    draw(cx);
+    cx.simulate_mouse_down(rest, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Link),
+            "the first handle press after Ctrl+Z must start a link, not be swallowed"
+        );
+        assert!(
+            view.state.gantt.selected_link.is_none(),
+            "handle press after undo must not select the outgoing stub"
         );
     });
 }
