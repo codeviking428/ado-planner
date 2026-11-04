@@ -55,6 +55,8 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
       dry-run: ${{ steps.meta.outputs.dry-run }}
+      dry-run-private-key: ${{ steps.dry-run-key.outputs.private-key }}
+      dry-run-public-key: ${{ steps.dry-run-key.outputs.public-key }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -93,6 +95,23 @@ jobs:
             echo "dry-run=$dry_run"
           } >>"$GITHUB_OUTPUT"
           echo "Building $tag ($ref), dry run: $dry_run"
+
+      - uses: taiki-e/install-action@v2
+        if: steps.meta.outputs.dry-run == 'true'
+        with:
+          tool: cargo-packager
+
+      # One throwaway key pair for every runner, as with the real secrets.
+      - name: Dry-run signing key
+        id: dry-run-key
+        if: steps.meta.outputs.dry-run == 'true'
+        run: |
+          set -euo pipefail
+          cargo packager signer generate --ci --force --password dry-run --path "$RUNNER_TEMP/dry-run.key"
+          {
+            echo "private-key=$(cat "$RUNNER_TEMP/dry-run.key")"
+            echo "public-key=$(cat "$RUNNER_TEMP/dry-run.key.pub")"
+          } >>"$GITHUB_OUTPUT"
 
   rust:
     name: Rust ${{ matrix.target }}
@@ -141,20 +160,24 @@ jobs:
           PRIVATE_KEY: ${{ needs.meta.outputs.dry-run != 'true' && secrets.UPDATER_PRIVATE_KEY || '' }}
           PRIVATE_KEY_PASSWORD: ${{ needs.meta.outputs.dry-run != 'true' && secrets.UPDATER_PRIVATE_KEY_PASSWORD || '' }}
           PUBLIC_KEY: ${{ needs.meta.outputs.dry-run != 'true' && secrets.UPDATER_PUBLIC_KEY || '' }}
+          DRY_RUN_PRIVATE_KEY: ${{ needs.meta.outputs.dry-run-private-key }}
+          DRY_RUN_PUBLIC_KEY: ${{ needs.meta.outputs.dry-run-public-key }}
         run: |
           set -euo pipefail
           keys="$RUNNER_TEMP/updater-keys"
           mkdir -p "$keys"
           if [ "$DRY_RUN" = true ]; then
-            PRIVATE_KEY_PASSWORD="dry-run-$GITHUB_RUN_ID"
-            cargo packager signer generate --ci --force --password "$PRIVATE_KEY_PASSWORD" --path "$keys/key"
-            PRIVATE_KEY="$(cat "$keys/key")"
-            PUBLIC_KEY="$(cat "$keys/key.pub")"
-          elif [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+            PRIVATE_KEY="$DRY_RUN_PRIVATE_KEY"
+            PRIVATE_KEY_PASSWORD=dry-run
+            PUBLIC_KEY="$DRY_RUN_PUBLIC_KEY"
+          fi
+          if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
             echo "::error::Set the UPDATER_PRIVATE_KEY, UPDATER_PRIVATE_KEY_PASSWORD, and UPDATER_PUBLIC_KEY secrets (docs/RELEASING.md)"
             exit 1
           fi
-          echo "::add-mask::$PRIVATE_KEY_PASSWORD"
+          if [ -n "$PRIVATE_KEY_PASSWORD" ]; then
+            echo "::add-mask::$PRIVATE_KEY_PASSWORD"
+          fi
           {
             echo "CARGO_PACKAGER_SIGN_PRIVATE_KEY=$PRIVATE_KEY"
             echo "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD=$PRIVATE_KEY_PASSWORD"
@@ -299,7 +322,10 @@ jobs:
           set -euo pipefail
           # Both runners must have signed with the same key pair.
           pubs=(updater-*.pub)
-          [ "$(sort -u "${pubs[@]}" | wc -l)" -eq 1 ]
+          if [ "$(sort -u "${pubs[@]}" | wc -l)" -ne 1 ]; then
+            echo "::error::The Linux and Windows builds embed different updater public keys"
+            exit 1
+          fi
           base64 -d <"${pubs[0]}" >"$RUNNER_TEMP/updater.pub"
           rm "${pubs[@]}"
           for sig in *.sig; do
