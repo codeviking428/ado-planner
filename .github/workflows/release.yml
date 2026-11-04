@@ -1,85 +1,226 @@
 name: Release
 
+# Builds a vX.Y.Z tag into a GitHub Release. See docs/RELEASING.md.
+#
+# - release-pr.yml calls this after it tags a merged release PR.
+# - Pushing a vX.Y.Z tag by hand runs it too.
+# - workflow_dispatch rebuilds an existing tag (assets are overwritten).
+# - PRs that touch release files run a dry run: everything is built and signed
+#   with a throwaway key, nothing is published, and the real secrets are unused.
+
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_call:
     inputs:
-      version:
-        description: Semver to publish (no v prefix), e.g. 0.2.0
+      tag:
+        description: Existing vX.Y.Z tag to build
         required: true
         type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to rebuild
+        required: true
+        type: string
+      dry-run:
+        description: Build without publishing
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/scripts/**
+      - crates/app/Cargo.toml
+      - electron-builder.yml
+      - cliff.toml
 
 concurrency:
-  group: release
-  cancel-in-progress: false
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
 
 jobs:
-  prepare:
-    name: Tag
+  meta:
     runs-on: ubuntu-latest
     outputs:
+      ref: ${{ steps.meta.outputs.ref }}
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      dry-run: ${{ steps.meta.outputs.dry-run }}
     steps:
-      - name: Require master
-        run: |
-          if [ "${GITHUB_REF}" != "refs/heads/master" ]; then
-            echo "Cut releases from master only (this run is ${GITHUB_REF})."
-            exit 1
-          fi
-
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
 
-      - name: Resolve version and tag
+      - name: Resolve tag and version
         id: meta
         env:
-          RAW: ${{ inputs.version }}
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry-run }}
         run: |
           set -euo pipefail
-          VERSION="${RAW#v}"
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid semver: $RAW"
-            exit 1
+          version="$(.github/scripts/release-version.sh check)"
+          if [ "$EVENT" = pull_request ]; then
+            tag="v$version"
+            ref="$GITHUB_SHA"
+            dry_run=true
+          else
+            tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+            ref="refs/tags/$tag"
+            dry_run="${INPUT_DRY_RUN:-false}"
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::$tag is not a vX.Y.Z tag"
+              exit 1
+            fi
+            if [ "$tag" != "v$version" ]; then
+              echo "::error::Tag $tag does not match the workspace version $version at that commit"
+              exit 1
+            fi
           fi
-          TAG="v$VERSION"
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
-            echo "Tag $TAG already exists"
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "ref=$ref"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "dry-run=$dry_run"
+          } >>"$GITHUB_OUTPUT"
+          echo "Building $tag ($ref), dry run: $dry_run"
 
-      - name: Bump package.json, commit, and tag
+  rust:
+    name: Rust ${{ matrix.target }}
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            installer: appimage
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            installer: nsis
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.ref }}
+
+      - name: Linux GPUI deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan-dev cmake pkg-config libfontconfig1-dev libfreetype6-dev clang
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager
+
+      - name: Signing key
+        shell: bash
         env:
-          VERSION: ${{ steps.meta.outputs.version }}
-          TAG: ${{ steps.meta.outputs.tag }}
+          DRY_RUN: ${{ needs.meta.outputs.dry-run }}
+          # Dry runs never read the real keys, so PR code can't reach them.
+          PRIVATE_KEY: ${{ needs.meta.outputs.dry-run != 'true' && secrets.UPDATER_PRIVATE_KEY || '' }}
+          PRIVATE_KEY_PASSWORD: ${{ needs.meta.outputs.dry-run != 'true' && secrets.UPDATER_PRIVATE_KEY_PASSWORD || '' }}
+          PUBLIC_KEY: ${{ needs.meta.outputs.dry-run != 'true' && secrets.UPDATER_PUBLIC_KEY || '' }}
         run: |
           set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          CURRENT="$(node -p "require('./package.json').version")"
-          if [ "$CURRENT" != "$VERSION" ]; then
-            node -e "
-              const fs = require('fs')
-              const path = 'package.json'
-              const pkg = JSON.parse(fs.readFileSync(path, 'utf8'))
-              pkg.version = process.env.VERSION
-              fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n')
-            "
-            git add package.json
-            git commit -m "chore(release): ${VERSION}"
+          keys="$RUNNER_TEMP/updater-keys"
+          mkdir -p "$keys"
+          if [ "$DRY_RUN" = true ]; then
+            PRIVATE_KEY_PASSWORD="dry-run-$GITHUB_RUN_ID"
+            cargo packager signer generate --ci --force --password "$PRIVATE_KEY_PASSWORD" --path "$keys/key"
+            PRIVATE_KEY="$(cat "$keys/key")"
+            PUBLIC_KEY="$(cat "$keys/key.pub")"
+          elif [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+            echo "::error::Set the UPDATER_PRIVATE_KEY, UPDATER_PRIVATE_KEY_PASSWORD, and UPDATER_PUBLIC_KEY secrets (docs/RELEASING.md)"
+            exit 1
           fi
-          git tag -a "$TAG" -m "ADO Planner ${VERSION}"
-          git push origin HEAD:master
-          git push origin "$TAG"
+          echo "::add-mask::$PRIVATE_KEY_PASSWORD"
+          {
+            echo "CARGO_PACKAGER_SIGN_PRIVATE_KEY=$PRIVATE_KEY"
+            echo "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD=$PRIVATE_KEY_PASSWORD"
+            echo "ADO_PLANNER_UPDATER_PUBKEY=$PUBLIC_KEY"
+          } >>"$GITHUB_ENV"
+          printf '%s' "$PUBLIC_KEY" >"$keys/key.pub"
 
-  release:
-    name: ${{ matrix.name }}
-    needs: prepare
+      - name: Build and package
+        working-directory: crates/app
+        env:
+          ADO_PLANNER_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
+        run: cargo packager --release --formats ${{ matrix.installer }}
+
+      - name: Check embedded version
+        shell: bash
+        run: |
+          set -euo pipefail
+          got="$(./target/release/ado-planner --version | tr -d '\r')"
+          echo "$got"
+          [ "$got" = "ado-planner $VERSION" ]
+
+      - name: Collect assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="ado-planner-$TAG-${{ matrix.target }}"
+          mkdir -p "dist" "$RUNNER_TEMP/$name"
+          cp README.md CHANGELOG.md "$RUNNER_TEMP/$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/ado-planner.exe "$RUNNER_TEMP/$name/"
+            (cd "$RUNNER_TEMP" && 7z a -tzip -bso0 "$GITHUB_WORKSPACE/dist/$name.zip" "$name")
+          else
+            cp target/release/ado-planner "$RUNNER_TEMP/$name/"
+            tar -C "$RUNNER_TEMP" -czf "dist/$name.tar.gz" "$name"
+          fi
+          # GitHub turns spaces in asset names into dots, which would break the
+          # latest.json URLs, so give installers fixed names. Signatures cover
+          # the bytes, not the name.
+          shopt -s nullglob
+          installers=(release/rust/*.exe release/rust/*.AppImage)
+          if [ "${#installers[@]}" -ne 1 ]; then
+            echo "::error::Expected one installer in release/rust, found: ${installers[*]}"
+            exit 1
+          fi
+          case "${installers[0]}" in
+          *.exe) out="ado-planner-$TAG-x86_64-setup.exe" ;;
+          *.AppImage) out="ado-planner-$TAG-x86_64.AppImage" ;;
+          esac
+          if [ ! -s "${installers[0]}.sig" ]; then
+            echo "::error::cargo-packager wrote no .sig file; the updater would reject this build"
+            exit 1
+          fi
+          cp "${installers[0]}" "dist/$out"
+          cp "${installers[0]}.sig" "dist/$out.sig"
+          cp "$RUNNER_TEMP/updater-keys/key.pub" "dist/updater-${{ matrix.target }}.pub"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  electron:
+    name: Electron ${{ matrix.name }}
+    needs: meta
     strategy:
       fail-fast: false
       matrix:
@@ -90,13 +231,12 @@ jobs:
           - name: Linux
             os: ubuntu-latest
             args: --linux AppImage
-          # macOS is off until we have an Apple Developer Program account and
-          # a Developer ID Application cert. See README → Publishing for Mac.
+          # macOS is off until we have Apple signing. See README → Publishing for Mac.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.meta.outputs.ref }}
 
       - uses: pnpm/action-setup@v4
         with:
@@ -110,11 +250,109 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      - name: Test
-        run: pnpm test
-
-      - name: Build and publish
-        run: pnpm build && pnpm exec electron-builder ${{ matrix.args }} --publish always
+      - name: Build
+        run: pnpm build && pnpm exec electron-builder ${{ matrix.args }} --publish never
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: electron-${{ matrix.name }}
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/*.AppImage
+            dist/latest*.yml
+          if-no-files-found: error
+
+  publish:
+    needs: [meta, rust, electron]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rust-*
+          path: dist/rust
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: electron-*
+          path: dist/electron
+          merge-multiple: true
+
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      - name: Verify updater signatures
+        working-directory: dist/rust
+        run: |
+          set -euo pipefail
+          # Both runners must have signed with the same key pair.
+          pubs=(updater-*.pub)
+          [ "$(sort -u "${pubs[@]}" | wc -l)" -eq 1 ]
+          base64 -d <"${pubs[0]}" >"$RUNNER_TEMP/updater.pub"
+          rm "${pubs[@]}"
+          for sig in *.sig; do
+            base64 -d <"$sig" >"$RUNNER_TEMP/$sig.minisig"
+            minisign -Vq -p "$RUNNER_TEMP/updater.pub" -m "${sig%.sig}" -x "$RUNNER_TEMP/$sig.minisig"
+            echo "verified ${sig%.sig}"
+          done
+
+      - name: Write updater feed
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          .github/scripts/release-version.sh notes "$TAG" >"$RUNNER_TEMP/notes.md"
+          python3 .github/scripts/write-rust-latest-json.py \
+            --dist dist/rust \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --repo "$REPO" \
+            --out dist/rust/latest.json \
+            --notes "$(cat "$RUNNER_TEMP/notes.md")"
+          cat dist/rust/latest.json
+          for platform in windows-x86_64 linux-x86_64; do
+            jq -e --arg p "$platform" '.platforms[$p].signature | length > 0' dist/rust/latest.json >/dev/null ||
+              { echo "::error::latest.json has no signed $platform entry"; exit 1; }
+          done
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          cp dist/rust/* dist/electron/* dist/release/
+          cd dist/release
+          sha256sum -- * >"$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          sha256sum -c --quiet SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        if: needs.meta.outputs.dry-run == 'true'
+        with:
+          name: release-dry-run-${{ env.TAG }}
+          path: dist/release/*
+
+      - name: Publish GitHub Release
+        if: needs.meta.outputs.dry-run != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ADO Planner ${{ env.VERSION }}
+          body_path: ${{ runner.temp }}/notes.md
+          # electron-updater and the Rust updater both read the latest release.
+          make_latest: 'true'
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: dist/release/*

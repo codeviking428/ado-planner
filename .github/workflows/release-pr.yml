@@ -1,0 +1,162 @@
+name: Release PR
+
+# On every push to master, either:
+# - the workspace version has no vX.Y.Z tag yet (a release PR just merged):
+#   tag that commit and call release.yml to build and publish it, or
+# - open or update the release PR that bumps the version and CHANGELOG.md
+#   from the Conventional Commits since the last tag.
+# See docs/RELEASING.md.
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_BRANCH: release/next
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      untagged: ${{ steps.plan.outputs.untagged }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare workspace version with tags
+        id: plan
+        run: |
+          set -euo pipefail
+          version="$(.github/scripts/release-version.sh check)"
+          tag="v$version"
+          untagged=false
+          if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            latest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+            if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "${latest#v}" "$version" | sort -V | tail -n1)" != "$version" ]; then
+              echo "::error::Cargo.toml version $version is older than the latest tag $latest"
+              exit 1
+            fi
+            untagged=true
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "untagged=$untagged"
+          } >>"$GITHUB_OUTPUT"
+          echo "Workspace version $version; untagged: $untagged"
+
+  release-pr:
+    needs: plan
+    if: needs.plan.outputs.untagged == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Pick the next version
+        id: next
+        env:
+          CURRENT: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          next="$(git cliff --bumped-version)"
+          echo "tag=$next" >>"$GITHUB_OUTPUT"
+          if [ "$next" = "$CURRENT" ]; then
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            echo "No feat, fix, perf, or breaking commits since $CURRENT; nothing to release."
+          else
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+            echo "Next release: $next"
+          fi
+
+      - name: Bump version and CHANGELOG.md
+        if: steps.next.outputs.changed == 'true'
+        id: bump
+        env:
+          NEXT: ${{ steps.next.outputs.tag }}
+        run: |
+          set -euo pipefail
+          .github/scripts/release-version.sh bump "$NEXT"
+          .github/scripts/release-version.sh changelog "$NEXT"
+          {
+            echo 'notes<<CHANGELOG_EOF'
+            .github/scripts/release-version.sh notes "$NEXT"
+            echo 'CHANGELOG_EOF'
+          } >>"$GITHUB_OUTPUT"
+          git diff --stat
+
+      # A PR opened with GITHUB_TOKEN does not trigger CI. Set RELEASE_PR_TOKEN
+      # (fine-grained PAT or GitHub App token with contents and pull-requests
+      # write) to get CI checks on the release PR.
+      - name: Open or update the release PR
+        if: steps.next.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.RELEASE_PR_TOKEN || github.token }}
+          branch: ${{ env.RELEASE_BRANCH }}
+          delete-branch: true
+          commit-message: 'chore(release): ${{ steps.next.outputs.tag }}'
+          title: 'chore(release): ${{ steps.next.outputs.tag }}'
+          labels: release
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
+            package.json
+            CHANGELOG.md
+          body: |
+            Merging this PR releases **${{ steps.next.outputs.tag }}**: the Release PR workflow tags the merge commit and builds Linux and Windows artifacts into a GitHub Release.
+
+            Edit `CHANGELOG.md` on this branch to reword the notes. Later pushes to `master` regenerate this PR and drop those edits, so merge soon after editing.
+
+            ## Changelog
+            ${{ steps.bump.outputs.notes }}
+
+  tag:
+    needs: plan
+    if: needs.plan.outputs.untagged == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag the release commit
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$TAG" -m "ADO Planner $VERSION" "$GITHUB_SHA"
+          git push origin "$TAG"
+
+  # Tags pushed with GITHUB_TOKEN don't trigger workflows, so call the build here.
+  release:
+    needs: [plan, tag]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+    secrets: inherit

@@ -21,7 +21,7 @@ win:
 nsis:
   oneClick: false
   perMachine: false
-  artifactName: ${name}-${version}-setup.${ext}
+  artifactName: ${name}-electron-${version}-setup.${ext}
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
   createDesktopShortcut: always
@@ -39,14 +39,14 @@ mac:
       arch:
         - universal
 dmg:
-  artifactName: ${name}-${version}.${ext}
+  artifactName: ${name}-electron-${version}.${ext}
 linux:
   target:
     - AppImage
   maintainer: ado-planner
   category: Utility
 appImage:
-  artifactName: ${name}-${version}.${ext}
+  artifactName: ${name}-electron-${version}.${ext}
 npmRebuild: false
 publish:
   provider: github
