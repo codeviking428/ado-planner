@@ -125,10 +125,14 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: actionlint,shellcheck,shfmt
+          tool: shellcheck,shfmt
 
       - name: actionlint
-        run: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          bash <(curl -sSfL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
+          ./actionlint -color
 
       - name: shellcheck and shfmt
         run: |
