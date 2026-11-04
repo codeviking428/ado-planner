@@ -253,4 +253,8 @@ fn gpui_sign_in_shell_renders(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("sign-in-shell").is_some(),
         "the PAT sign-in shell must paint without spawning ADO I/O"
     );
+    assert!(
+        cx.debug_bounds("app-version").is_some(),
+        "the sign-in card shows the embedded version"
+    );
 }

@@ -2524,6 +2524,14 @@ impl PlannerView {
                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                             .child("ADO Planner"),
                     )
+                    .child(
+                        div()
+                            .id("app-version")
+                            .debug_selector(|| "app-version".into())
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("Version {}", crate::VERSION)),
+                    )
                     .when(pat_mode, |el| {
                         el.child(
                             v_flex()
@@ -2607,9 +2615,12 @@ impl PlannerView {
                     .child(
                         v_flex()
                             .child(
-                                Label::new("ADO Planner")
+                                div()
+                                    .id("header-app-version")
+                                    .debug_selector(|| "header-app-version".into())
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("ADO Planner {}", crate::VERSION)),
                             )
                             .child(div().id("session-name").child(name)),
                     ),
