@@ -50,7 +50,7 @@ Both updaters read the release GitHub marks as latest. The Rust app fetches `rel
 
 ### Other ways in
 
-- **Rebuild a tag:** Actions → Release → Run workflow, enter an existing `vX.Y.Z`. Assets with the same name are replaced. Tick _Build without publishing_ for a dry run.
+- **Rebuild a tag:** Actions → Release → Run workflow, enter an existing `vX.Y.Z`. Assets with the same name are replaced. The release is marked latest only if its tag is the highest `vX.Y.Z`, so rebuilding an older tag leaves both updaters on the newest release. Tick _Build without publishing_ for a dry run.
 - **Push a tag by hand:** `git tag -a v1.2.3 -m "ADO Planner 1.2.3" && git push origin v1.2.3`. The tag must match the `Cargo.toml` version at that commit, or the build stops.
 - **Dry run on a PR:** PRs that touch `release.yml`, `.github/scripts/`, `crates/app/Cargo.toml`, `electron-builder.yml`, or `cliff.toml` run the whole build. A throwaway key signs it, nothing is published, and the result is uploaded as the `release-dry-run-vX.Y.Z` artifact.
 - **Preview the next version locally:** `git cliff --bumped-version` and `git cliff --unreleased --bump`.
