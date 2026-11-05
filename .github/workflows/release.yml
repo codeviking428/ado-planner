@@ -37,7 +37,8 @@ on:
       - cliff.toml
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref }}
+  # Tag pushes, calls, and rebuilds of one tag share a group, keyed on the tag name.
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -378,7 +379,7 @@ jobs:
           set -euo pipefail
           highest="$(git ls-remote --tags --refs origin 'v*' |
             sed 's#.*refs/tags/##' |
-            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+            { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } |
             { cat; echo "$TAG"; } |
             sort -V | tail -n1)"
           if [ "$highest" = "$TAG" ]; then
