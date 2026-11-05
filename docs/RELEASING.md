@@ -4,11 +4,12 @@ Every release is a `vX.Y.Z` tag on `master` and one GitHub Release holding both 
 
 ## Workflows
 
-| Workflow                           | Runs on                                          | Does                                                                                                                                            |
-| ---------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.github/workflows/ci.yml`         | every PR, every push to `master`                 | Electron lint, typecheck, tests, and e2e; Rust fmt, clippy, nextest, build, and `cargo deny` on Linux, Windows, and macOS; actionlint; PR title |
-| `.github/workflows/release-pr.yml` | every push to `master`, manual                   | opens or updates the release PR; after it merges, tags the commit and calls `release.yml`                                                       |
-| `.github/workflows/release.yml`    | a `vX.Y.Z` tag, a call, manual, release-file PRs | builds, signs, checksums, and publishes the GitHub Release                                                                                      |
+| Workflow                           | Runs on                                          | Does                                                                                                                                  |
+| ---------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `.github/workflows/ci.yml`         | every PR, every push to `master`                 | Electron lint, typecheck, tests, and e2e; Rust fmt, clippy, nextest, build, and `cargo deny` on Linux, Windows, and macOS; actionlint |
+| `.github/workflows/pr-title.yml`   | PR opened, edited, or pushed                     | rejects PR titles that are not Conventional Commits                                                                                   |
+| `.github/workflows/release-pr.yml` | every push to `master`, manual on `master` only  | opens or updates the release PR; after it merges, tags the version-bump commit and calls `release.yml`                                |
+| `.github/workflows/release.yml`    | a `vX.Y.Z` tag, a call, manual, release-file PRs | builds, signs, checksums, and publishes the GitHub Release                                                                            |
 
 ## How the version is chosen
 
@@ -31,7 +32,7 @@ The workspace version in the root `Cargo.toml` is the single version. Every crat
 
 1. Merge PRs to `master` as usual. After each push, **Release PR** opens or refreshes the PR `chore(release): vX.Y.Z` on branch `release/next`. That PR bumps `Cargo.toml`, `Cargo.lock`, and `package.json`, and prepends the new section to `CHANGELOG.md`.
 2. Review it. To reword the notes, edit `CHANGELOG.md` on that branch. The next push to `master` regenerates the PR and drops those edits.
-3. Merge it. **Release PR** sees a version with no tag, creates `vX.Y.Z` on the merge commit, and calls **Release**.
+3. Merge it. **Release PR** sees a version with no tag, creates `vX.Y.Z` on the commit that set that version (the release PR's merge commit), and calls **Release**. Commits pushed after it are not in the release; they go into the next release PR, which the same run opens.
 4. **Release** builds the following and publishes them to the `vX.Y.Z` GitHub Release, marked latest:
 
    | Asset                                                                                                      | What                              |

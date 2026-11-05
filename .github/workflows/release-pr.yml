@@ -25,11 +25,15 @@ env:
 
 jobs:
   plan:
+    # Only master holds approved release PRs; a manual run on another branch
+    # must not tag that branch's version bump.
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       untagged: ${{ steps.plan.outputs.untagged }}
+      commit: ${{ steps.plan.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,17 +53,30 @@ jobs:
               exit 1
             fi
             untagged=true
+            # Tag the commit that set this version, not GITHUB_SHA: a later push
+            # can replace this pending run, and its extra commits were not in
+            # the approved release PR.
+            commit="$(git log -1 --first-parent --format=%H -G"^version = \"${version//./\\.}\"$" -- Cargo.toml)"
+            if [ -z "$commit" ]; then
+              echo "::error::No commit on master sets version $version in Cargo.toml"
+              exit 1
+            fi
           fi
           {
             echo "version=$version"
             echo "tag=$tag"
             echo "untagged=$untagged"
+            echo "commit=${commit:-}"
           } >>"$GITHUB_OUTPUT"
-          echo "Workspace version $version; untagged: $untagged"
+          echo "Workspace version $version; untagged: $untagged; version commit: ${commit:-n/a}"
 
+  # Also runs after tagging, so commits that landed after the version bump get
+  # their own release PR without waiting for another push.
   release-pr:
-    needs: plan
-    if: needs.plan.outputs.untagged == 'false'
+    needs: [plan, tag]
+    if: >-
+      always() && needs.plan.result == 'success' &&
+      (needs.plan.outputs.untagged == 'false' || needs.tag.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -139,16 +156,19 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Tag the release commit
         env:
           TAG: ${{ needs.plan.outputs.tag }}
           VERSION: ${{ needs.plan.outputs.version }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git tag -a "$TAG" -m "ADO Planner $VERSION" "$GITHUB_SHA"
+          git tag -a "$TAG" -m "ADO Planner $VERSION" "$COMMIT"
           git push origin "$TAG"
 
   # Tags pushed with GITHUB_TOKEN don't trigger workflows, so call the build here.
