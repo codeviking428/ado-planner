@@ -3664,8 +3664,19 @@ impl PlannerView {
                             .w_full()
                             .child(
                                 Button::new("critical-path")
-                                    .label("Critical path")
+                                    .accessibility_label("Critical path")
+                                    .when(selected, |btn| {
+                                        btn.child(
+                                            div()
+                                                .debug_selector(|| {
+                                                    "gantt-critical-path-check".into()
+                                                })
+                                                .child("✓"),
+                                        )
+                                    })
+                                    .child("Critical path")
                                     .compact()
+                                    .toggled(selected)
                                     .selected(selected)
                                     .when(selected, |btn| btn.primary())
                                     .when(!selected, |btn| btn.ghost())
