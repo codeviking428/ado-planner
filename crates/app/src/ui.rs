@@ -11137,27 +11137,12 @@ fn layout_date_pills(
     let (mut start_x, mut end_x) = drag_date_pill_lefts(bar.x, painted_w, start_w, end_w);
     let mut y = hover_date_pill_y(bar.y, bar.paint_top());
     let neighbors = overlay_neighbor_obstacles(bars, bar.id, timeline_w, today_x);
-    let (nudged_start, nudged_y) = nudge_overlay_off(
-        OverlayRect {
-            x: start_x,
-            y,
-            w: start_w,
-            h: DATE_PILL_H,
-        },
-        &neighbors,
-        timeline_w,
-        bar.y,
-        viewport_h,
-        0.0,
-    );
-    start_x = nudged_start;
-    y = nudged_y;
-    if end_w > 0.0 {
-        let (nudged_end, _) = nudge_overlay_off(
+    let nudge = |x: f32, y: f32, w: f32| {
+        nudge_overlay_off(
             OverlayRect {
-                x: end_x,
+                x,
                 y,
-                w: end_w,
+                w,
                 h: DATE_PILL_H,
             },
             &neighbors,
@@ -11165,8 +11150,23 @@ fn layout_date_pills(
             bar.y,
             viewport_h,
             0.0,
-        );
+        )
+    };
+    // Both pills share one row. When the end pill has to step up or down,
+    // move the start pill with it and re-check it at the new row.
+    for _ in 0..3 {
+        let (nudged_start, start_y) = nudge(start_x, y, start_w);
+        start_x = nudged_start;
+        y = start_y;
+        if end_w <= 0.0 {
+            break;
+        }
+        let (nudged_end, end_y) = nudge(end_x, y, end_w);
         end_x = nudged_end;
+        if (end_y - y).abs() < 0.1 {
+            break;
+        }
+        y = end_y;
     }
     (start_x, end_x, y)
 }
@@ -13366,5 +13366,49 @@ mod bar_label_tests {
             "nudged chip y={y} must sit ≥8px below Cart {}",
             cart.y + cart.h
         );
+    }
+
+    #[test]
+    fn date_pills_step_together_off_a_title_above_the_end_pill() {
+        let summary = |id: i64, title: &str, width: f32, y: f32| BarLayout {
+            id,
+            kind: GanttBarKind::Scheduled,
+            x: 807.5,
+            width,
+            y,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: title.into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+            floored: false,
+        };
+        // Year: Cart's outside title sits above Persist cart's end pill only.
+        let bars = vec![
+            summary(1002, "Cart", 60.0, 0.0),
+            summary(1003, "Persist cart", 24.0, ROW_HEIGHT),
+        ];
+        let (start_x, end_x, y) =
+            super::layout_date_pills(&bars[1], 54.0, 62.0, &bars, 1100.0, None, 800.0);
+        let obstacles = super::overlay_neighbor_obstacles(&bars, 1003, 1100.0, None);
+        for (name, x, w) in [("start", start_x, 54.0), ("end", end_x, 62.0)] {
+            let pill = super::OverlayRect {
+                x,
+                y,
+                w,
+                h: super::DATE_PILL_H,
+            };
+            for obstacle in &obstacles {
+                assert!(
+                    !super::overlay_too_close(pill, *obstacle, super::OVERLAY_CLEARANCE),
+                    "{name} pill {pill:?} must keep ≥8px from Cart's bar and title {obstacle:?}"
+                );
+            }
+        }
     }
 }
