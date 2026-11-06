@@ -2272,15 +2272,68 @@ impl PlannerState {
     }
 
     pub async fn add_item_under(&mut self, parent_id: Option<i64>) -> Result<(), AppError> {
+        let work_item_type = self.new_item_default_type(parent_id);
+        self.create_item(parent_id, &work_item_type, "New work item")
+            .await
+    }
+
+    /// Types offered when creating a child of `parent_id` (root when `None`),
+    /// default first.
+    pub fn new_item_types(&self, parent_id: Option<i64>) -> Vec<String> {
+        let types = self.types();
+        let parent_type = parent_id
+            .and_then(|id| self.nodes.iter().find(|node| node.id == id))
+            .map(|node| node.work_item_type.as_str());
+        let mut offered = child_work_item_types(parent_type, &types);
+        if offered.is_empty() {
+            offered.push(child_work_item_type(parent_type, &types));
+        }
+        offered
+    }
+
+    pub fn new_item_default_type(&self, parent_id: Option<i64>) -> String {
+        self.new_item_types(parent_id)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "User Story".into())
+    }
+
+    /// Parents offered when creating from `from`: that row, then its
+    /// ancestors, then `None` for the root.
+    pub fn new_item_parents(&self, from: Option<i64>) -> Vec<Option<i64>> {
+        let mut parents = Vec::new();
+        let mut next = from;
+        while let Some(id) = next {
+            if parents.contains(&Some(id)) {
+                break;
+            }
+            let Some(node) = self.nodes.iter().find(|node| node.id == id) else {
+                break;
+            };
+            parents.push(Some(id));
+            next = node.parent_id;
+        }
+        parents.push(None);
+        parents
+    }
+
+    pub async fn create_item(
+        &mut self,
+        parent_id: Option<i64>,
+        work_item_type: &str,
+        title: &str,
+    ) -> Result<(), AppError> {
         let Some(scope) = self.scope() else {
             return Err(AppError::message("Choose a Team first"));
         };
-        let types = self.types();
-        let (parent_id, work_item_type, area, iteration) = {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return Err(AppError::message("Title cannot be empty"));
+        }
+        let work_item_type = work_item_type.to_string();
+        let (parent_id, area, iteration) = {
             let selected = parent_id.and_then(|id| self.nodes.iter().find(|node| node.id == id));
             let parent_id = selected.map(|node| node.id);
-            let work_item_type =
-                child_work_item_type(selected.map(|node| node.work_item_type.as_str()), &types);
             let area = selected
                 .map(|node| node.area_path.clone())
                 .or_else(|| self.nodes.first().map(|node| node.area_path.clone()))
@@ -2293,13 +2346,13 @@ impl PlannerState {
                     (!path.is_empty()).then_some(path)
                 })
                 .unwrap_or_default();
-            (parent_id, work_item_type, area, iteration)
+            (parent_id, area, iteration)
         };
         let mut ops = vec![
             ado_core::JsonPatchOp {
                 op: ado_core::PatchOp::Add,
                 path: "/fields/System.Title".into(),
-                value: Some(json!("New work item")),
+                value: Some(json!(title)),
             },
             ado_core::JsonPatchOp {
                 op: ado_core::PatchOp::Add,
@@ -4056,6 +4109,15 @@ pub(crate) fn field_toast_name(reference: &str, label: Option<&str>) -> String {
 }
 
 pub(crate) fn child_work_item_type(parent_type: Option<&str>, types: &[String]) -> String {
+    child_work_item_types(parent_type, types)
+        .into_iter()
+        .next()
+        .or_else(|| types.first().cloned())
+        .unwrap_or_else(|| "User Story".into())
+}
+
+/// Loaded types that suit a child of `parent_type`, most likely first.
+pub(crate) fn child_work_item_types(parent_type: Option<&str>, types: &[String]) -> Vec<String> {
     let preferred: &[&str] = match parent_type {
         Some("Epic") => &[
             "Feature",
@@ -4095,10 +4157,9 @@ pub(crate) fn child_work_item_type(parent_type: Option<&str>, types: &[String]) 
     };
     preferred
         .iter()
-        .find(|ty| types.iter().any(|item| item == **ty))
+        .filter(|ty| types.iter().any(|item| item == **ty))
         .map(|ty| (*ty).to_string())
-        .or_else(|| types.first().cloned())
-        .unwrap_or_else(|| "User Story".into())
+        .collect()
 }
 
 fn toggle_hidden(list: &mut Vec<String>, value: &str) {

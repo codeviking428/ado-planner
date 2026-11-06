@@ -12676,7 +12676,7 @@ fn mock_tree_node(id: i64, parent: Option<i64>, ty: &str, title: &str) -> WorkIt
 }
 
 #[gpui_kit::test]
-fn add_child_starts_inline_rename(cx: &mut gpui_kit::TestAppContext) {
+fn created_item_does_not_open_inline_rename(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
     let mut state = idle_state(&dir);
@@ -12699,8 +12699,8 @@ fn add_child_starts_inline_rename(cx: &mut gpui_kit::TestAppContext) {
     });
     draw(cx);
     assert!(
-        cx.debug_bounds("gantt-inline-title").is_some(),
-        "Add child must focus inline rename on the new row"
+        cx.debug_bounds("gantt-inline-title").is_none(),
+        "the create dialog already set the title, so the new row must not open rename"
     );
     view.update(cx, |view, _| {
         assert_eq!(view.state.gantt.selected_id, Some(1999));
@@ -12735,10 +12735,6 @@ fn add_child_undo_clears_title_focus_ticks(cx: &mut gpui_kit::TestAppContext) {
         view.after_io_selection_change_for_test(Some(1));
     });
     draw(cx);
-    assert!(
-        cx.debug_bounds("gantt-inline-title").is_some(),
-        "new child must open rename before undo"
-    );
     view.update(cx, |view, _| {
         view.state.nodes.retain(|node| node.id != 1999);
         view.state.gantt.selected_id = None;
@@ -12766,6 +12762,154 @@ fn add_child_undo_clears_title_focus_ticks(cx: &mut gpui_kit::TestAppContext) {
             );
         });
     });
+}
+
+#[gpui_kit::test]
+fn add_item_opens_a_dialog_and_escape_creates_nothing(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let before = state.nodes.len();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    open_gantt_overflow(cx);
+    let add = cx.debug_bounds("gantt-add-item").expect("+ Add item");
+    cx.simulate_click(add.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-create-dialog").is_some(),
+        "+ Add item must open the create dialog"
+    );
+    assert!(cx.debug_bounds("gantt-create-title").is_some());
+    assert!(cx.debug_bounds("gantt-create-parent-1").is_some());
+    assert!(cx.debug_bounds("gantt-create-parent-root").is_some());
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.nodes.len(),
+            before,
+            "opening the dialog must not create"
+        );
+        assert!(view.state.history.undo.is_empty());
+        assert_eq!(view.create_draft(), Some((Some(1), "Feature".into())));
+    });
+    let root = cx
+        .debug_bounds("gantt-create-parent-root")
+        .expect("root parent");
+    cx.simulate_click(root.center(), Modifiers::default());
+    draw(cx);
+    let epic = cx
+        .debug_bounds("gantt-create-type-Epic")
+        .expect("a root item offers Epic");
+    cx.simulate_click(epic.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.create_draft(), Some((None, "Epic".into())));
+    });
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-create-dialog").is_none(),
+        "Escape must close the create dialog"
+    );
+    view.update(cx, |view, _| {
+        assert!(!view.create_dialog_open());
+        assert_eq!(view.state.nodes.len(), before, "cancel must not create");
+        assert!(view.state.history.undo.is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn create_dialog_needs_a_title_and_cancel_closes_it(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let before = state.nodes.len();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| view.open_create(Some(1), cx));
+    draw(cx);
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-create-dialog").is_some(),
+        "Enter with an empty title must keep the dialog open"
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.nodes.len(), before);
+        assert!(view.state.history.undo.is_empty());
+    });
+    let cancel = cx.debug_bounds("gantt-create-cancel").expect("Cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    draw(cx);
+    assert!(cx.debug_bounds("gantt-create-dialog").is_none());
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.nodes.len(), before, "Cancel must not create");
+    });
+}
+
+#[gpui_kit::test]
+fn add_child_dialog_creates_on_the_mock_with_the_typed_title(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, mut state, _dir) = signed_in_with_mock();
+    state.gantt.context_menu = Some(ContextTarget {
+        id: 1001,
+        from_bar: false,
+        x: 320.0,
+        y: 280.0,
+        link: None,
+    });
+    let before = state.nodes.len();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let add = cx
+        .debug_bounds("gantt-menu-Add child")
+        .expect("Add child action");
+    cx.simulate_mouse_down(add.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.create_draft(), Some((Some(1001), "Feature".into())));
+        assert_eq!(
+            view.state.nodes.len(),
+            before,
+            "Add child must wait for Create"
+        );
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.set_create_title("Payments", window, cx));
+    });
+    let create = cx.debug_bounds("gantt-create-confirm").expect("Create");
+    cx.simulate_click(create.center(), Modifiers::default());
+    draw(cx);
+    allow_ado_client_wake(cx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut created = None;
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        created = view.update(cx, |view, _| {
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.title == "Payments")
+                .cloned()
+        });
+        if created.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let created = created.expect("Create must add the item");
+    assert_eq!(created.work_item_type, "Feature");
+    assert_eq!(created.parent_id, Some(1001));
+    assert!(cx.debug_bounds("gantt-create-dialog").is_none());
+    let stored = runtime
+        .block_on(mock.work_item(created.id))
+        .expect("stored on the mock");
+    assert_eq!(stored["fields"]["System.Title"].as_str(), Some("Payments"));
 }
 
 #[gpui_kit::test]
