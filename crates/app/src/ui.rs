@@ -5857,10 +5857,13 @@ impl PlannerView {
                         .border_1()
                         .border_dashed()
                         .border_color(muted_fg.opacity(0.55))
+                        .flex()
                         .items_center()
                         .px_1()
                         .child(
                             div()
+                                .id(("gantt-no-dates", id as u64))
+                                .debug_selector(move || format!("gantt-no-dates-{id}"))
                                 .text_xs()
                                 .truncate()
                                 .text_color(muted_fg)
