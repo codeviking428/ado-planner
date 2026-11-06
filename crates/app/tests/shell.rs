@@ -25,6 +25,43 @@ async fn signed_in_state() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDi
 }
 
 #[tokio::test]
+async fn expired_pat_shows_a_sign_in_error_and_retry_clears_it() {
+    let mock = ado_mock::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::new(dir.path().to_path_buf());
+    let store = EncryptedStore::new(Box::new(MemoryStore::new(false)), None);
+    let session = PlannerSession::pat(store).with_bases(&mock.url, &mock.url);
+    let mut state = PlannerState::new(
+        paths,
+        session,
+        Some(mock.url.clone()),
+        Some(mock.url.clone()),
+    );
+    state.sign_in_org = "https://dev.azure.com/contoso".into();
+    state.sign_in_pat = "expired-pat-value".into();
+    mock.fail_next(
+        "/contoso/_apis/projects",
+        401,
+        "<html>TF400813: Personal access token has expired</html>",
+    );
+    assert!(state.login_pat().await.is_err());
+    assert!(!state.session_info.signed_in);
+    let inline = state.sign_in_error.clone().expect("inline sign-in error");
+    assert!(inline.contains("invalid, expired"), "{inline}");
+    assert!(!inline.contains("<html>") && !inline.contains("expired-pat-value"));
+
+    state.sign_in_pat = "pat-secret-value".into();
+    state.login_pat().await.expect("retry");
+    assert!(state.session_info.signed_in);
+    assert!(state.sign_in_error.is_none());
+    assert!(
+        state.toasts.last_error_message().is_none(),
+        "a rejected attempt must not leave an error toast for the signed-in shell"
+    );
+    assert_eq!(mock.mutating_writes(), Vec::<(String, String)>::new());
+}
+
+#[tokio::test]
 async fn seeded_session_shows_signed_in_chrome_and_scope_picker() {
     let (_mock, state, _dir) = signed_in_state().await;
     assert!(state.session_info.signed_in);
@@ -391,6 +428,10 @@ fn failed_sign_in_clears_busy_state_and_allows_retry(cx: &mut gpui_kit::TestAppC
         "busy feedback must clear when sign-in fails"
     );
     assert!(cx.debug_bounds("sign-in-shell").is_some());
+    assert!(
+        cx.debug_bounds("sign-in-error").is_some(),
+        "a rejected PAT must show an inline error once busy clears"
+    );
 
     let retried = view.update_in(cx, |view, window, cx| {
         view.submit_pat_for_test(
@@ -401,6 +442,11 @@ fn failed_sign_in_clears_busy_state_and_allows_retry(cx: &mut gpui_kit::TestAppC
         )
     });
     assert!(retried, "Continue must work again after a failed sign-in");
+    draw(cx);
+    assert!(
+        cx.debug_bounds("sign-in-error").is_none(),
+        "the previous error must not show beside the busy state"
+    );
     wait_for_idle(&view, cx);
     assert_eq!(mock.request_count(LOGIN_PING), 2);
     view.read_with(cx, |view, _| {

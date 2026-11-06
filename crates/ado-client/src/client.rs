@@ -139,7 +139,8 @@ impl AdoClient {
             return Ok(Value::Null);
         }
         let text = response.text().await.unwrap_or_default();
-        if !status.is_success() {
+        // Azure DevOps answers rejected credentials with 203 and an HTML sign-in page.
+        if !status.is_success() || status == StatusCode::NON_AUTHORITATIVE_INFORMATION {
             return Err(ClientError::Status {
                 status,
                 url: url.to_string(),
