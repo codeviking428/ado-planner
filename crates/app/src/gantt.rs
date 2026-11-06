@@ -8962,6 +8962,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let go_live = bar(true, 400.0, MILESTONE_SIZE);
         let (label_x, _) =

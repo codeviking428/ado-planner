@@ -13384,6 +13384,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         // Year: Cart's outside title sits above Persist cart's end pill only.
         let bars = vec![
