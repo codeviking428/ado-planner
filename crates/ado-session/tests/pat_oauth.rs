@@ -34,6 +34,59 @@ async fn pat_login_validates_by_listing_projects() {
     );
 }
 
+const EXPIRED_PAT_PAGE: &str = "<!DOCTYPE html><html><head><title>Azure DevOps Services | Sign In</title></head><body>Access Denied: The Personal Access Token used has expired.</body></html>";
+
+async fn pat_login_error(status: u16) -> (ado_core::Error, PlannerSession) {
+    let mock = ado_mock::start().await;
+    mock.fail_next_html("/contoso/_apis/projects", status, EXPIRED_PAT_PAGE);
+    let store = EncryptedStore::new(Box::new(MemoryStore::new(true)), Some([3u8; 32]));
+    let mut session = PlannerSession::pat(store).with_bases(&mock.url, &mock.url);
+    let err = session
+        .login(Some(LoginCreds {
+            pat: Some("pat-secret-value".into()),
+            organization: Some("contoso".into()),
+        }))
+        .await
+        .expect_err("rejected PAT");
+    assert!(mock.mutating_writes().is_empty());
+    (err, session)
+}
+
+fn assert_sign_in_safe(message: &str) {
+    assert!(!message.contains('<'), "raw HTML in {message:?}");
+    assert!(!message.contains("Access Denied"), "body in {message:?}");
+    assert!(
+        !message.contains("pat-secret-value"),
+        "token in {message:?}"
+    );
+    assert!(!message.contains("_apis"), "URL in {message:?}");
+}
+
+#[tokio::test]
+async fn expired_pat_is_rejected_without_html_or_token() {
+    let (err, mut session) = pat_login_error(401).await;
+    assert_eq!(err, ado_core::Error::PatRejected);
+    let message = err.to_string();
+    assert!(message.contains("invalid or expired"), "{message}");
+    assert_sign_in_safe(&message);
+    let info = session.session_info().await.expect("session info");
+    assert!(!info.signed_in, "a rejected PAT must not create a Session");
+}
+
+#[tokio::test]
+async fn non_authoritative_sign_in_page_counts_as_a_rejected_pat() {
+    let (err, _session) = pat_login_error(203).await;
+    assert_eq!(err, ado_core::Error::PatRejected);
+}
+
+#[tokio::test]
+async fn other_sign_in_failures_name_the_status_without_the_body() {
+    let (err, _session) = pat_login_error(500).await;
+    let message = err.to_string();
+    assert!(message.contains("500"), "{message}");
+    assert_sign_in_safe(&message);
+}
+
 trait TokenSourceExt {
     async fn org(&self) -> Option<String>;
 }

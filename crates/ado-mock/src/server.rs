@@ -19,6 +19,7 @@ struct Pending {
     path: String,
     delay_ms: u64,
     failure: Option<(u16, String)>,
+    html: bool,
 }
 
 struct AppState {
@@ -42,6 +43,7 @@ impl AdoMock {
             path: path.to_string(),
             delay_ms,
             failure: None,
+            html: false,
         });
     }
 
@@ -50,6 +52,18 @@ impl AdoMock {
             path: path.to_string(),
             delay_ms: 0,
             failure: Some((status, message.to_string())),
+            html: false,
+        });
+    }
+
+    /// Fail the next matching request with an HTML page, as Azure DevOps does
+    /// for an invalid or expired PAT.
+    pub fn fail_next_html(&self, path: &str, status: u16, html: &str) {
+        self.state.pending.lock().expect("pending").push(Pending {
+            path: path.to_string(),
+            delay_ms: 0,
+            failure: Some((status, html.to_string())),
+            html: true,
         });
     }
 
@@ -146,6 +160,14 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> Respo
             tokio::time::sleep(Duration::from_millis(pending.delay_ms)).await;
         }
         if let Some((status, message)) = pending.failure {
+            if pending.html {
+                return (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    [("content-type", "text/html; charset=utf-8")],
+                    message,
+                )
+                    .into_response();
+            }
             return json_response(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 json!({ "message": message }),

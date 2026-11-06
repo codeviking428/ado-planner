@@ -125,6 +125,44 @@ async fn patch_rev_conflict() {
 }
 
 #[tokio::test]
+async fn unauthorized_html_body_stays_out_of_the_error_text() {
+    let mock = ado_mock::start().await;
+    mock.fail_next_html(
+        "/contoso/_apis/projects",
+        401,
+        "<html><body>Access Denied: The Personal Access Token used has expired.</body></html>",
+    );
+    let ado = AdoClient::with_base_urls(
+        tokens(AuthScheme::Pat, Some("contoso")),
+        &mock.url,
+        &mock.url,
+    );
+    let err = ado.list_projects("contoso").await.expect_err("401");
+    assert!(err.is_unauthorized());
+    let text = err.to_string();
+    assert!(text.starts_with("401 Unauthorized"), "{text}");
+    assert!(
+        !text.contains('<') && !text.contains("Access Denied"),
+        "{text}"
+    );
+    assert!(!text.contains("pat-secret-value"), "{text}");
+}
+
+#[tokio::test]
+async fn json_error_bodies_stay_in_the_error_text() {
+    let mock = ado_mock::start().await;
+    mock.fail_next("/contoso/_apis/projects", 503, "Projects unavailable");
+    let ado = AdoClient::with_base_urls(
+        tokens(AuthScheme::Pat, Some("contoso")),
+        &mock.url,
+        &mock.url,
+    );
+    let err = ado.list_projects("contoso").await.expect_err("503");
+    assert!(!err.is_unauthorized());
+    assert!(err.to_string().contains("Projects unavailable"));
+}
+
+#[tokio::test]
 async fn patch_with_rev_retry_recovers_from_stale_rev() {
     let mock = ado_mock::start().await;
     let ado = AdoClient::with_base_urls(

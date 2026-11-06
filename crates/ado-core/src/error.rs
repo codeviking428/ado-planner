@@ -14,6 +14,10 @@ pub enum Error {
     NoPatSession,
     #[error("No Azure DevOps organization is configured")]
     NoOrganization,
+    #[error(
+        "Azure DevOps rejected the personal access token. It may be invalid or expired. Check the organization, create a new token if needed, and try again."
+    )]
+    PatRejected,
 }
 
 impl Error {

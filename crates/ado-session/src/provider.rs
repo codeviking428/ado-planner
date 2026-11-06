@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use ado_client::{AdoClient, AuthScheme, StaticTokens, TokenSource};
+use ado_client::{AdoClient, AuthScheme, ClientError, StaticTokens, TokenSource};
 use ado_core::{AuthMode, Error, SessionInfo};
 
 use crate::auth_mode::entra_client_id;
@@ -13,6 +13,25 @@ use crate::organization::normalize_organization;
 use crate::persist::{
     EncryptedStore, FileStore, MemoryStore, StoredOauth, StoredPat, delete_keyring_key, unix_now,
 };
+
+/// Sign-in errors reach the sign-in card and the log, so they carry neither
+/// the response body (often an HTML page) nor the request URL.
+fn pat_validation_error(err: ClientError) -> Error {
+    match err {
+        err if err.is_unauthorized() => Error::PatRejected,
+        ClientError::Status { status, .. } => Error::message(format!(
+            "Azure DevOps sign-in failed ({status}). Check the organization and personal access token, then try again."
+        )),
+        ClientError::Http(err) => Error::message(format!(
+            "Could not reach Azure DevOps ({}). Check your network connection and try again.",
+            err.without_url()
+        )),
+        ClientError::Core(err) => err,
+        ClientError::Message(_) => Error::message(
+            "Azure DevOps sent an unexpected sign-in response. Check the organization and try again.",
+        ),
+    }
+}
 
 pub struct LoginCreds {
     pub pat: Option<String>,
@@ -172,10 +191,7 @@ impl PlannerSession {
             (Some(ado), Some(vssps)) => AdoClient::with_base_urls(tokens, ado, vssps),
             _ => AdoClient::new(tokens),
         };
-        client
-            .ping_org(org)
-            .await
-            .map_err(|err| Error::message(err.to_string()))?;
+        client.ping_org(org).await.map_err(pat_validation_error)?;
         Ok(())
     }
 

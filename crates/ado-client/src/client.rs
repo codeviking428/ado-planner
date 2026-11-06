@@ -27,7 +27,7 @@ pub enum ClientError {
     Core(#[from] ado_core::Error),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
-    #[error("{status} {url}: {body}")]
+    #[error("{status} {url}{}", status_body_suffix(body))]
     Status {
         status: StatusCode,
         url: String,
@@ -35,7 +35,27 @@ pub enum ClientError {
     },
 }
 
+/// HTML bodies (sign-in pages, IIS errors) are noise in toasts and logs.
+fn status_body_suffix(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() || body.starts_with('<') {
+        String::new()
+    } else {
+        format!(": {body}")
+    }
+}
+
 impl ClientError {
+    /// 401, or the 203 HTML sign-in page Azure DevOps returns for a bad PAT.
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(
+            self,
+            Self::Status { status, .. }
+                if *status == StatusCode::UNAUTHORIZED
+                    || *status == StatusCode::NON_AUTHORITATIVE_INFORMATION
+        )
+    }
+
     pub fn is_precondition_failed(&self) -> bool {
         matches!(self, Self::Status { status, .. } if *status == StatusCode::PRECONDITION_FAILED)
     }
@@ -139,7 +159,7 @@ impl AdoClient {
             return Ok(Value::Null);
         }
         let text = response.text().await.unwrap_or_default();
-        if !status.is_success() {
+        if !status.is_success() || status == StatusCode::NON_AUTHORITATIVE_INFORMATION {
             return Err(ClientError::Status {
                 status,
                 url: url.to_string(),
