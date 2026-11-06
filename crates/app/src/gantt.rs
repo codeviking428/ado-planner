@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use ado_core::{
-    DEFAULT_BAR_DAYS, GanttBarKind, IterationHint, IterationNode, WorkItemNode, compact_date,
-    dates_column_text, format_date_range, from_gantt_exclusive_end, gantt_bar_display,
+    DEFAULT_BAR_DAYS, GanttBarKind, HierarchyIndex, IterationHint, IterationNode, WorkItemNode,
+    compact_date, dates_column_text, dates_column_text_indexed, format_date_range,
+    from_gantt_exclusive_end, gantt_bar_display, gantt_bar_display_indexed,
     iteration_hint_for_path, parse_iso_date,
 };
 use jiff::civil::Date;
@@ -1604,9 +1605,10 @@ impl GanttView {
     /// bar so loaded work is on-screen instead of sitting off to one side.
     pub fn reveal_content(&mut self, nodes: &[WorkItemNode], iterations: &[IterationNode]) {
         let mut earliest: Option<Date> = None;
+        let index = HierarchyIndex::new(nodes);
         for node in nodes {
             let hint = iteration_hint_for_path(&node.iteration_path, iterations);
-            let display = gantt_bar_display(node, nodes, hint.as_ref());
+            let display = gantt_bar_display_indexed(node, nodes, &index, hint.as_ref());
             if let Some(start) = display.start {
                 earliest = Some(match earliest {
                     Some(current) if start < current => start,
@@ -1743,15 +1745,28 @@ impl GanttView {
         iterations: &[IterationNode],
         viewport_h: f32,
     ) -> Vec<BarLayout> {
+        let index = HierarchyIndex::new(nodes);
+        self.layout_bars_indexed(nodes, &index, rows, iterations, viewport_h)
+    }
+
+    /// [`GanttView::layout_bars`] with `index` built over `nodes`, so a frame
+    /// costs the visible window rather than the whole Hierarchy.
+    pub fn layout_bars_indexed(
+        &self,
+        nodes: &[WorkItemNode],
+        index: &HierarchyIndex,
+        rows: &[VisibleRow],
+        iterations: &[IterationNode],
+        viewport_h: f32,
+    ) -> Vec<BarLayout> {
         let window = self.visible_window(rows, viewport_h);
-        let by_id: HashMap<i64, &WorkItemNode> = nodes.iter().map(|node| (node.id, node)).collect();
         window
             .iter()
             .enumerate()
             .filter_map(|(offset, row)| {
-                let node = by_id.get(&row.id)?;
+                let node = index.get(nodes, row.id)?;
                 let hint = iteration_hint_for_path(&node.iteration_path, iterations);
-                let display = gantt_bar_display(node, nodes, hint.as_ref());
+                let display = gantt_bar_display_indexed(node, nodes, index, hint.as_ref());
                 let live = self
                     .gesture
                     .as_ref()
@@ -1773,7 +1788,7 @@ impl GanttView {
                         // the "No dates" text, and gets rollup edges.
                         summary: false,
                         milestone: false,
-                        label: dates_column_text(node, nodes, hint.as_ref()),
+                        label: dates_column_text_indexed(node, nodes, index, hint.as_ref()),
                         title: node.title.clone(),
                         color: parse_type_color(ado_core::color_for_type(&node.work_item_type)),
                         progress: None,
@@ -1814,7 +1829,7 @@ impl GanttView {
                 let label = if let Some(gesture) = live {
                     format_date_range(Some(gesture.live_start), Some(gesture.live_target))
                 } else {
-                    dates_column_text(node, nodes, hint.as_ref())
+                    dates_column_text_indexed(node, nodes, index, hint.as_ref())
                 };
                 if start_only && live.is_none() && x + width <= 0.0 {
                     // Fully left of the clip: pin a hittable sliver at x = 0.
@@ -1844,12 +1859,12 @@ impl GanttView {
                     label,
                     title: node.title.clone(),
                     color: parse_type_color(ado_core::color_for_type(&node.work_item_type)),
-                    progress: child_completion(nodes, node.id)
+                    progress: child_completion_indexed(nodes, index, node.id)
                         .or_else(|| Some(state_progress(&node.state))),
                     predecessors: node.predecessors.clone(),
                     marker,
                     open_ended,
-                    overflow_badge: parent_date_overflow(nodes, node.id),
+                    overflow_badge: parent_overflow_span_indexed(nodes, index, node.id).is_some(),
                     floored,
                 })
             })
@@ -2339,6 +2354,14 @@ impl GanttView {
         let mut earliest: Option<Date> = None;
         let mut latest: Option<Date> = None;
         for node in nodes {
+            // Without its own dates a bar is a Rollup, iteration hint, or
+            // "No dates" — all skipped below — so skip the O(N) Rollup walk.
+            if !node.has_date_fields
+                || (parse_iso_date(node.start_date.as_deref()).is_none()
+                    && parse_iso_date(node.target_date.as_deref()).is_none())
+            {
+                continue;
+            }
             let hint = iteration_hint_for_path(&node.iteration_path, iterations);
             let display = gantt_bar_display(node, nodes, hint.as_ref());
             if display.kind == GanttBarKind::Unscheduled {
@@ -3927,6 +3950,23 @@ fn parent_overflow_span(nodes: &[WorkItemNode], id: i64) -> Option<(Option<Date>
     let node = nodes.iter().find(|node| node.id == id)?;
     let parent_id = node.parent_id?;
     let parent = nodes.iter().find(|node| node.id == parent_id)?;
+    child_outside_parent(node, parent)
+}
+
+fn parent_overflow_span_indexed(
+    nodes: &[WorkItemNode],
+    index: &HierarchyIndex,
+    id: i64,
+) -> Option<(Option<Date>, Option<Date>)> {
+    let node = index.get(nodes, id)?;
+    let parent = index.get(nodes, node.parent_id?)?;
+    child_outside_parent(node, parent)
+}
+
+fn child_outside_parent(
+    node: &WorkItemNode,
+    parent: &WorkItemNode,
+) -> Option<(Option<Date>, Option<Date>)> {
     let child_start = parse_iso_date(node.start_date.as_deref());
     let child_end = parse_iso_date(node.target_date.as_deref());
     let parent_start = parse_iso_date(parent.start_date.as_deref());
@@ -5023,18 +5063,22 @@ pub fn state_progress(state: &str) -> f32 {
 
 /// Fraction of direct children complete, counting Active as half done.
 pub fn child_completion(nodes: &[WorkItemNode], id: i64) -> Option<f32> {
-    let children: Vec<_> = nodes
-        .iter()
-        .filter(|node| node.parent_id == Some(id))
-        .collect();
-    if children.is_empty() {
-        return None;
-    }
-    let total: f32 = children
-        .iter()
-        .map(|node| state_progress(&node.state))
-        .sum();
-    Some(total / children.len() as f32)
+    completion(nodes.iter().filter(|node| node.parent_id == Some(id)))
+}
+
+fn child_completion_indexed(
+    nodes: &[WorkItemNode],
+    index: &HierarchyIndex,
+    id: i64,
+) -> Option<f32> {
+    completion(index.children(nodes, id))
+}
+
+fn completion<'a>(children: impl Iterator<Item = &'a WorkItemNode>) -> Option<f32> {
+    let (count, total) = children.fold((0usize, 0.0f32), |(count, total), node| {
+        (count + 1, total + state_progress(&node.state))
+    });
+    (count > 0).then(|| total / count as f32)
 }
 
 pub fn flatten_visible(nodes: &[WorkItemNode], collapsed: &HashSet<i64>) -> Vec<VisibleRow> {

@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ado_core::{
-    AuthMode, FLAVORS, FormControlKind, color_for_type, compact_date, dates_column_text,
+    AuthMode, FLAVORS, FormControlKind, color_for_type, compact_date, dates_column_text_indexed,
     format_date_range, identity_from_field, is_unscheduled, iso_date_only, parse_iso_date,
     parse_user_date,
 };
@@ -1438,14 +1438,9 @@ impl PlannerView {
             self.clear_bar_hover(cx);
             return;
         }
-        let visible = self.state.visible_nodes();
-        let rows = self.state.gantt.flatten(&visible);
-        let bars = self.state.gantt.layout_bars(
-            &visible,
-            &rows,
-            &self.state.iterations,
-            self.state.gantt.viewport_h.max(720.0),
-        );
+        let bars = self
+            .state
+            .layout_visible_bars(self.state.gantt.viewport_h.max(720.0));
         let origin_y = self.timeline_body_origin_y.get();
         let local_y = if origin_y > 0.0 {
             y - origin_y
@@ -3229,8 +3224,8 @@ impl PlannerView {
                 ))
                 .into_any_element();
         }
-        let visible = self.state.visible_nodes();
-        let empty_canvas = visible.is_empty();
+        let visible = self.state.visible();
+        let empty_canvas = visible.nodes.is_empty();
         if empty_canvas
             && !self.state.hierarchy_loading
             && !self.state.has_saved_gantt_view()
@@ -3243,28 +3238,30 @@ impl PlannerView {
                 self.state.gantt.go_today(today);
             }
         }
-        let rows = self.state.gantt.flatten(&visible);
         // A taller window can leave the old scroll past the last row.
         let measured_h = self.state.gantt.viewport_h;
-        self.state.gantt.clamp_scroll(rows.len(), measured_h);
+        self.state
+            .gantt
+            .clamp_scroll(visible.rows.len(), measured_h);
         let committed = self.state.gantt.snapshot();
         if let Some(pose) = self.animated_camera() {
             self.state.gantt.restore(pose);
         }
         let viewport_h = self.state.gantt.viewport_h.max(120.0);
         let content_h = (viewport_h - TIMELINE_HEADER_H).max(80.0);
-        let window = self.state.gantt.visible_window(&rows, content_h).to_vec();
-        let bars = self
+        let window = self
             .state
             .gantt
-            .layout_bars(&visible, &rows, &self.state.iterations, content_h);
+            .visible_window(&visible.rows, content_h)
+            .to_vec();
+        let bars = visible.layout_bars(&self.state, content_h);
         let body_box = self.gantt_body_box.clone();
         let entity_id = cx.entity_id();
         let gantt = v_flex()
             .id("gantt")
             .size_full()
             .relative()
-            .child(self.render_gantt_nav(cx))
+            .child(self.render_gantt_nav(&visible.nodes, cx))
             .child(
                 h_flex()
                     .id("gantt-body")
@@ -3291,7 +3288,7 @@ impl PlannerView {
                             this.clear_canvas_hover(cx);
                         }
                     }))
-                    .child(self.render_tree(&visible, &window, content_h, cx))
+                    .child(self.render_tree(&visible.nodes, &visible.index, &window, content_h, cx))
                     .child(
                         h_flex()
                             .id("gantt-splitter")
@@ -3339,7 +3336,7 @@ impl PlannerView {
                                 }),
                             ),
                     )
-                    .child(self.render_timeline(&window, &bars, content_h, cx))
+                    .child(self.render_timeline(&visible.nodes, &window, &bars, content_h, cx))
                     .when(empty_canvas && !self.state.hierarchy_loading, |el| {
                         el.child(
                             div()
@@ -3454,7 +3451,11 @@ impl PlannerView {
             })
     }
 
-    fn render_gantt_nav(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_gantt_nav(
+        &mut self,
+        nodes: &[ado_core::WorkItemNode],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let sync_label = self.sync_status_text();
         let sync_color = if sync_label == "Error" {
             cx.theme().danger
@@ -3500,9 +3501,8 @@ impl PlannerView {
                     ),
             )
             .child({
-                let nodes = self.state.visible_nodes();
                 let can_auto_fit =
-                    GanttView::scheduled_span(&nodes, &self.state.iterations).is_some();
+                    GanttView::scheduled_span(nodes, &self.state.iterations).is_some();
                 div()
                     .id("gantt-auto-fit")
                     .debug_selector(|| "gantt-auto-fit".into())
@@ -3534,7 +3534,7 @@ impl PlannerView {
                             })),
                     )
             })
-            .child(self.render_gantt_overflow(cx))
+            .child(self.render_gantt_overflow(nodes, cx))
             .child(
                 div()
                     .id("gantt-prev-period")
@@ -3715,9 +3715,13 @@ impl PlannerView {
             )
     }
 
-    fn render_gantt_overflow(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_gantt_overflow(
+        &mut self,
+        nodes: &[ado_core::WorkItemNode],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let open = self.toolbar_more_open;
-        let has_dated = self.state.visible_nodes().iter().any(|node| {
+        let has_dated = nodes.iter().any(|node| {
             parse_iso_date(node.start_date.as_deref()).is_some()
                 && parse_iso_date(node.target_date.as_deref()).is_some()
         });
@@ -3947,12 +3951,11 @@ impl PlannerView {
     fn render_tree(
         &mut self,
         nodes: &[ado_core::WorkItemNode],
+        index: &ado_core::HierarchyIndex,
         window: &[crate::gantt::VisibleRow],
         content_h: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let by_id: std::collections::HashMap<_, _> =
-            nodes.iter().map(|n| (n.id, n.clone())).collect();
         let header_fg = cx.theme().muted_foreground;
         let hover_bg = cx.theme().list_hover;
         let selected_bg = cx.theme().list_active;
@@ -4027,7 +4030,7 @@ impl PlannerView {
                         v_flex()
                             .mt(px(-remainder))
                             .children(window.iter().enumerate().map(|(offset, row)| {
-                                let node = by_id.get(&row.id).cloned();
+                                let node = index.get(nodes, row.id).cloned();
                                 let Some(node) = node else {
                                     return div().into_any_element();
                                 };
@@ -4036,7 +4039,8 @@ impl PlannerView {
                                 let striped = (first_row + offset) % 2 == 1;
                                 let hint =
                                     crate::gantt::iteration_for(&node, &self.state.iterations);
-                                let dates = dates_column_text(&node, nodes, hint.as_ref());
+                                let dates =
+                                    dates_column_text_indexed(&node, nodes, index, hint.as_ref());
                                 let depth = row.depth;
                                 let expanded = row.expanded;
                                 let has_children = row.has_children;
@@ -4796,6 +4800,7 @@ impl PlannerView {
 
     fn render_timeline(
         &mut self,
+        nodes: &[ado_core::WorkItemNode],
         window: &[crate::gantt::VisibleRow],
         bars: &[crate::gantt::BarLayout],
         content_h: f32,
@@ -4822,12 +4827,12 @@ impl PlannerView {
             .hovered_id
             .or(self.state.gantt.bar_hovered_id);
         let path = if self.state.gantt.show_critical_path {
-            crate::gantt::critical_path(&self.state.visible_nodes())
+            crate::gantt::critical_path(nodes)
         } else {
             CriticalPath::default()
         };
         let related_ids: HashSet<i64> = if let Some(hid) = hovered_id {
-            related_dependency_ids(&self.state.visible_nodes(), hid)
+            related_dependency_ids(nodes, hid)
         } else {
             HashSet::new()
         };
@@ -9140,13 +9145,8 @@ impl PlannerView {
         let source = self.state.gantt.gesture.as_ref().map(|gesture| gesture.id);
         let local_x = self.timeline_local_x(window_x);
         let local_y = self.link_target_local_y(window_y);
-        let visible = self.state.visible_nodes();
-        let rows = self.state.gantt.flatten(&visible);
         let content_h = (self.state.gantt.viewport_h - TIMELINE_HEADER_H).max(80.0);
-        let bars = self
-            .state
-            .gantt
-            .layout_bars(&visible, &rows, &self.state.iterations, content_h);
+        let bars = self.state.layout_visible_bars(content_h);
         match GanttView::hit_test_link_target(&bars, local_x, local_y) {
             Some(id) if source != Some(id) => self.state.gantt.set_link_target(id),
             _ => self.state.gantt.clear_link_target(),
