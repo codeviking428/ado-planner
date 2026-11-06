@@ -143,8 +143,13 @@ jobs:
           shellcheck .github/scripts/*.sh
           shfmt -d .github/scripts/*.sh
 
-      - name: Updater feed tests
-        run: python3 .github/scripts/test_write_rust_latest_json.py
+      - name: Release script tests
+        run: |
+          python3 .github/scripts/test_write_rust_latest_json.py
+          python3 .github/scripts/test_check_pe_subsystem.py
+
+      - name: NSIS template matches cargo-packager
+        run: .github/scripts/check-nsis-template.sh 0.11.8
 
       - name: Versions agree
         run: .github/scripts/release-version.sh check

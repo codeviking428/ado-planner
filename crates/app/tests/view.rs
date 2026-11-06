@@ -1696,6 +1696,54 @@ fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext)
 }
 
 #[gpui_kit::test]
+fn toolbar_week_to_day_keeps_the_range_with_an_off_screen_selection(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 10, 5).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = Some(1005);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let (centre, range) = view.update(cx, |view, _| {
+        let gantt = &view.state.gantt;
+        let cart_ui = Date::new(2026, 7, 21).unwrap();
+        assert!(
+            gantt.x_for_date(cart_ui) < 0.0,
+            "precondition: the Cart UI selection must start off-screen, range={}",
+            gantt.viewport_range_title()
+        );
+        (gantt.viewport_center_date(), gantt.viewport_range_title())
+    });
+    for (scale, selector) in [
+        (GanttScale::Week, "gantt-scale-Week"),
+        (GanttScale::Day, "gantt-scale-Day"),
+    ] {
+        let button = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(button.center(), Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            let gantt = &view.state.gantt;
+            assert_eq!(gantt.scale, scale);
+            assert_eq!(
+                gantt.viewport_center_date(),
+                centre,
+                "{scale:?} must keep the visible range ({range}), not jump to the selection, got {}",
+                gantt.viewport_range_title()
+            );
+        });
+    }
+}
+
+#[gpui_kit::test]
 fn mock_fixture_month_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -2761,6 +2809,44 @@ fn critical_path_toolbar_toggles_the_highlight(cx: &mut gpui_kit::TestAppContext
             "a second click must turn the highlight off"
         );
     });
+}
+
+#[gpui_kit::test]
+fn critical_path_menu_item_shows_a_check_while_on(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    open_gantt_overflow(cx);
+    assert!(
+        cx.debug_bounds("gantt-critical-path-check").is_none(),
+        "no check while the highlight is off"
+    );
+    let btn = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path button");
+    cx.simulate_click(btn.center(), Modifiers::default());
+    draw(cx);
+    open_gantt_overflow(cx);
+    assert!(
+        cx.debug_bounds("gantt-critical-path-check").is_some(),
+        "the menu item must show a check while the highlight is on"
+    );
+    let btn = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path button");
+    cx.simulate_click(btn.center(), Modifiers::default());
+    draw(cx);
+    open_gantt_overflow(cx);
+    assert!(
+        cx.debug_bounds("gantt-critical-path-check").is_none(),
+        "the check must clear once the highlight is off"
+    );
 }
 
 #[gpui_kit::test]
@@ -14980,6 +15066,45 @@ fn year_bars_keep_a_minimum_height(cx: &mut gpui_kit::TestAppContext) {
             h + 0.1 >= YEAR_MIN_BAR_H,
             "{selector} Year sliver height {h} must stay ≥ {YEAR_MIN_BAR_H}"
         );
+    }
+}
+
+#[gpui_kit::test]
+fn period_buttons_move_the_range_title_with_the_view(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    for scale in [GanttScale::Month, GanttScale::Quarter, GanttScale::Year] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = idle_state(&dir);
+        state.gantt.origin = Date::new(2026, 8, 1).unwrap();
+        state.gantt.scale = scale;
+        let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+        cx.simulate_resize(gpui_kit::Size {
+            width: px(1280.),
+            height: px(800.),
+        });
+        draw(cx);
+        let mut title = view.update(cx, |view, _| view.state.gantt.viewport_range_title());
+        for (button, name) in [
+            ("gantt-next-period", "›"),
+            ("gantt-next-period", "›"),
+            ("gantt-next-period", "›"),
+            ("gantt-prev-period", "‹"),
+        ] {
+            let bounds = cx.debug_bounds(button).expect(name);
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            draw(cx);
+            let (next, end) = view.update(cx, |view, _| {
+                let gantt = &view.state.gantt;
+                let end = gantt.date_for_x((gantt.timeline_width - 1.0).max(0.0));
+                (gantt.viewport_range_title(), end)
+            });
+            assert_ne!(next, title, "{scale:?} {name} must update the range title");
+            assert!(
+                next.ends_with(&end.year().to_string()) && next.contains(&end.day().to_string()),
+                "{scale:?} title {next:?} must end on the last visible day {end}"
+            );
+            title = next;
+        }
     }
 }
 

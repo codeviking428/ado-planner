@@ -258,3 +258,153 @@ fn gpui_sign_in_shell_renders(cx: &mut gpui_kit::TestAppContext) {
         "the sign-in card shows the embedded version"
     );
 }
+
+/// The PAT validation ping. Initial loading lists projects with `$top=200`.
+const LOGIN_PING: &str = "/contoso/_apis/projects?$top=1&";
+
+fn signed_out_with_mock() -> (
+    tokio::runtime::Runtime,
+    ado_mock::AdoMock,
+    PlannerState,
+    tempfile::TempDir,
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("ado-mock-sign-in")
+        .build()
+        .expect("ado-mock sign-in runtime");
+    let (mock, state, dir) = runtime.block_on(async {
+        let mock = ado_mock::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(dir.path().to_path_buf());
+        let store = EncryptedStore::new(Box::new(MemoryStore::new(true)), Some([3u8; 32]));
+        let session = PlannerSession::pat(store).with_bases(&mock.url, &mock.url);
+        let mut state = PlannerState::new(
+            paths,
+            session,
+            Some(mock.url.clone()),
+            Some(mock.url.clone()),
+        );
+        state.session_loading = false;
+        (mock, state, dir)
+    });
+    (runtime, mock, state, dir)
+}
+
+fn draw(cx: &mut gpui_kit::VisualTestContext) {
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+}
+
+/// Real HTTP to the mock completes on the `ado-client` runtime; the GPUI test
+/// scheduler must be allowed to park while it waits.
+fn wait_for_idle(view: &gpui_kit::Entity<PlannerView>, cx: &mut gpui_kit::VisualTestContext) {
+    cx.background_executor.allow_parking();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        if !view.read_with(cx, |view, _| view.is_busy()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("sign-in did not finish within 10s");
+}
+
+#[gpui_kit::test]
+fn continue_shows_busy_state_and_ignores_resubmits_until_sign_in_loads(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let (_runtime, mock, state, _dir) = signed_out_with_mock();
+    mock.delay_next("/contoso/_apis/projects", 400);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(cx.debug_bounds("sign-in-status").is_none());
+
+    let started = view.update_in(cx, |view, window, cx| {
+        view.submit_pat_for_test(
+            "https://dev.azure.com/contoso",
+            "pat-secret-value",
+            window,
+            cx,
+        )
+    });
+    assert!(started, "Continue must start a sign-in");
+    draw(cx);
+    assert!(
+        cx.debug_bounds("sign-in-status").is_some(),
+        "busy feedback must paint on the first frame after Continue"
+    );
+    assert!(
+        cx.debug_bounds("sign-in-shell").is_some(),
+        "the sign-in card stays up while signing in"
+    );
+    for _ in 0..3 {
+        let again = view.update(cx, |view, cx| view.resubmit_pat_for_test(cx));
+        assert!(
+            !again,
+            "Continue or Enter while signing in must not resubmit"
+        );
+    }
+
+    wait_for_idle(&view, cx);
+    assert_eq!(
+        mock.request_count(LOGIN_PING),
+        1,
+        "repeat submits during sign-in must not send another login"
+    );
+    view.read_with(cx, |view, _| {
+        assert!(view.state.session_info.signed_in);
+        assert!(
+            !view.state.nodes.is_empty(),
+            "busy state covers the initial hierarchy load"
+        );
+    });
+    assert!(cx.debug_bounds("sign-in-status").is_none());
+    assert!(cx.debug_bounds("sign-in-shell").is_none());
+}
+
+#[gpui_kit::test]
+fn failed_sign_in_clears_busy_state_and_allows_retry(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (_runtime, mock, state, _dir) = signed_out_with_mock();
+    mock.fail_next("/contoso/_apis/projects", 401, "Unauthorized");
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+
+    let started = view.update_in(cx, |view, window, cx| {
+        view.submit_pat_for_test("https://dev.azure.com/contoso", "expired-pat", window, cx)
+    });
+    assert!(started);
+    draw(cx);
+    assert!(cx.debug_bounds("sign-in-status").is_some());
+
+    wait_for_idle(&view, cx);
+    view.read_with(cx, |view, _| {
+        assert!(!view.state.session_info.signed_in);
+    });
+    assert!(
+        cx.debug_bounds("sign-in-status").is_none(),
+        "busy feedback must clear when sign-in fails"
+    );
+    assert!(cx.debug_bounds("sign-in-shell").is_some());
+
+    let retried = view.update_in(cx, |view, window, cx| {
+        view.submit_pat_for_test(
+            "https://dev.azure.com/contoso",
+            "pat-secret-value",
+            window,
+            cx,
+        )
+    });
+    assert!(retried, "Continue must work again after a failed sign-in");
+    wait_for_idle(&view, cx);
+    assert_eq!(mock.request_count(LOGIN_PING), 2);
+    view.read_with(cx, |view, _| {
+        assert!(view.state.session_info.signed_in);
+    });
+    assert!(cx.debug_bounds("sign-in-shell").is_none());
+}

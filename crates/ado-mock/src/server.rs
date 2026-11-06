@@ -28,6 +28,7 @@ struct AppState {
     patches: StdMutex<Vec<String>>,
     last_patch_content_type: StdMutex<Option<String>>,
     writes: StdMutex<Vec<(String, String)>>,
+    requests: StdMutex<Vec<String>>,
 }
 
 pub struct AdoMock {
@@ -51,6 +52,17 @@ impl AdoMock {
             delay_ms: 0,
             failure: Some((status, message.to_string())),
         });
+    }
+
+    /// Requests whose path and query contain `fragment`, reads included.
+    pub fn request_count(&self, fragment: &str) -> usize {
+        self.state
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|uri| uri.contains(fragment))
+            .count()
     }
 
     pub fn patch_count(&self) -> usize {
@@ -114,6 +126,7 @@ pub async fn start() -> AdoMock {
         patches: StdMutex::new(Vec::new()),
         last_patch_content_type: StdMutex::new(None),
         writes: StdMutex::new(Vec::new()),
+        requests: StdMutex::new(Vec::new()),
     });
     let app = Router::new()
         .fallback(any(handle))
@@ -141,6 +154,11 @@ pub async fn start() -> AdoMock {
 async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+    state.requests.lock().expect("requests").push(
+        req.uri()
+            .path_and_query()
+            .map_or_else(|| path.clone(), ToString::to_string),
+    );
     if let Some(pending) = take_pending(&state, &path).await {
         if pending.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(pending.delay_ms)).await;

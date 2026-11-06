@@ -1,6 +1,7 @@
 //! Native GPUI shell for ADO Planner.
 
 pub mod app_icon;
+pub mod assets;
 pub mod cache;
 pub mod error;
 pub mod flavor_theme;
