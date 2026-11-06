@@ -2764,6 +2764,44 @@ fn critical_path_toolbar_toggles_the_highlight(cx: &mut gpui_kit::TestAppContext
 }
 
 #[gpui_kit::test]
+fn critical_path_menu_item_shows_a_check_while_on(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    open_gantt_overflow(cx);
+    assert!(
+        cx.debug_bounds("gantt-critical-path-check").is_none(),
+        "no check while the highlight is off"
+    );
+    let btn = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path button");
+    cx.simulate_click(btn.center(), Modifiers::default());
+    draw(cx);
+    open_gantt_overflow(cx);
+    assert!(
+        cx.debug_bounds("gantt-critical-path-check").is_some(),
+        "the menu item must show a check while the highlight is on"
+    );
+    let btn = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path button");
+    cx.simulate_click(btn.center(), Modifiers::default());
+    draw(cx);
+    open_gantt_overflow(cx);
+    assert!(
+        cx.debug_bounds("gantt-critical-path-check").is_none(),
+        "the check must clear once the highlight is off"
+    );
+}
+
+#[gpui_kit::test]
 fn auto_fit_toolbar_button_fits_the_span(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
