@@ -79,6 +79,7 @@ const PROGRESS_ROLLUP_TIP: &str =
     "Progress is rolled up from child work-item states. Active counts as half done.";
 const DATES_ROLLUP_TIP: &str = "Dates roll up from children";
 const DRAG_DATE_PILL_GAP: f32 = 4.0;
+const EMPTY_GANTT_MAX_W: f32 = 480.0;
 
 fn drag_date_pill_text_width(text: &str) -> f32 {
     (text.chars().count() as f32 * 7.0 + 16.0).max(36.0)
@@ -3254,6 +3255,7 @@ impl PlannerView {
             .child(
                 h_flex()
                     .id("gantt-body")
+                    .debug_selector(|| "gantt-body".into())
                     .flex_1()
                     .min_w(px(0.))
                     .min_h(px(0.))
@@ -3333,11 +3335,13 @@ impl PlannerView {
                                 .flex()
                                 .items_center()
                                 .justify_center()
+                                .p_4()
                                 .occlude()
                                 .child(
                                     v_flex()
                                         .id("empty-gantt-card")
                                         .debug_selector(|| "empty-gantt-card".into())
+                                        .max_w_full()
                                         .bg(cx.theme().background)
                                         .border_1()
                                         .border_color(cx.theme().border)
@@ -3402,8 +3406,10 @@ impl PlannerView {
         v_flex()
             .id("empty-gantt")
             .debug_selector(|| "empty-gantt".into())
+            .max_w(px(EMPTY_GANTT_MAX_W))
             .items_center()
             .justify_center()
+            .text_center()
             .px_8()
             .gap_2()
             .child(Label::new(message))
