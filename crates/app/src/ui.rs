@@ -26,6 +26,7 @@ use gpui_kit::component::h_flex;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::v_flex;
@@ -951,7 +952,9 @@ impl PlannerView {
             &self.org_input,
             window,
             |this, input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => this.submit_pat(cx),
+                InputEvent::PressEnter { .. } => {
+                    this.submit_pat(cx);
+                }
                 InputEvent::Change => {
                     let value = input.read(cx).value().to_string();
                     input.update(cx, |state, cx| {
@@ -1936,13 +1939,38 @@ impl PlannerView {
         window.focus(&input.read(cx).focus_handle(cx), cx);
     }
 
-    fn submit_pat(&mut self, cx: &mut Context<Self>) {
+    /// Returns false when a sign-in (or other I/O) is already in flight, so
+    /// Enter or a repeat click cannot send a second login.
+    fn submit_pat(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.io_busy {
+            return false;
+        }
         self.state.sign_in_org = self.org_input.read(cx).value().to_string();
         self.state.sign_in_pat = self.pat_input.read(cx).value().to_string();
         self.spawn_state(cx, |mut state| async move {
             let result = state.login_pat().await;
             (state, result)
+        })
+    }
+
+    pub fn submit_pat_for_test(
+        &mut self,
+        org: &str,
+        pat: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.org_input.update(cx, |input, cx| {
+            input.set_value(org, window, cx);
         });
+        self.pat_input.update(cx, |input, cx| {
+            input.set_value(pat, window, cx);
+        });
+        self.submit_pat(cx)
+    }
+
+    pub fn resubmit_pat_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.submit_pat(cx)
     }
 
     fn render_error_banner(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -2498,6 +2526,18 @@ impl PlannerView {
 
     fn render_sign_in(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let pat_mode = self.state.session_info.auth_mode == AuthMode::Pat;
+        // Sign-in runs on spawn_state, so io_busy spans validation and the
+        // initial project, team and hierarchy load.
+        let busy = self.io_busy;
+        let status = h_flex()
+            .id("sign-in-status")
+            .debug_selector(|| "sign-in-status".into())
+            .gap_2()
+            .items_center()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(Spinner::new().small())
+            .child("Signing in and loading your projects…");
         v_flex()
             .id("sign-in-shell")
             .debug_selector(|| "sign-in-shell".into())
@@ -2538,26 +2578,39 @@ impl PlannerView {
                             v_flex()
                                 .gap_3()
                                 .child(Label::new("Organization"))
-                                .child(Input::new(&self.org_input).id("organization-input"))
-                                .child(Label::new("Personal access token"))
-                                .child(Input::new(&self.pat_input).id("pat-input"))
                                 .child(
-                                    Button::new("sign-in").primary().label("Continue").on_click(
-                                        cx.listener(|this, _, _, cx| this.submit_pat(cx)),
-                                    ),
+                                    Input::new(&self.org_input)
+                                        .id("organization-input")
+                                        .disabled(busy),
+                                )
+                                .child(Label::new("Personal access token"))
+                                .child(Input::new(&self.pat_input).id("pat-input").disabled(busy))
+                                .child(
+                                    Button::new("sign-in")
+                                        .primary()
+                                        .label(if busy { "Signing in…" } else { "Continue" })
+                                        .loading(busy)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.submit_pat(cx);
+                                        })),
                                 ),
                         )
                     })
                     .when(!pat_mode, |el| {
-                        el.child(Button::new("sign-in").primary().label("Sign in").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.spawn_state(cx, |mut state| async move {
-                                    let result = state.login_entra().await;
-                                    (state, result)
-                                });
-                            }),
-                        ))
-                    }),
+                        el.child(
+                            Button::new("sign-in")
+                                .primary()
+                                .label(if busy { "Signing in…" } else { "Sign in" })
+                                .loading(busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.spawn_state(cx, |mut state| async move {
+                                        let result = state.login_entra().await;
+                                        (state, result)
+                                    });
+                                })),
+                        )
+                    })
+                    .when(busy, |el| el.child(status)),
             )
     }
 
