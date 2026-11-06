@@ -235,6 +235,9 @@ pub struct PlannerView {
     /// Painted left of `gantt-timeline-body`. Tree flex-shrink makes
     /// `tree_width + splitter` a miss, so bar mouse-down uses this.
     timeline_body_origin_x: Rc<Cell<Option<f32>>>,
+    /// Painted box of `gantt-body`, so the tree and timeline share its real
+    /// height rather than a guess at the header and banner chrome above it.
+    gantt_body_box: Rc<Cell<Option<GanttBodyBox>>>,
     /// Painted bar left/right in window coordinates, filled from on_prepaint.
     painted_bar_bounds: Rc<RefCell<HashMap<i64, PaintedBar>>>,
     /// Window box of the "No scheduled dates" chip, filled from on_prepaint.
@@ -258,6 +261,15 @@ pub struct PlannerView {
     last_committed_start_for_test: Option<jiff::civil::Date>,
     last_committed_target_for_test: Option<jiff::civil::Date>,
     _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GanttBodyBox {
+    top: f32,
+    height: f32,
+    /// Window height when painted; a resize shifts the bottom by the delta
+    /// until the next prepaint remeasures.
+    window_h: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -533,6 +545,7 @@ impl PlannerView {
             pending_focus_planner: false,
             timeline_body_origin_y: Rc::new(Cell::new(0.0)),
             timeline_body_origin_x: Rc::new(Cell::new(None)),
+            gantt_body_box: Rc::new(Cell::new(None)),
             painted_bar_bounds: Rc::new(RefCell::new(HashMap::new())),
             empty_hint_bounds: Rc::new(RefCell::new(None)),
             pinned_tooltip_bounds: Rc::new(RefCell::new(None)),
@@ -3229,11 +3242,14 @@ impl PlannerView {
                 self.state.gantt.go_today(today);
             }
         }
+        let rows = self.state.gantt.flatten(&visible);
+        // A taller window can leave the old scroll past the last row.
+        let measured_h = self.state.gantt.viewport_h;
+        self.state.gantt.clamp_scroll(rows.len(), measured_h);
         let committed = self.state.gantt.snapshot();
         if let Some(pose) = self.animated_camera() {
             self.state.gantt.restore(pose);
         }
-        let rows = self.state.gantt.flatten(&visible);
         let viewport_h = self.state.gantt.viewport_h.max(120.0);
         let content_h = (viewport_h - TIMELINE_HEADER_H).max(80.0);
         let window = self.state.gantt.visible_window(&rows, content_h).to_vec();
@@ -3241,6 +3257,8 @@ impl PlannerView {
             .state
             .gantt
             .layout_bars(&visible, &rows, &self.state.iterations, content_h);
+        let body_box = self.gantt_body_box.clone();
+        let entity_id = cx.entity_id();
         let gantt = v_flex()
             .id("gantt")
             .size_full()
@@ -3251,8 +3269,21 @@ impl PlannerView {
                     .id("gantt-body")
                     .flex_1()
                     .min_w(px(0.))
+                    .min_h(px(0.))
                     .relative()
                     .overflow_hidden()
+                    .on_prepaint(move |bounds, window, cx| {
+                        let measured = GanttBodyBox {
+                            top: f32::from(bounds.origin.y),
+                            height: f32::from(bounds.size.height),
+                            window_h: f32::from(window.viewport_size().height),
+                        };
+                        if body_box.replace(Some(measured)) != Some(measured) {
+                            // This frame laid rows out for the old height;
+                            // render again so the timeline fills the new one.
+                            cx.defer(move |cx| cx.notify(entity_id));
+                        }
+                    })
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         if !*hovered {
                             this.clear_canvas_hover(cx);
@@ -3981,6 +4012,7 @@ impl PlannerView {
                     .id("gantt-tree-body")
                     .debug_selector(|| "gantt-tree-body".into())
                     .flex_1()
+                    .min_h(px(0.))
                     .overflow_hidden()
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         this.apply_scroll(event, cx);
@@ -4511,7 +4543,7 @@ impl PlannerView {
             return div().into_any_element();
         }
         let (x, mut y) = self.dates_anchor.unwrap_or((320.0, 160.0));
-        let window_h = self.state.gantt.viewport_h + 200.0;
+        let window_h = self.state.gantt.timeline_origin_y + self.state.gantt.viewport_h;
         let window_w = self.state.gantt.viewport_w.max(320.0);
         let popover_h = 380.0;
         let popover_w = 280.0;
@@ -4882,7 +4914,7 @@ impl PlannerView {
                     .top(px(TIMELINE_HEADER_H))
                     .left_0()
                     .right_0()
-                    .h(px(content_h))
+                    .bottom_0()
                     .overflow_hidden()
                     .on_prepaint(move |bounds, _, _| {
                         body_origin_y.set(f32::from(bounds.origin.y));
@@ -11592,14 +11624,20 @@ impl Render for PlannerView {
         }
         let viewport_h = f32::from(window.viewport_size().height);
         let viewport_w = f32::from(window.viewport_size().width);
-        self.state.gantt.viewport_h = (viewport_h - 200.0).max(120.0);
+        if let Some(body) = self.gantt_body_box.get() {
+            self.state.gantt.viewport_h = (body.height + viewport_h - body.window_h).max(0.0);
+            self.state.gantt.timeline_origin_y = body.top;
+        } else {
+            self.state.gantt.viewport_h = (viewport_h - 200.0).max(120.0);
+            self.state.gantt.timeline_origin_y =
+                (viewport_h - self.state.gantt.viewport_h).max(0.0);
+        }
         self.state.gantt.viewport_w = viewport_w;
         self.state.gantt.clamp_tree_width();
         self.state.gantt.timeline_origin_x = self
             .timeline_body_origin_x
             .get()
             .unwrap_or(self.state.gantt.tree_width + SPLITTER_WIDTH);
-        self.state.gantt.timeline_origin_y = (viewport_h - self.state.gantt.viewport_h).max(0.0);
         if self.state.toasts.items.is_empty() {
             self.toast_hover_depth = 0;
             self.state.toasts.paused = false;
@@ -11815,6 +11853,7 @@ impl Render for PlannerView {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_h(px(0.))
                                     .relative()
                                     .child(self.render_gantt(cx))
                                     .child(self.render_error_banner(cx)),
