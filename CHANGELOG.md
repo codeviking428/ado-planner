@@ -4,6 +4,12 @@ All notable changes to ADO Planner. The release PR generates each entry from
 Conventional Commits; edit the wording in that PR before merging. See
 [docs/RELEASING.md](docs/RELEASING.md).
 
+## [0.2.1](https://github.com/codeviking428/ado-planner/releases/tag/v0.2.1) - 2026-11-06
+
+### Bug fixes
+
+- **release:** Build Linux binaries on Ubuntu 22.04 so they run on glibc 2.35 ([#70](https://github.com/codeviking428/ado-planner/pull/70))
+
 ## [0.2.0](https://github.com/codeviking428/ado-planner/releases/tag/v0.2.0) - 2026-11-06
 
 ### Features
