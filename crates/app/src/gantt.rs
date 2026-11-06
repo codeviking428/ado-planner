@@ -1345,11 +1345,14 @@ impl GanttView {
     /// identical range. Year/Quarter still hold the left-edge date.
     /// Re-clicking the current scale is a no-op: leftover snap and a
     /// selection pin must not pan. After Today, skip leftover/gutter snap
-    /// so a selection cannot pull the camera off Today.
+    /// so a selection cannot pull the camera off Today. An off-screen
+    /// selection is ignored so it cannot pull the camera off the visible range.
     pub fn apply_toolbar_scale(&mut self, scale: GanttScale, today: Date, keep: Option<Date>) {
         if self.scale == scale {
             return;
         }
+        let width = self.timeline_width.max(1.0);
+        let keep = keep.filter(|date| (0.0..=width).contains(&self.x_for_date(*date)));
         if self.keep_today {
             self.set_scale_from_toolbar_keeping(scale, today, keep);
             return;
@@ -13652,6 +13655,38 @@ mod tests {
         assert!(
             (day_x - before).abs() < 2.0,
             "Week→Day must keep the selection at its screen x, x={day_x} was {before}"
+        );
+    }
+
+    #[test]
+    fn toolbar_week_day_ignores_an_off_screen_selection() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let keep = Date::new(2026, 7, 6).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 20).unwrap(),
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            timeline_width: 840.0,
+            ..Default::default()
+        };
+        assert!(
+            gantt.x_for_date(keep) < 0.0,
+            "precondition: the selection starts before the visible range"
+        );
+        let centre = gantt.viewport_center_date();
+        gantt.apply_toolbar_scale(GanttScale::Day, today, Some(keep));
+        assert_eq!(
+            gantt.viewport_center_date(),
+            centre,
+            "Week→Day must keep the visible range, not jump to an off-screen selection, range={}",
+            gantt.viewport_range_title()
+        );
+        gantt.apply_toolbar_scale(GanttScale::Week, today, Some(keep));
+        assert_eq!(
+            gantt.viewport_center_date(),
+            centre,
+            "Day→Week must keep the visible range too, range={}",
+            gantt.viewport_range_title()
         );
     }
 
