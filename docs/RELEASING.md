@@ -39,13 +39,15 @@ The workspace version in the root `Cargo.toml` is the single version. Every crat
    | ---------------------------------------------------------------------------------------------------------- | --------------------------------- |
    | `ado-planner-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`                                                       | Rust binary for Linux             |
    | `ado-planner-vX.Y.Z-x86_64-pc-windows-msvc.zip`                                                            | Rust binary for Windows           |
-   | `ado-planner-vX.Y.Z-x86_64-setup.exe` (+ `.sig`)                                                           | Rust NSIS installer, per-user     |
+   | `ado-planner-vX.Y.Z-x86_64-setup.exe` (+ `.sig`)                                                           | Rust NSIS installer, all users    |
    | `ado-planner-vX.Y.Z-x86_64.AppImage` (+ `.sig`)                                                            | Rust AppImage                     |
    | `latest.json`                                                                                              | Rust updater feed                 |
    | `ado-planner-electron-X.Y.Z-setup.exe`, `ado-planner-electron-X.Y.Z.AppImage`, `latest*.yml`, `*.blockmap` | Electron app and its updater feed |
    | `SHA256SUMS`                                                                                               | checksums for every file above    |
 
 The notes come from that version's `CHANGELOG.md` section.
+
+Both Windows installers install for all users and ask UAC for admin rights: the Rust app to `C:\Program Files\ADO Planner`, the Electron app to `C:\Program Files\ado-planner`. Each removes a per-user install from releases up to 0.2.1 and leaves user data in `%APPDATA%\ado-planner` alone. Updates also need admin rights, so a standard user gets a UAC credential prompt on every update. Before publishing, the **Windows installers** job installs v0.2.1 per-user and then the new build on a runner, and checks the paths, the migration, and that user data survives. The Rust NSIS script is `crates/app/packaging/windows/installer.nsi`, cargo-packager 0.11.8's template plus marked changes; CI fails if it drifts from that version.
 
 The Linux binaries are built on Ubuntu 22.04 and need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+). The release stops if a build needs a newer glibc.
 
