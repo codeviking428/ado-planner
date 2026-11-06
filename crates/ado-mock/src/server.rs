@@ -28,6 +28,7 @@ struct AppState {
     patches: StdMutex<Vec<String>>,
     last_patch_content_type: StdMutex<Option<String>>,
     writes: StdMutex<Vec<(String, String)>>,
+    requests: StdMutex<Vec<(String, String)>>,
 }
 
 pub struct AdoMock {
@@ -46,11 +47,27 @@ impl AdoMock {
     }
 
     pub fn fail_next(&self, path: &str, status: u16, message: &str) {
+        self.fail_next_after(path, 0, status, message);
+    }
+
+    pub fn fail_next_after(&self, path: &str, delay_ms: u64, status: u16, message: &str) {
         self.state.pending.lock().expect("pending").push(Pending {
             path: path.to_string(),
-            delay_ms: 0,
+            delay_ms,
             failure: Some((status, message.to_string())),
         });
+    }
+
+    /// Requests received so far whose path contains `path`, counted on
+    /// arrival so a delayed response still counts while it is in flight.
+    pub fn request_count(&self, method: &str, path: &str) -> usize {
+        self.state
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|(m, p)| m == method && p.contains(path))
+            .count()
     }
 
     pub fn patch_count(&self) -> usize {
@@ -114,6 +131,7 @@ pub async fn start() -> AdoMock {
         patches: StdMutex::new(Vec::new()),
         last_patch_content_type: StdMutex::new(None),
         writes: StdMutex::new(Vec::new()),
+        requests: StdMutex::new(Vec::new()),
     });
     let app = Router::new()
         .fallback(any(handle))
@@ -141,6 +159,11 @@ pub async fn start() -> AdoMock {
 async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+    state
+        .requests
+        .lock()
+        .expect("requests")
+        .push((method.to_string(), path.clone()));
     if let Some(pending) = take_pending(&state, &path).await {
         if pending.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(pending.delay_ms)).await;
