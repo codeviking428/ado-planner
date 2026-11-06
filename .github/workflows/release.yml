@@ -94,7 +94,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         if: steps.meta.outputs.dry-run == 'true'
         with:
-          tool: cargo-packager
+          tool: cargo-packager@0.11.8
 
       # One throwaway key pair for every runner, as with the real secrets.
       - name: Dry-run signing key
@@ -141,9 +141,11 @@ jobs:
           toolchain: 1.99.1
           targets: ${{ matrix.target }}
 
+      # crates/app/packaging/windows/installer.nsi is this version's template plus
+      # marked changes; bump both together (check-nsis-template.sh).
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-packager
+          tool: cargo-packager@0.11.8
 
       - name: Signing key
         shell: bash
@@ -191,6 +193,10 @@ jobs:
           got="$(./target/release/ado-planner --version | tr -d '\r')"
           echo "$got"
           [ "$got" = "ado-planner $VERSION" ]
+
+      - name: Check Windows GUI subsystem
+        if: runner.os == 'Windows'
+        run: python .github/scripts/check-pe-subsystem.py target/release/ado-planner.exe gui
 
       - name: Check glibc baseline
         if: runner.os == 'Linux'
@@ -291,8 +297,48 @@ jobs:
             dist/latest*.yml
           if-no-files-found: error
 
-  publish:
+  # Installs the last per-user release, then this build, on a clean runner.
+  windows-installers:
+    name: Windows installers
     needs: [meta, rust, electron]
+    runs-on: windows-latest
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-x86_64-pc-windows-msvc
+          path: dist/rust
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: electron-Windows
+          path: dist/electron
+
+      - name: Elevation in installers and update feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          for exe in "dist/rust/ado-planner-$TAG-x86_64-setup.exe" "dist/electron/ado-planner-electron-$VERSION-setup.exe"; do
+            level="$(grep -aoE 'requestedExecutionLevel level="[A-Za-z]+"' "$exe" | sort -u)"
+            echo "$exe: $level"
+            [ "$level" = 'requestedExecutionLevel level="requireAdministrator"' ]
+          done
+          grep -qx 'isAdminRightsRequired: true' dist/electron/latest.yml
+
+      - name: Install, migrate, and uninstall
+        shell: pwsh
+        run: >-
+          ./.github/scripts/test-windows-installers.ps1
+          -Version $env:VERSION
+          -RustInstaller "dist/rust/ado-planner-$env:TAG-x86_64-setup.exe"
+          -ElectronInstaller "dist/electron/ado-planner-electron-$env:VERSION-setup.exe"
+
+  publish:
+    needs: [meta, rust, electron, windows-installers]
     runs-on: ubuntu-latest
     permissions:
       contents: write
