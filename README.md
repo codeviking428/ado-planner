@@ -45,10 +45,10 @@ No browser tabs, no CSV round-trips, no second tool that drifts out of date.
 ### Windows & Linux (the usual way)
 
 1. Open the <a href="https://github.com/codeviking428/ado-planner/releases/latest">latest release</a>.
-2. **Windows:** download `ado-planner-electron-*-setup.exe` and run it. It installs per-user — no admin prompt. You'll get a Start Menu and desktop shortcut.
+2. **Windows:** download `ado-planner-electron-*-setup.exe` and run it. It installs for all users to `C:\Program Files\ado-planner` and asks for admin rights (UAC). You'll get a Start Menu and desktop shortcut. An older per-user install is removed; your settings stay.
 3. **Linux:** download `ado-planner-electron-*.AppImage`, mark it executable (`chmod +x ado-planner-electron-*.AppImage`), and run it.
 
-Each release also carries the native Rust app, which is replacing Electron ([ADR 0001](docs/adr/0001-rewrite-in-rust-gpui.md)): `ado-planner-v*-x86_64-setup.exe`, `ado-planner-v*-x86_64.AppImage`, and plain binaries in `ado-planner-v*-<target>.zip` / `.tar.gz`. `SHA256SUMS` covers every file.
+Each release also carries the native Rust app, which is replacing Electron ([ADR 0001](docs/adr/0001-rewrite-in-rust-gpui.md)): `ado-planner-v*-x86_64-setup.exe` (installs to `C:\Program Files\ADO Planner`, admin rights required), `ado-planner-v*-x86_64.AppImage`, and plain binaries in `ado-planner-v*-<target>.zip` / `.tar.gz`. `SHA256SUMS` covers every file.
 
 The installed app checks for updates on launch. Yes downloads, installs, and restarts; No snoozes until next time.
 
@@ -145,7 +145,7 @@ pnpm typecheck
 pnpm lint
 pnpm format
 pnpm e2e           # Playwright `_electron` against a loopback ADO mock
-pnpm build:win     # NSIS installer (per-user)
+pnpm build:win     # NSIS installer (all users, Program Files)
 pnpm build:linux   # AppImage
 ```
 

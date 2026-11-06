@@ -39,6 +39,9 @@ url.workspace = true
 urlencoding.workspace = true
 cargo-packager-updater = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [dev-dependencies]
 ado-mock.workspace = true
 gpui-kit = { version = "0.8.1", features = ["component", "assets", "test-support"] }
@@ -56,8 +59,12 @@ out-dir = "../../release/rust"
 binaries = [{ path = "ado-planner", main = true }]
 icons = ["../../build/icon.png", "../../build/icon.ico"]
 
+# Installs to C:\Program Files\ADO Planner for all users and asks UAC for admin
+# rights. The template removes a per-user install from releases up to 0.2.1 and
+# starts the app unelevated afterwards; see packaging/windows/installer.nsi.
 [package.metadata.packager.nsis]
-installer-mode = "currentUser"
+installer-mode = "perMachine"
+template = "packaging/windows/installer.nsi"
 
 # cargo-packager has no updater table. src/updater.rs compiles in the feed URL
 # and the minisign public key from ADO_PLANNER_UPDATER_ENDPOINT and
