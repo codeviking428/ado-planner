@@ -527,6 +527,153 @@ fn painted_700x500_window_keeps_a_240px_timeline(cx: &mut gpui_kit::TestAppConte
     );
 }
 
+fn painted_bottom(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> f32 {
+    f32::from(bounds.origin.y) + f32::from(bounds.size.height)
+}
+
+fn debug_bounds_of(
+    cx: &mut VisualTestContext,
+    selector: String,
+) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    cx.debug_bounds(Box::leak(selector.into_boxed_str()))
+}
+
+/// Tree and timeline bodies end at the window bottom, and every painted tree
+/// row has a timeline band with the same bottom edge.
+fn assert_panes_share_bottom(view: &Entity<PlannerView>, cx: &mut VisualTestContext, case: &str) {
+    // The first paint measures `gantt-body`; the second lays rows out for it.
+    draw(cx);
+    draw(cx);
+    let window_h = cx.update(|window, _| f32::from(window.viewport_size().height));
+    let tree = cx.debug_bounds("gantt-tree-body").expect("tree body");
+    let timeline = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    assert!(
+        (painted_bottom(tree) - window_h).abs() < 1.0,
+        "{case}: tree body ends at {}, window at {window_h}",
+        painted_bottom(tree)
+    );
+    assert!(
+        (painted_bottom(timeline) - painted_bottom(tree)).abs() < 1.0,
+        "{case}: timeline body ends at {}, tree body at {}",
+        painted_bottom(timeline),
+        painted_bottom(tree)
+    );
+    let (window_ids, more_below, overflows) = view.update(cx, |view, _| {
+        let gantt = &view.state.gantt;
+        let rows = gantt.flatten(&view.state.visible_nodes());
+        let content_h = gantt.viewport_h - ado_planner::gantt::TIMELINE_HEADER_H;
+        let ids: Vec<i64> = gantt
+            .visible_window(&rows, content_h)
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        let rows_h = rows.len() as f32 * ROW_HEIGHT;
+        let more_below = rows_h > gantt.scroll_y + content_h + 0.5;
+        (ids, more_below, rows_h >= content_h)
+    });
+    let mut lowest_band = f32::MIN;
+    for id in &window_ids {
+        let row = debug_bounds_of(cx, format!("gantt-tree-row-{id}"))
+            .unwrap_or_else(|| panic!("{case}: tree row {id} should paint"));
+        let band = debug_bounds_of(cx, format!("gantt-row-band-{id}"))
+            .unwrap_or_else(|| panic!("{case}: timeline band {id} should paint"));
+        assert!(
+            (painted_bottom(row) - painted_bottom(band)).abs() < 1.0,
+            "{case}: row {id} ends at {} in the tree, {} on the timeline",
+            painted_bottom(row),
+            painted_bottom(band)
+        );
+        lowest_band = lowest_band.max(painted_bottom(band));
+    }
+    if more_below {
+        assert!(
+            lowest_band >= painted_bottom(timeline) - 1.0,
+            "{case}: row bands stop at {lowest_band}, timeline body at {}",
+            painted_bottom(timeline)
+        );
+    } else if let Some(last) = window_ids.last().filter(|_| overflows) {
+        let row = debug_bounds_of(cx, format!("gantt-tree-row-{last}")).unwrap();
+        assert!(
+            (painted_bottom(row) - painted_bottom(tree)).abs() < 1.0,
+            "{case}: scrolled to the end, last row ends at {}, pane at {}",
+            painted_bottom(row),
+            painted_bottom(tree)
+        );
+    }
+}
+
+fn scroll_gantt_to_end(view: &Entity<PlannerView>, cx: &mut VisualTestContext) {
+    view.update(cx, |view, cx| {
+        let rows = view.state.gantt.flatten(&view.state.visible_nodes()).len();
+        let viewport_h = view.state.gantt.viewport_h;
+        view.state.gantt.scroll_y = f32::MAX;
+        view.state.gantt.clamp_scroll(rows, viewport_h);
+        cx.notify();
+    });
+}
+
+#[gpui_kit::test]
+fn timeline_grid_reaches_the_bottom_of_the_tree_pane(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_hierarchy(200);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    for (w, h) in [
+        (1280.0, 800.0),
+        (1280.0, 600.0),
+        (1600.0, 1000.0),
+        (900.0, 520.0),
+    ] {
+        cx.simulate_resize(gpui_kit::Size {
+            width: px(w),
+            height: px(h),
+        });
+        assert_panes_share_bottom(&view, cx, &format!("{w}x{h} after resize"));
+        view.update(cx, |view, cx| {
+            view.state.gantt.scroll_y = 0.0;
+            cx.notify();
+        });
+        assert_panes_share_bottom(&view, cx, &format!("{w}x{h} top"));
+        view.update(cx, |view, cx| {
+            view.state.gantt.scroll_y = 7.5 * ROW_HEIGHT + 13.0;
+            cx.notify();
+        });
+        assert_panes_share_bottom(&view, cx, &format!("{w}x{h} mid-row scroll"));
+        // Re-clamp once the measured height is in, as a scroll event would.
+        draw(cx);
+        scroll_gantt_to_end(&view, cx);
+        assert_panes_share_bottom(&view, cx, &format!("{w}x{h} scrolled to end"));
+    }
+    for scale in [
+        GanttScale::Day,
+        GanttScale::Week,
+        GanttScale::Year,
+        GanttScale::Month,
+    ] {
+        view.update(cx, |view, cx| {
+            view.state.gantt.set_scale(scale);
+            cx.notify();
+        });
+        assert_panes_share_bottom(&view, cx, &format!("{scale:?} scale"));
+    }
+    view.update(cx, |view, cx| {
+        view.state.nodes = Vec::new();
+        view.state.gantt.scroll_y = 0.0;
+        cx.notify();
+    });
+    assert_panes_share_bottom(&view, cx, "empty team");
+    view.update(cx, |view, cx| {
+        view.state.nodes = fake_hierarchy(200);
+        cx.notify();
+    });
+    assert_panes_share_bottom(&view, cx, "back from an empty team");
+    scroll_gantt_to_end(&view, cx);
+    assert_panes_share_bottom(&view, cx, "back from an empty team, scrolled to end");
+}
+
 #[gpui_kit::test]
 fn clicking_the_dates_cell_opens_a_range_picker(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
