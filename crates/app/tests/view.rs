@@ -12848,6 +12848,94 @@ fn create_dialog_needs_a_title_and_cancel_closes_it(cx: &mut gpui_kit::TestAppCo
 }
 
 #[gpui_kit::test]
+fn create_dialog_blocks_gantt_shortcuts_behind_it(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| view.open_create(Some(1), cx));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.focus_planner_for_test(window, cx));
+    });
+    cx.simulate_keystrokes("delete");
+    cx.simulate_keystrokes("backspace");
+    cx.simulate_keystrokes("f2");
+    draw(cx);
+    assert!(cx.debug_bounds("gantt-create-dialog").is_some());
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_none(),
+        "F2 must not open rename behind the create dialog"
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.pending_delete_id(),
+            None,
+            "Delete must not open the delete confirm behind the create dialog"
+        );
+        assert_eq!(view.state.gantt.selected_id, Some(1));
+    });
+}
+
+#[gpui_kit::test]
+fn enter_after_create_does_not_open_details(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (_runtime, _mock, mut state, _dir) = signed_in_with_mock();
+    state.gantt.selected_id = Some(1001);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| view.open_create(Some(1001), cx));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.set_create_title("Refunds", window, cx));
+    });
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    allow_ado_client_wake(cx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut created = false;
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        created = view.update(cx, |view, _| {
+            view.state.nodes.iter().any(|node| node.title == "Refunds")
+        });
+        if created {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(created, "Enter must create the item");
+    view.update(cx, |view, _| {
+        assert!(
+            !view.form_is_loading() && view.state.form.is_none(),
+            "the Enter that created the item must not also open details"
+        );
+    });
+    let held = KeyDownEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+        is_held: true,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| view.handle_key(&held, cx));
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            !view.form_is_loading() && view.state.form.is_none(),
+            "a held Enter repeating after Create must not open details"
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.form_is_loading() || view.state.form.is_some(),
+            "a fresh Enter on the new row still opens details"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn add_child_dialog_creates_on_the_mock_with_the_typed_title(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let (runtime, mock, mut state, _dir) = signed_in_with_mock();

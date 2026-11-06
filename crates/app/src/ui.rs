@@ -158,6 +158,7 @@ pub struct PlannerView {
     /// Add item / Add child dialog. Nothing is created until Create.
     pending_create: Option<CreateDraft>,
     create_title_input: Entity<InputState>,
+    create_enter_guard: Option<CreateEnterGuard>,
     /// True after Enter commits an inline editor so the same key does not
     /// also open the details dialog.
     inline_enter_guard: bool,
@@ -310,6 +311,14 @@ struct CreateDraft {
     focus_title: bool,
 }
 
+/// GPUI still dispatches the Enter that submitted the create dialog, and a
+/// held Enter keeps repeating; neither may open details on the new row.
+#[derive(Clone, Copy, Debug)]
+enum CreateEnterGuard {
+    SameKey,
+    Repeats,
+}
+
 struct CameraAnim {
     from: SavedGanttView,
     to: SavedGanttView,
@@ -407,7 +416,9 @@ impl PlannerView {
                 }
                 if this.pending_create.is_some() {
                     if key == "enter" {
-                        this.submit_create(cx);
+                        if this.submit_create(cx) {
+                            this.create_enter_guard = Some(CreateEnterGuard::SameKey);
+                        }
                         cx.stop_propagation();
                     }
                     return;
@@ -443,6 +454,7 @@ impl PlannerView {
                 let confirm_delete = this.pending_delete.is_some()
                     && matches!(key, "enter" | "escape" | "delete" | "backspace");
                 let open_details = key == "enter"
+                    && this.create_enter_guard.is_none()
                     && this.pending_delete.is_none()
                     && !this.io_busy
                     && !this.details_overlay()
@@ -513,6 +525,7 @@ impl PlannerView {
             pending_delete: None,
             pending_create: None,
             create_title_input,
+            create_enter_guard: None,
             inline_enter_guard: false,
             dates_anchor: None,
             banner_dismissed: false,
@@ -1172,6 +1185,10 @@ impl PlannerView {
 
     pub fn after_io_selection_change_for_test(&mut self, prev_selected: Option<i64>) {
         self.after_io_selection_change(prev_selected);
+    }
+
+    pub fn focus_planner_for_test(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_planner(window, cx);
     }
 
     fn spawn_unbounded<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
@@ -7667,9 +7684,10 @@ impl PlannerView {
         cx.notify();
     }
 
-    pub fn submit_create(&mut self, cx: &mut Context<Self>) {
+    /// Returns true once the create request is on its way.
+    pub fn submit_create(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(draft) = self.pending_create.clone() else {
-            return;
+            return false;
         };
         let title = self.create_title_input.read(cx).value().trim().to_string();
         if title.is_empty() {
@@ -7677,7 +7695,7 @@ impl PlannerView {
                 draft.error = Some("Enter a title.".into());
             }
             cx.notify();
-            return;
+            return false;
         }
         let CreateDraft {
             parent_id,
@@ -7688,10 +7706,11 @@ impl PlannerView {
             let result = state.create_item(parent_id, &work_item_type, &title).await;
             (state, result)
         }) {
-            return;
+            return false;
         }
         self.pending_create = None;
         cx.notify();
+        true
     }
 
     fn create_parent_label(&self, parent_id: Option<i64>) -> String {
@@ -10365,6 +10384,9 @@ impl PlannerView {
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        if key != "enter" {
+            self.create_enter_guard = None;
+        }
         if event.is_held
             && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
             && (key == "z" || key == "y")
@@ -10390,6 +10412,21 @@ impl PlannerView {
                 self.confirm_delete(cx);
             }
             return;
+        }
+        if self.pending_create.is_some() {
+            return;
+        }
+        if key == "enter"
+            && let Some(guard) = self.create_enter_guard
+        {
+            match guard {
+                CreateEnterGuard::SameKey => {
+                    self.create_enter_guard = Some(CreateEnterGuard::Repeats);
+                    return;
+                }
+                CreateEnterGuard::Repeats if event.is_held => return,
+                CreateEnterGuard::Repeats => self.create_enter_guard = None,
+            }
         }
         if key == "enter" && self.inline_edit.is_some() {
             self.commit_inline(cx);
@@ -11925,6 +11962,9 @@ impl Render for PlannerView {
                 let key = event.keystroke.key.as_str();
                 if this.form_loading.is_some() && key != "escape" {
                     cx.stop_propagation();
+                    return;
+                }
+                if this.pending_create.is_some() {
                     return;
                 }
                 if key == "f2"
