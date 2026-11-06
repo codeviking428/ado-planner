@@ -20,7 +20,11 @@ win:
   executableName: ado-planner
 nsis:
   oneClick: false
-  perMachine: false
+  # Installs to C:\Program Files\ado-planner and asks UAC for admin rights.
+  # electron-builder uninstalls an older per-user copy (keeping app data),
+  # writes isAdminRightsRequired to latest.yml so electron-updater elevates,
+  # and starts the app unelevated after installing.
+  perMachine: true
   artifactName: ${name}-electron-${version}-setup.${ext}
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}

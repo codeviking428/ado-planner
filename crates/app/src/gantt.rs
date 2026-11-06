@@ -310,9 +310,22 @@ fn compact_date_span(start: Date, end: Date) -> String {
     }
 }
 
-fn quarter_title(date: Date) -> String {
-    let q = ((date.month() as i32 - 1) / 3) + 1;
-    format!("{} Q{q}", date.year())
+/// Month/Quarter/Year banners carry years, and a span can cross one, so the
+/// title names it too: `Aug 12 – Sep 24, 2026`, `Dec 4, 2026 – Feb 8, 2027`.
+fn dated_span(start: Date, end: Date) -> String {
+    if start >= end {
+        format!("{}, {}", compact_date(start), start.year())
+    } else if start.year() != end.year() {
+        format!(
+            "{}, {} – {}, {}",
+            compact_date(start),
+            start.year(),
+            compact_date(end),
+            end.year()
+        )
+    } else {
+        format!("{}, {}", compact_date_span(start, end), end.year())
+    }
 }
 
 fn month_abbrev(date: Date) -> &'static str {
@@ -1058,96 +1071,29 @@ impl GanttView {
             .unwrap_or(0.0)
     }
 
+    /// Month/Quarter/Year name visible days, not whole periods: a ‹/› step
+    /// is a quarter of the view, finer than a month, quarter or year column,
+    /// so a period title would sit still for several clicks and then jump.
+    /// The span starts at the first column the axis labels (a cramped
+    /// leftover it dropped is not claimed) and ends on the last pixel.
     pub fn viewport_range_title(&self) -> String {
-        let start = self.viewport_axis_start_date();
-        let width = self.timeline_width.max(1.0);
-        let end = self.date_for_x((width - 1.0).max(0.0));
         match self.scale {
-            GanttScale::Month => {
-                if start.month() != end.month() || start.year() != end.year() {
-                    if start.year() == end.year() {
-                        format!(
-                            "{} – {} {}",
-                            month_abbrev(start),
-                            month_abbrev(end),
-                            start.year()
-                        )
-                    } else {
-                        format!(
-                            "{} {} – {} {}",
-                            month_abbrev(start),
-                            start.year(),
-                            month_abbrev(end),
-                            end.year()
-                        )
-                    }
-                } else {
-                    self.scale.range_title(start)
-                }
-            }
             GanttScale::Day | GanttScale::Week => {
                 let (start, end) = self.painted_tick_range();
                 compact_date_span(start, end)
             }
-            GanttScale::Quarter => {
-                let (start, end) = self.painted_tick_range();
-                let left = quarter_title(start);
-                let right = quarter_title(end);
-                if left == right {
-                    left
+            GanttScale::Month | GanttScale::Quarter | GanttScale::Year => {
+                let width = self.timeline_width.max(1.0);
+                let axis_start = if matches!(self.scale, GanttScale::Quarter) {
+                    self.painted_tick_range().0
                 } else {
-                    format!("{left} – {right}")
-                }
-            }
-            GanttScale::Year => {
-                let (start, end) = self.painted_year_range();
-                if start.year() == end.year() {
-                    start.year().to_string()
-                } else {
-                    format!("{} – {}", start.year(), end.year())
-                }
+                    self.viewport_axis_start_date()
+                };
+                let start = axis_start.max(self.date_for_x(0.0));
+                let end = self.date_for_x((width - 1.0).max(0.0));
+                dated_span(start, end)
             }
         }
-    }
-
-    /// First leftover year through the last painted Year major or month tick.
-    /// A 2029 banner can sit on the clip (`fit_labels_to_width` shifts it in)
-    /// while `date_for_x(width-1)` is still late 2028.
-    fn painted_year_range(&self) -> (Date, Date) {
-        let width = self.timeline_width.max(1.0);
-        let start = self.viewport_axis_start_date();
-        let mut end = self.date_for_x((width - 1.0).max(0.0));
-        let ticks = self.timeline_ticks(width);
-        let resolve = |x: f32, label: &str, major: bool| -> Option<Date> {
-            ticks
-                .iter()
-                .filter(|tick| {
-                    if major {
-                        tick.major && tick.major_label == label
-                    } else {
-                        tick.label == label
-                    }
-                })
-                .min_by(|a, b| {
-                    let da = (a.x.max(0.0) - x).abs();
-                    let db = (b.x.max(0.0) - x).abs();
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|tick| tick.date)
-        };
-        if let Some((x, label)) = self.header_major_labels(width).last()
-            && let Some(date) = resolve(*x, label, true)
-            && date > end
-        {
-            end = date;
-        }
-        if let Some((x, label)) = self.header_tick_labels(width).last()
-            && let Some(date) = resolve(*x, label, false)
-            && date > end
-        {
-            end = date;
-        }
-        (start, end)
     }
 
     /// First and last painted tick dates, matching `header_tick_labels`
@@ -1345,11 +1291,14 @@ impl GanttView {
     /// identical range. Year/Quarter still hold the left-edge date.
     /// Re-clicking the current scale is a no-op: leftover snap and a
     /// selection pin must not pan. After Today, skip leftover/gutter snap
-    /// so a selection cannot pull the camera off Today.
+    /// so a selection cannot pull the camera off Today. An off-screen
+    /// selection is ignored so it cannot pull the camera off the visible range.
     pub fn apply_toolbar_scale(&mut self, scale: GanttScale, today: Date, keep: Option<Date>) {
         if self.scale == scale {
             return;
         }
+        let width = self.timeline_width.max(1.0);
+        let keep = keep.filter(|date| (0.0..=width).contains(&self.x_for_date(*date)));
         if self.keep_today {
             self.set_scale_from_toolbar_keeping(scale, today, keep);
             return;
@@ -2150,20 +2099,13 @@ impl GanttView {
         }
         let left = self.date_for_x(-ppd);
         let right = self.date_for_x(width + ppd.max(1.0));
-        // Year majors just past the clip are still painted: fit_labels_to_width
-        // slides "2029" onto the right edge while date_for_x(width-1) is 2028.
-        let overflow = if matches!(self.scale, GanttScale::Year) {
-            MAJOR_LABEL_ESTIMATE.max(ppd * 32.0)
-        } else {
-            1.0
-        };
         let mut date = self.scale.tick_floor(left);
         let mut ticks = Vec::new();
         let mut last_major = String::new();
         let mut guard = 0;
         while guard < 512 {
             let x = self.x_for_date(date);
-            if x > width + overflow && date > right {
+            if x > width + 1.0 && date > right {
                 break;
             }
             let major_label = self.scale.major_label(date);
@@ -2212,7 +2154,7 @@ impl GanttView {
         let ticks: Vec<(f32, String)> = self
             .timeline_ticks(width)
             .into_iter()
-            .filter(|tick| tick.major)
+            .filter(|tick| tick.major && tick.x < width)
             .map(|tick| (tick.x.max(0.0), tick.major_label))
             .collect();
         let mut labels = Self::sticky_header_labels(ticks, false, 72.0);
@@ -2240,7 +2182,9 @@ impl GanttView {
             .timeline_ticks(width)
             .into_iter()
             .filter_map(|tick| {
-                if tick.label.is_empty() {
+                // fit_labels_to_width slides the last label onto the clip,
+                // so a tick past it would name an off-screen period.
+                if tick.label.is_empty() || tick.x >= width {
                     None
                 } else {
                     Some((tick.x, tick.label))
@@ -7419,6 +7363,54 @@ mod tests {
     }
 
     #[test]
+    fn every_pan_step_moves_the_range_title_with_the_view() {
+        for scale in [GanttScale::Month, GanttScale::Quarter, GanttScale::Year] {
+            for direction in [1, -1] {
+                let mut gantt = GanttView {
+                    origin: Date::new(2026, 8, 1).unwrap(),
+                    scale,
+                    zoom: 1.0,
+                    timeline_width: 512.0,
+                    ..Default::default()
+                };
+                let mut title = gantt.viewport_range_title();
+                for step in 0..8 {
+                    gantt.retarget_year_gutter(|gantt| gantt.step_period(direction));
+                    let next = gantt.viewport_range_title();
+                    assert_ne!(
+                        next, title,
+                        "{scale:?} step {step} ({direction:+}) must update the title"
+                    );
+                    let end = gantt.date_for_x(511.0);
+                    assert!(
+                        next.ends_with(&format!("{}, {}", compact_date(end), end.year())),
+                        "{scale:?} title {next:?} must end on the last visible day {end}"
+                    );
+                    title = next;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dated_span_names_years_once_unless_crossed() {
+        let d = |y, m, day| Date::new(y, m, day).unwrap();
+        assert_eq!(
+            dated_span(d(2026, 8, 12), d(2026, 9, 24)),
+            "Aug 12 – Sep 24, 2026"
+        );
+        assert_eq!(
+            dated_span(d(2026, 8, 3), d(2026, 8, 24)),
+            "Aug 3 – 24, 2026"
+        );
+        assert_eq!(
+            dated_span(d(2026, 12, 4), d(2027, 2, 8)),
+            "Dec 4, 2026 – Feb 8, 2027"
+        );
+        assert_eq!(dated_span(d(2026, 8, 3), d(2026, 8, 3)), "Aug 3, 2026");
+    }
+
+    #[test]
     fn scroll_left_reveals_earlier_months() {
         let mut gantt = GanttView {
             origin: Date::new(2026, 8, 1).unwrap(),
@@ -12578,9 +12570,10 @@ mod tests {
     }
 
     #[test]
-    fn year_title_covers_a_painted_next_year_major() {
-        // Zoomed-out Year: last pixel is still 2028 while fit_labels_to_width
-        // slides a 2029 banner (and a Nov column) onto the clip.
+    fn year_header_and_title_stop_at_the_clip() {
+        // Zoomed-out Year: Jan 2029 sits just past the clip. Its banner and
+        // tick must not slide onto the edge, and the title ends on the last
+        // visible day of 2028.
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
             scale: GanttScale::Year,
@@ -12588,21 +12581,35 @@ mod tests {
             timeline_width: 800.0,
             ..Default::default()
         };
-        let majors = gantt.header_major_labels(800.0);
-        let ticks = gantt.header_tick_labels(800.0);
-        let title = gantt.viewport_range_title();
+        let jan_2029 = gantt.x_for_date(Date::new(2029, 1, 1).unwrap());
         let pixel_end = gantt.date_for_x(799.0);
         assert!(
-            majors.iter().any(|(_, label)| label == "2029"),
-            "precondition: 2029 must paint (shifted onto the clip) while the last pixel is {pixel_end}, majors={majors:?} ticks={ticks:?}"
+            jan_2029 > 800.0 && jan_2029 < 800.0 + MAJOR_LABEL_ESTIMATE,
+            "precondition: Jan 2029 just past the clip, got x={jan_2029}"
+        );
+        let majors = gantt.header_major_labels(800.0);
+        let ticks = gantt.header_tick_labels(800.0);
+        assert!(
+            !majors.iter().any(|(_, label)| label == "2029"),
+            "an off-screen 2029 must not paint, majors={majors:?}"
+        );
+        assert_ne!(
+            ticks.last().map(|(_, label)| label.as_str()),
+            Some("Jan"),
+            "an off-screen Jan 2029 tick must not paint, ticks={ticks:?}"
+        );
+        let title = gantt.viewport_range_title();
+        assert!(
+            title.ends_with(&format!(
+                "{}, {}",
+                compact_date(pixel_end),
+                pixel_end.year()
+            )),
+            "Year title {title:?} must end on the last visible day {pixel_end}"
         );
         assert!(
-            pixel_end.year() <= 2028,
-            "precondition: last pixel must still be 2028 so the title cannot use date_for_x, got {pixel_end}"
-        );
-        assert!(
-            title.contains("2029"),
-            "Year title {title:?} must cover painted 2029 even when the last pixel is {pixel_end}, majors={majors:?} ticks={ticks:?}"
+            !title.contains("2029"),
+            "title {title:?} names off-screen 2029"
         );
     }
 
@@ -12619,30 +12626,20 @@ mod tests {
         };
         let labels = gantt.header_tick_labels(800.0);
         let title = gantt.viewport_range_title();
-        let first = labels
-            .first()
-            .map(|(_, label)| label.as_str())
-            .unwrap_or("");
+        let q3_x = gantt.x_for_date(Date::new(2026, 7, 1).unwrap());
         assert!(
-            first.starts_with('Q'),
-            "Quarter axis must paint Q labels, got {labels:?}"
+            q3_x > 0.0 && q3_x < 48.0,
+            "precondition: Q3 cramped against the left edge, got x={q3_x}"
+        );
+        assert_eq!(
+            labels.first().map(|(_, label)| label.as_str()),
+            Some("Q3"),
+            "Quarter axis must drop the cramped leftover Q2, got {labels:?}"
         );
         assert!(
-            title.contains(first),
-            "Quarter title {title:?} must name the first painted column {first:?}, labels={labels:?}"
+            title.starts_with("Jul 1, 2026 – "),
+            "cramped leftover Q2 must not title the range, got {title:?} labels={labels:?}"
         );
-        assert!(
-            !title.contains("Q2") || first == "Q2" || title.matches("Q2").count() == 1,
-            "title must not claim leftover Q2 when the axis starts at {first}: {title} vs {labels:?}"
-        );
-        let q3 = Date::new(2026, 7, 1).unwrap();
-        let q3_x = gantt.x_for_date(q3);
-        if q3_x > 0.0 && q3_x < 48.0 {
-            assert!(
-                title.starts_with("2026 Q3"),
-                "cramped leftover Q2 must not title the range, got {title:?} Q3_x={q3_x} labels={labels:?}"
-            );
-        }
     }
 
     #[test]
@@ -13652,6 +13649,38 @@ mod tests {
         assert!(
             (day_x - before).abs() < 2.0,
             "Week→Day must keep the selection at its screen x, x={day_x} was {before}"
+        );
+    }
+
+    #[test]
+    fn toolbar_week_day_ignores_an_off_screen_selection() {
+        let today = Date::new(2026, 11, 3).unwrap();
+        let keep = Date::new(2026, 7, 6).unwrap();
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 20).unwrap(),
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            timeline_width: 840.0,
+            ..Default::default()
+        };
+        assert!(
+            gantt.x_for_date(keep) < 0.0,
+            "precondition: the selection starts before the visible range"
+        );
+        let centre = gantt.viewport_center_date();
+        gantt.apply_toolbar_scale(GanttScale::Day, today, Some(keep));
+        assert_eq!(
+            gantt.viewport_center_date(),
+            centre,
+            "Week→Day must keep the visible range, not jump to an off-screen selection, range={}",
+            gantt.viewport_range_title()
+        );
+        gantt.apply_toolbar_scale(GanttScale::Week, today, Some(keep));
+        assert_eq!(
+            gantt.viewport_center_date(),
+            centre,
+            "Day→Week must keep the visible range too, range={}",
+            gantt.viewport_range_title()
         );
     }
 
