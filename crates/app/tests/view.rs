@@ -15070,6 +15070,45 @@ fn year_bars_keep_a_minimum_height(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn period_buttons_move_the_range_title_with_the_view(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    for scale in [GanttScale::Month, GanttScale::Quarter, GanttScale::Year] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = idle_state(&dir);
+        state.gantt.origin = Date::new(2026, 8, 1).unwrap();
+        state.gantt.scale = scale;
+        let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+        cx.simulate_resize(gpui_kit::Size {
+            width: px(1280.),
+            height: px(800.),
+        });
+        draw(cx);
+        let mut title = view.update(cx, |view, _| view.state.gantt.viewport_range_title());
+        for (button, name) in [
+            ("gantt-next-period", "›"),
+            ("gantt-next-period", "›"),
+            ("gantt-next-period", "›"),
+            ("gantt-prev-period", "‹"),
+        ] {
+            let bounds = cx.debug_bounds(button).expect(name);
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            draw(cx);
+            let (next, end) = view.update(cx, |view, _| {
+                let gantt = &view.state.gantt;
+                let end = gantt.date_for_x((gantt.timeline_width - 1.0).max(0.0));
+                (gantt.viewport_range_title(), end)
+            });
+            assert_ne!(next, title, "{scale:?} {name} must update the range title");
+            assert!(
+                next.ends_with(&end.year().to_string()) && next.contains(&end.day().to_string()),
+                "{scale:?} title {next:?} must end on the last visible day {end}"
+            );
+            title = next;
+        }
+    }
+}
+
+#[gpui_kit::test]
 fn month_period_buttons_pan_a_week(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
