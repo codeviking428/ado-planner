@@ -89,6 +89,14 @@ pub enum DateSaveRole {
     Cascade,
 }
 
+/// Work Item to create from the Add item dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewItem {
+    pub title: String,
+    pub work_item_type: String,
+    pub parent_id: Option<i64>,
+}
+
 /// Date change already applied and recorded locally; persist over HTTP next.
 #[derive(Clone)]
 pub struct PendingDateSave {
@@ -2272,15 +2280,47 @@ impl PlannerState {
     }
 
     pub async fn add_item_under(&mut self, parent_id: Option<i64>) -> Result<(), AppError> {
+        let mut item = self.new_item_defaults(parent_id);
+        item.title = "New work item".into();
+        self.create_item(item).await
+    }
+
+    /// Type and parent the Add item dialog starts with. A parent that is not
+    /// loaded falls back to the root.
+    pub fn new_item_defaults(&self, parent_id: Option<i64>) -> NewItem {
+        let parent = parent_id.and_then(|id| self.nodes.iter().find(|node| node.id == id));
+        NewItem {
+            title: String::new(),
+            work_item_type: child_work_item_type(
+                parent.map(|node| node.work_item_type.as_str()),
+                &self.types(),
+            ),
+            parent_id: parent.map(|node| node.id),
+        }
+    }
+
+    pub async fn create_item(&mut self, item: NewItem) -> Result<(), AppError> {
         let Some(scope) = self.scope() else {
             return Err(AppError::message("Choose a Team first"));
         };
-        let types = self.types();
-        let (parent_id, work_item_type, area, iteration) = {
-            let selected = parent_id.and_then(|id| self.nodes.iter().find(|node| node.id == id));
+        let title = item.title.trim().to_string();
+        if title.is_empty() {
+            return Err(AppError::message("Title cannot be empty"));
+        }
+        let work_item_type = item.work_item_type.trim().to_string();
+        if work_item_type.is_empty() {
+            return Err(AppError::message("Choose a work item type"));
+        }
+        if let Some(id) = item.parent_id
+            && !self.nodes.iter().any(|node| node.id == id)
+        {
+            return Err(AppError::message(format!("Work item #{id} is not loaded")));
+        }
+        let (parent_id, area, iteration) = {
+            let selected = item
+                .parent_id
+                .and_then(|id| self.nodes.iter().find(|node| node.id == id));
             let parent_id = selected.map(|node| node.id);
-            let work_item_type =
-                child_work_item_type(selected.map(|node| node.work_item_type.as_str()), &types);
             let area = selected
                 .map(|node| node.area_path.clone())
                 .or_else(|| self.nodes.first().map(|node| node.area_path.clone()))
@@ -2293,13 +2333,13 @@ impl PlannerState {
                     (!path.is_empty()).then_some(path)
                 })
                 .unwrap_or_default();
-            (parent_id, work_item_type, area, iteration)
+            (parent_id, area, iteration)
         };
         let mut ops = vec![
             ado_core::JsonPatchOp {
                 op: ado_core::PatchOp::Add,
                 path: "/fields/System.Title".into(),
-                value: Some(json!("New work item")),
+                value: Some(json!(title)),
             },
             ado_core::JsonPatchOp {
                 op: ado_core::PatchOp::Add,

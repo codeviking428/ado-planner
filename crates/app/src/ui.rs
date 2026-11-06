@@ -59,7 +59,7 @@ use crate::gantt::{
 };
 use crate::paths::AppPaths;
 use crate::state::{
-    DateSaveRole, PendingDateSave, PlannerState, coalesce_superseded_date_saves,
+    DateSaveRole, NewItem, PendingDateSave, PlannerState, coalesce_superseded_date_saves,
     undone_message as undone_toast_message,
 };
 use crate::toasts::{HistoryEntry, ToastExtra, ToastKind, UndoAction};
@@ -155,6 +155,10 @@ pub struct PlannerView {
     inline_dates_error: Option<String>,
     pending_typed_preview: Option<String>,
     pending_delete: Option<(i64, String)>,
+    /// Open Add item dialog. Nothing is written to Azure DevOps until Create.
+    pending_create: Option<CreateDraft>,
+    create_title_input: Entity<InputState>,
+    create_parent_input: Entity<InputState>,
     /// True after Enter commits an inline editor so the same key does not
     /// also open the details dialog.
     inline_enter_guard: bool,
@@ -257,6 +261,15 @@ pub struct PlannerView {
     _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CreateDraft {
+    work_item_type: String,
+    /// The user picked a type, so editing the parent keeps it.
+    type_chosen: bool,
+    error: Option<String>,
+    submitting: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PaintedBar {
     left: f32,
@@ -356,6 +369,13 @@ impl PlannerView {
                 return;
             };
             view.update(cx, |this, cx| {
+                if this.pending_create.is_some() {
+                    if key == "escape" {
+                        this.cancel_create(cx);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 let overlay = this.details_overlay()
                     || this.state.gantt.context_menu.is_some()
                     || this.popup_open()
@@ -489,6 +509,9 @@ impl PlannerView {
             inline_dates_error: None,
             pending_typed_preview: None,
             pending_delete: None,
+            pending_create: None,
+            create_title_input: cx.new(|cx| InputState::new(window, cx)),
+            create_parent_input: cx.new(|cx| InputState::new(window, cx)),
             inline_enter_guard: false,
             dates_anchor: None,
             banner_dismissed: false,
@@ -547,8 +570,15 @@ impl PlannerView {
         this.filter_query.update(cx, |input, cx| {
             input.set_placeholder("Search", window, cx);
         });
+        this.create_title_input.update(cx, |input, cx| {
+            input.set_placeholder("Title", window, cx);
+        });
+        this.create_parent_input.update(cx, |input, cx| {
+            input.set_placeholder("Parent ID, blank for root", window, cx);
+        });
         this.bind_sign_in_events(window, cx);
         this.bind_inline_input(cx);
+        this.bind_create_inputs(cx);
         this
     }
 
@@ -938,6 +968,16 @@ impl PlannerView {
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(window)
+            || self
+                .create_title_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .create_parent_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
     }
 
     fn bind_sign_in_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -991,6 +1031,130 @@ impl PlannerView {
             }
         });
         self._subscriptions.push(events);
+    }
+
+    fn bind_create_inputs(&mut self, cx: &mut Context<Self>) {
+        let title = cx.subscribe(
+            &self.create_title_input,
+            |this, _, event: &InputEvent, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_create(cx),
+                InputEvent::Change => {
+                    if let Some(draft) = this.pending_create.as_mut() {
+                        draft.error = None;
+                    }
+                    cx.notify();
+                }
+                _ => {}
+            },
+        );
+        let parent = cx.subscribe(
+            &self.create_parent_input,
+            |this, _, event: &InputEvent, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_create(cx),
+                InputEvent::Change => this.on_create_parent_changed(cx),
+                _ => {}
+            },
+        );
+        self._subscriptions.push(title);
+        self._subscriptions.push(parent);
+    }
+
+    fn open_create_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let defaults = self.state.new_item_defaults(self.state.gantt.selected_id);
+        let parent_text = defaults
+            .parent_id
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        self.create_title_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.create_parent_input.update(cx, |input, cx| {
+            input.set_value(parent_text, window, cx);
+        });
+        self.inline_edit = None;
+        self.state.gantt.context_menu = None;
+        self.pending_create = Some(CreateDraft {
+            work_item_type: defaults.work_item_type,
+            ..CreateDraft::default()
+        });
+        Self::focus_input(&self.create_title_input, window, cx);
+        cx.notify();
+    }
+
+    fn cancel_create(&mut self, cx: &mut Context<Self>) {
+        if self.pending_create.take().is_some() {
+            self.pending_focus_planner = true;
+            cx.notify();
+        }
+    }
+
+    /// Blank means root; anything else must be a loaded Work Item ID.
+    fn create_parent_choice(&self, cx: &App) -> Result<Option<i64>, String> {
+        let text = self.create_parent_input.read(cx).value().to_string();
+        let text = text.trim().trim_start_matches('#');
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let id: i64 = text
+            .parse()
+            .map_err(|_| format!("\"{text}\" is not a work item ID"))?;
+        if self.state.nodes.iter().any(|node| node.id == id) {
+            Ok(Some(id))
+        } else {
+            Err(format!("Work item #{id} is not loaded"))
+        }
+    }
+
+    fn on_create_parent_changed(&mut self, cx: &mut Context<Self>) {
+        let parent = self.create_parent_choice(cx).ok().flatten();
+        let Some(draft) = self.pending_create.as_mut() else {
+            return;
+        };
+        draft.error = None;
+        if !draft.type_chosen {
+            draft.work_item_type = self.state.new_item_defaults(parent).work_item_type;
+        }
+        cx.notify();
+    }
+
+    fn submit_create(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.pending_create.as_ref() else {
+            return;
+        };
+        if draft.submitting {
+            return;
+        }
+        let title = self.create_title_input.read(cx).value().trim().to_string();
+        let parent = self.create_parent_choice(cx);
+        let error = if title.is_empty() {
+            Some("Enter a title".to_string())
+        } else if draft.work_item_type.is_empty() {
+            Some("Choose a type".to_string())
+        } else {
+            parent.as_ref().err().cloned()
+        };
+        if let Some(error) = error {
+            if let Some(draft) = self.pending_create.as_mut() {
+                draft.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
+        let item = NewItem {
+            title,
+            work_item_type: draft.work_item_type.clone(),
+            parent_id: parent.ok().flatten(),
+        };
+        self.state.gantt.clear_hover();
+        let spawned = self.spawn_state(cx, move |mut state| async move {
+            let result = state.create_item(item).await;
+            (state, result)
+        });
+        if let Some(draft) = self.pending_create.as_mut() {
+            draft.submitting = spawned;
+            draft.error = (!spawned).then(|| "Still saving, try again in a moment".to_string());
+        }
+        cx.notify();
     }
 
     fn spawn_state<F, Fut>(&mut self, cx: &mut Context<Self>, work: F) -> bool
@@ -1111,6 +1275,38 @@ impl PlannerView {
 
     fn after_io_selection_change(&mut self, prev_selected: Option<i64>) {
         self.drop_stale_inline_edit();
+        if self
+            .pending_create
+            .as_ref()
+            .is_some_and(|draft| draft.submitting)
+        {
+            let created = self.state.gantt.selected_id != prev_selected
+                && matches!(
+                    (self.state.history.undo.last(), self.state.gantt.selected_id),
+                    (Some(HistoryEntry::Created { id, .. }), Some(selected)) if *id == selected
+                );
+            if created {
+                self.pending_create = None;
+                self.state.gantt.clear_hover();
+                self.state.gantt.hover_locked = true;
+                let rows = self.state.gantt.flatten(&self.state.nodes);
+                self.state.gantt.select_relative(&rows, 0);
+                // The dialog already took the title, so skip inline rename.
+                self.pending_inline_title = None;
+                self.pending_focus_planner = true;
+                return;
+            }
+            let error = self
+                .state
+                .toasts
+                .last_error_message()
+                .unwrap_or("Could not create work item")
+                .to_string();
+            if let Some(draft) = self.pending_create.as_mut() {
+                draft.submitting = false;
+                draft.error = Some(error);
+            }
+        }
         if self.state.gantt.selected_id == prev_selected {
             return;
         }
@@ -1309,6 +1505,7 @@ impl PlannerView {
         self.pending_typed_preview = None;
         self.dates_anchor = None;
         self.pending_delete = None;
+        self.pending_create = None;
         self.state.gantt.context_menu = None;
         self.state.gantt.selected_link = None;
         self.dismiss_empty_timeline_hint();
@@ -3646,14 +3843,11 @@ impl PlannerView {
                                 Button::new("add-item")
                                     .ghost()
                                     .label("+ Add item")
-                                    .tooltip("Add a child work item under the selected row.")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .tooltip("Choose a title, type, and parent for a new work item.")
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.toolbar_more_open = false;
                                         this.state.gantt.clear_hover();
-                                        this.spawn_state(cx, |mut state| async move {
-                                            let result = state.add_item().await;
-                                            (state, result)
-                                        });
+                                        this.open_create_dialog(window, cx);
                                     })),
                             ),
                     )
@@ -7605,6 +7799,187 @@ impl PlannerView {
             .into_any_element()
     }
 
+    fn create_parent_hint(&self, cx: &App) -> Result<String, String> {
+        Ok(match self.create_parent_choice(cx)? {
+            None => "At the root".into(),
+            Some(id) => {
+                let parent = self.state.nodes.iter().find(|node| node.id == id);
+                match parent {
+                    Some(node) => format!("Under {} #{id} \"{}\"", node.work_item_type, node.title),
+                    None => format!("Under #{id}"),
+                }
+            }
+        })
+    }
+
+    fn render_create_dialog(&self, cx: &Context<Self>) -> impl IntoElement {
+        let Some(draft) = self.pending_create.as_ref() else {
+            return div().into_any_element();
+        };
+        let label = |text: &'static str| {
+            Label::new(text)
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+        };
+        let types = self.state.types();
+        let mut type_buttons = h_flex()
+            .id("gantt-create-types")
+            .debug_selector(|| "gantt-create-types".into())
+            .flex_wrap()
+            .gap_1();
+        for ty in types {
+            let selected = ty == draft.work_item_type;
+            let selector = format!("gantt-create-type-{ty}");
+            let pick = ty.clone();
+            type_buttons = type_buttons.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .child(
+                        Button::new(SharedString::from(format!("create-type-{ty}")))
+                            .compact()
+                            .label(ty)
+                            .selected(selected)
+                            .when(selected, |btn| btn.primary())
+                            .when(!selected, |btn| btn.ghost())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(draft) = this.pending_create.as_mut() {
+                                    draft.work_item_type = pick.clone();
+                                    draft.type_chosen = true;
+                                    draft.error = None;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        let (hint, hint_error) = match self.create_parent_hint(cx) {
+            Ok(text) => (text, false),
+            Err(text) => (text, true),
+        };
+        let submitting = draft.submitting;
+        v_flex()
+            .id("gantt-create-overlay")
+            .debug_selector(|| "gantt-create-overlay".into())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(cx.theme().overlay)
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.cancel_create(cx)),
+            )
+            .child(
+                v_flex()
+                    .id("gantt-create-dialog")
+                    .debug_selector(|| "gantt-create-dialog".into())
+                    .w(px(440.))
+                    .gap_3()
+                    .p_4()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Label::new("New work item")
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        v_flex().gap_1().child(label("Title")).child(
+                            div()
+                                .id("gantt-create-title")
+                                .debug_selector(|| "gantt-create-title".into())
+                                .child(Input::new(&self.create_title_input).id("create-title")),
+                        ),
+                    )
+                    .child(v_flex().gap_1().child(label("Type")).child(type_buttons))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(label("Parent"))
+                            .child(
+                                div()
+                                    .id("gantt-create-parent")
+                                    .debug_selector(|| "gantt-create-parent".into())
+                                    .child(
+                                        Input::new(&self.create_parent_input).id("create-parent"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("gantt-create-parent-hint")
+                                    .debug_selector(|| "gantt-create-parent-hint".into())
+                                    .child(Label::new(hint).text_xs().text_color(if hint_error {
+                                        cx.theme().danger
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })),
+                            ),
+                    )
+                    .when_some(draft.error.clone(), |el, error| {
+                        el.child(
+                            div()
+                                .id("gantt-create-error")
+                                .debug_selector(|| "gantt-create-error".into())
+                                .child(Label::new(error).text_xs().text_color(cx.theme().danger)),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                div()
+                                    .id("gantt-create-cancel")
+                                    .debug_selector(|| "gantt-create-cancel".into())
+                                    .child(Button::new("cancel-create").label("Cancel").on_click(
+                                        cx.listener(|this, _, _, cx| this.cancel_create(cx)),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("gantt-create-submit")
+                                    .debug_selector(|| "gantt-create-submit".into())
+                                    .child(
+                                        Button::new("confirm-create")
+                                            .primary()
+                                            .label(if submitting {
+                                                "Creating…"
+                                            } else {
+                                                "Create"
+                                            })
+                                            .disabled(submitting)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit_create(cx);
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    pub fn create_dialog_open(&self) -> bool {
+        self.pending_create.is_some()
+    }
+
+    pub fn create_dialog_type(&self) -> Option<String> {
+        self.pending_create
+            .as_ref()
+            .map(|draft| draft.work_item_type.clone())
+    }
+
+    pub fn create_dialog_error(&self) -> Option<String> {
+        self.pending_create
+            .as_ref()
+            .and_then(|draft| draft.error.clone())
+    }
+
     fn remove_link(&mut self, from_id: i64, to_id: i64, cx: &mut Context<Self>) {
         self.state.gantt.context_menu = None;
         self.state.gantt.selected_link = None;
@@ -10127,6 +10502,12 @@ impl PlannerView {
         {
             return;
         }
+        if self.pending_create.is_some() {
+            if key == "escape" {
+                self.cancel_create(cx);
+            }
+            return;
+        }
         if key == "escape" {
             if self.pending_delete.take().is_some() {
                 cx.notify();
@@ -11669,6 +12050,13 @@ impl Render for PlannerView {
             .track_focus(&self.form_focus)
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
+                if this.pending_create.is_some() {
+                    if key == "escape" {
+                        this.cancel_create(cx);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 if this.form_loading.is_some() && key != "escape" {
                     cx.stop_propagation();
                     return;
@@ -11752,6 +12140,7 @@ impl Render for PlannerView {
                             .child(self.render_dates_popover(cx))
                             .child(self.render_form(cx))
                             .child(self.render_delete_confirm(cx))
+                            .child(self.render_create_dialog(cx))
                             .child(self.render_toasts(cx)),
                     )
                 },

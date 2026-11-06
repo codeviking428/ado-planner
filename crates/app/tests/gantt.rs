@@ -1,7 +1,7 @@
 use ado_core::{START_DATE_FIELD, TARGET_DATE_FIELD, parse_iso_date};
 use ado_planner::gantt::{GanttScale, GanttView, GestureKind, NudgeAxis};
 use ado_planner::paths::AppPaths;
-use ado_planner::state::{DateSaveRole, PlannerState, fake_hierarchy};
+use ado_planner::state::{DateSaveRole, NewItem, PlannerState, fake_hierarchy};
 use ado_planner::toasts::{HistoryEntry, UndoAction};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use jiff::ToSpan;
@@ -2029,6 +2029,103 @@ async fn add_item_on_an_epic_creates_a_child_feature() {
             .map(|node| node.parent_id),
         Some(Some(1001)),
         "visible tree must keep the Epic parent, not strip it to root"
+    );
+}
+
+#[tokio::test]
+async fn new_item_defaults_follow_the_parent() {
+    let (_mock, state, _dir) = signed_in().await;
+    let root = state.new_item_defaults(None);
+    assert_eq!(root.parent_id, None);
+    assert_eq!(root.work_item_type, "Epic");
+    assert!(root.title.is_empty(), "the dialog title starts blank");
+    let under_epic = state.new_item_defaults(Some(1001));
+    assert_eq!(under_epic.parent_id, Some(1001));
+    assert_eq!(under_epic.work_item_type, "Feature");
+    let missing = state.new_item_defaults(Some(999_999));
+    assert_eq!(
+        missing.parent_id, None,
+        "an unloaded parent falls back to the root"
+    );
+}
+
+#[tokio::test]
+async fn create_item_uses_the_chosen_title_type_and_parent() {
+    let (mock, mut state, _dir) = signed_in().await;
+    state.gantt.selected_id = Some(1012);
+    state
+        .create_item(NewItem {
+            title: "  Checkout API  ".into(),
+            work_item_type: "User Story".into(),
+            parent_id: Some(1001),
+        })
+        .await
+        .expect("create");
+    let created = created_item(&state);
+    assert_eq!(created.title, "Checkout API");
+    assert_eq!(created.work_item_type, "User Story");
+    assert_eq!(created.parent_id, Some(1001));
+    let writes = mock.mutating_writes();
+    assert_eq!(writes.len(), 1, "one create POST, got {writes:?}");
+    assert!(
+        writes[0].1.contains("/workitems/$User%20Story")
+            || writes[0].1.contains("/workitems/$User Story"),
+        "the POST must target the chosen type, got {writes:?}"
+    );
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.contains("Created User Story \"Checkout API\" under Epic"),
+        "toast must name the chosen type and title, got {message}"
+    );
+}
+
+#[tokio::test]
+async fn create_item_at_the_root_ignores_the_selected_row() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    state.gantt.selected_id = Some(1001);
+    state
+        .create_item(NewItem {
+            title: "Spike".into(),
+            work_item_type: "Feature".into(),
+            parent_id: None,
+        })
+        .await
+        .expect("create");
+    let created = created_item(&state);
+    assert_eq!(created.parent_id, None);
+    assert_eq!(created.work_item_type, "Feature");
+}
+
+#[tokio::test]
+async fn create_item_rejects_bad_input_without_writing() {
+    let (mock, mut state, _dir) = signed_in().await;
+    let before = state.nodes.len();
+    for item in [
+        NewItem {
+            title: "   ".into(),
+            work_item_type: "Epic".into(),
+            parent_id: None,
+        },
+        NewItem {
+            title: "Spike".into(),
+            work_item_type: String::new(),
+            parent_id: None,
+        },
+        NewItem {
+            title: "Spike".into(),
+            work_item_type: "Task".into(),
+            parent_id: Some(999_999),
+        },
+    ] {
+        assert!(
+            state.create_item(item.clone()).await.is_err(),
+            "{item:?} must be rejected"
+        );
+    }
+    assert_eq!(state.nodes.len(), before);
+    assert!(
+        mock.mutating_writes().is_empty(),
+        "rejected input must not reach Azure DevOps"
     );
 }
 
