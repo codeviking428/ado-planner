@@ -47,6 +47,8 @@ The workspace version in the root `Cargo.toml` is the single version. Every crat
 
 The notes come from that version's `CHANGELOG.md` section.
 
+The Linux binaries are built on Ubuntu 22.04 and need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+). The release stops if a build needs a newer glibc.
+
 Both updaters read the release GitHub marks as latest. The Rust app fetches `releases/latest/download/latest.json` and checks each download against the minisign public key built into the binary. Before publishing, the job verifies every `.sig` against that key with `minisign`, so a mismatched key pair stops the release.
 
 ### Other ways in

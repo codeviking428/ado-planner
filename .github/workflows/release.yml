@@ -115,9 +115,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # The binary links against the build host's glibc and the AppImage
+          # doesn't bundle it, so build on the oldest supported image.
+          # ubuntu-latest (26.04) produced binaries needing glibc 2.43.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             installer: appimage
+            max-glibc: '2.35'
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             installer: nsis
@@ -187,6 +191,19 @@ jobs:
           got="$(./target/release/ado-planner --version | tr -d '\r')"
           echo "$got"
           [ "$got" = "ado-planner $VERSION" ]
+
+      - name: Check glibc baseline
+        if: runner.os == 'Linux'
+        env:
+          MAX_GLIBC: ${{ matrix.max-glibc }}
+        run: |
+          set -euo pipefail
+          need="$(objdump -T target/release/ado-planner | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1)"
+          echo "ado-planner needs glibc $need (max allowed $MAX_GLIBC)"
+          if [ "$(printf '%s\n%s\n' "$need" "$MAX_GLIBC" | sort -V | tail -n1)" != "$MAX_GLIBC" ]; then
+            echo "::error::ado-planner needs glibc $need, newer than the $MAX_GLIBC baseline"
+            exit 1
+          fi
 
       - name: Collect assets
         shell: bash
