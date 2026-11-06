@@ -1762,7 +1762,9 @@ impl GanttView {
                         x: UNSCHEDULED_GUTTER_X,
                         width,
                         y: self.row_y(offset),
-                        summary: row.has_children,
+                        // Parents too: a summary bar is 14px, shorter than
+                        // the "No dates" text, and gets rollup edges.
+                        summary: false,
                         milestone: false,
                         label: dates_column_text(node, nodes, hint.as_ref()),
                         title: node.title.clone(),
