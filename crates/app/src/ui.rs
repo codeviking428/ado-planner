@@ -980,6 +980,12 @@ impl PlannerView {
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(window)
+            || (self.pending_create.is_some()
+                && self
+                    .create_title_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window))
     }
 
     fn bind_sign_in_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7766,6 +7772,7 @@ impl PlannerView {
             return false;
         }
         self.pending_create = None;
+        self.pending_focus_planner = true;
         cx.notify();
         true
     }

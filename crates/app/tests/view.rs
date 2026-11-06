@@ -13022,6 +13022,60 @@ fn enter_after_create_does_not_open_details(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn failed_create_returns_focus_to_the_planner(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (_runtime, mock, mut state, _dir) = signed_in_with_mock();
+    state.gantt.selected_id = Some(1001);
+    let before = state.nodes.len();
+    mock.fail_next("/workitems/$", 503, "create failed");
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| view.open_create(Some(1001), cx));
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.set_create_title("Refunds", window, cx));
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, _| {
+            assert!(
+                !view.planner_keys_are_focused(window),
+                "precondition: the title field has focus while the dialog is open"
+            );
+        });
+    });
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    allow_ado_client_wake(cx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut failed = false;
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        failed = view.update(cx, |view, _| {
+            view.state
+                .toasts
+                .items
+                .iter()
+                .any(|toast| toast.kind == ToastKind::Error)
+        });
+        if failed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(failed, "the mock must reject the create");
+    assert!(cx.debug_bounds("gantt-create-dialog").is_none());
+    cx.update(|window, cx| {
+        view.update(cx, |view, _| {
+            assert_eq!(view.state.nodes.len(), before);
+            assert!(
+                view.planner_keys_are_focused(window),
+                "a failed create must not leave focus on the hidden title field"
+            );
+        });
+    });
+}
+
+#[gpui_kit::test]
 fn add_child_dialog_creates_on_the_mock_with_the_typed_title(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let (runtime, mock, mut state, _dir) = signed_in_with_mock();
