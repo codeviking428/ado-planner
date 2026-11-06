@@ -1155,10 +1155,16 @@ impl GanttView {
         let first_in_view = ticks
             .iter()
             .find(|tick| tick.x > 0.0 && !tick.label.is_empty());
-        let room = first_in_view.is_none_or(|tick| {
-            leftover.is_none_or(|left| leftover_label_has_room(tick.x, &left.label, TICK_MIN_GAP))
+        // Ask the painted header rather than re-deriving room from raw ticks:
+        // Year thinning can keep a leftover whose raw neighbour was dropped.
+        let painted = leftover.is_some_and(|left| {
+            first_in_view.is_none()
+                || self
+                    .header_tick_labels(width)
+                    .first()
+                    .is_some_and(|(x, label)| *x <= HEADER_LEFT_PAD && *label == left.label)
         });
-        if let Some(tick) = leftover.filter(|_| room) {
+        if let Some(tick) = leftover.filter(|_| painted) {
             tick.date
         } else if let Some(tick) = first_in_view.or(leftover) {
             tick.date
@@ -10945,6 +10951,32 @@ mod tests {
             first.first().map(|(_, label)| label.as_str()),
             Some("23"),
             "the leftover the toolbar names must be painted"
+        );
+    }
+
+    #[test]
+    fn year_axis_start_follows_the_painted_leftover_after_thinning() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Year,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        // Aug 1 lands at x = 30, too close for "Jul", but Year thinning drops
+        // Aug so the leftover Jul keeps its slot.
+        gantt.scroll_x = 16.5;
+        let labels: Vec<String> = gantt
+            .header_tick_labels(800.0)
+            .into_iter()
+            .take(2)
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(labels, ["Jul", "Sep"], "precondition: thinned Year axis");
+        assert_eq!(
+            gantt.viewport_axis_start_date(),
+            Date::new(2026, 7, 1).unwrap(),
+            "axis start must name the painted leftover Jul, not the thinned Aug"
         );
     }
 
