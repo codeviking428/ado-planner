@@ -49,11 +49,11 @@ PNG_SIZES = (16, 24, 32, 48, 64, 128, 256, 512)
 # 16/32/48/256 are the classic shell sizes; 20/24/40/64 cover 125% to 200%
 # scaling of the 16 and 32 px title bar and taskbar slots.
 ICO_SIZES = (16, 20, 24, 32, 40, 48, 64, 256)
-# (OSType, pixel size). icp4..icp6 hold PNG data on macOS 10.7 and later.
+# (OSType, pixel size), the set iconutil writes. IconServices draws PNG in
+# icp4/icp5 as noise in some views, so 16 and 32 px use ARGB in ic04/ic05.
+ICNS_ARGB_TYPES = ((b"ic04", 16), (b"ic05", 32))
 ICNS_TYPES = (
-    (b"icp4", 16),
-    (b"icp5", 32),
-    (b"icp6", 64),
+    *ICNS_ARGB_TYPES,
     (b"ic07", 128),
     (b"ic08", 256),
     (b"ic09", 512),
@@ -171,10 +171,68 @@ def pack_ico(pngs: dict[int, bytes]) -> bytes:
     return head + entries + b"".join(blob for _, blob in images)
 
 
+def icns_rle(channel: bytes) -> bytes:
+    """The icns PackBits variant: 0..127 copies n+1 bytes, 128..255 repeats one n-125 times."""
+    out = bytearray()
+    i, n = 0, len(channel)
+    while i < n:
+        run = 1
+        while i + run < n and run < 130 and channel[i + run] == channel[i]:
+            run += 1
+        if run >= 3:
+            out += bytes((0x80 + run - 3, channel[i]))
+            i += run
+            continue
+        start = i
+        while i < n and i - start < 128:
+            if i + 2 < n and channel[i] == channel[i + 1] == channel[i + 2]:
+                break
+            i += 1
+        out.append(i - start - 1)
+        out += channel[start:i]
+    return bytes(out)
+
+
+def icns_unrle(data: bytes, length: int) -> bytes:
+    out = bytearray()
+    i = 0
+    while len(out) < length:
+        if i >= len(data):
+            raise IconError("icns RLE data ends early")
+        c = data[i]
+        if c < 0x80:
+            out += data[i + 1 : i + 2 + c]
+            i += 2 + c
+        else:
+            out += data[i + 1 : i + 2] * (c - 125)
+            i += 2
+    if len(out) != length or i != len(data):
+        raise IconError("icns RLE data has the wrong length")
+    return bytes(out)
+
+
+def icns_argb(png: bytes) -> bytes:
+    """ic04/ic05 payload: "ARGB", then the A, R, G, and B planes, each RLE-compressed."""
+    _, _, rgba = decode_rgba(png)
+    planes = (rgba[3::4], rgba[0::4], rgba[1::4], rgba[2::4])
+    return b"ARGB" + b"".join(icns_rle(plane) for plane in planes)
+
+
+def icns_argb_to_rgba(payload: bytes, size: int) -> bytes:
+    if payload[:4] != b"ARGB":
+        raise IconError("ARGB icns entry lacks its ARGB header")
+    planes = icns_unrle(payload[4:], 4 * size * size)
+    n = size * size
+    a, r, g, b = (planes[k * n : (k + 1) * n] for k in range(4))
+    return bytes(v for px in zip(r, g, b, a) for v in px)
+
+
 def pack_icns(pngs: dict[int, bytes]) -> bytes:
-    body = b"".join(
-        kind + struct.pack(">I", 8 + len(pngs[size])) + pngs[size] for kind, size in ICNS_TYPES
-    )
+    argb = dict(ICNS_ARGB_TYPES)
+    body = b""
+    for kind, size in ICNS_TYPES:
+        payload = icns_argb(pngs[size]) if kind in argb else pngs[size]
+        body += kind + struct.pack(">I", 8 + len(payload)) + payload
     return b"icns" + struct.pack(">I", 8 + len(body)) + body
 
 
@@ -326,7 +384,8 @@ def check_appdir(appdir: Path, root: Path, require_svg: bool) -> None:
             raise IconError(f"{rel} differs from {source.relative_to(root).as_posix()}")
 
 
-def read_icns(data: bytes) -> dict[bytes, tuple[int, int]]:
+def read_icns(data: bytes) -> dict[bytes, bytes]:
+    """Map each icns OSType to its payload."""
     if data[:4] != b"icns" or struct.unpack(">I", data[4:8])[0] != len(data):
         raise IconError("not an .icns")
     found = {}
@@ -336,7 +395,7 @@ def read_icns(data: bytes) -> dict[bytes, tuple[int, int]]:
         (length,) = struct.unpack(">I", data[pos + 4 : pos + 8])
         if length < 8 or pos + length > len(data):
             raise IconError(f"icns entry {kind!r} is truncated")
-        found[kind] = png_size(data[pos + 8 : pos + length])
+        found[kind] = data[pos + 8 : pos + length]
         pos += length
     return found
 
@@ -434,9 +493,21 @@ def check(root: Path) -> list[str]:
 
     def icns() -> None:
         found = read_icns((root / ICNS).read_bytes())
+        want = [kind for kind, _ in ICNS_TYPES]
+        if sorted(found) != sorted(want):
+            raise IconError(
+                f"types {sorted(k.decode() for k in found)}, want {sorted(k.decode() for k in want)}"
+            )
+        argb = dict(ICNS_ARGB_TYPES)
         for kind, size in ICNS_TYPES:
-            if found.get(kind) != (size, size):
-                raise IconError(f"{kind.decode()} is {found.get(kind)}, want {size}x{size}")
+            if kind in argb:
+                pixels = icns_argb_to_rgba(found[kind], size)
+                if pixels != decode_rgba((root / png_path(size)).read_bytes())[2]:
+                    raise IconError(
+                        f"{kind.decode()} pixels differ from {png_path(size).as_posix()}"
+                    )
+            elif png_size(found[kind]) != (size, size):
+                raise IconError(f"{kind.decode()} is {png_size(found[kind])}, want {size}x{size}")
 
     guard(ICNS.as_posix(), icns)
 

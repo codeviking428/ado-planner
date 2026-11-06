@@ -108,9 +108,27 @@ class PackTests(unittest.TestCase):
         self.assertEqual(len(mask), 8)
         self.assertEqual(mask[0], 0x80, "x=0 is fully transparent, x=1 opaque")
 
-    def test_icns_lists_every_type_at_its_size(self) -> None:
-        found = icons.read_icns(icons.pack_icns(self.pngs()))
-        self.assertEqual(found, {k: (s, s) for k, s in icons.ICNS_TYPES})
+    def test_icns_uses_argb_for_16_and_32_and_png_above(self) -> None:
+        pngs = self.pngs()
+        found = icons.read_icns(icons.pack_icns(pngs))
+        self.assertEqual(sorted(found), sorted(k for k, _ in icons.ICNS_TYPES))
+        for kind, size in icons.ICNS_TYPES:
+            with self.subTest(kind=kind):
+                if kind in (b"ic04", b"ic05"):
+                    self.assertEqual(found[kind][:4], b"ARGB")
+                    self.assertEqual(
+                        icons.icns_argb_to_rgba(found[kind], size), icons.decode_rgba(pngs[size])[2]
+                    )
+                else:
+                    self.assertEqual(icons.png_size(found[kind]), (size, size))
+        self.assertFalse({b"icp4", b"icp5", b"icp6"} & set(found))
+
+    def test_icns_rle_round_trips_runs_and_literals(self) -> None:
+        for data in (b"", b"a", b"ab", b"aaa", b"a" * 131, b"a" * 300 + bytes(range(256)) * 2):
+            with self.subTest(n=len(data)):
+                self.assertEqual(icons.icns_unrle(icons.icns_rle(data), len(data)), data)
+        self.assertEqual(icons.icns_rle(b"\x07" * 130), b"\xff\x07")
+        self.assertEqual(icons.icns_rle(b"xyz"), b"\x02xyz")
 
 
 def make_pe(resources: dict[tuple[int, int], bytes]) -> bytes:
