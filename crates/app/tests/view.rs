@@ -15009,3 +15009,52 @@ fn month_period_buttons_pan_a_week(cx: &mut gpui_kit::TestAppContext) {
         "Month ‹ must pan ¼ of the visible span ({step} days), {after} vs {before}"
     );
 }
+
+#[gpui_kit::test]
+fn period_buttons_pan_one_step_on_every_scale(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let pin = Date::new(2026, 8, 1).unwrap();
+    for scale in GanttScale::ALL {
+        for offset in 0..7 {
+            view.update(cx, |view, _| {
+                let gantt = &mut view.state.gantt;
+                gantt.scale = scale;
+                gantt.zoom = 1.0;
+                gantt.scroll_x = 0.0;
+                gantt.year_gutter_snap = 0.0;
+                gantt.origin = pin.saturating_add(offset.days());
+                gantt.retarget_year_gutter(|_| {});
+            });
+            draw(cx);
+            for (selector, sign) in [
+                ("gantt-prev-period", 1.0),
+                ("gantt-prev-period", 1.0),
+                ("gantt-next-period", -1.0),
+                ("gantt-next-period", -1.0),
+                ("gantt-next-period", -1.0),
+            ] {
+                let (before, want) = view.update(cx, |view, _| {
+                    let gantt = &view.state.gantt;
+                    let step = gantt.pan_step_days() as f32 * scale.pixels_per_day(gantt.zoom);
+                    (gantt.x_for_date(pin), sign * step)
+                });
+                let button = cx.debug_bounds(selector).expect(selector);
+                cx.simulate_click(button.center(), Modifiers::default());
+                draw(cx);
+                let moved = view.update(cx, |view, _| view.state.gantt.x_for_date(pin)) - before;
+                assert!(
+                    (moved - want).abs() < 0.5,
+                    "{scale:?} {selector} from origin +{offset}d moved {moved}px, want {want}px"
+                );
+            }
+        }
+    }
+}
