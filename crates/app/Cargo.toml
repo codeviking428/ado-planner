@@ -38,6 +38,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 cargo-packager-updater = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 ado-mock.workspace = true
@@ -47,6 +48,9 @@ tempfile.workspace = true
 [lints]
 workspace = true
 
+[build-dependencies]
+winresource = "0.1"
+
 [package.metadata.packager]
 product-name = "ADO Planner"
 identifier = "com.codeviking428.ado-planner"
@@ -54,12 +58,23 @@ before-packaging-command = "cargo build --release -p ado-planner"
 formats = ["nsis", "appimage", "dmg"]
 out-dir = "../../release/rust"
 binaries = [{ path = "ado-planner", main = true }]
-icons = ["../../build/icon.png", "../../build/icon.ico"]
+# Icons come from assets/icons/ado-planner.svg; regenerate with
+# `python3 .github/scripts/icons.py generate`. Each PNG lands in
+# usr/share/icons/hicolor/<size>/apps/ado-planner.png in the AppImage.
+icons = [
+  "../../assets/icons/png/*.png",
+  "../../assets/icons/ado-planner.ico",
+  "../../assets/icons/ado-planner.icns",
+]
 
 [package.metadata.packager.nsis]
+installer-icon = "../../assets/icons/ado-planner.ico"
 installer-mode = "currentUser"
 
 # cargo-packager has no updater table. src/updater.rs compiles in the feed URL
 # and the minisign public key from ADO_PLANNER_UPDATER_ENDPOINT and
 # ADO_PLANNER_UPDATER_PUBKEY at build time (see .github/workflows/release.yml).
 # Without a key, local packages never check for updates.
+
+[package.metadata.packager.appimage]
+files = { "../../assets/icons/ado-planner.svg" = "usr/share/icons/hicolor/scalable/apps/ado-planner.svg" }

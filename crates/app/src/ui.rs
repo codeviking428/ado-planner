@@ -11787,6 +11787,8 @@ pub fn start_app(data_dir: Option<PathBuf>, ado_base: Option<String>, vssps_base
                     title: Some("ADO Planner".into()),
                     ..Default::default()
                 }),
+                app_id: Some(crate::app_icon::APP_ID.into()),
+                icon: Some(crate::app_icon::window_icon()),
                 ..Default::default()
             },
             cx,
