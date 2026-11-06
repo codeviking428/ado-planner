@@ -5649,7 +5649,9 @@ impl PlannerView {
         let label_pad = if can_resize { HANDLE_WIDTH + 4.0 } else { 6.0 };
         let open_ended_link_origin = bar.x + bar.width;
         let progress_value = bar.progress.unwrap_or(0.0);
-        let show_progress = !open_ended && (summary || progress_value > 0.0);
+        // Gutter markers have no span to fill; the summary fill's rollup
+        // tooltip would also stack on the marker's own hover tooltip.
+        let show_progress = !open_ended && !marker && (summary || progress_value > 0.0);
         let progress_w =
             (bar.width.max(8.0) * progress_value).max(if progress_value > 0.0 { 4.0 } else { 0.0 });
         let visible_progress_w = (progress_w - clip_pad).max(0.0);

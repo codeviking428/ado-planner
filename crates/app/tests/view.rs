@@ -9734,6 +9734,129 @@ fn two_to_four_px_inside_the_end_edge_resizes(cx: &mut gpui_kit::TestAppContext)
 }
 
 #[gpui_kit::test]
+fn unscheduled_parent_marker_shows_one_tooltip(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut nodes = mock_fixture_nodes();
+    let template = nodes[0].clone();
+    let node = |id: i64, parent: Option<i64>, ty: &str, title: &str, dated: bool| WorkItemNode {
+        id,
+        parent_id: parent,
+        work_item_type: ty.into(),
+        title: title.into(),
+        start_date: dated.then(|| "2026-07-08T00:00:00Z".into()),
+        target_date: dated.then(|| "2026-07-24T00:00:00Z".into()),
+        ..template.clone()
+    };
+    nodes.extend([
+        node(2001, None, "Epic", "Unscheduled parent", false),
+        node(2002, Some(2001), "Task", "Unscheduled child", false),
+        node(2003, Some(2001), "User Story", "Scheduled child", true),
+    ]);
+    state.nodes = nodes;
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        let parent = bars.iter().find(|bar| bar.id == 2001).expect("parent");
+        assert!(
+            parent.summary && parent.marker,
+            "an undated parent must paint as a summary gutter marker"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-bar-progress-2001").is_none(),
+        "the parent marker must not host the rollup progress tooltip beside its hover tooltip"
+    );
+    assert!(
+        cx.debug_bounds("gantt-bar-progress-1001").is_some(),
+        "scheduled parents keep the rollup progress fill and its tooltip"
+    );
+
+    let body = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let body_top = f32::from(body.origin.y);
+    for (id, selector, title) in [
+        (2001, "gantt-bar-2001", "Unscheduled parent"),
+        (2002, "gantt-bar-2002", "Unscheduled child"),
+    ] {
+        let marker = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("marker {id}"));
+        cx.simulate_mouse_move(marker.center(), None, Modifiers::default());
+        cx.background_executor
+            .advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.state.gantt.bar_hovered_id, Some(id));
+            let rows = view.state.gantt.flatten(&view.state.nodes);
+            let bars = view
+                .state
+                .gantt
+                .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+            let bar = bars.iter().find(|bar| bar.id == id).expect("marker bar");
+            let tip = bar_hover_tooltip(bar, &view.state.nodes);
+            assert!(
+                tip.contains(title),
+                "#{id} hover copy must name the item, got {tip:?}"
+            );
+        });
+        let tip = cx
+            .debug_bounds("gantt-hover-tooltip")
+            .unwrap_or_else(|| panic!("#{id} must show its item tooltip"));
+        assert!(
+            f32::from(tip.origin.y) >= body_top,
+            "#{id} tooltip must sit below the timeline header, tip_top={} body_top={body_top}",
+            f32::from(tip.origin.y)
+        );
+    }
+
+    let scheduled = cx
+        .debug_bounds("gantt-bar-2003")
+        .expect("scheduled child bar");
+    cx.simulate_mouse_move(scheduled.center(), None, Modifiers::default());
+    cx.background_executor
+        .advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.bar_hovered_id, Some(2003));
+    });
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_some(),
+        "scheduled bars keep their item tooltip"
+    );
+
+    cx.simulate_mouse_move(
+        point(
+            body.origin.x + px(4.),
+            body.origin.y + body.size.height - px(4.),
+        ),
+        None,
+        Modifiers::default(),
+    );
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_none(),
+        "leaving the marker must dismiss the tooltip"
+    );
+}
+
+#[gpui_kit::test]
 fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
