@@ -49,12 +49,15 @@ async fn expired_pat_shows_a_sign_in_error_and_retry_clears_it() {
     let inline = state.sign_in_error.clone().expect("inline sign-in error");
     assert!(inline.contains("invalid, expired"), "{inline}");
     assert!(!inline.contains("<html>") && !inline.contains("expired-pat-value"));
-    assert_eq!(state.toasts.last_error_message(), Some(inline.as_str()));
 
     state.sign_in_pat = "pat-secret-value".into();
     state.login_pat().await.expect("retry");
     assert!(state.session_info.signed_in);
     assert!(state.sign_in_error.is_none());
+    assert!(
+        state.toasts.last_error_message().is_none(),
+        "a rejected attempt must not leave an error toast for the signed-in shell"
+    );
     assert_eq!(mock.mutating_writes(), Vec::<(String, String)>::new());
 }
 

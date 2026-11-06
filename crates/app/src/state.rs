@@ -485,13 +485,13 @@ impl PlannerState {
         let info = match login {
             Ok(info) => info,
             Err(err) => {
-                self.show_sign_in_error(err.to_string());
+                self.sign_in_error = Some(err.to_string());
                 return Err(err.into());
             }
         };
         self.session_info = info;
         if !self.session_info.signed_in {
-            self.show_sign_in_error("Sign-in did not create a Session".into());
+            self.sign_in_error = Some("Sign-in did not create a Session".into());
             return Ok(());
         }
         self.session_token_ready = self.session_info.signed_in;
@@ -510,11 +510,6 @@ impl PlannerState {
         self.session_token_ready = self.session_info.signed_in;
         self.warn_if_identity_missing();
         self.reload_after_sign_in().await
-    }
-
-    fn show_sign_in_error(&mut self, message: String) {
-        self.toasts.push(ToastKind::Error, message.clone());
-        self.sign_in_error = Some(message);
     }
 
     fn warn_if_identity_missing(&mut self) {
