@@ -1155,7 +1155,9 @@ impl GanttView {
         let first_in_view = ticks
             .iter()
             .find(|tick| tick.x > 0.0 && !tick.label.is_empty());
-        let room = first_in_view.is_none_or(|tick| tick.x >= TICK_MIN_GAP);
+        let room = first_in_view.is_none_or(|tick| {
+            leftover.is_none_or(|left| leftover_label_has_room(tick.x, &left.label, TICK_MIN_GAP))
+        });
         if let Some(tick) = leftover.filter(|_| room) {
             tick.date
         } else if let Some(tick) = first_in_view.or(leftover) {
@@ -2310,7 +2312,9 @@ impl GanttView {
             return out;
         }
         if let Some(label) = sticky {
-            let room = out.first().is_none_or(|(x, _)| *x >= sticky_min);
+            let room = out
+                .first()
+                .is_none_or(|(x, _)| leftover_label_has_room(*x, &label, sticky_min));
             if room {
                 out.insert(0, (0.0, label));
             }
@@ -3785,6 +3789,13 @@ fn parse_type_color(hex: &str) -> u32 {
 
 pub(crate) fn header_label_px(label: &str) -> f32 {
     (label.chars().count() as f32 * 7.0 + 8.0).max(14.0)
+}
+
+/// Whether the leftover label, painted at `HEADER_LEFT_PAD`, fits before the
+/// first in-view tick at `next_x`. Too narrow, the leftover gives way: a
+/// two-day "Jun" sliver must not push "Jul" out of the header.
+fn leftover_label_has_room(next_x: f32, leftover: &str, min_gap: f32) -> bool {
+    next_x >= min_gap.max(HEADER_LEFT_PAD + header_label_px(leftover))
 }
 
 /// Painted x of the "Today" pill, matching the timeline header.
@@ -5944,6 +5955,64 @@ mod tests {
             bars[0].x,
             bars[0].width
         );
+    }
+
+    #[test]
+    fn auto_fit_month_header_keeps_the_first_full_month_label() {
+        let mut item = node(1, None);
+        item.start_date = Some("2026-07-01T00:00:00Z".into());
+        item.target_date = Some("2026-09-30T00:00:00Z".into());
+        let nodes = vec![item];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 11, 1).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.auto_fit(&nodes, &[], 800.0);
+        assert_eq!(gantt.origin, Date::new(2026, 6, 29).unwrap());
+        let labels: Vec<String> = gantt
+            .header_tick_labels(800.0)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(
+            labels.first().map(String::as_str),
+            Some("Jul"),
+            "a two-day June sliver must not hide the Jul label: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "Jun"),
+            "the June sliver label must give way to Jul: {labels:?}"
+        );
+        let title = gantt.viewport_range_title();
+        assert!(
+            title.starts_with("Jul"),
+            "toolbar must name the first painted month, got {title:?} for {labels:?}"
+        );
+    }
+
+    #[test]
+    fn leftover_month_label_stays_when_the_next_tick_has_room() {
+        let gantt = GanttView {
+            origin: Date::new(2026, 6, 20).unwrap(),
+            scale: GanttScale::Month,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        let labels: Vec<String> = gantt
+            .header_tick_labels(800.0)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(
+            &labels[..2],
+            ["Jun", "Jul"],
+            "an 11-day June column has room for its label: {labels:?}"
+        );
+        assert!(gantt.viewport_range_title().starts_with("Jun"));
     }
 
     #[test]
@@ -10857,9 +10926,10 @@ mod tests {
             timeline_width: 800.0,
             ..Default::default()
         };
-        // Half a day into Oct 23's leftover column: the sticky "23" sits at
-        // x = 0 while date_for_x(0) still rounds to Oct 24.
-        gantt.scroll_x = -20.0;
+        // Under half a day into Oct 23's leftover column: the sticky "23"
+        // still fits while date_for_x(0) rounds to Oct 24.
+        gantt.zoom = 2.0;
+        gantt.scroll_x = -40.0;
         let title = gantt.viewport_range_title();
         assert!(
             title.starts_with("Oct 23"),
@@ -10870,6 +10940,40 @@ mod tests {
             Date::new(2026, 10, 23).unwrap()
         );
         assert_eq!(gantt.date_for_x(0.0), Date::new(2026, 10, 24).unwrap());
+        let first = gantt.header_tick_labels(800.0);
+        assert_eq!(
+            first.first().map(|(_, label)| label.as_str()),
+            Some("23"),
+            "the leftover the toolbar names must be painted"
+        );
+    }
+
+    #[test]
+    fn day_leftover_too_narrow_for_its_label_gives_way_to_the_next_day() {
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 10, 24).unwrap(),
+            scale: GanttScale::Day,
+            zoom: 1.0,
+            timeline_width: 800.0,
+            ..Default::default()
+        };
+        gantt.scroll_x = -20.0;
+        let labels: Vec<String> = gantt
+            .header_tick_labels(800.0)
+            .into_iter()
+            .take(3)
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["24", "25", "26"],
+            "a 20px leftover must not hide the next day"
+        );
+        assert!(
+            gantt.viewport_range_title().starts_with("Oct 24"),
+            "toolbar must name the first painted day, got {:?}",
+            gantt.viewport_range_title()
+        );
     }
 
     #[test]
