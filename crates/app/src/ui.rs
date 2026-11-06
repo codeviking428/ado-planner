@@ -40,6 +40,7 @@ use gpui_kit::{
 };
 use jiff::ToSpan;
 
+use crate::assets::AppAssets;
 use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
@@ -11785,28 +11786,32 @@ pub fn start_app(data_dir: Option<PathBuf>, ado_base: Option<String>, vssps_base
     let paths = AppPaths::new(data_dir.unwrap_or_else(AppPaths::default_dir));
     let flavor = crate::prefs::AppPrefs::load(&paths.prefs_file()).flavor;
     let session = ado_session::create_session(&paths.data_dir);
-    gpui_kit::application().run(move |cx| {
-        gpui_kit::init(cx);
-        apply_flavor(cx, flavor);
-        let paths = paths.clone();
-        let session = session;
-        let ado_base = ado_base.clone();
-        let vssps_base = vssps_base.clone();
-        gpui_kit::open_window(
-            gpui_kit::WindowOptions {
-                titlebar: Some(gpui_kit::TitlebarOptions {
-                    title: Some("ADO Planner".into()),
+    gpui_kit::application()
+        .with_assets(AppAssets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            apply_flavor(cx, flavor);
+            let paths = paths.clone();
+            let session = session;
+            let ado_base = ado_base.clone();
+            let vssps_base = vssps_base.clone();
+            gpui_kit::open_window(
+                gpui_kit::WindowOptions {
+                    titlebar: Some(gpui_kit::TitlebarOptions {
+                        title: Some("ADO Planner".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            cx,
-            move |window, cx| {
-                cx.new(move |cx| PlannerView::new(window, cx, session, paths, ado_base, vssps_base))
-            },
-        )
-        .expect("failed to open window");
-    });
+                },
+                cx,
+                move |window, cx| {
+                    cx.new(move |cx| {
+                        PlannerView::new(window, cx, session, paths, ado_base, vssps_base)
+                    })
+                },
+            )
+            .expect("failed to open window");
+        });
 }
 
 #[cfg(test)]
