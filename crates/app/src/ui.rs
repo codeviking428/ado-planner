@@ -1556,7 +1556,14 @@ impl PlannerView {
     }
 
     /// Start (or target) of the selected row, used as the scale-change focal date.
+    /// Selection date a toolbar scale switch holds still. `None` when the
+    /// selected row is scrolled out of view so a selection the user cannot
+    /// see does not steer the camera.
     fn selected_focal_date(&self) -> Option<jiff::civil::Date> {
+        let rows = self.state.gantt.flatten(&self.state.visible_nodes());
+        if !self.state.gantt.selected_row_in_view(&rows) {
+            return None;
+        }
         let id = self.state.gantt.selected_id?;
         let node = self.state.nodes.iter().find(|node| node.id == id)?;
         parse_iso_date(node.start_date.as_deref())

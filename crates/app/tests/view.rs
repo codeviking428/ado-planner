@@ -15009,3 +15009,47 @@ fn month_period_buttons_pan_a_week(cx: &mut gpui_kit::TestAppContext) {
         "Month ‹ must pan ¼ of the visible span ({step} days), {after} vs {before}"
     );
 }
+
+#[gpui_kit::test]
+fn week_to_day_ignores_a_selection_hidden_in_a_collapsed_parent(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 20).unwrap();
+    state.gantt.scale = GanttScale::Week;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = Some(1005);
+    state.gantt.collapsed.insert(1001);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let (centre, cart_ui_x) = view.update(cx, |view, _| {
+        let gantt = &view.state.gantt;
+        (
+            gantt.viewport_center_date(),
+            gantt.x_for_date(Date::new(2026, 7, 21).unwrap()),
+        )
+    });
+    let width = view.update(cx, |view, _| view.state.gantt.timeline_width);
+    assert!(
+        (0.0..=width).contains(&cart_ui_x) && (cart_ui_x - width * 0.5).abs() > 48.0,
+        "precondition: Cart UI must be on the timeline but off-centre, x={cart_ui_x} width={width}"
+    );
+    let day = cx.debug_bounds("gantt-scale-Day").expect("Day toolbar");
+    cx.simulate_click(day.center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gantt = &view.state.gantt;
+        assert_eq!(gantt.scale, GanttScale::Day);
+        assert_eq!(
+            gantt.viewport_center_date(),
+            centre,
+            "a selection hidden under a collapsed parent must not anchor Week→Day, got {}",
+            gantt.viewport_range_title()
+        );
+    });
+}

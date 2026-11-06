@@ -960,6 +960,20 @@ impl GanttView {
         &rows[start..end]
     }
 
+    /// Whether the selected row is inside the painted rows area, not just
+    /// in the `visible_window` overscan.
+    pub fn selected_row_in_view(&self, rows: &[VisibleRow]) -> bool {
+        let Some(index) = self
+            .selected_id
+            .and_then(|id| rows.iter().position(|row| row.id == id))
+        else {
+            return false;
+        };
+        let top = index as f32 * ROW_HEIGHT - self.scroll_y;
+        let content_h = (self.viewport_h - TIMELINE_HEADER_H).max(0.0);
+        top + ROW_HEIGHT > 0.0 && top < content_h
+    }
+
     pub fn row_scroll_remainder(&self) -> f32 {
         self.scroll_y.rem_euclid(ROW_HEIGHT)
     }
@@ -1345,11 +1359,15 @@ impl GanttView {
     /// identical range. Year/Quarter still hold the left-edge date.
     /// Re-clicking the current scale is a no-op: leftover snap and a
     /// selection pin must not pan. After Today, skip leftover/gutter snap
-    /// so a selection cannot pull the camera off Today.
+    /// so a selection cannot pull the camera off Today. A `keep` date
+    /// outside the timeline is ignored so an off-screen selection cannot
+    /// move the camera off the visible range.
     pub fn apply_toolbar_scale(&mut self, scale: GanttScale, today: Date, keep: Option<Date>) {
         if self.scale == scale {
             return;
         }
+        let width = self.timeline_width.max(1.0);
+        let keep = keep.filter(|date| (0.0..=width).contains(&self.x_for_date(*date)));
         if self.keep_today {
             self.set_scale_from_toolbar_keeping(scale, today, keep);
             return;
@@ -13653,6 +13671,64 @@ mod tests {
             (day_x - before).abs() < 2.0,
             "Week→Day must keep the selection at its screen x, x={day_x} was {before}"
         );
+    }
+
+    #[test]
+    fn toolbar_week_to_day_keeps_the_visible_range() {
+        let today = Date::new(2026, 10, 30).unwrap();
+        let week = || GanttView {
+            origin: Date::new(2026, 7, 20).unwrap(),
+            scale: GanttScale::Week,
+            zoom: 1.0,
+            timeline_width: 840.0,
+            ..Default::default()
+        };
+        assert_eq!(week().viewport_range_title(), "Jul 20 – Aug 24");
+        let centre = week().viewport_center_date();
+        for keep in [None, Some(Date::new(2026, 7, 6).unwrap())] {
+            let mut gantt = week();
+            gantt.apply_toolbar_scale(GanttScale::Day, today, keep);
+            assert_eq!(
+                gantt.viewport_center_date(),
+                centre,
+                "Week→Day with selection {keep:?} must keep the centre date, got {}",
+                gantt.viewport_range_title()
+            );
+            assert_eq!(gantt.viewport_range_title(), "Jul 29 – Aug 15");
+        }
+    }
+
+    #[test]
+    fn selected_row_in_view_ignores_rows_scrolled_away() {
+        let rows: Vec<VisibleRow> = (0..40)
+            .map(|id| VisibleRow {
+                id,
+                depth: 0,
+                has_children: false,
+                expanded: false,
+            })
+            .collect();
+        let mut gantt = GanttView {
+            viewport_h: TIMELINE_HEADER_H + ROW_HEIGHT * 10.0,
+            ..Default::default()
+        };
+        assert!(!gantt.selected_row_in_view(&rows), "no selection");
+        gantt.selected_id = Some(3);
+        assert!(gantt.selected_row_in_view(&rows));
+        gantt.selected_id = Some(12);
+        assert!(
+            !gantt.selected_row_in_view(&rows),
+            "row 12 sits below a 10-row viewport"
+        );
+        gantt.scroll_y = ROW_HEIGHT * 5.0;
+        assert!(gantt.selected_row_in_view(&rows));
+        gantt.selected_id = Some(4);
+        assert!(
+            !gantt.selected_row_in_view(&rows),
+            "row 4 is scrolled above the viewport"
+        );
+        gantt.selected_id = Some(99);
+        assert!(!gantt.selected_row_in_view(&rows), "selection not in rows");
     }
 
     #[test]
