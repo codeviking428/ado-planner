@@ -12,6 +12,10 @@ pub enum Error {
     PatRequired,
     #[error("No PAT Session")]
     NoPatSession,
+    #[error(
+        "Azure DevOps rejected the personal access token. It may be invalid, expired, or missing access to this organization."
+    )]
+    PatRejected,
     #[error("No Azure DevOps organization is configured")]
     NoOrganization,
 }

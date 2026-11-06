@@ -43,6 +43,7 @@ pub struct PlannerState {
     pub session_loading: bool,
     pub sign_in_org: String,
     pub sign_in_pat: String,
+    pub sign_in_error: Option<String>,
     pub orgs: Vec<Organization>,
     pub projects: Vec<Project>,
     pub teams: Vec<Team>,
@@ -174,6 +175,7 @@ impl PlannerState {
             session_loading: true,
             sign_in_org: String::new(),
             sign_in_pat: String::new(),
+            sign_in_error: None,
             orgs: Vec::new(),
             projects: Vec::new(),
             teams: Vec::new(),
@@ -469,7 +471,8 @@ impl PlannerState {
     }
 
     pub async fn login_pat(&mut self) -> Result<(), AppError> {
-        let info = self
+        self.sign_in_error = None;
+        let login = self
             .session
             .inner()
             .lock()
@@ -478,11 +481,17 @@ impl PlannerState {
                 pat: Some(self.sign_in_pat.clone()),
                 organization: Some(self.sign_in_org.clone()),
             }))
-            .await?;
+            .await;
+        let info = match login {
+            Ok(info) => info,
+            Err(err) => {
+                self.show_sign_in_error(err.to_string());
+                return Err(err.into());
+            }
+        };
         self.session_info = info;
         if !self.session_info.signed_in {
-            self.toasts
-                .push(ToastKind::Error, "Sign-in did not create a Session");
+            self.show_sign_in_error("Sign-in did not create a Session".into());
             return Ok(());
         }
         self.session_token_ready = self.session_info.signed_in;
@@ -501,6 +510,11 @@ impl PlannerState {
         self.session_token_ready = self.session_info.signed_in;
         self.warn_if_identity_missing();
         self.reload_after_sign_in().await
+    }
+
+    fn show_sign_in_error(&mut self, message: String) {
+        self.toasts.push(ToastKind::Error, message.clone());
+        self.sign_in_error = Some(message);
     }
 
     fn warn_if_identity_missing(&mut self) {
