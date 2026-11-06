@@ -105,6 +105,10 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
+      - name: Windows exe icon
+        if: runner.os == 'Windows'
+        run: python .github/scripts/icons.py check-exe target/debug/ado-planner.exe
+
       - name: Version flag
         shell: bash
         run: |
@@ -144,3 +148,8 @@ jobs:
 
       - name: Versions agree
         run: .github/scripts/release-version.sh check
+
+      - name: App icons match assets/icons/ado-planner.svg
+        run: |
+          python3 .github/scripts/test_icons.py
+          python3 .github/scripts/icons.py check
