@@ -1938,6 +1938,7 @@ impl PlannerView {
     fn submit_pat(&mut self, cx: &mut Context<Self>) {
         self.state.sign_in_org = self.org_input.read(cx).value().to_string();
         self.state.sign_in_pat = self.pat_input.read(cx).value().to_string();
+        self.state.sign_in_error = None;
         self.spawn_state(cx, |mut state| async move {
             let result = state.login_pat().await;
             (state, result)
@@ -2550,12 +2551,28 @@ impl PlannerView {
                     .when(!pat_mode, |el| {
                         el.child(Button::new("sign-in").primary().label("Sign in").on_click(
                             cx.listener(|this, _, _, cx| {
+                                this.state.sign_in_error = None;
                                 this.spawn_state(cx, |mut state| async move {
                                     let result = state.login_entra().await;
                                     (state, result)
                                 });
                             }),
                         ))
+                    })
+                    .when_some(self.state.sign_in_error.clone(), |el, message| {
+                        el.child(
+                            div()
+                                .id("sign-in-error")
+                                .debug_selector(|| "sign-in-error".into())
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().danger.opacity(0.35))
+                                .bg(cx.theme().danger.opacity(0.14))
+                                .text_sm()
+                                .child(message),
+                        )
                     }),
             )
     }

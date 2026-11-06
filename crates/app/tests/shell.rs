@@ -229,6 +229,71 @@ async fn types_fall_back_to_loaded_nodes_when_hierarchy_types_are_empty() {
     );
 }
 
+#[tokio::test]
+async fn expired_pat_shows_a_sign_in_error_and_retry_signs_in() {
+    let mock = ado_mock::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::new(dir.path().to_path_buf());
+    let store = EncryptedStore::new(Box::new(MemoryStore::new(true)), Some([3u8; 32]));
+    let session = PlannerSession::pat(store).with_bases(&mock.url, &mock.url);
+    let mut state = PlannerState::new(
+        paths,
+        session,
+        Some(mock.url.clone()),
+        Some(mock.url.clone()),
+    );
+    state.session_loading = false;
+    state.sign_in_org = "https://dev.azure.com/contoso".into();
+    state.sign_in_pat = "expired-pat-value".into();
+    mock.fail_next_html(
+        "/contoso/_apis/projects",
+        401,
+        "<html><body>Access Denied: The Personal Access Token used has expired.</body></html>",
+    );
+
+    assert!(state.login_pat().await.is_err());
+    assert!(!state.session_info.signed_in);
+    assert!(!state.session_loading);
+    let message = state.sign_in_error.clone().expect("sign-in error");
+    assert!(message.contains("invalid or expired"), "{message}");
+    assert!(!message.contains('<'), "raw HTML in {message:?}");
+    assert!(
+        !message.contains("expired-pat-value"),
+        "token in {message:?}"
+    );
+
+    state.sign_in_pat = "pat-secret-value".into();
+    state.login_pat().await.expect("retry with a corrected PAT");
+    assert!(state.session_info.signed_in);
+    assert_eq!(state.sign_in_error, None);
+    assert!(mock.mutating_writes().is_empty());
+}
+
+#[gpui_kit::test]
+fn gpui_sign_in_error_paints_on_the_sign_in_card(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::new(dir.path().to_path_buf());
+    let store = EncryptedStore::new(Box::new(MemoryStore::new(false)), None);
+    let session = PlannerSession::pat(store);
+    let mut state = PlannerState::new(paths, session, None, None);
+    state.session_loading = false;
+    state.sign_in_error = Some(ado_core::Error::PatRejected.to_string());
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(cx.debug_bounds("sign-in-shell").is_some());
+    assert!(
+        cx.debug_bounds("sign-in-error").is_some(),
+        "a failed sign-in must be visible on the card, not only in the log"
+    );
+}
+
 #[gpui_kit::test]
 fn gpui_sign_in_shell_renders(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
@@ -257,4 +322,5 @@ fn gpui_sign_in_shell_renders(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("app-version").is_some(),
         "the sign-in card shows the embedded version"
     );
+    assert!(cx.debug_bounds("sign-in-error").is_none());
 }

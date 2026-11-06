@@ -43,6 +43,8 @@ pub struct PlannerState {
     pub session_loading: bool,
     pub sign_in_org: String,
     pub sign_in_pat: String,
+    /// Shown on the sign-in card, where toasts do not render.
+    pub sign_in_error: Option<String>,
     pub orgs: Vec<Organization>,
     pub projects: Vec<Project>,
     pub teams: Vec<Team>,
@@ -174,6 +176,7 @@ impl PlannerState {
             session_loading: true,
             sign_in_org: String::new(),
             sign_in_pat: String::new(),
+            sign_in_error: None,
             orgs: Vec::new(),
             projects: Vec::new(),
             teams: Vec::new(),
@@ -469,33 +472,34 @@ impl PlannerState {
     }
 
     pub async fn login_pat(&mut self) -> Result<(), AppError> {
-        let info = self
-            .session
-            .inner()
-            .lock()
-            .await
-            .login(Some(LoginCreds {
-                pat: Some(self.sign_in_pat.clone()),
-                organization: Some(self.sign_in_org.clone()),
-            }))
-            .await?;
-        self.session_info = info;
-        if !self.session_info.signed_in {
-            self.toasts
-                .push(ToastKind::Error, "Sign-in did not create a Session");
-            return Ok(());
-        }
-        self.session_token_ready = self.session_info.signed_in;
-        self.warn_if_identity_missing();
-        self.reload_after_sign_in().await
+        let creds = LoginCreds {
+            pat: Some(self.sign_in_pat.clone()),
+            organization: Some(self.sign_in_org.clone()),
+        };
+        let result = self.session.inner().lock().await.login(Some(creds)).await;
+        self.finish_login(result).await
     }
 
     pub async fn login_entra(&mut self) -> Result<(), AppError> {
-        let info = self.session.inner().lock().await.login(None).await?;
+        let result = self.session.inner().lock().await.login(None).await;
+        self.finish_login(result).await
+    }
+
+    async fn finish_login(
+        &mut self,
+        result: Result<SessionInfo, ado_core::Error>,
+    ) -> Result<(), AppError> {
+        self.sign_in_error = None;
+        let info = match result {
+            Ok(info) => info,
+            Err(err) => {
+                self.sign_in_error = Some(err.to_string());
+                return Err(err.into());
+            }
+        };
         self.session_info = info;
         if !self.session_info.signed_in {
-            self.toasts
-                .push(ToastKind::Error, "Sign-in did not create a Session");
+            self.sign_in_error = Some("Sign-in did not create a Session".into());
             return Ok(());
         }
         self.session_token_ready = self.session_info.signed_in;
