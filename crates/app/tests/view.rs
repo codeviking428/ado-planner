@@ -15289,3 +15289,65 @@ fn period_buttons_pan_one_step_on_every_scale(cx: &mut gpui_kit::TestAppContext)
         }
     }
 }
+
+fn assert_empty_card_inside_planner(cx: &mut VisualTestContext, size: (f32, f32), step: &str) {
+    let card = cx
+        .debug_bounds("empty-gantt-card")
+        .unwrap_or_else(|| panic!("{step}: empty team must show the card"));
+    let body = cx.debug_bounds("gantt-body").expect("gantt body");
+    let (card_l, card_t) = (f32::from(card.origin.x), f32::from(card.origin.y));
+    let card_r = card_l + f32::from(card.size.width);
+    let card_b = card_t + f32::from(card.size.height);
+    let body_l = f32::from(body.origin.x);
+    let body_t = f32::from(body.origin.y);
+    let right = (body_l + f32::from(body.size.width)).min(size.0);
+    let bottom = (body_t + f32::from(body.size.height)).min(size.1);
+    assert!(
+        card_l >= body_l && card_t >= body_t && card_r <= right && card_b <= bottom,
+        "{step} at {}x{}: card {card_l},{card_t}..{card_r},{card_b} must sit inside the visible planner body {body_l},{body_t}..{right},{bottom}",
+        size.0,
+        size.1,
+    );
+}
+
+#[gpui_kit::test]
+fn empty_team_card_keeps_every_edge_inside_the_planner(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let populated = state.nodes.clone();
+    state.nodes.clear();
+    state.prefs.planner.team = "Customer Experience Platform Reliability".into();
+    state.gantt.origin = jiff::Zoned::now().date();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    let sizes = [(1280., 800.), (900., 600.), (700., 500.), (1920., 1080.)];
+    for size in sizes {
+        cx.simulate_resize(gpui_kit::Size {
+            width: px(size.0),
+            height: px(size.1),
+        });
+        draw(cx);
+        assert_empty_card_inside_planner(cx, size, "resize");
+    }
+    for size in sizes {
+        cx.simulate_resize(gpui_kit::Size {
+            width: px(size.0),
+            height: px(size.1),
+        });
+        view.update(cx, |view, _| {
+            view.state.nodes = populated.clone();
+            view.state.prefs.planner.team = "Platform".into();
+        });
+        draw(cx);
+        assert!(
+            cx.debug_bounds("empty-gantt-card").is_none(),
+            "a populated team must not show the empty card"
+        );
+        view.update(cx, |view, _| {
+            view.state.nodes.clear();
+            view.state.prefs.planner.team = "Customer Experience Platform Reliability".into();
+        });
+        draw(cx);
+        assert_empty_card_inside_planner(cx, size, "populated -> empty");
+    }
+}
