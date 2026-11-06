@@ -1841,6 +1841,123 @@ fn painted_parent_summary_bar_is_shorter_than_a_leaf_and_shows_fill(
     );
 }
 
+fn assert_no_dates_pill_unclipped(cx: &mut VisualTestContext, id: i64, when: &str) {
+    let [pill, label, band] = match id {
+        1 => ["gantt-bar-1", "gantt-no-dates-1", "gantt-row-band-1"],
+        2 => ["gantt-bar-2", "gantt-no-dates-2", "gantt-row-band-2"],
+        21 => ["gantt-bar-21", "gantt-no-dates-21", "gantt-row-band-21"],
+        22 => ["gantt-bar-22", "gantt-no-dates-22", "gantt-row-band-22"],
+        _ => unreachable!("no selectors for #{id}"),
+    };
+    let pill = cx
+        .debug_bounds(pill)
+        .unwrap_or_else(|| panic!("{when}: No dates pill #{id} should paint"));
+    let label = cx
+        .debug_bounds(label)
+        .unwrap_or_else(|| panic!("{when}: No dates label #{id} should paint"));
+    let band = cx
+        .debug_bounds(band)
+        .unwrap_or_else(|| panic!("{when}: row band #{id} should paint"));
+    let (pill_top, pill_bottom) = (
+        f32::from(pill.origin.y),
+        f32::from(pill.origin.y + pill.size.height),
+    );
+    let (label_top, label_bottom) = (
+        f32::from(label.origin.y),
+        f32::from(label.origin.y + label.size.height),
+    );
+    let (band_top, band_bottom) = (
+        f32::from(band.origin.y),
+        f32::from(band.origin.y + band.size.height),
+    );
+    assert!(
+        label_top >= pill_top - 0.5 && label_bottom <= pill_bottom + 0.5,
+        "{when}: #{id} label {label_top}..{label_bottom} must fit inside the pill {pill_top}..{pill_bottom}"
+    );
+    assert!(
+        pill_top >= band_top - 0.5 && pill_bottom <= band_bottom + 0.5,
+        "{when}: #{id} pill {pill_top}..{pill_bottom} must fit inside its row {band_top}..{band_bottom}"
+    );
+    let label_mid = (label_top + label_bottom) / 2.0;
+    let pill_mid = (pill_top + pill_bottom) / 2.0;
+    let band_mid = (band_top + band_bottom) / 2.0;
+    assert!(
+        (label_mid - pill_mid).abs() <= 1.0,
+        "{when}: #{id} label center {label_mid} must sit on the pill center {pill_mid}"
+    );
+    assert!(
+        (pill_mid - band_mid).abs() <= 1.0,
+        "{when}: #{id} pill center {pill_mid} must sit on the row center {band_mid}"
+    );
+}
+
+#[gpui_kit::test]
+fn parent_no_dates_pill_is_not_clipped(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_hierarchy(40);
+    for node in state.nodes.iter_mut() {
+        if matches!(node.id, 1 | 2 | 21 | 22) {
+            node.has_date_fields = false;
+            node.start_date = None;
+            node.target_date = None;
+        }
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, _| {
+        let bars = view.state.gantt.layout_bars(
+            &view.state.nodes,
+            &view.state.gantt.flatten(&view.state.nodes),
+            &[],
+            720.0,
+        );
+        let parent = bars.iter().find(|bar| bar.id == 1).expect("parent pill");
+        let child = bars.iter().find(|bar| bar.id == 2).expect("child pill");
+        assert_eq!(parent.kind, GanttBarKind::NoFields);
+        assert_eq!(
+            parent.paint_h(),
+            child.paint_h(),
+            "parent and child No dates pills must share one height"
+        );
+    });
+    assert_no_dates_pill_unclipped(cx, 1, "default");
+    assert_no_dates_pill_unclipped(cx, 2, "default");
+
+    view.update(cx, |view, cx| {
+        view.state.gantt.toggle_expand(1);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-2").is_none(),
+        "collapse hides #2"
+    );
+    assert_no_dates_pill_unclipped(cx, 1, "collapsed");
+    assert_no_dates_pill_unclipped(cx, 21, "collapsed");
+
+    view.update(cx, |view, cx| {
+        view.state.gantt.toggle_expand(1);
+        view.state.gantt.scroll_y = 19.5 * ROW_HEIGHT;
+        cx.notify();
+    });
+    draw(cx);
+    assert_no_dates_pill_unclipped(cx, 21, "scrolled");
+    assert_no_dates_pill_unclipped(cx, 22, "scrolled");
+
+    for scale in GanttScale::ALL {
+        view.update(cx, |view, cx| {
+            view.state.gantt.scroll_y = 0.0;
+            view.state.gantt.set_scale(scale);
+            cx.notify();
+        });
+        draw(cx);
+        assert_no_dates_pill_unclipped(cx, 1, &format!("{scale:?}"));
+        assert_no_dates_pill_unclipped(cx, 2, &format!("{scale:?}"));
+    }
+}
+
 #[gpui_kit::test]
 fn painted_dependency_arrow_joins_predecessor_to_successor(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
