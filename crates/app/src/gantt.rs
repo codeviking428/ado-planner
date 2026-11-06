@@ -82,13 +82,18 @@ pub const OUTSIDE_LABEL_GAP: f32 =
     LINK_HANDLE_GAP + LINK_HANDLE_HIT + OVERFLOW_BADGE_GAP + OVERFLOW_BADGE + 6.0;
 /// Outside title chip height, matching `render_gantt_bar_label`.
 pub const OUTSIDE_LABEL_H: f32 = 16.0;
-/// Gap from a diamond to its outside title, past the handle dot so Week/Day
-/// "Go-live" keeps ≥8px from the outbound connector (handle occupies
-/// `LINK_HANDLE_GAP..LINK_HANDLE_GAP+LINK_HANDLE`).
-pub const MILESTONE_LABEL_GAP: f32 = LINK_HANDLE_GAP + LINK_HANDLE + 8.0;
+/// Minimum gap from a link handle's hit plate to an outside title.
+pub const HANDLE_TITLE_CLEARANCE: f32 = 8.0;
+/// Gap from a diamond to its outside title. The outbound plate is
+/// `OUTER_LINK_HIT` wide, centred on the connector at
+/// `LINK_HANDLE_GAP + LINK_HANDLE / 2` past the diamond.
+pub const MILESTONE_LABEL_GAP: f32 =
+    LINK_HANDLE_GAP + LINK_HANDLE / 2.0 + OUTER_LINK_HIT / 2.0 + HANDLE_TITLE_CLEARANCE;
 /// Gap from a flipped outside title's right edge to the bar's left edge.
-/// The inbound handle sits at `local_left - LINK_HANDLE_HIT - 2`.
-pub const OUTSIDE_TITLE_LEFT_GAP: f32 = LINK_HANDLE_HIT + LINK_HANDLE_GAP;
+/// The inbound plate is `LINK_HANDLE_HIT` wide, centred on the connector at
+/// `bar.x - LINK_HANDLE_GAP - LINK_HANDLE / 2`.
+pub const OUTSIDE_TITLE_LEFT_GAP: f32 =
+    LINK_HANDLE_GAP + LINK_HANDLE / 2.0 + LINK_HANDLE_HIT / 2.0 + HANDLE_TITLE_CLEARANCE;
 /// Gap from an outside title's painted right edge to a long finish-to-start
 /// outgoing vertical. Reviewer floor is 6px; 8px covers antialiasing.
 const SOURCE_LABEL_CLEARANCE: f32 = 16.0;
@@ -525,7 +530,9 @@ impl BarLayout {
     /// near the painted end (R100 ~653/659 on a 63px bar) still starts a
     /// link without eating the 2–6px-inside resize halo.
     pub fn outer_link_hit(&self) -> f32 {
-        if self.width.max(8.0) < SHORT_BAR_OUTER_LINK {
+        // Diamonds have no resize halo to reach past, and a wider plate
+        // would run into the title at `MILESTONE_LABEL_GAP`.
+        if !self.milestone && !self.marker && self.width.max(8.0) < SHORT_BAR_OUTER_LINK {
             SHORT_BAR_OUTER_LINK_HIT
         } else {
             OUTER_LINK_HIT
@@ -8934,6 +8941,58 @@ mod tests {
         assert!(
             (gap - MILESTONE_LABEL_GAP).abs() < 0.1,
             "milestone gap must match MILESTONE_LABEL_GAP, got {gap}"
+        );
+    }
+
+    #[test]
+    fn link_plates_keep_eight_px_from_the_outside_title() {
+        let bar = |milestone: bool, x: f32, width: f32| BarLayout {
+            id: 1013,
+            kind: GanttBarKind::Scheduled,
+            x,
+            width,
+            y: 0.0,
+            summary: false,
+            milestone,
+            label: String::new(),
+            title: "Go-live milestone".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: false,
+            overflow_badge: false,
+        };
+        let go_live = bar(true, 400.0, MILESTONE_SIZE);
+        let (label_x, _) =
+            bar_outside_label_frame(&go_live, 1200.0, true, None, false).expect("right title");
+        let plate_right = go_live.end_link_hit_left() + go_live.outer_link_hit();
+        assert!(
+            label_x - plate_right >= HANDLE_TITLE_CLEARANCE - 0.1,
+            "Go-live outbound plate must sit ≥8px left of its title, plate_right={plate_right} label_x={label_x}"
+        );
+        // Today just past the diamond flips the title left of the inbound plate.
+        let today = go_live.x + MILESTONE_SIZE + 40.0;
+        let (label_x, w) = bar_outside_label_frame(&go_live, 1200.0, true, Some(today), false)
+            .expect("flipped title");
+        let plate_left = go_live.start_link_origin() - LINK_HANDLE_HIT / 2.0;
+        assert!(
+            label_x + w <= go_live.x,
+            "precondition: Today must flip the title left, label={label_x}+{w}"
+        );
+        assert!(
+            plate_left - (label_x + w) >= HANDLE_TITLE_CLEARANCE - 0.1,
+            "Go-live inbound plate must sit ≥8px right of a flipped title, plate_left={plate_left} label_right={}",
+            label_x + w
+        );
+        let short = bar(false, 400.0, 30.0);
+        let (label_x, w) = bar_outside_label_frame(&short, 1200.0, true, Some(520.0), false)
+            .expect("flipped bar title");
+        let plate_left = short.start_link_origin() - LINK_HANDLE_HIT / 2.0;
+        assert!(
+            label_x + w <= short.x && plate_left - (label_x + w) >= HANDLE_TITLE_CLEARANCE - 0.1,
+            "a flipped bar title must sit ≥8px left of the inbound plate, plate_left={plate_left} label_right={}",
+            label_x + w
         );
     }
 
