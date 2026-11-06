@@ -1,0 +1,19 @@
+{
+  "source": {
+    "path": "assets/icons/ado-planner.svg",
+    "sha256": "4d693d09e0f8f48dc22ec3ff4407c8c5f4af39eb091625ecd872be0b9981e807"
+  },
+  "outputs": {
+    "assets/icons/png/16x16.png": "7326d2b6b03a3ad838252b65132a3f7856eae95db67ede0ddc54831a25ebdec5",
+    "assets/icons/png/24x24.png": "c9ac5d0b215591758a8588d85c2919941a33e1e7d5471389e3897ce7fd2323b3",
+    "assets/icons/png/32x32.png": "1e92047a4f24900045c91f78231a17d455a489bd1c396253ec681f0b86253766",
+    "assets/icons/png/48x48.png": "19db4b4a6ce9de5bf238806bf549adbd4cf4b9f77c1df5dba53ffdee2d41f8ed",
+    "assets/icons/png/64x64.png": "5e520831644758344201b2921c7ff5cf885aec5e9f9e854e31396cdd4b32fc51",
+    "assets/icons/png/128x128.png": "e4da85eb47614fe1bd11e47f5bcda697bd3c52181dc29e995a9d3039e6f95f8b",
+    "assets/icons/png/256x256.png": "b00b5b049da09e110474eaa3bd495817e8f5aa1bd0c479abc075fa2e3fcc8ecb",
+    "assets/icons/png/512x512.png": "fb0113c76c9171bd0c52eb3fa469a607c10c4fdb8029741baa6b42f10460b08e",
+    "assets/icons/ado-planner.ico": "7c823f65c816cf9b8787bdc658c38e947270629275a903ec88f42a14913ce054",
+    "assets/icons/ado-planner.icns": "19c86ccabafdb9ab440322e04302a78ce6e20d5ed8678babcf32c1b38129d73e",
+    "resources/icon.png": "fb0113c76c9171bd0c52eb3fa469a607c10c4fdb8029741baa6b42f10460b08e"
+  }
+}
