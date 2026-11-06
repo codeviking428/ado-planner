@@ -163,7 +163,8 @@ pub struct PlannerView {
     dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
     /// Click/scroll/scale dismissed the "No scheduled dates" chip. Reset
-    /// when switching teams so a new empty backlog shows the hint again.
+    /// when switching teams so a new empty backlog shows the hint again,
+    /// unless a known pointer would leave it stranded.
     empty_timeline_hint_dismissed: bool,
     form_loading: Option<(i64, String)>,
     io_busy: bool,
@@ -1321,6 +1322,22 @@ impl PlannerView {
     fn dismiss_empty_timeline_hint(&mut self) {
         self.empty_timeline_hint_dismissed = true;
         self.empty_hint_bounds.borrow_mut().take();
+    }
+
+    /// Scope and filter changes swap the rows under a still pointer, which
+    /// usually rests on a picker. Drop hover tooltips so none stays on a row
+    /// that moved or left; the next pointer move re-hits the new rows. With
+    /// a known pointer the empty-timeline chip is dismissed too: a move is
+    /// the only other thing that clears it, so it would wait under a
+    /// cursor that is elsewhere.
+    fn drop_tooltips_for_reload(&mut self, cx: &mut Context<Self>) {
+        self.state.gantt.clear_hover();
+        self.pinned_tooltip_bounds.borrow_mut().take();
+        self.hover_bar_zone = None;
+        if self.last_pointer_window.is_some() {
+            self.dismiss_empty_timeline_hint();
+        }
+        cx.notify();
     }
 
     /// Any pointer move outside the chip rect dismisses it. Hover-leave is
@@ -2896,6 +2913,7 @@ impl PlannerView {
         self.loading_shown_at = Some(std::time::Instant::now());
         self.banner_dismissed = false;
         self.empty_timeline_hint_dismissed = false;
+        self.drop_tooltips_for_reload(cx);
         self.spawn_state(cx, move |mut state| async move {
             let result = state.set_team(team).await;
             (state, result)
@@ -2904,6 +2922,9 @@ impl PlannerView {
 
     fn choose_scope(&mut self, id: &str, value: String, cx: &mut Context<Self>) {
         self.open_scope = None;
+        if id != "team" {
+            self.drop_tooltips_for_reload(cx);
+        }
         match id {
             "org" => {
                 self.spawn_state(cx, move |mut state| async move {
@@ -3047,7 +3068,7 @@ impl PlannerView {
                             "state-filter" => this.state.show_all_states(),
                             _ => this.state.show_all_roots(),
                         }
-                        cx.notify();
+                        this.drop_tooltips_for_reload(cx);
                     })),
             )
             .child(
@@ -3092,7 +3113,7 @@ impl PlannerView {
                             "state-filter" => this.state.toggle_hidden_state(&item_click),
                             _ => this.state.toggle_hidden_root(&item_click),
                         }
-                        cx.notify();
+                        this.drop_tooltips_for_reload(cx);
                     }))
             }))
     }
@@ -3369,7 +3390,7 @@ impl PlannerView {
                                     this.state.show_all_states();
                                     this.state.show_all_roots();
                                     this.state.set_assignee("anyone".into());
-                                    cx.notify();
+                                    this.drop_tooltips_for_reload(cx);
                                 })),
                         ),
                 )
@@ -3476,11 +3497,7 @@ impl PlannerView {
                             .tooltip("Pan earlier")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toolbar_more_open = false;
-                                this.animate_gantt(cx, |gantt| {
-                                    gantt.retarget_year_gutter(|gantt| {
-                                        gantt.step_period(-1);
-                                    });
-                                });
+                                this.animate_gantt(cx, |gantt| gantt.step_period(-1));
                                 cx.notify();
                             })),
                     ),
@@ -3497,11 +3514,7 @@ impl PlannerView {
                             .tooltip("Pan later")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toolbar_more_open = false;
-                                this.animate_gantt(cx, |gantt| {
-                                    gantt.retarget_year_gutter(|gantt| {
-                                        gantt.step_period(1);
-                                    });
-                                });
+                                this.animate_gantt(cx, |gantt| gantt.step_period(1));
                                 cx.notify();
                             })),
                     ),
@@ -7964,14 +7977,14 @@ impl PlannerView {
                         this.state.toggle_hidden_type(ty);
                     }
                     this.state.gantt.context_menu = None;
-                    cx.notify();
+                    this.drop_tooltips_for_reload(cx);
                 }))
                 .child(self.menu_item("Hide this state", cx, move |this, cx| {
                     if let Some(state) = &state {
                         this.state.toggle_hidden_state(state);
                     }
                     this.state.gantt.context_menu = None;
-                    cx.notify();
+                    this.drop_tooltips_for_reload(cx);
                 }))
             })
             .into_any_element()
@@ -11893,6 +11906,7 @@ mod bar_label_tests {
             marker: true,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             PlannerView::bar_external_label_frame(&bar, 800.0, false, None, false).is_none(),
@@ -11918,6 +11932,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -11960,6 +11975,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = 250.0;
@@ -12002,6 +12018,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let summary = BarLayout {
             id: 2,
@@ -12038,6 +12055,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -12069,6 +12087,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
@@ -12107,6 +12126,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -12150,6 +12170,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -12195,6 +12216,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let diamond_right = bar.x + MILESTONE_SIZE;
         let estimated = bar_title_paint_px(&bar.title);
@@ -12241,6 +12263,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let diamond_right = bar.x + MILESTONE_SIZE;
@@ -12281,6 +12304,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = 400.0;
@@ -12324,6 +12348,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
@@ -12364,6 +12389,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + MILESTONE_SIZE + MILESTONE_LABEL_GAP;
@@ -12404,6 +12430,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let diamond_right = bar.x + MILESTONE_SIZE;
@@ -12447,6 +12474,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: true,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = 604.0;
@@ -12482,6 +12510,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let (label_x, max_w) =
@@ -12800,6 +12829,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let left = 100.0;
         let right = 180.0;
@@ -12850,6 +12880,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, None, true);
         if let Some((label_x, max_w)) = frame {
@@ -12882,6 +12913,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let bar_right = bar.x + bar.width.max(8.0);
@@ -12920,6 +12952,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
@@ -12977,6 +13010,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let persist = BarLayout {
             id: 1003,
@@ -13007,6 +13041,7 @@ mod bar_label_tests {
         let cart_ui = BarLayout {
             open_ended: true,
             overflow_badge: false,
+            floored: false,
             progress: None,
             ..spike.clone()
         };
@@ -13022,6 +13057,7 @@ mod bar_label_tests {
             color: 0xa6e3a1,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
             ..spike.clone()
         };
         let ink = painted_bar_title_color(&cart, canvas);
@@ -13046,6 +13082,7 @@ mod bar_label_tests {
             color: 0xa6e3a1,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
             ..spike.clone()
         };
         let ink = painted_bar_title_color(&persist_summary, mocha);
@@ -13074,6 +13111,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: true,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             PlannerView::bar_title_fits_inside(&bar),
