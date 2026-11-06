@@ -138,14 +138,15 @@ pub fn theme_color(flavor: Flavor) -> ThemeColor {
 pub fn apply_flavor(cx: &mut App, flavor: Flavor) {
     let colors = theme_color(flavor);
     let dark = is_dark_flavor(flavor);
+    // A mode change reloads that mode's stock colors, so set colors after it.
     Theme::update(cx, |theme| {
         theme.mode = if dark {
             ThemeMode::Dark
         } else {
             ThemeMode::Light
         };
-        theme.colors = colors;
     });
+    Theme::update(cx, |theme| theme.colors = colors);
 }
 
 #[cfg(test)]

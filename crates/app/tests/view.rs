@@ -1,6 +1,6 @@
 //! Rendered `PlannerView` coverage for popups, the Gantt header, and the form.
 
-use ado_core::{GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
+use ado_core::{FLAVORS, Flavor, GanttBarKind, IdentityValue, SessionInfo, WorkItemNode};
 use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind,
@@ -12,6 +12,7 @@ use ado_planner::gantt::{
     related_dependency_ids,
 };
 use ado_planner::paths::AppPaths;
+use ado_planner::prefs::AppPrefs;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
 use ado_planner::toasts::{HistoryEntry, ToastExtra, ToastKind, UndoAction};
 use ado_planner::ui::PlannerView;
@@ -21,6 +22,7 @@ use ado_planner::ui::{
     typed_dates_error, typed_dates_error_in,
 };
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::calendar::Date as PickerDate;
 use gpui_kit::{
     Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, ScrollDelta, ScrollEvent,
@@ -13023,6 +13025,124 @@ fn theme_icon_opens_a_flavor_menu(cx: &mut gpui_kit::TestAppContext) {
         f32::from(logout.origin.x) > f32::from(theme.origin.x),
         "log out must sit to the right of theme"
     );
+}
+
+#[gpui_kit::test]
+fn apply_flavor_keeps_each_palette_across_light_and_dark(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    for flavor in [
+        Flavor::Mocha,
+        Flavor::Latte,
+        Flavor::Frappe,
+        Flavor::Latte,
+        Flavor::Macchiato,
+        Flavor::Mocha,
+    ] {
+        cx.update(|cx| {
+            ado_planner::flavor_theme::apply_flavor(cx, flavor);
+            assert_eq!(
+                cx.theme().mode.is_dark(),
+                ado_core::is_dark_flavor(flavor),
+                "{flavor:?} must set its mode"
+            );
+            assert_eq!(
+                cx.theme().colors,
+                ado_planner::flavor_theme::theme_color(flavor),
+                "{flavor:?} must keep its palette after the mode change"
+            );
+        });
+    }
+}
+
+const FLAVOR_OPTION_SELECTORS: [&str; 4] = [
+    "flavor-option-latte",
+    "flavor-option-frappe",
+    "flavor-option-macchiato",
+    "flavor-option-mocha",
+];
+
+#[gpui_kit::test]
+fn theme_menu_is_reachable_and_applies_at_small_windows(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let prefs_file = AppPaths::new(dir.path().to_path_buf()).prefs_file();
+    let state = idle_state(&dir);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    assert_eq!(
+        FLAVORS.map(|f| format!("flavor-option-{}", f.as_str())),
+        FLAVOR_OPTION_SELECTORS.map(String::from),
+        "the menu must offer every supported flavor"
+    );
+    for (width, height, pick, option_selector) in [
+        (1024., 720., Flavor::Latte, "flavor-option-latte"),
+        (800., 600., Flavor::Frappe, "flavor-option-frappe"),
+    ] {
+        cx.simulate_resize(gpui_kit::Size {
+            width: px(width),
+            height: px(height),
+        });
+        draw(cx);
+        let trigger = cx
+            .debug_bounds("header-theme-trigger")
+            .expect("theme trigger");
+        assert!(
+            f32::from(trigger.size.width) >= 16.0 && f32::from(trigger.size.height) >= 16.0,
+            "theme trigger must be clickable at {width}x{height}, got {:?}",
+            trigger.size
+        );
+        assert!(
+            f32::from(trigger.origin.x) + f32::from(trigger.size.width) <= width
+                && f32::from(trigger.origin.y) + f32::from(trigger.size.height) <= height,
+            "theme trigger must sit inside the {width}x{height} window, got {trigger:?}"
+        );
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        draw(cx);
+        for selector in FLAVOR_OPTION_SELECTORS {
+            let option = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("menu must list {selector} at {width}x{height}"));
+            assert!(
+                f32::from(option.origin.x) >= 0.0
+                    && f32::from(option.origin.x) + f32::from(option.size.width) <= width
+                    && f32::from(option.origin.y) + f32::from(option.size.height) <= height,
+                "{selector} must paint inside the {width}x{height} window, got {option:?}"
+            );
+        }
+        let option = cx.debug_bounds(option_selector).expect("option");
+        cx.simulate_click(option.center(), Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, cx| {
+            assert_eq!(
+                view.state.flavor(),
+                pick,
+                "{option_selector} must select {pick:?}"
+            );
+            assert_eq!(
+                cx.theme().colors,
+                ado_planner::flavor_theme::theme_color(pick),
+                "{option_selector} must apply {pick:?}"
+            );
+        });
+        assert!(
+            cx.debug_bounds("flavor-option-mocha").is_none(),
+            "choosing a theme must close the menu"
+        );
+        assert_eq!(
+            AppPrefs::load(&prefs_file).flavor,
+            pick,
+            "the choice must persist"
+        );
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        draw(cx);
+        assert!(
+            cx.debug_bounds(option_selector).is_some(),
+            "the theme menu must reopen after a choice"
+        );
+        view.update(cx, |view, cx| {
+            view.set_open_flavor(false);
+            cx.notify();
+        });
+    }
 }
 
 #[gpui_kit::test]
