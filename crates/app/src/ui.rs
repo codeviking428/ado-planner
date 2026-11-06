@@ -167,7 +167,8 @@ pub struct PlannerView {
     dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
     /// Click/scroll/scale dismissed the "No scheduled dates" chip. Reset
-    /// when switching teams so a new empty backlog shows the hint again.
+    /// when switching teams so a new empty backlog shows the hint again,
+    /// unless a known pointer would leave it stranded.
     empty_timeline_hint_dismissed: bool,
     form_loading: Option<(i64, String)>,
     io_busy: bool,
@@ -238,6 +239,9 @@ pub struct PlannerView {
     /// Painted left of `gantt-timeline-body`. Tree flex-shrink makes
     /// `tree_width + splitter` a miss, so bar mouse-down uses this.
     timeline_body_origin_x: Rc<Cell<Option<f32>>>,
+    /// Painted box of `gantt-body`, so the tree and timeline share its real
+    /// height rather than a guess at the header and banner chrome above it.
+    gantt_body_box: Rc<Cell<Option<GanttBodyBox>>>,
     /// Painted bar left/right in window coordinates, filled from on_prepaint.
     painted_bar_bounds: Rc<RefCell<HashMap<i64, PaintedBar>>>,
     /// Window box of the "No scheduled dates" chip, filled from on_prepaint.
@@ -261,6 +265,15 @@ pub struct PlannerView {
     last_committed_start_for_test: Option<jiff::civil::Date>,
     last_committed_target_for_test: Option<jiff::civil::Date>,
     _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GanttBodyBox {
+    top: f32,
+    height: f32,
+    /// Window height when painted; a resize shifts the bottom by the delta
+    /// until the next prepaint remeasures.
+    window_h: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -569,6 +582,7 @@ impl PlannerView {
             pending_focus_planner: false,
             timeline_body_origin_y: Rc::new(Cell::new(0.0)),
             timeline_body_origin_x: Rc::new(Cell::new(None)),
+            gantt_body_box: Rc::new(Cell::new(None)),
             painted_bar_bounds: Rc::new(RefCell::new(HashMap::new())),
             empty_hint_bounds: Rc::new(RefCell::new(None)),
             pinned_tooltip_bounds: Rc::new(RefCell::new(None)),
@@ -1362,6 +1376,22 @@ impl PlannerView {
     fn dismiss_empty_timeline_hint(&mut self) {
         self.empty_timeline_hint_dismissed = true;
         self.empty_hint_bounds.borrow_mut().take();
+    }
+
+    /// Scope and filter changes swap the rows under a still pointer, which
+    /// usually rests on a picker. Drop hover tooltips so none stays on a row
+    /// that moved or left; the next pointer move re-hits the new rows. With
+    /// a known pointer the empty-timeline chip is dismissed too: a move is
+    /// the only other thing that clears it, so it would wait under a
+    /// cursor that is elsewhere.
+    fn drop_tooltips_for_reload(&mut self, cx: &mut Context<Self>) {
+        self.state.gantt.clear_hover();
+        self.pinned_tooltip_bounds.borrow_mut().take();
+        self.hover_bar_zone = None;
+        if self.last_pointer_window.is_some() {
+            self.dismiss_empty_timeline_hint();
+        }
+        cx.notify();
     }
 
     /// Any pointer move outside the chip rect dismisses it. Hover-leave is
@@ -2937,6 +2967,7 @@ impl PlannerView {
         self.loading_shown_at = Some(std::time::Instant::now());
         self.banner_dismissed = false;
         self.empty_timeline_hint_dismissed = false;
+        self.drop_tooltips_for_reload(cx);
         self.spawn_state(cx, move |mut state| async move {
             let result = state.set_team(team).await;
             (state, result)
@@ -2945,6 +2976,9 @@ impl PlannerView {
 
     fn choose_scope(&mut self, id: &str, value: String, cx: &mut Context<Self>) {
         self.open_scope = None;
+        if id != "team" {
+            self.drop_tooltips_for_reload(cx);
+        }
         match id {
             "org" => {
                 self.spawn_state(cx, move |mut state| async move {
@@ -3088,7 +3122,7 @@ impl PlannerView {
                             "state-filter" => this.state.show_all_states(),
                             _ => this.state.show_all_roots(),
                         }
-                        cx.notify();
+                        this.drop_tooltips_for_reload(cx);
                     })),
             )
             .child(
@@ -3133,7 +3167,7 @@ impl PlannerView {
                             "state-filter" => this.state.toggle_hidden_state(&item_click),
                             _ => this.state.toggle_hidden_root(&item_click),
                         }
-                        cx.notify();
+                        this.drop_tooltips_for_reload(cx);
                     }))
             }))
     }
@@ -3236,11 +3270,14 @@ impl PlannerView {
                 self.state.gantt.go_today(today);
             }
         }
+        let rows = self.state.gantt.flatten(&visible);
+        // A taller window can leave the old scroll past the last row.
+        let measured_h = self.state.gantt.viewport_h;
+        self.state.gantt.clamp_scroll(rows.len(), measured_h);
         let committed = self.state.gantt.snapshot();
         if let Some(pose) = self.animated_camera() {
             self.state.gantt.restore(pose);
         }
-        let rows = self.state.gantt.flatten(&visible);
         let viewport_h = self.state.gantt.viewport_h.max(120.0);
         let content_h = (viewport_h - TIMELINE_HEADER_H).max(80.0);
         let window = self.state.gantt.visible_window(&rows, content_h).to_vec();
@@ -3248,6 +3285,8 @@ impl PlannerView {
             .state
             .gantt
             .layout_bars(&visible, &rows, &self.state.iterations, content_h);
+        let body_box = self.gantt_body_box.clone();
+        let entity_id = cx.entity_id();
         let gantt = v_flex()
             .id("gantt")
             .size_full()
@@ -3258,8 +3297,21 @@ impl PlannerView {
                     .id("gantt-body")
                     .flex_1()
                     .min_w(px(0.))
+                    .min_h(px(0.))
                     .relative()
                     .overflow_hidden()
+                    .on_prepaint(move |bounds, window, cx| {
+                        let measured = GanttBodyBox {
+                            top: f32::from(bounds.origin.y),
+                            height: f32::from(bounds.size.height),
+                            window_h: f32::from(window.viewport_size().height),
+                        };
+                        if body_box.replace(Some(measured)) != Some(measured) {
+                            // This frame laid rows out for the old height;
+                            // render again so the timeline fills the new one.
+                            cx.defer(move |cx| cx.notify(entity_id));
+                        }
+                    })
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         if !*hovered {
                             this.clear_canvas_hover(cx);
@@ -3410,7 +3462,7 @@ impl PlannerView {
                                     this.state.show_all_states();
                                     this.state.show_all_roots();
                                     this.state.set_assignee("anyone".into());
-                                    cx.notify();
+                                    this.drop_tooltips_for_reload(cx);
                                 })),
                         ),
                 )
@@ -3985,6 +4037,7 @@ impl PlannerView {
                     .id("gantt-tree-body")
                     .debug_selector(|| "gantt-tree-body".into())
                     .flex_1()
+                    .min_h(px(0.))
                     .overflow_hidden()
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         this.apply_scroll(event, cx);
@@ -4516,7 +4569,7 @@ impl PlannerView {
             return div().into_any_element();
         }
         let (x, mut y) = self.dates_anchor.unwrap_or((320.0, 160.0));
-        let window_h = self.state.gantt.viewport_h + 200.0;
+        let window_h = self.state.gantt.timeline_origin_y + self.state.gantt.viewport_h;
         let window_w = self.state.gantt.viewport_w.max(320.0);
         let popover_h = 380.0;
         let popover_w = 280.0;
@@ -4887,7 +4940,7 @@ impl PlannerView {
                     .top(px(TIMELINE_HEADER_H))
                     .left_0()
                     .right_0()
-                    .h(px(content_h))
+                    .bottom_0()
                     .overflow_hidden()
                     .on_prepaint(move |bounds, _, _| {
                         body_origin_y.set(f32::from(bounds.origin.y));
@@ -8226,14 +8279,14 @@ impl PlannerView {
                         this.state.toggle_hidden_type(ty);
                     }
                     this.state.gantt.context_menu = None;
-                    cx.notify();
+                    this.drop_tooltips_for_reload(cx);
                 }))
                 .child(self.menu_item("Hide this state", cx, move |this, cx| {
                     if let Some(state) = &state {
                         this.state.toggle_hidden_state(state);
                     }
                     this.state.gantt.context_menu = None;
-                    cx.notify();
+                    this.drop_tooltips_for_reload(cx);
                 }))
             })
             .into_any_element()
@@ -11856,14 +11909,20 @@ impl Render for PlannerView {
         }
         let viewport_h = f32::from(window.viewport_size().height);
         let viewport_w = f32::from(window.viewport_size().width);
-        self.state.gantt.viewport_h = (viewport_h - 200.0).max(120.0);
+        if let Some(body) = self.gantt_body_box.get() {
+            self.state.gantt.viewport_h = (body.height + viewport_h - body.window_h).max(0.0);
+            self.state.gantt.timeline_origin_y = body.top;
+        } else {
+            self.state.gantt.viewport_h = (viewport_h - 200.0).max(120.0);
+            self.state.gantt.timeline_origin_y =
+                (viewport_h - self.state.gantt.viewport_h).max(0.0);
+        }
         self.state.gantt.viewport_w = viewport_w;
         self.state.gantt.clamp_tree_width();
         self.state.gantt.timeline_origin_x = self
             .timeline_body_origin_x
             .get()
             .unwrap_or(self.state.gantt.tree_width + SPLITTER_WIDTH);
-        self.state.gantt.timeline_origin_y = (viewport_h - self.state.gantt.viewport_h).max(0.0);
         if self.state.toasts.items.is_empty() {
             self.toast_hover_depth = 0;
             self.state.toasts.paused = false;
@@ -12082,6 +12141,7 @@ impl Render for PlannerView {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_h(px(0.))
                                     .relative()
                                     .child(self.render_gantt(cx))
                                     .child(self.render_error_banner(cx)),
@@ -12185,6 +12245,7 @@ mod bar_label_tests {
             marker: true,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             PlannerView::bar_external_label_frame(&bar, 800.0, false, None, false).is_none(),
@@ -12210,6 +12271,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -12252,6 +12314,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = 250.0;
@@ -12294,6 +12357,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let summary = BarLayout {
             id: 2,
@@ -12330,6 +12394,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -12361,6 +12426,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
@@ -12399,6 +12465,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -12442,6 +12509,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             !PlannerView::bar_title_fits_inside(&bar),
@@ -12487,6 +12555,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let diamond_right = bar.x + MILESTONE_SIZE;
         let estimated = bar_title_paint_px(&bar.title);
@@ -12533,6 +12602,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let diamond_right = bar.x + MILESTONE_SIZE;
@@ -12573,6 +12643,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = 400.0;
@@ -12616,6 +12687,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
@@ -12656,6 +12728,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + MILESTONE_SIZE + MILESTONE_LABEL_GAP;
@@ -12696,6 +12769,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let diamond_right = bar.x + MILESTONE_SIZE;
@@ -12739,6 +12813,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: true,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let today_x = 604.0;
@@ -12774,6 +12849,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let (label_x, max_w) =
@@ -13092,6 +13168,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let left = 100.0;
         let right = 180.0;
@@ -13142,6 +13219,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let frame = PlannerView::bar_external_label_frame(&bar, 800.0, true, None, true);
         if let Some((label_x, max_w)) = frame {
@@ -13174,6 +13252,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let bar_right = bar.x + bar.width.max(8.0);
@@ -13212,6 +13291,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let (label_x, max_w) =
             PlannerView::bar_external_label_frame(&bar, 800.0, true, None, false)
@@ -13269,6 +13349,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
         };
         let persist = BarLayout {
             id: 1003,
@@ -13299,6 +13380,7 @@ mod bar_label_tests {
         let cart_ui = BarLayout {
             open_ended: true,
             overflow_badge: false,
+            floored: false,
             progress: None,
             ..spike.clone()
         };
@@ -13314,6 +13396,7 @@ mod bar_label_tests {
             color: 0xa6e3a1,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
             ..spike.clone()
         };
         let ink = painted_bar_title_color(&cart, canvas);
@@ -13338,6 +13421,7 @@ mod bar_label_tests {
             color: 0xa6e3a1,
             open_ended: false,
             overflow_badge: false,
+            floored: false,
             ..spike.clone()
         };
         let ink = painted_bar_title_color(&persist_summary, mocha);
@@ -13366,6 +13450,7 @@ mod bar_label_tests {
             marker: false,
             open_ended: true,
             overflow_badge: false,
+            floored: false,
         };
         assert!(
             PlannerView::bar_title_fits_inside(&bar),

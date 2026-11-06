@@ -527,6 +527,153 @@ fn painted_700x500_window_keeps_a_240px_timeline(cx: &mut gpui_kit::TestAppConte
     );
 }
 
+fn painted_bottom(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> f32 {
+    f32::from(bounds.origin.y) + f32::from(bounds.size.height)
+}
+
+fn debug_bounds_of(
+    cx: &mut VisualTestContext,
+    selector: String,
+) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    cx.debug_bounds(Box::leak(selector.into_boxed_str()))
+}
+
+/// Tree and timeline bodies end at the window bottom, and every painted tree
+/// row has a timeline band with the same bottom edge.
+fn assert_panes_share_bottom(view: &Entity<PlannerView>, cx: &mut VisualTestContext, case: &str) {
+    // The first paint measures `gantt-body`; the second lays rows out for it.
+    draw(cx);
+    draw(cx);
+    let window_h = cx.update(|window, _| f32::from(window.viewport_size().height));
+    let tree = cx.debug_bounds("gantt-tree-body").expect("tree body");
+    let timeline = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    assert!(
+        (painted_bottom(tree) - window_h).abs() < 1.0,
+        "{case}: tree body ends at {}, window at {window_h}",
+        painted_bottom(tree)
+    );
+    assert!(
+        (painted_bottom(timeline) - painted_bottom(tree)).abs() < 1.0,
+        "{case}: timeline body ends at {}, tree body at {}",
+        painted_bottom(timeline),
+        painted_bottom(tree)
+    );
+    let (window_ids, more_below, overflows) = view.update(cx, |view, _| {
+        let gantt = &view.state.gantt;
+        let rows = gantt.flatten(&view.state.visible_nodes());
+        let content_h = gantt.viewport_h - ado_planner::gantt::TIMELINE_HEADER_H;
+        let ids: Vec<i64> = gantt
+            .visible_window(&rows, content_h)
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        let rows_h = rows.len() as f32 * ROW_HEIGHT;
+        let more_below = rows_h > gantt.scroll_y + content_h + 0.5;
+        (ids, more_below, rows_h >= content_h)
+    });
+    let mut lowest_band = f32::MIN;
+    for id in &window_ids {
+        let row = debug_bounds_of(cx, format!("gantt-tree-row-{id}"))
+            .unwrap_or_else(|| panic!("{case}: tree row {id} should paint"));
+        let band = debug_bounds_of(cx, format!("gantt-row-band-{id}"))
+            .unwrap_or_else(|| panic!("{case}: timeline band {id} should paint"));
+        assert!(
+            (painted_bottom(row) - painted_bottom(band)).abs() < 1.0,
+            "{case}: row {id} ends at {} in the tree, {} on the timeline",
+            painted_bottom(row),
+            painted_bottom(band)
+        );
+        lowest_band = lowest_band.max(painted_bottom(band));
+    }
+    if more_below {
+        assert!(
+            lowest_band >= painted_bottom(timeline) - 1.0,
+            "{case}: row bands stop at {lowest_band}, timeline body at {}",
+            painted_bottom(timeline)
+        );
+    } else if let Some(last) = window_ids.last().filter(|_| overflows) {
+        let row = debug_bounds_of(cx, format!("gantt-tree-row-{last}")).unwrap();
+        assert!(
+            (painted_bottom(row) - painted_bottom(tree)).abs() < 1.0,
+            "{case}: scrolled to the end, last row ends at {}, pane at {}",
+            painted_bottom(row),
+            painted_bottom(tree)
+        );
+    }
+}
+
+fn scroll_gantt_to_end(view: &Entity<PlannerView>, cx: &mut VisualTestContext) {
+    view.update(cx, |view, cx| {
+        let rows = view.state.gantt.flatten(&view.state.visible_nodes()).len();
+        let viewport_h = view.state.gantt.viewport_h;
+        view.state.gantt.scroll_y = f32::MAX;
+        view.state.gantt.clamp_scroll(rows, viewport_h);
+        cx.notify();
+    });
+}
+
+#[gpui_kit::test]
+fn timeline_grid_reaches_the_bottom_of_the_tree_pane(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_hierarchy(200);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    for (w, h) in [
+        (1280.0, 800.0),
+        (1280.0, 600.0),
+        (1600.0, 1000.0),
+        (900.0, 520.0),
+    ] {
+        cx.simulate_resize(gpui_kit::Size {
+            width: px(w),
+            height: px(h),
+        });
+        assert_panes_share_bottom(&view, cx, &format!("{w}x{h} after resize"));
+        view.update(cx, |view, cx| {
+            view.state.gantt.scroll_y = 0.0;
+            cx.notify();
+        });
+        assert_panes_share_bottom(&view, cx, &format!("{w}x{h} top"));
+        view.update(cx, |view, cx| {
+            view.state.gantt.scroll_y = 7.5 * ROW_HEIGHT + 13.0;
+            cx.notify();
+        });
+        assert_panes_share_bottom(&view, cx, &format!("{w}x{h} mid-row scroll"));
+        // Re-clamp once the measured height is in, as a scroll event would.
+        draw(cx);
+        scroll_gantt_to_end(&view, cx);
+        assert_panes_share_bottom(&view, cx, &format!("{w}x{h} scrolled to end"));
+    }
+    for scale in [
+        GanttScale::Day,
+        GanttScale::Week,
+        GanttScale::Year,
+        GanttScale::Month,
+    ] {
+        view.update(cx, |view, cx| {
+            view.state.gantt.set_scale(scale);
+            cx.notify();
+        });
+        assert_panes_share_bottom(&view, cx, &format!("{scale:?} scale"));
+    }
+    view.update(cx, |view, cx| {
+        view.state.nodes = Vec::new();
+        view.state.gantt.scroll_y = 0.0;
+        cx.notify();
+    });
+    assert_panes_share_bottom(&view, cx, "empty team");
+    view.update(cx, |view, cx| {
+        view.state.nodes = fake_hierarchy(200);
+        cx.notify();
+    });
+    assert_panes_share_bottom(&view, cx, "back from an empty team");
+    scroll_gantt_to_end(&view, cx);
+    assert_panes_share_bottom(&view, cx, "back from an empty team, scrolled to end");
+}
+
 #[gpui_kit::test]
 fn clicking_the_dates_cell_opens_a_range_picker(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
@@ -1289,6 +1436,76 @@ fn unscheduled_empty_hint_dismisses_when_the_team_picker_opens(cx: &mut gpui_kit
     assert!(
         cx.debug_bounds("unscheduled-empty-hint").is_none(),
         "opening the team picker must dismiss the empty-timeline hint"
+    );
+}
+
+#[gpui_kit::test]
+fn team_switch_does_not_leave_the_empty_hint_under_a_still_pointer(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let (_runtime, _mock, state, _dir) = signed_in_with_mock();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_ne!(view.state.prefs.planner.team, "Amego");
+        assert!(
+            view.state.teams.iter().any(|team| team.name == "Amego"),
+            "precondition: the mock lists the all-unscheduled Amego team"
+        );
+    });
+    let trigger = cx.debug_bounds("team-trigger").expect("team picker");
+    cx.simulate_mouse_move(trigger.center(), None, Modifiers::default());
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    draw(cx);
+    let amego = cx
+        .debug_bounds("team-option-Amego")
+        .expect("Amego in the team picker");
+    cx.simulate_mouse_move(amego.center(), None, Modifiers::default());
+    cx.simulate_click(amego.center(), Modifiers::default());
+    allow_ado_client_wake(cx);
+    let loaded = |view: &PlannerView| {
+        view.state.prefs.planner.team == "Amego"
+            && !view.is_busy()
+            && !view.state.hierarchy_loading
+            && !view.state.nodes.is_empty()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        draw(cx);
+        if view.update(cx, |view, _| loaded(view)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(loaded(view), "Amego must finish loading from the mock");
+        assert!(
+            view.state
+                .visible_nodes()
+                .iter()
+                .all(|node| node.start_date.is_none() && node.target_date.is_none()),
+            "precondition: Amego is all-unscheduled, so the hint would qualify"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-timeline").is_some(),
+        "the Amego board must paint its timeline"
+    );
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "a Team change must not leave the No scheduled dates chip painted under a pointer resting elsewhere"
+    );
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_none(),
+        "a Team change must not leave a bar hover tooltip on the new board"
     );
 }
 
@@ -8758,8 +8975,8 @@ fn short_year_parent_has_no_rollup_edge(cx: &mut gpui_kit::TestAppContext) {
     let bar = cx.debug_bounds("gantt-bar-1").expect("Year parent sliver");
     let bar_w = f32::from(bar.size.width);
     assert!(
-        bar_w > 8.0 && bar_w <= 24.5,
-        "Year 14-day parent should be a 16–24px sliver, width={bar_w}"
+        bar_w > 8.0 && bar_w <= YEAR_MIN_BAR_WIDTH + 0.5,
+        "Year 14-day parent should be floored to {YEAR_MIN_BAR_WIDTH}px, width={bar_w}"
     );
     assert!(
         cx.debug_bounds("gantt-summary-edge-1-start").is_none(),
@@ -15391,6 +15608,42 @@ fn period_buttons_move_the_range_title_with_the_view(cx: &mut gpui_kit::TestAppC
             );
             title = next;
         }
+    }
+}
+
+#[gpui_kit::test]
+fn year_min_zoom_cart_bars_paint_readable_and_select_on_click(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = GanttView::next_zoom(0.0, -1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    for (id, title) in [(1002_i64, "Cart"), (1005, "Cart UI")] {
+        let selector: &'static str = Box::leak(format!("gantt-bar-{id}").into_boxed_str());
+        let bar = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("Year {title} must paint"));
+        let (w, h) = (f32::from(bar.size.width), f32::from(bar.size.height));
+        assert!(
+            w + 0.1 >= YEAR_MIN_BAR_WIDTH && w > h * 1.25,
+            "Year {title} must paint a bar, not a dot or circle, {w}x{h}"
+        );
+        cx.simulate_click(bar.center(), Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.state.gantt.selected_id,
+                Some(id),
+                "a click on the Year {title} bar must select it"
+            );
+        });
     }
 }
 
