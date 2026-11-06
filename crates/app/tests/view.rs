@@ -8672,16 +8672,16 @@ fn short_year_parent_has_no_rollup_edge(cx: &mut gpui_kit::TestAppContext) {
     let bar = cx.debug_bounds("gantt-bar-1").expect("Year parent sliver");
     let bar_w = f32::from(bar.size.width);
     assert!(
-        bar_w > 8.0 && bar_w <= 24.5,
-        "Year 14-day parent should be a 16–24px sliver, width={bar_w}"
+        (bar_w - YEAR_MIN_BAR_WIDTH).abs() < 0.5,
+        "Year 14-day parent should be a {YEAR_MIN_BAR_WIDTH}px floored sliver, width={bar_w}"
     );
     assert!(
         cx.debug_bounds("gantt-summary-edge-1-start").is_none(),
-        "a 16–24px Year parent must not paint a rollup not-allowed start"
+        "a floored Year parent must not paint a rollup not-allowed start"
     );
     assert!(
         cx.debug_bounds("gantt-summary-edge-1-end").is_none(),
-        "a 16–24px Year parent must not paint a rollup not-allowed end"
+        "a floored Year parent must not paint a rollup not-allowed end"
     );
     let edge = point(bar.origin.x + px(2.), bar.center().y);
     cx.simulate_mouse_down(edge, MouseButton::Left, Modifiers::default());
@@ -8696,7 +8696,7 @@ fn short_year_parent_has_no_rollup_edge(cx: &mut gpui_kit::TestAppContext) {
         assert_eq!(
             gesture.kind,
             GestureKind::Move,
-            "16–24px parent edges must stay Move, got {:?}",
+            "floored Year parent edges must stay Move, got {:?}",
             gesture.kind
         );
     });
@@ -14979,6 +14979,36 @@ fn year_bars_keep_a_minimum_height(cx: &mut gpui_kit::TestAppContext) {
         assert!(
             h + 0.1 >= YEAR_MIN_BAR_H,
             "{selector} Year sliver height {h} must stay ≥ {YEAR_MIN_BAR_H}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn year_short_bars_paint_wider_than_tall(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let year = cx.debug_bounds("gantt-scale-Year").expect("Year");
+    cx.simulate_click(year.center(), Modifiers::default());
+    draw(cx);
+    // Persist cart (summary), Cart UI (start-only leaf), spike (14-day leaf).
+    for selector in ["gantt-bar-1003", "gantt-bar-1005", "gantt-bar-1012"] {
+        let bar = cx.debug_bounds(selector).expect(selector);
+        let (w, h) = (f32::from(bar.size.width), f32::from(bar.size.height));
+        assert!(
+            w + 0.1 >= YEAR_MIN_BAR_WIDTH,
+            "{selector} Year width {w} must stay ≥ {YEAR_MIN_BAR_WIDTH}"
+        );
+        assert!(
+            w > h,
+            "{selector} Year bar must read as a bar, not a dot: {w}×{h}"
         );
     }
 }

@@ -39,7 +39,7 @@ pub const SELECTED_ROW_TINT: f32 = 0.65;
 /// Left accent on the selected tree/timeline row.
 pub const SELECTED_ACCENT_W: f32 = 3.0;
 /// Year-scale bars shorter than this still paint a hittable body, not a sliver.
-pub const YEAR_MIN_BAR_WIDTH: f32 = 24.0;
+pub const YEAR_MIN_BAR_WIDTH: f32 = 32.0;
 /// Year/Quarter summary bars read as slivers at 14px; keep a thicker body.
 pub const YEAR_MIN_BAR_H: f32 = 20.0;
 /// Floor so a zero-width day still paints on Month/Week/Quarter.
@@ -449,6 +449,9 @@ pub struct BarLayout {
     pub open_ended: bool,
     /// Parent-overflow `!` is painted; outside titles use the wider gap.
     pub overflow_badge: bool,
+    /// Year view widened this bar to `YEAR_MIN_BAR_WIDTH`, so its painted
+    /// ends are not its dates.
+    pub min_width_floor: bool,
 }
 
 impl BarLayout {
@@ -457,7 +460,7 @@ impl BarLayout {
             MILESTONE_SIZE
         } else if self.summary {
             // Year start-only slivers are floored to `YEAR_MIN_BAR_WIDTH`.
-            // Thicken those, not a 24px Persist cart, so connector lanes
+            // Thicken those, not a floored Persist cart, so connector lanes
             // still have a gap under the 14px summary body.
             if self.open_ended && self.width <= YEAR_MIN_BAR_WIDTH + 0.5 {
                 YEAR_MIN_BAR_H.max(SUMMARY_BAR_H)
@@ -538,7 +541,10 @@ impl BarLayout {
             && !self.milestone
             && !self.marker
             && !self.open_ended
-            // 16–24px Year/Quarter slivers stay all-Move. Two 8px grips plus
+            // Floored Year bars stay all-Move: a grip on a painted end that
+            // is not the date would resize by the wrong amount.
+            && !self.min_width_floor
+            // 16–24px Quarter slivers stay all-Move. Two 8px grips plus
             // a 6px link sliver leave no hittable body on that width.
             // Parents with their own dates resize once they clear 24px.
             && self.width > HANDLE_WIDTH * 2.0 + LINK_HANDLE_INSET + 2.0
@@ -629,6 +635,7 @@ impl BarLayout {
             && !self.can_resize()
             && !self.milestone
             && !self.marker
+            && !self.min_width_floor
             && self.width > HANDLE_WIDTH * 2.0 + LINK_HANDLE_INSET + 2.0
     }
 
@@ -1813,6 +1820,7 @@ impl GanttView {
                         marker: false,
                         open_ended: false,
                         overflow_badge: false,
+                        min_width_floor: false,
                     });
                 } else if display.kind == GanttBarKind::Unscheduled {
                     // Gutter pill, not a fake iteration/rollup bar and not a
@@ -1857,8 +1865,12 @@ impl GanttView {
                     width = visible.min(width.max(HANDLE_WIDTH * 2.0));
                     x = 0.0;
                 }
-                if matches!(self.scale, GanttScale::Year) && !marker && !display.milestone {
-                    width = width.max(YEAR_MIN_BAR_WIDTH);
+                let min_width_floor = matches!(self.scale, GanttScale::Year)
+                    && !marker
+                    && !display.milestone
+                    && width < YEAR_MIN_BAR_WIDTH;
+                if min_width_floor {
+                    width = YEAR_MIN_BAR_WIDTH;
                 }
                 Some(BarLayout {
                     id: node.id,
@@ -1877,6 +1889,7 @@ impl GanttView {
                     marker,
                     open_ended,
                     overflow_badge: parent_date_overflow(nodes, node.id),
+                    min_width_floor,
                 })
             })
             .collect()
@@ -5418,6 +5431,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let bars = [bar.clone()];
         assert_eq!(
@@ -5604,6 +5618,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let (end_x, end_w) = resize_end_handle(&bar);
         let link_x = bar.x + bar.width + HANDLE_WIDTH;
@@ -6081,6 +6096,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         assert_eq!(bar_offscreen_edge(&on_screen, 512.0), None);
         let peeking = BarLayout {
@@ -6140,6 +6156,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let (x, w, label, side) =
             offscreen_edge_chip(&go_live, 512.0).expect("Go-live past the clip must show a cue");
@@ -6375,6 +6392,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         assert!(bar.can_resize(), "Month Persist cart must still resize");
         assert!(
@@ -6444,6 +6462,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let (start, end, link) = bar.edge_zones();
         assert!(
@@ -6570,6 +6589,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         assert!(bar.can_resize(), "a 33px Persist cart still resizes");
         let (start, end, link) = bar.edge_zones();
@@ -6612,6 +6632,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let left = bar.x;
         let right = bar.x + bar.width;
@@ -6667,6 +6688,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let left = bar.x;
         let right = bar.x + bar.width;
@@ -6711,6 +6733,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         assert!(bar.can_resize());
         assert!(bar.resize_end_link_inset() > 0.0);
@@ -6740,6 +6763,7 @@ mod tests {
             marker: false,
             open_ended: true,
             overflow_badge: false,
+            min_width_floor: false,
         };
         assert!(
             !bar.link_handle_insets_into_bar(),
@@ -6774,6 +6798,7 @@ mod tests {
             marker: false,
             open_ended: true,
             overflow_badge: false,
+            min_width_floor: false,
         };
         assert_eq!(
             GanttView::hit_test_bar(
@@ -8813,6 +8838,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         assert!(
             bar_outside_title_span_clipped(&pill, 800.0, None).is_none(),
@@ -8855,6 +8881,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
@@ -8912,6 +8939,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: true,
+            min_width_floor: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_plain = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
@@ -8959,6 +8987,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
@@ -9007,6 +9036,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let estimated = bar_title_paint_px(&bar.title);
         let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
@@ -9148,6 +9178,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let right_x = bar.x + bar.width.max(8.0) + LINK_HANDLE_GAP + LINK_HANDLE_HIT + 20.0;
         let estimated = bar_title_paint_px(&bar.title);
@@ -10109,6 +10140,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         assert_eq!(
             GanttView::hit_test_link_target(std::slice::from_ref(&bar), 200.0, 44.0),
@@ -11076,6 +11108,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let mid1 = BarLayout {
             id: 2,
@@ -11093,6 +11126,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let mid2 = BarLayout {
             id: 3,
@@ -11110,6 +11144,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let blocker = BarLayout {
             id: 5,
@@ -11127,6 +11162,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let succ = BarLayout {
             id: 4,
@@ -11144,6 +11180,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
@@ -11212,6 +11249,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let mid = BarLayout {
             id: 2,
@@ -11229,6 +11267,7 @@ mod tests {
             marker: false,
             open_ended: true,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let succ = BarLayout {
             id: 3,
@@ -11246,6 +11285,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
@@ -11297,6 +11337,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let pill = BarLayout {
             id: 2,
@@ -11314,6 +11355,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let succ = BarLayout {
             id: 3,
@@ -11331,6 +11373,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
@@ -11982,6 +12025,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let mid = BarLayout {
             id: 2,
@@ -11999,6 +12043,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let succ = BarLayout {
             id: 3,
@@ -12016,6 +12061,7 @@ mod tests {
             marker: false,
             open_ended: false,
             overflow_badge: false,
+            min_width_floor: false,
         };
         let gantt = GanttView {
             origin: Date::new(2026, 7, 1).unwrap(),
@@ -12250,9 +12296,11 @@ mod tests {
             arrows[0].x1,
             arrows[0].x2
         );
+        // Same-date bars: the floored predecessor ends one floor past the
+        // head, and the drop sits one stub past that.
         let head_span = (arrows[0].x2 - arrows[0].x_head).abs();
         assert!(
-            head_span < 40.0,
+            head_span < YEAR_MIN_BAR_WIDTH + DependencyArrow::WRAP_STUB + 4.0,
             "Year inbound stub must stay next to the head, x2={} x_head={}",
             arrows[0].x2,
             arrows[0].x_head
