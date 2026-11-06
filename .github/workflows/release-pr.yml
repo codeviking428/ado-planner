@@ -2,7 +2,7 @@ name: Release PR
 
 # On every push to master, either:
 # - the workspace version has no vX.Y.Z tag yet (a release PR just merged):
-#   tag that commit and call release.yml to build and publish it, or
+#   tag that commit and dispatch release.yml on the tag to build and publish it, or
 # - open or update the release PR that bumps the version and CHANGELOG.md
 #   from the Conventional Commits since the last tag.
 # See docs/RELEASING.md.
@@ -154,6 +154,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -171,12 +172,11 @@ jobs:
           git tag -a "$TAG" -m "ADO Planner $VERSION" "$COMMIT"
           git push origin "$TAG"
 
-  # Tags pushed with GITHUB_TOKEN don't trigger workflows, so call the build here.
-  release:
-    needs: [plan, tag]
-    permissions:
-      contents: write
-    uses: ./.github/workflows/release.yml
-    with:
-      tag: ${{ needs.plan.outputs.tag }}
-    secrets: inherit
+      # A tag pushed with GITHUB_TOKEN doesn't trigger workflows, but a
+      # workflow_dispatch does. Dispatching on the tag ref builds the tag's own
+      # code with tag-scoped caches, never master's.
+      - name: Start the release build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: gh workflow run release.yml --ref "$TAG"

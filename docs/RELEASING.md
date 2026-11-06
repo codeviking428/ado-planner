@@ -4,12 +4,12 @@ Every release is a `vX.Y.Z` tag on `master` and one GitHub Release holding both 
 
 ## Workflows
 
-| Workflow                           | Runs on                                          | Does                                                                                                                                  |
-| ---------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `.github/workflows/ci.yml`         | every PR, every push to `master`                 | Electron lint, typecheck, tests, and e2e; Rust fmt, clippy, nextest, build, and `cargo deny` on Linux, Windows, and macOS; actionlint |
-| `.github/workflows/pr-title.yml`   | PR opened, edited, or pushed                     | rejects PR titles that are not Conventional Commits                                                                                   |
-| `.github/workflows/release-pr.yml` | every push to `master`, manual on `master` only  | opens or updates the release PR; after it merges, tags the version-bump commit and calls `release.yml`                                |
-| `.github/workflows/release.yml`    | a `vX.Y.Z` tag, a call, manual, release-file PRs | builds, signs, checksums, and publishes the GitHub Release                                                                            |
+| Workflow                           | Runs on                                           | Does                                                                                                                                  |
+| ---------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `.github/workflows/ci.yml`         | every PR, every push to `master`                  | Electron lint, typecheck, tests, and e2e; Rust fmt, clippy, nextest, build, and `cargo deny` on Linux, Windows, and macOS; actionlint |
+| `.github/workflows/pr-title.yml`   | PR opened, edited, or pushed                      | rejects PR titles that are not Conventional Commits                                                                                   |
+| `.github/workflows/release-pr.yml` | every push to `master`, manual on `master` only   | opens or updates the release PR; after it merges, tags the version-bump commit and dispatches `release.yml` on that tag               |
+| `.github/workflows/release.yml`    | a `vX.Y.Z` tag push or dispatch, release-file PRs | builds, signs, checksums, and publishes the GitHub Release                                                                            |
 
 ## How the version is chosen
 
@@ -32,7 +32,7 @@ The workspace version in the root `Cargo.toml` is the single version. Every crat
 
 1. Merge PRs to `master` as usual. After each push, **Release PR** opens or refreshes the PR `chore(release): vX.Y.Z` on branch `release/next`. That PR bumps `Cargo.toml`, `Cargo.lock`, and `package.json`, and prepends the new section to `CHANGELOG.md`.
 2. Review it. To reword the notes, edit `CHANGELOG.md` on that branch. The next push to `master` regenerates the PR and drops those edits.
-3. Merge it. **Release PR** sees a version with no tag, creates `vX.Y.Z` on the commit that set that version (the release PR's merge commit), and calls **Release**. Commits pushed after it are not in the release; they go into the next release PR, which the same run opens.
+3. Merge it. **Release PR** sees a version with no tag, creates `vX.Y.Z` on the commit that set that version (the release PR's merge commit), and starts **Release** on that tag. Commits pushed after it are not in the release; they go into the next release PR, which the same run opens.
 4. **Release** builds the following and publishes them to the `vX.Y.Z` GitHub Release, marked latest:
 
    | Asset                                                                                                      | What                              |
@@ -51,9 +51,10 @@ Both updaters read the release GitHub marks as latest. The Rust app fetches `rel
 
 ### Other ways in
 
-- **Rebuild a tag:** Actions → Release → Run workflow, enter an existing `vX.Y.Z`. Assets with the same name are replaced. The release is marked latest only if its tag is the highest `vX.Y.Z`, so rebuilding an older tag leaves both updaters on the newest release. Tick _Build without publishing_ for a dry run.
-- **Push a tag by hand:** `git tag -a v1.2.3 -m "ADO Planner 1.2.3" && git push origin v1.2.3`. The tag must match the `Cargo.toml` version at that commit, or the build stops.
+- **Rebuild a tag:** Actions → Release → Run workflow, and set _Use workflow from_ to the `vX.Y.Z` tag. A branch is rejected. Assets with the same name are replaced. The release is marked latest only if its tag is the highest `vX.Y.Z`, so rebuilding an older tag leaves both updaters on the newest release. Tick _Build without publishing_ for a dry run.
+- **Push a tag by hand:** `git tag -a v1.2.3 -m "ADO Planner 1.2.3" && git push origin v1.2.3`. The tag must match the `Cargo.toml` version at that commit and point at a commit on `master`, or the build stops.
 - **Dry run on a PR:** PRs that touch `release.yml`, `.github/scripts/`, `crates/app/Cargo.toml`, `electron-builder.yml`, or `cliff.toml` run the whole build. A throwaway key signs it, nothing is published, and the result is uploaded as the `release-dry-run-vX.Y.Z` artifact.
+- **Caches:** release builds neither restore nor save Actions caches, and they always build the tag they run on, never a ref passed in. Code built for a release therefore can't write a cache that a `master` CI run would restore.
 - **Preview the next version locally:** `git cliff --bumped-version` and `git cliff --unreleased --bump`.
 
 ## Secrets and settings

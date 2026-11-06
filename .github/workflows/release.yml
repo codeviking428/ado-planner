@@ -2,28 +2,23 @@ name: Release
 
 # Builds a vX.Y.Z tag into a GitHub Release. See docs/RELEASING.md.
 #
-# - release-pr.yml calls this after it tags a merged release PR.
+# - release-pr.yml dispatches this on the tag after it tags a merged release PR.
 # - Pushing a vX.Y.Z tag by hand runs it too.
-# - workflow_dispatch rebuilds an existing tag (assets are overwritten).
+# - Run workflow with "Use workflow from" set to a tag rebuilds it (assets are
+#   overwritten).
 # - PRs that touch release files run a dry run: everything is built and signed
 #   with a throwaway key, nothing is published, and the real secrets are unused.
+#
+# Every job builds github.ref, never a ref from an input, so a run can only
+# write caches scoped to its own tag or PR and never master's. Release jobs
+# also skip caching entirely.
 
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
-  workflow_call:
-    inputs:
-      tag:
-        description: Existing vX.Y.Z tag to build
-        required: true
-        type: string
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing vX.Y.Z tag to rebuild
-        required: true
-        type: string
       dry-run:
         description: Build without publishing
         type: boolean
@@ -37,8 +32,8 @@ on:
       - cliff.toml
 
 concurrency:
-  # Tag pushes, calls, and rebuilds of one tag share a group, keyed on the tag name.
-  group: release-${{ inputs.tag || github.ref_name }}
+  # Tag pushes and rebuilds of one tag share a group, keyed on the tag name.
+  group: release-${{ github.ref_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -52,7 +47,6 @@ jobs:
   meta:
     runs-on: ubuntu-latest
     outputs:
-      ref: ${{ steps.meta.outputs.ref }}
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
       dry-run: ${{ steps.meta.outputs.dry-run }}
@@ -61,27 +55,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Resolve tag and version
         id: meta
         env:
           EVENT: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.tag }}
           INPUT_DRY_RUN: ${{ inputs.dry-run }}
         run: |
           set -euo pipefail
           version="$(.github/scripts/release-version.sh check)"
           if [ "$EVENT" = pull_request ]; then
             tag="v$version"
-            ref="$GITHUB_SHA"
             dry_run=true
           else
-            tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
-            ref="refs/tags/$tag"
+            tag="$GITHUB_REF_NAME"
             dry_run="${INPUT_DRY_RUN:-false}"
-            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::error::$tag is not a vX.Y.Z tag"
+            if [[ "$GITHUB_REF" != refs/tags/* || ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Run Release on a vX.Y.Z tag (Use workflow from: tag), not $GITHUB_REF"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+              echo "::error::$tag points at $GITHUB_SHA, which is not on master"
               exit 1
             fi
             if [ "$tag" != "v$version" ]; then
@@ -90,12 +85,11 @@ jobs:
             fi
           fi
           {
-            echo "ref=$ref"
             echo "tag=$tag"
             echo "version=$version"
             echo "dry-run=$dry_run"
           } >>"$GITHUB_OUTPUT"
-          echo "Building $tag ($ref), dry run: $dry_run"
+          echo "Building $tag ($GITHUB_SHA), dry run: $dry_run"
 
       - uses: taiki-e/install-action@v2
         if: steps.meta.outputs.dry-run == 'true'
@@ -133,8 +127,6 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.meta.outputs.ref }}
 
       - name: Linux GPUI deps
         if: runner.os == 'Linux'
@@ -144,10 +136,6 @@ jobs:
         with:
           toolchain: 1.99.1
           targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release
 
       - uses: taiki-e/install-action@v2
         with:
@@ -259,8 +247,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.meta.outputs.ref }}
 
       - uses: pnpm/action-setup@v4
         with:
@@ -269,7 +255,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
 
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -299,8 +284,6 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.meta.outputs.ref }}
 
       - uses: actions/download-artifact@v4
         with:
