@@ -27,6 +27,9 @@ nsis:
   # writes isAdminRightsRequired to latest.yml so electron-updater elevates,
   # and starts the app unelevated after installing.
   perMachine: true
+  # The default is already true, but electron-builder only writes
+  # isAdminRightsRequired when this is set explicitly.
+  packElevateHelper: true
   artifactName: ${name}-electron-${version}-setup.${ext}
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
