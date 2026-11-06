@@ -1293,6 +1293,76 @@ fn unscheduled_empty_hint_dismisses_when_the_team_picker_opens(cx: &mut gpui_kit
 }
 
 #[gpui_kit::test]
+fn team_switch_does_not_leave_the_empty_hint_under_a_still_pointer(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let (_runtime, _mock, state, _dir) = signed_in_with_mock();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_ne!(view.state.prefs.planner.team, "Amego");
+        assert!(
+            view.state.teams.iter().any(|team| team.name == "Amego"),
+            "precondition: the mock lists the all-unscheduled Amego team"
+        );
+    });
+    let trigger = cx.debug_bounds("team-trigger").expect("team picker");
+    cx.simulate_mouse_move(trigger.center(), None, Modifiers::default());
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    draw(cx);
+    let amego = cx
+        .debug_bounds("team-option-Amego")
+        .expect("Amego in the team picker");
+    cx.simulate_mouse_move(amego.center(), None, Modifiers::default());
+    cx.simulate_click(amego.center(), Modifiers::default());
+    allow_ado_client_wake(cx);
+    let loaded = |view: &PlannerView| {
+        view.state.prefs.planner.team == "Amego"
+            && !view.is_busy()
+            && !view.state.hierarchy_loading
+            && !view.state.nodes.is_empty()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        draw(cx);
+        if view.update(cx, |view, _| loaded(view)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(loaded(view), "Amego must finish loading from the mock");
+        assert!(
+            view.state
+                .visible_nodes()
+                .iter()
+                .all(|node| node.start_date.is_none() && node.target_date.is_none()),
+            "precondition: Amego is all-unscheduled, so the hint would qualify"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-timeline").is_some(),
+        "the Amego board must paint its timeline"
+    );
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "a Team change must not leave the No scheduled dates chip painted under a pointer resting elsewhere"
+    );
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_none(),
+        "a Team change must not leave a bar hover tooltip on the new board"
+    );
+}
+
+#[gpui_kit::test]
 fn auto_fit_is_disabled_when_nothing_is_scheduled(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -8777,8 +8847,8 @@ fn short_year_parent_has_no_rollup_edge(cx: &mut gpui_kit::TestAppContext) {
     let bar = cx.debug_bounds("gantt-bar-1").expect("Year parent sliver");
     let bar_w = f32::from(bar.size.width);
     assert!(
-        bar_w > 8.0 && bar_w <= 24.5,
-        "Year 14-day parent should be a 16–24px sliver, width={bar_w}"
+        bar_w > 8.0 && bar_w <= YEAR_MIN_BAR_WIDTH + 0.5,
+        "Year 14-day parent should be floored to {YEAR_MIN_BAR_WIDTH}px, width={bar_w}"
     );
     assert!(
         cx.debug_bounds("gantt-summary-edge-1-start").is_none(),
@@ -15124,6 +15194,42 @@ fn period_buttons_move_the_range_title_with_the_view(cx: &mut gpui_kit::TestAppC
             );
             title = next;
         }
+    }
+}
+
+#[gpui_kit::test]
+fn year_min_zoom_cart_bars_paint_readable_and_select_on_click(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = GanttView::next_zoom(0.0, -1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    for (id, title) in [(1002_i64, "Cart"), (1005, "Cart UI")] {
+        let selector: &'static str = Box::leak(format!("gantt-bar-{id}").into_boxed_str());
+        let bar = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("Year {title} must paint"));
+        let (w, h) = (f32::from(bar.size.width), f32::from(bar.size.height));
+        assert!(
+            w + 0.1 >= YEAR_MIN_BAR_WIDTH && w > h * 1.25,
+            "Year {title} must paint a bar, not a dot or circle, {w}x{h}"
+        );
+        cx.simulate_click(bar.center(), Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.state.gantt.selected_id,
+                Some(id),
+                "a click on the Year {title} bar must select it"
+            );
+        });
     }
 }
 
