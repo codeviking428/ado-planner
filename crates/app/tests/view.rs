@@ -13362,6 +13362,60 @@ fn enter_after_create_does_not_open_details(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn opening_create_drops_an_in_progress_rename(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_inline_title(1, window, cx));
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_some(),
+        "precondition: F2 rename is open on row 1"
+    );
+    view.update(cx, |view, cx| view.open_create(Some(1), cx));
+    draw(cx);
+    assert!(cx.debug_bounds("gantt-create-dialog").is_some());
+    assert!(
+        cx.debug_bounds("gantt-inline-title").is_none(),
+        "opening the create dialog must drop the rename so a later Enter cannot commit it"
+    );
+}
+
+#[gpui_kit::test]
+fn finishing_io_does_not_steal_focus_from_the_create_dialog(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.gantt.selected_id = Some(1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| view.open_create(Some(1), cx));
+    draw(cx);
+    view.update(cx, |view, _| {
+        view.state.gantt.selected_id = Some(2);
+        view.after_io_selection_change_for_test(Some(1));
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, _| {
+            assert!(view.create_dialog_open());
+            assert!(
+                !view.planner_keys_are_focused(window),
+                "I/O finishing behind the dialog must leave focus on the title field"
+            );
+        });
+    });
+}
+
+#[gpui_kit::test]
 fn failed_create_returns_focus_to_the_planner(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let (_runtime, mock, mut state, _dir) = signed_in_with_mock();

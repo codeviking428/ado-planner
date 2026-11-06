@@ -766,7 +766,7 @@ impl PlannerView {
     }
 
     fn focus_planner(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.inline_edit.is_none() {
+        if self.inline_edit.is_none() && self.pending_create.is_none() {
             window.focus(&self.form_focus, cx);
         }
     }
@@ -7764,7 +7764,8 @@ impl PlannerView {
     }
 
     pub fn open_create(&mut self, parent_id: Option<i64>, cx: &mut Context<Self>) {
-        self.state.gantt.context_menu = None;
+        self.dismiss_overlays();
+        self.pending_inline_title = None;
         let parents = self.state.new_item_parents(parent_id);
         let parent_id = parents.first().copied().flatten();
         self.pending_create = Some(CreateDraft {
