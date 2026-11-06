@@ -45,8 +45,10 @@ No browser tabs, no CSV round-trips, no second tool that drifts out of date.
 ### Windows & Linux (the usual way)
 
 1. Open the <a href="https://github.com/codeviking428/ado-planner/releases/latest">latest release</a>.
-2. **Windows:** download `ado-planner-*-setup.exe` and run it. It installs per-user — no admin prompt. You'll get a Start Menu and desktop shortcut.
-3. **Linux:** download `ado-planner-*.AppImage`, mark it executable (`chmod +x ado-planner-*.AppImage`), and run it.
+2. **Windows:** download `ado-planner-electron-*-setup.exe` and run it. It installs per-user — no admin prompt. You'll get a Start Menu and desktop shortcut.
+3. **Linux:** download `ado-planner-electron-*.AppImage`, mark it executable (`chmod +x ado-planner-electron-*.AppImage`), and run it.
+
+Each release also carries the native Rust app, which is replacing Electron ([ADR 0001](docs/adr/0001-rewrite-in-rust-gpui.md)): `ado-planner-v*-x86_64-setup.exe`, `ado-planner-v*-x86_64.AppImage`, and plain binaries in `ado-planner-v*-<target>.zip` / `.tar.gz`. `SHA256SUMS` covers every file.
 
 The installed app checks for updates on launch. Yes downloads, installs, and restarts; No snoozes until next time.
 
@@ -101,21 +103,21 @@ Sign-in opens the system browser (MSAL public client, PKCE, loopback). The Sessi
 
 Pick **Org → Project → Team** in the header. The Gantt loads that Team's Work Item Hierarchy.
 
-| You want to…                 | Do this                                                         |
-| ---------------------------- | --------------------------------------------------------------- |
-| Scope to a sprint            | **Iteration** dropdown (or leave **All**)                       |
-| See only your items          | **Assignee → Me** (or **Unassigned**)                           |
-| Hide clutter                 | Check **Hide types** / **Hide states**                          |
-| Move work in time            | Drag a bar; Start + Target save together                        |
-| Change just the finish       | Drag the bar's right edge (left edge changes Start)             |
-| Nudge a day at a time        | Focus a bar, then **←** / **→** (one day at every scale)        |
-| Nudge Target only            | **Shift+←** / **Shift+→**                                       |
-| Nudge Start only             | **Alt+←** / **Alt+→**                                           |
-| Cancel a drag or unsaved Nudge | **Escape**                                                    |
-| Edit title, state, assignee… | Double-click a bar or a Work Item row                           |
-| Jump around the timeline     | **Today**, **‹ ›**, scale (Day → Year), and **+ −** zoom        |
-| Switch light/dark            | **Flavor** — Catppuccin `latte`, `frappe`, `macchiato`, `mocha` |
-| Sign out                     | **Log out** — clears the stored Session / PAT                   |
+| You want to…                   | Do this                                                         |
+| ------------------------------ | --------------------------------------------------------------- |
+| Scope to a sprint              | **Iteration** dropdown (or leave **All**)                       |
+| See only your items            | **Assignee → Me** (or **Unassigned**)                           |
+| Hide clutter                   | Check **Hide types** / **Hide states**                          |
+| Move work in time              | Drag a bar; Start + Target save together                        |
+| Change just the finish         | Drag the bar's right edge (left edge changes Start)             |
+| Nudge a day at a time          | Focus a bar, then **←** / **→** (one day at every scale)        |
+| Nudge Target only              | **Shift+←** / **Shift+→**                                       |
+| Nudge Start only               | **Alt+←** / **Alt+→**                                           |
+| Cancel a drag or unsaved Nudge | **Escape**                                                      |
+| Edit title, state, assignee…   | Double-click a bar or a Work Item row                           |
+| Jump around the timeline       | **Today**, **‹ ›**, scale (Day → Year), and **+ −** zoom        |
+| Switch light/dark              | **Flavor** — Catppuccin `latte`, `frappe`, `macchiato`, `mocha` |
+| Sign out                       | **Log out** — clears the stored Session / PAT                   |
 
 Items without Start/Target date fields can't be dragged (you'll get a toast). They show an `Unscheduled` hint from their iteration dates instead.
 
@@ -151,7 +153,7 @@ Linux e2e without a desktop session: `xvfb-run -a pnpm e2e`.
 
 Every PR (and every push to `master`) runs lint, typecheck, Vitest, `electron-vite` build, and Playwright `_electron` e2e under Xvfb. Those e2e tests drive the packaged Electron app against a loopback ADO mock — they do not need Playwright’s Chromium/Chrome browsers.
 
-Releases are **manual**. When `master` is stable: **Actions → Release → Run workflow**, leave the branch on `master`, and enter the next semver (e.g. `0.2.0`). That tags `v*`, builds Windows NSIS and Linux AppImage, and publishes them. Packaged builds auto-update from that feed (`electron-updater`, `autoDownload: false`).
+Releases go through a release PR: merging it tags `vX.Y.Z` and publishes the Electron and Rust builds to one GitHub Release. Both apps auto-update from that release. See [docs/RELEASING.md](docs/RELEASING.md).
 
 ### Publishing for Mac
 

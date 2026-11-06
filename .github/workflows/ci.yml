@@ -10,9 +10,13 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   # E2E launches Electron via Playwright `_electron`, not Chromium/Firefox/WebKit.
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+  CARGO_TERM_COLOR: always
 
 jobs:
   check:
@@ -72,6 +76,9 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PR runs reuse master's cache but don't overwrite it.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - uses: taiki-e/install-action@v2
         with:
@@ -85,15 +92,55 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Tests
         if: runner.os != 'Linux'
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --locked
 
       - name: Tests
         if: runner.os == 'Linux'
-        run: xvfb-run -a cargo nextest run --workspace
+        run: xvfb-run -a cargo nextest run --workspace --locked
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Version flag
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="ado-planner $(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "ado-planner") | .version')"
+          got="$(./target/debug/ado-planner --version | tr -d '\r')"
+          echo "$got"
+          [ "$got" = "$want" ]
 
       - name: Deny
         run: cargo deny check
+
+  workflows:
+    name: Workflows and release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: shellcheck,shfmt
+
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          bash <(curl -sSfL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
+          ./actionlint -color
+
+      - name: shellcheck and shfmt
+        run: |
+          shellcheck .github/scripts/*.sh
+          shfmt -d .github/scripts/*.sh
+
+      - name: Updater feed tests
+        run: python3 .github/scripts/test_write_rust_latest_json.py
+
+      - name: Versions agree
+        run: .github/scripts/release-version.sh check

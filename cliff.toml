@@ -1,0 +1,54 @@
+# git-cliff picks the next SemVer and renders CHANGELOG.md for the release PR.
+# See docs/RELEASING.md.
+
+[changelog]
+# CHANGELOG.md owns its header; release-version.sh inserts each section below it.
+header = ""
+body = """
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}](https://github.com/codeviking428/ado-planner/releases/tag/{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## Unreleased
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
+{% if commit.breaking %}[**breaking**] {% endif %}\
+{{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+postprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/codeviking428/ado-planner/pull/${1}))" },
+]
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+# Keeps `refactor!:` and `BREAKING CHANGE:` commits even when their type is skipped below.
+protect_breaking_commits = true
+filter_commits = false
+# Only plain vX.Y.Z tags mark releases.
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+topo_order = false
+sort_commits = "oldest"
+# Only feat, fix, perf, and breaking commits produce a release. Every other type
+# is skipped, so a PR of docs or CI changes alone opens no release PR.
+commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = ".*", group = "<!-- 3 -->Other breaking changes", skip = true },
+]
+
+[bump]
+# Bump minor for feat and major for breaking changes even below 1.0.0,
+# instead of Cargo's 0.x convention.
+features_always_bump_minor = true
+breaking_always_bump_major = true
+initial_tag = "v0.1.0"

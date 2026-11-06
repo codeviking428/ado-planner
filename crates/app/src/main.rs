@@ -2,6 +2,23 @@ use ado_planner::paths::AppPaths;
 use ado_planner::ui::start_app;
 
 fn main() {
+    if let Some(arg) = std::env::args().nth(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("{}", ado_planner::version_line());
+                return;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "{}\n\nUsage: ado-planner [--version | --help]",
+                    ado_planner::version_line()
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

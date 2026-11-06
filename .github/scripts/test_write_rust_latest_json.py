@@ -64,7 +64,7 @@ class CollectTests(unittest.TestCase):
             tarball.with_name(tarball.name + ".sig").write_text("sig-tar\n", encoding="utf-8")
             dmg.with_name(dmg.name + ".sig").write_text("sig-dmg\n", encoding="utf-8")
 
-            platforms = collect(dist, "codeviking428/ado-planner", "rust-v0.2.0")
+            platforms = collect(dist, "codeviking428/ado-planner", "v0.2.0")
 
         self.assertEqual(set(platforms), {"darwin-aarch64", "macos-aarch64"})
         for entry in platforms.values():
@@ -85,7 +85,7 @@ class CollectTests(unittest.TestCase):
                 path.write_bytes(b"bin")
                 path.with_name(name + ".sig").write_text(f"sig-{name}", encoding="utf-8")
 
-            platforms = collect(dist, "org/repo", "rust-v1.0.0")
+            platforms = collect(dist, "org/repo", "v1.0.0")
 
         self.assertEqual(
             set(platforms),
