@@ -1822,6 +1822,123 @@ fn painted_parent_summary_bar_is_shorter_than_a_leaf_and_shows_fill(
     );
 }
 
+fn assert_no_dates_pill_unclipped(cx: &mut VisualTestContext, id: i64, when: &str) {
+    let [pill, label, band] = match id {
+        1 => ["gantt-bar-1", "gantt-no-dates-1", "gantt-row-band-1"],
+        2 => ["gantt-bar-2", "gantt-no-dates-2", "gantt-row-band-2"],
+        21 => ["gantt-bar-21", "gantt-no-dates-21", "gantt-row-band-21"],
+        22 => ["gantt-bar-22", "gantt-no-dates-22", "gantt-row-band-22"],
+        _ => unreachable!("no selectors for #{id}"),
+    };
+    let pill = cx
+        .debug_bounds(pill)
+        .unwrap_or_else(|| panic!("{when}: No dates pill #{id} should paint"));
+    let label = cx
+        .debug_bounds(label)
+        .unwrap_or_else(|| panic!("{when}: No dates label #{id} should paint"));
+    let band = cx
+        .debug_bounds(band)
+        .unwrap_or_else(|| panic!("{when}: row band #{id} should paint"));
+    let (pill_top, pill_bottom) = (
+        f32::from(pill.origin.y),
+        f32::from(pill.origin.y + pill.size.height),
+    );
+    let (label_top, label_bottom) = (
+        f32::from(label.origin.y),
+        f32::from(label.origin.y + label.size.height),
+    );
+    let (band_top, band_bottom) = (
+        f32::from(band.origin.y),
+        f32::from(band.origin.y + band.size.height),
+    );
+    assert!(
+        label_top >= pill_top - 0.5 && label_bottom <= pill_bottom + 0.5,
+        "{when}: #{id} label {label_top}..{label_bottom} must fit inside the pill {pill_top}..{pill_bottom}"
+    );
+    assert!(
+        pill_top >= band_top - 0.5 && pill_bottom <= band_bottom + 0.5,
+        "{when}: #{id} pill {pill_top}..{pill_bottom} must fit inside its row {band_top}..{band_bottom}"
+    );
+    let label_mid = (label_top + label_bottom) / 2.0;
+    let pill_mid = (pill_top + pill_bottom) / 2.0;
+    let band_mid = (band_top + band_bottom) / 2.0;
+    assert!(
+        (label_mid - pill_mid).abs() <= 1.0,
+        "{when}: #{id} label center {label_mid} must sit on the pill center {pill_mid}"
+    );
+    assert!(
+        (pill_mid - band_mid).abs() <= 1.0,
+        "{when}: #{id} pill center {pill_mid} must sit on the row center {band_mid}"
+    );
+}
+
+#[gpui_kit::test]
+fn parent_no_dates_pill_is_not_clipped(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_hierarchy(40);
+    for node in state.nodes.iter_mut() {
+        if matches!(node.id, 1 | 2 | 21 | 22) {
+            node.has_date_fields = false;
+            node.start_date = None;
+            node.target_date = None;
+        }
+    }
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    view.update(cx, |view, _| {
+        let bars = view.state.gantt.layout_bars(
+            &view.state.nodes,
+            &view.state.gantt.flatten(&view.state.nodes),
+            &[],
+            720.0,
+        );
+        let parent = bars.iter().find(|bar| bar.id == 1).expect("parent pill");
+        let child = bars.iter().find(|bar| bar.id == 2).expect("child pill");
+        assert_eq!(parent.kind, GanttBarKind::NoFields);
+        assert_eq!(
+            parent.paint_h(),
+            child.paint_h(),
+            "parent and child No dates pills must share one height"
+        );
+    });
+    assert_no_dates_pill_unclipped(cx, 1, "default");
+    assert_no_dates_pill_unclipped(cx, 2, "default");
+
+    view.update(cx, |view, cx| {
+        view.state.gantt.toggle_expand(1);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-bar-2").is_none(),
+        "collapse hides #2"
+    );
+    assert_no_dates_pill_unclipped(cx, 1, "collapsed");
+    assert_no_dates_pill_unclipped(cx, 21, "collapsed");
+
+    view.update(cx, |view, cx| {
+        view.state.gantt.toggle_expand(1);
+        view.state.gantt.scroll_y = 19.5 * ROW_HEIGHT;
+        cx.notify();
+    });
+    draw(cx);
+    assert_no_dates_pill_unclipped(cx, 21, "scrolled");
+    assert_no_dates_pill_unclipped(cx, 22, "scrolled");
+
+    for scale in GanttScale::ALL {
+        view.update(cx, |view, cx| {
+            view.state.gantt.scroll_y = 0.0;
+            view.state.gantt.set_scale(scale);
+            cx.notify();
+        });
+        draw(cx);
+        assert_no_dates_pill_unclipped(cx, 1, &format!("{scale:?}"));
+        assert_no_dates_pill_unclipped(cx, 2, &format!("{scale:?}"));
+    }
+}
+
 #[gpui_kit::test]
 fn painted_dependency_arrow_joins_predecessor_to_successor(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
@@ -9881,6 +9998,129 @@ fn two_to_four_px_inside_the_end_edge_resizes(cx: &mut gpui_kit::TestAppContext)
 }
 
 #[gpui_kit::test]
+fn unscheduled_parent_marker_shows_one_tooltip(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let mut nodes = mock_fixture_nodes();
+    let template = nodes[0].clone();
+    let node = |id: i64, parent: Option<i64>, ty: &str, title: &str, dated: bool| WorkItemNode {
+        id,
+        parent_id: parent,
+        work_item_type: ty.into(),
+        title: title.into(),
+        start_date: dated.then(|| "2026-07-08T00:00:00Z".into()),
+        target_date: dated.then(|| "2026-07-24T00:00:00Z".into()),
+        ..template.clone()
+    };
+    nodes.extend([
+        node(2001, None, "Epic", "Unscheduled parent", false),
+        node(2002, Some(2001), "Task", "Unscheduled child", false),
+        node(2003, Some(2001), "User Story", "Scheduled child", true),
+    ]);
+    state.nodes = nodes;
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = FITTED_MONTH_ZOOM;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        let parent = bars.iter().find(|bar| bar.id == 2001).expect("parent");
+        assert!(
+            parent.summary && parent.marker,
+            "an undated parent must paint as a summary gutter marker"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-bar-progress-2001").is_none(),
+        "the parent marker must not host the rollup progress tooltip beside its hover tooltip"
+    );
+    assert!(
+        cx.debug_bounds("gantt-bar-progress-1001").is_some(),
+        "scheduled parents keep the rollup progress fill and its tooltip"
+    );
+
+    let body = cx
+        .debug_bounds("gantt-timeline-body")
+        .expect("timeline body");
+    let body_top = f32::from(body.origin.y);
+    for (id, selector, title) in [
+        (2001, "gantt-bar-2001", "Unscheduled parent"),
+        (2002, "gantt-bar-2002", "Unscheduled child"),
+    ] {
+        let marker = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("marker {id}"));
+        cx.simulate_mouse_move(marker.center(), None, Modifiers::default());
+        cx.background_executor
+            .advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.state.gantt.bar_hovered_id, Some(id));
+            let rows = view.state.gantt.flatten(&view.state.nodes);
+            let bars = view
+                .state
+                .gantt
+                .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+            let bar = bars.iter().find(|bar| bar.id == id).expect("marker bar");
+            let tip = bar_hover_tooltip(bar, &view.state.nodes);
+            assert!(
+                tip.contains(title),
+                "#{id} hover copy must name the item, got {tip:?}"
+            );
+        });
+        let tip = cx
+            .debug_bounds("gantt-hover-tooltip")
+            .unwrap_or_else(|| panic!("#{id} must show its item tooltip"));
+        assert!(
+            f32::from(tip.origin.y) >= body_top,
+            "#{id} tooltip must sit below the timeline header, tip_top={} body_top={body_top}",
+            f32::from(tip.origin.y)
+        );
+    }
+
+    let scheduled = cx
+        .debug_bounds("gantt-bar-2003")
+        .expect("scheduled child bar");
+    cx.simulate_mouse_move(scheduled.center(), None, Modifiers::default());
+    cx.background_executor
+        .advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.gantt.bar_hovered_id, Some(2003));
+    });
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_some(),
+        "scheduled bars keep their item tooltip"
+    );
+
+    cx.simulate_mouse_move(
+        point(
+            body.origin.x + px(4.),
+            body.origin.y + body.size.height - px(4.),
+        ),
+        None,
+        Modifiers::default(),
+    );
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_none(),
+        "leaving the marker must dismiss the tooltip"
+    );
+}
+
+#[gpui_kit::test]
 fn milestone_diamond_shows_a_hover_tooltip(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -15434,5 +15674,67 @@ fn period_buttons_pan_one_step_on_every_scale(cx: &mut gpui_kit::TestAppContext)
                 );
             }
         }
+    }
+}
+
+fn assert_empty_card_inside_planner(cx: &mut VisualTestContext, size: (f32, f32), step: &str) {
+    let card = cx
+        .debug_bounds("empty-gantt-card")
+        .unwrap_or_else(|| panic!("{step}: empty team must show the card"));
+    let body = cx.debug_bounds("gantt-body").expect("gantt body");
+    let (card_l, card_t) = (f32::from(card.origin.x), f32::from(card.origin.y));
+    let card_r = card_l + f32::from(card.size.width);
+    let card_b = card_t + f32::from(card.size.height);
+    let body_l = f32::from(body.origin.x);
+    let body_t = f32::from(body.origin.y);
+    let right = (body_l + f32::from(body.size.width)).min(size.0);
+    let bottom = (body_t + f32::from(body.size.height)).min(size.1);
+    assert!(
+        card_l >= body_l && card_t >= body_t && card_r <= right && card_b <= bottom,
+        "{step} at {}x{}: card {card_l},{card_t}..{card_r},{card_b} must sit inside the visible planner body {body_l},{body_t}..{right},{bottom}",
+        size.0,
+        size.1,
+    );
+}
+
+#[gpui_kit::test]
+fn empty_team_card_keeps_every_edge_inside_the_planner(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    let populated = state.nodes.clone();
+    state.nodes.clear();
+    state.prefs.planner.team = "Customer Experience Platform Reliability".into();
+    state.gantt.origin = jiff::Zoned::now().date();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    let sizes = [(1280., 800.), (900., 600.), (700., 500.), (1920., 1080.)];
+    for size in sizes {
+        cx.simulate_resize(gpui_kit::Size {
+            width: px(size.0),
+            height: px(size.1),
+        });
+        draw(cx);
+        assert_empty_card_inside_planner(cx, size, "resize");
+    }
+    for size in sizes {
+        cx.simulate_resize(gpui_kit::Size {
+            width: px(size.0),
+            height: px(size.1),
+        });
+        view.update(cx, |view, _| {
+            view.state.nodes = populated.clone();
+            view.state.prefs.planner.team = "Platform".into();
+        });
+        draw(cx);
+        assert!(
+            cx.debug_bounds("empty-gantt-card").is_none(),
+            "a populated team must not show the empty card"
+        );
+        view.update(cx, |view, _| {
+            view.state.nodes.clear();
+            view.state.prefs.planner.team = "Customer Experience Platform Reliability".into();
+        });
+        draw(cx);
+        assert_empty_card_inside_planner(cx, size, "populated -> empty");
     }
 }
