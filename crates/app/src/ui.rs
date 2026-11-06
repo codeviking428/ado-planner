@@ -165,6 +165,9 @@ pub struct PlannerView {
     empty_timeline_hint_dismissed: bool,
     form_loading: Option<(i64, String)>,
     io_busy: bool,
+    /// Sign-in and the initial load run as one spawn; the card stays up
+    /// until it finishes, so it shows its own busy state.
+    sign_in_busy: bool,
     saving_shown_at: Option<Instant>,
     saving_hold_gen: u64,
     /// Undo/Redo should not leave the 400ms Saving… hold in the header.
@@ -495,6 +498,7 @@ impl PlannerView {
             empty_timeline_hint_dismissed: false,
             form_loading: None,
             io_busy: false,
+            sign_in_busy: false,
             saving_shown_at: None,
             saving_hold_gen: 0,
             skip_saving_hold: false,
@@ -1031,6 +1035,7 @@ impl PlannerView {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
                 this.io_busy = false;
+                this.sign_in_busy = false;
                 if saving {
                     this.finish_or_hold_saving_status(cx);
                 }
@@ -1936,12 +1941,42 @@ impl PlannerView {
     }
 
     fn submit_pat(&mut self, cx: &mut Context<Self>) {
+        if self.sign_in_busy {
+            return;
+        }
         self.state.sign_in_org = self.org_input.read(cx).value().to_string();
         self.state.sign_in_pat = self.pat_input.read(cx).value().to_string();
-        self.spawn_state(cx, |mut state| async move {
+        self.sign_in_busy = self.spawn_state(cx, |mut state| async move {
             let result = state.login_pat().await;
             (state, result)
         });
+    }
+
+    fn submit_entra(&mut self, cx: &mut Context<Self>) {
+        if self.sign_in_busy {
+            return;
+        }
+        self.sign_in_busy = self.spawn_state(cx, |mut state| async move {
+            let result = state.login_entra().await;
+            (state, result)
+        });
+    }
+
+    pub fn is_signing_in(&self) -> bool {
+        self.sign_in_busy
+    }
+
+    pub fn set_sign_in_for_test(
+        &mut self,
+        org: &str,
+        pat: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.org_input
+            .update(cx, |input, cx| input.set_value(org.to_string(), window, cx));
+        self.pat_input
+            .update(cx, |input, cx| input.set_value(pat.to_string(), window, cx));
     }
 
     fn render_error_banner(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -2497,6 +2532,7 @@ impl PlannerView {
 
     fn render_sign_in(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let pat_mode = self.state.session_info.auth_mode == AuthMode::Pat;
+        let busy = self.sign_in_busy;
         v_flex()
             .id("sign-in-shell")
             .debug_selector(|| "sign-in-shell".into())
@@ -2537,25 +2573,56 @@ impl PlannerView {
                             v_flex()
                                 .gap_3()
                                 .child(Label::new("Organization"))
-                                .child(Input::new(&self.org_input).id("organization-input"))
-                                .child(Label::new("Personal access token"))
-                                .child(Input::new(&self.pat_input).id("pat-input"))
                                 .child(
-                                    Button::new("sign-in").primary().label("Continue").on_click(
-                                        cx.listener(|this, _, _, cx| this.submit_pat(cx)),
-                                    ),
+                                    Input::new(&self.org_input)
+                                        .id("organization-input")
+                                        .disabled(busy),
+                                )
+                                .child(Label::new("Personal access token"))
+                                .child(Input::new(&self.pat_input).id("pat-input").disabled(busy))
+                                .child(
+                                    div()
+                                        .id("sign-in-button")
+                                        .debug_selector(|| "sign-in-button".into())
+                                        .child(
+                                            Button::new("sign-in")
+                                                .w_full()
+                                                .primary()
+                                                .label("Continue")
+                                                .loading(busy)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.submit_pat(cx)
+                                                })),
+                                        ),
                                 ),
                         )
                     })
                     .when(!pat_mode, |el| {
-                        el.child(Button::new("sign-in").primary().label("Sign in").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.spawn_state(cx, |mut state| async move {
-                                    let result = state.login_entra().await;
-                                    (state, result)
-                                });
-                            }),
-                        ))
+                        el.child(
+                            div()
+                                .id("sign-in-button")
+                                .debug_selector(|| "sign-in-button".into())
+                                .child(
+                                    Button::new("sign-in")
+                                        .w_full()
+                                        .primary()
+                                        .label("Sign in")
+                                        .loading(busy)
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.submit_entra(cx)),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(busy, |el| {
+                        el.child(
+                            div()
+                                .id("sign-in-status")
+                                .debug_selector(|| "sign-in-status".into())
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Signing in and loading projects…"),
+                        )
                     }),
             )
     }

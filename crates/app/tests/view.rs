@@ -1513,6 +1513,146 @@ fn sign_in_shell_still_renders(cx: &mut gpui_kit::TestAppContext) {
     draw(cx);
 }
 
+fn signed_out_with_mock() -> (
+    tokio::runtime::Runtime,
+    ado_mock::AdoMock,
+    PlannerState,
+    tempfile::TempDir,
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("ado-mock-sign-in")
+        .build()
+        .expect("ado-mock sign-in runtime");
+    let (mock, state, dir) = runtime.block_on(async {
+        let mock = ado_mock::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(dir.path().to_path_buf());
+        let store = EncryptedStore::new(Box::new(MemoryStore::new(true)), Some([3u8; 32]));
+        let session = PlannerSession::pat(store).with_bases(&mock.url, &mock.url);
+        let mut state = PlannerState::new(
+            paths,
+            session,
+            Some(mock.url.clone()),
+            Some(mock.url.clone()),
+        );
+        state.session_loading = false;
+        (mock, state, dir)
+    });
+    (runtime, mock, state, dir)
+}
+
+const SIGN_IN_PING: &str = "/contoso/_apis/projects";
+
+fn click_continue(cx: &mut VisualTestContext) {
+    let button = cx.debug_bounds("sign-in-button").expect("Continue");
+    cx.simulate_click(button.center(), Modifiers::default());
+    draw(cx);
+}
+
+fn wait_until(
+    cx: &mut VisualTestContext,
+    secs: u64,
+    mut done: impl FnMut(&mut VisualTestContext) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        if done(cx) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn start_sign_in(
+    cx: &mut gpui_kit::TestAppContext,
+    state: PlannerState,
+) -> (Entity<PlannerView>, &mut VisualTestContext) {
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update_in(cx, |view, window, cx| {
+        view.set_sign_in_for_test(
+            "https://dev.azure.com/contoso",
+            "pat-secret-value",
+            window,
+            cx,
+        );
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("sign-in-status").is_none(),
+        "no busy text before Continue"
+    );
+    click_continue(cx);
+    assert!(
+        cx.debug_bounds("sign-in-status").is_some(),
+        "Continue must show busy text in the same frame"
+    );
+    view.update(cx, |view, _| assert!(view.is_signing_in()));
+    allow_ado_client_wake(cx);
+    (view, cx)
+}
+
+#[gpui_kit::test]
+fn continue_stays_busy_until_a_delayed_sign_in_loads(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (_runtime, mock, state, _dir) = signed_out_with_mock();
+    mock.delay_next(SIGN_IN_PING, 1_500);
+    let (view, cx) = start_sign_in(cx, state);
+    wait_until(cx, 4, |_| mock.request_count("GET", SIGN_IN_PING) >= 1);
+    click_continue(cx);
+    click_continue(cx);
+    std::thread::sleep(Duration::from_millis(150));
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(
+        mock.request_count("GET", SIGN_IN_PING),
+        1,
+        "clicking Continue while signing in must not send another request"
+    );
+    assert!(
+        cx.debug_bounds("sign-in-status").is_some(),
+        "busy text must stay up while the PAT check is in flight"
+    );
+    wait_until(cx, 8, |cx| view.update(cx, |view, _| !view.is_signing_in()));
+    view.update(cx, |view, _| {
+        assert!(!view.is_signing_in(), "busy state must clear on success");
+        assert!(view.state.session_info.signed_in);
+        assert!(!view.state.projects.is_empty(), "initial load must finish");
+    });
+    assert!(cx.debug_bounds("sign-in-status").is_none());
+    assert!(cx.debug_bounds("sign-in-shell").is_none());
+    assert!(mock.mutating_writes().is_empty(), "sign-in must not write");
+}
+
+#[gpui_kit::test]
+fn continue_clears_busy_after_a_delayed_failure_and_allows_retry(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let (_runtime, mock, state, _dir) = signed_out_with_mock();
+    mock.fail_next_after(SIGN_IN_PING, 800, 401, "Unauthorized");
+    let (view, cx) = start_sign_in(cx, state);
+    wait_until(cx, 6, |cx| view.update(cx, |view, _| !view.is_signing_in()));
+    view.update(cx, |view, _| {
+        assert!(!view.is_signing_in(), "busy state must clear on failure");
+        assert!(!view.state.session_info.signed_in);
+    });
+    assert!(cx.debug_bounds("sign-in-status").is_none());
+    assert!(cx.debug_bounds("sign-in-shell").is_some());
+    click_continue(cx);
+    assert!(
+        cx.debug_bounds("sign-in-status").is_some(),
+        "retry must show the busy state again"
+    );
+    wait_until(cx, 8, |cx| view.update(cx, |view, _| !view.is_signing_in()));
+    view.update(cx, |view, _| {
+        assert!(view.state.session_info.signed_in, "retry must sign in");
+    });
+    assert!(mock.mutating_writes().is_empty(), "sign-in must not write");
+}
+
 #[gpui_kit::test]
 fn escape_closes_a_freshly_opened_form_without_a_focused_field(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
