@@ -3476,11 +3476,7 @@ impl PlannerView {
                             .tooltip("Pan earlier")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toolbar_more_open = false;
-                                this.animate_gantt(cx, |gantt| {
-                                    gantt.retarget_year_gutter(|gantt| {
-                                        gantt.step_period(-1);
-                                    });
-                                });
+                                this.animate_gantt(cx, |gantt| gantt.step_period(-1));
                                 cx.notify();
                             })),
                     ),
@@ -3497,11 +3493,7 @@ impl PlannerView {
                             .tooltip("Pan later")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toolbar_more_open = false;
-                                this.animate_gantt(cx, |gantt| {
-                                    gantt.retarget_year_gutter(|gantt| {
-                                        gantt.step_period(1);
-                                    });
-                                });
+                                this.animate_gantt(cx, |gantt| gantt.step_period(1));
                                 cx.notify();
                             })),
                     ),

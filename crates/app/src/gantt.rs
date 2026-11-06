@@ -1218,6 +1218,8 @@ impl GanttView {
 
     /// ‹ / › pan, as days. A quarter of the visible span at the current
     /// scale and zoom so Day/Week/Month/Quarter/Year move the same fraction.
+    /// Callers must not wrap the pan in [`retarget_year_gutter`]: the
+    /// leading-column and gutter snaps would add up to a period to the step.
     pub fn pan_step_days(&self) -> i32 {
         let ppd = self.scale.pixels_per_day(self.zoom).max(0.4);
         let viewport_days = (self.timeline_width.max(MIN_TIMELINE_WIDTH) / ppd).max(1.0);
