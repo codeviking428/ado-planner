@@ -1696,6 +1696,54 @@ fn mock_fixture_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext)
 }
 
 #[gpui_kit::test]
+fn toolbar_week_to_day_keeps_the_range_with_an_off_screen_selection(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 10, 5).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = Some(1005);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let (centre, range) = view.update(cx, |view, _| {
+        let gantt = &view.state.gantt;
+        let cart_ui = Date::new(2026, 7, 21).unwrap();
+        assert!(
+            gantt.x_for_date(cart_ui) < 0.0,
+            "precondition: the Cart UI selection must start off-screen, range={}",
+            gantt.viewport_range_title()
+        );
+        (gantt.viewport_center_date(), gantt.viewport_range_title())
+    });
+    for (scale, selector) in [
+        (GanttScale::Week, "gantt-scale-Week"),
+        (GanttScale::Day, "gantt-scale-Day"),
+    ] {
+        let button = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(button.center(), Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            let gantt = &view.state.gantt;
+            assert_eq!(gantt.scale, scale);
+            assert_eq!(
+                gantt.viewport_center_date(),
+                centre,
+                "{scale:?} must keep the visible range ({range}), not jump to the selection, got {}",
+                gantt.viewport_range_title()
+            );
+        });
+    }
+}
+
+#[gpui_kit::test]
 fn mock_fixture_month_painted_verticals_stay_offset(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
