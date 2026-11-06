@@ -161,7 +161,8 @@ pub struct PlannerView {
     dates_anchor: Option<(f32, f32)>,
     banner_dismissed: bool,
     /// Click/scroll/scale dismissed the "No scheduled dates" chip. Reset
-    /// when switching teams so a new empty backlog shows the hint again.
+    /// when switching teams so a new empty backlog shows the hint again,
+    /// unless a known pointer would leave it stranded.
     empty_timeline_hint_dismissed: bool,
     form_loading: Option<(i64, String)>,
     io_busy: bool,
@@ -1317,6 +1318,22 @@ impl PlannerView {
     fn dismiss_empty_timeline_hint(&mut self) {
         self.empty_timeline_hint_dismissed = true;
         self.empty_hint_bounds.borrow_mut().take();
+    }
+
+    /// Scope and filter changes swap the rows under a still pointer, which
+    /// usually rests on a picker. Drop hover tooltips so none stays on a row
+    /// that moved or left; the next pointer move re-hits the new rows. With
+    /// a known pointer the empty-timeline chip is dismissed too: a move is
+    /// the only other thing that clears it, so it would wait under a
+    /// cursor that is elsewhere.
+    fn drop_tooltips_for_reload(&mut self, cx: &mut Context<Self>) {
+        self.state.gantt.clear_hover();
+        self.pinned_tooltip_bounds.borrow_mut().take();
+        self.hover_bar_zone = None;
+        if self.last_pointer_window.is_some() {
+            self.dismiss_empty_timeline_hint();
+        }
+        cx.notify();
     }
 
     /// Any pointer move outside the chip rect dismisses it. Hover-leave is
@@ -2842,6 +2859,7 @@ impl PlannerView {
         self.loading_shown_at = Some(std::time::Instant::now());
         self.banner_dismissed = false;
         self.empty_timeline_hint_dismissed = false;
+        self.drop_tooltips_for_reload(cx);
         self.spawn_state(cx, move |mut state| async move {
             let result = state.set_team(team).await;
             (state, result)
@@ -2850,6 +2868,9 @@ impl PlannerView {
 
     fn choose_scope(&mut self, id: &str, value: String, cx: &mut Context<Self>) {
         self.open_scope = None;
+        if id != "team" {
+            self.drop_tooltips_for_reload(cx);
+        }
         match id {
             "org" => {
                 self.spawn_state(cx, move |mut state| async move {
@@ -2993,7 +3014,7 @@ impl PlannerView {
                             "state-filter" => this.state.show_all_states(),
                             _ => this.state.show_all_roots(),
                         }
-                        cx.notify();
+                        this.drop_tooltips_for_reload(cx);
                     })),
             )
             .child(
@@ -3038,7 +3059,7 @@ impl PlannerView {
                             "state-filter" => this.state.toggle_hidden_state(&item_click),
                             _ => this.state.toggle_hidden_root(&item_click),
                         }
-                        cx.notify();
+                        this.drop_tooltips_for_reload(cx);
                     }))
             }))
     }
@@ -3315,7 +3336,7 @@ impl PlannerView {
                                     this.state.show_all_states();
                                     this.state.show_all_roots();
                                     this.state.set_assignee("anyone".into());
-                                    cx.notify();
+                                    this.drop_tooltips_for_reload(cx);
                                 })),
                         ),
                 )
@@ -7899,14 +7920,14 @@ impl PlannerView {
                         this.state.toggle_hidden_type(ty);
                     }
                     this.state.gantt.context_menu = None;
-                    cx.notify();
+                    this.drop_tooltips_for_reload(cx);
                 }))
                 .child(self.menu_item("Hide this state", cx, move |this, cx| {
                     if let Some(state) = &state {
                         this.state.toggle_hidden_state(state);
                     }
                     this.state.gantt.context_menu = None;
-                    cx.notify();
+                    this.drop_tooltips_for_reload(cx);
                 }))
             })
             .into_any_element()

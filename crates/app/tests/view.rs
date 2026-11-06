@@ -1293,6 +1293,76 @@ fn unscheduled_empty_hint_dismisses_when_the_team_picker_opens(cx: &mut gpui_kit
 }
 
 #[gpui_kit::test]
+fn team_switch_does_not_leave_the_empty_hint_under_a_still_pointer(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let (_runtime, _mock, state, _dir) = signed_in_with_mock();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_ne!(view.state.prefs.planner.team, "Amego");
+        assert!(
+            view.state.teams.iter().any(|team| team.name == "Amego"),
+            "precondition: the mock lists the all-unscheduled Amego team"
+        );
+    });
+    let trigger = cx.debug_bounds("team-trigger").expect("team picker");
+    cx.simulate_mouse_move(trigger.center(), None, Modifiers::default());
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    draw(cx);
+    let amego = cx
+        .debug_bounds("team-option-Amego")
+        .expect("Amego in the team picker");
+    cx.simulate_mouse_move(amego.center(), None, Modifiers::default());
+    cx.simulate_click(amego.center(), Modifiers::default());
+    allow_ado_client_wake(cx);
+    let loaded = |view: &PlannerView| {
+        view.state.prefs.planner.team == "Amego"
+            && !view.is_busy()
+            && !view.state.hierarchy_loading
+            && !view.state.nodes.is_empty()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        draw(cx);
+        if view.update(cx, |view, _| loaded(view)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert!(loaded(view), "Amego must finish loading from the mock");
+        assert!(
+            view.state
+                .visible_nodes()
+                .iter()
+                .all(|node| node.start_date.is_none() && node.target_date.is_none()),
+            "precondition: Amego is all-unscheduled, so the hint would qualify"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-timeline").is_some(),
+        "the Amego board must paint its timeline"
+    );
+    assert!(
+        cx.debug_bounds("unscheduled-empty-hint").is_none(),
+        "a Team change must not leave the No scheduled dates chip painted under a pointer resting elsewhere"
+    );
+    assert!(
+        cx.debug_bounds("gantt-hover-tooltip").is_none(),
+        "a Team change must not leave a bar hover tooltip on the new board"
+    );
+}
+
+#[gpui_kit::test]
 fn auto_fit_is_disabled_when_nothing_is_scheduled(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
