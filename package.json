@@ -1,6 +1,6 @@
 {
   "name": "ado-planner",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Monday-lite Azure DevOps Team Hierarchy Gantt",
   "main": "./out/main/index.js",
   "bin": {
