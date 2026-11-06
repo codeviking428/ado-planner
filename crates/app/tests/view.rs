@@ -8758,8 +8758,8 @@ fn short_year_parent_has_no_rollup_edge(cx: &mut gpui_kit::TestAppContext) {
     let bar = cx.debug_bounds("gantt-bar-1").expect("Year parent sliver");
     let bar_w = f32::from(bar.size.width);
     assert!(
-        bar_w > 8.0 && bar_w <= 24.5,
-        "Year 14-day parent should be a 16–24px sliver, width={bar_w}"
+        bar_w > 8.0 && bar_w <= YEAR_MIN_BAR_WIDTH + 0.5,
+        "Year 14-day parent should be floored to {YEAR_MIN_BAR_WIDTH}px, width={bar_w}"
     );
     assert!(
         cx.debug_bounds("gantt-summary-edge-1-start").is_none(),
@@ -15105,6 +15105,42 @@ fn period_buttons_move_the_range_title_with_the_view(cx: &mut gpui_kit::TestAppC
             );
             title = next;
         }
+    }
+}
+
+#[gpui_kit::test]
+fn year_min_zoom_cart_bars_paint_readable_and_select_on_click(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.scale = GanttScale::Year;
+    state.gantt.zoom = GanttView::next_zoom(0.0, -1);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    for (id, title) in [(1002_i64, "Cart"), (1005, "Cart UI")] {
+        let selector: &'static str = Box::leak(format!("gantt-bar-{id}").into_boxed_str());
+        let bar = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("Year {title} must paint"));
+        let (w, h) = (f32::from(bar.size.width), f32::from(bar.size.height));
+        assert!(
+            w + 0.1 >= YEAR_MIN_BAR_WIDTH && w > h * 1.25,
+            "Year {title} must paint a bar, not a dot or circle, {w}x{h}"
+        );
+        cx.simulate_click(bar.center(), Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.state.gantt.selected_id,
+                Some(id),
+                "a click on the Year {title} bar must select it"
+            );
+        });
     }
 }
 
