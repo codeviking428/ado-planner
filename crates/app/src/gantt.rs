@@ -474,9 +474,11 @@ impl BarLayout {
             MILESTONE_SIZE
         } else if self.summary {
             // Year start-only slivers are floored to `YEAR_MIN_BAR_WIDTH`.
-            // Thicken those, not a floored Persist cart, so connector lanes
-            // still have a gap under the 14px summary body.
-            if self.open_ended && self.width <= YEAR_MIN_BAR_WIDTH + 0.5 {
+            // Thicken those and ≤24px start-only slivers on any scale, not a
+            // floored Persist cart or a 25–40px Month parent, so connector
+            // lanes still have a gap under the 14px summary body.
+            let sliver = self.width <= HANDLE_WIDTH * 2.0 + LINK_HANDLE_INSET + 2.5;
+            if self.open_ended && (self.floored || sliver) {
                 YEAR_MIN_BAR_H.max(SUMMARY_BAR_H)
             } else {
                 SUMMARY_BAR_H
@@ -6364,6 +6366,35 @@ mod tests {
             !epic.floored && epic.width > YEAR_MIN_BAR_WIDTH,
             "a Year bar wider than the floor keeps its date width, {}",
             epic.width
+        );
+    }
+
+    #[test]
+    fn only_slivers_and_floored_start_only_parents_paint_thicker() {
+        let parent = |width: f32, floored: bool| BarLayout {
+            id: 1,
+            kind: GanttBarKind::Scheduled,
+            x: 100.0,
+            width,
+            y: 0.0,
+            summary: true,
+            milestone: false,
+            label: String::new(),
+            title: "Cart".into(),
+            color: 0,
+            progress: None,
+            predecessors: Vec::new(),
+            marker: false,
+            open_ended: true,
+            overflow_badge: false,
+            floored,
+        };
+        assert_eq!(parent(YEAR_MIN_BAR_WIDTH, true).paint_h(), YEAR_MIN_BAR_H);
+        assert_eq!(parent(24.0, false).paint_h(), YEAR_MIN_BAR_H);
+        assert_eq!(
+            parent(32.0, false).paint_h(),
+            SUMMARY_BAR_H,
+            "a 32px start-only parent off Year keeps the 14px summary body"
         );
     }
 
