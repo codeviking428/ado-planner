@@ -1938,11 +1938,13 @@ impl PlannerView {
     fn submit_pat(&mut self, cx: &mut Context<Self>) {
         self.state.sign_in_org = self.org_input.read(cx).value().to_string();
         self.state.sign_in_pat = self.pat_input.read(cx).value().to_string();
-        self.state.sign_in_error = None;
-        self.spawn_state(cx, |mut state| async move {
+        let started = self.spawn_state(cx, |mut state| async move {
             let result = state.login_pat().await;
             (state, result)
         });
+        if started {
+            self.state.sign_in_error = None;
+        }
     }
 
     fn render_error_banner(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -2551,11 +2553,13 @@ impl PlannerView {
                     .when(!pat_mode, |el| {
                         el.child(Button::new("sign-in").primary().label("Sign in").on_click(
                             cx.listener(|this, _, _, cx| {
-                                this.state.sign_in_error = None;
-                                this.spawn_state(cx, |mut state| async move {
+                                let started = this.spawn_state(cx, |mut state| async move {
                                     let result = state.login_entra().await;
                                     (state, result)
                                 });
+                                if started {
+                                    this.state.sign_in_error = None;
+                                }
                             }),
                         ))
                     })
@@ -9978,6 +9982,10 @@ impl PlannerView {
 
     pub fn is_busy(&self) -> bool {
         self.io_busy
+    }
+
+    pub fn submit_pat_for_test(&mut self, cx: &mut Context<Self>) {
+        self.submit_pat(cx);
     }
 
     pub fn set_busy_for_test(&mut self, busy: bool) {

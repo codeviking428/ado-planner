@@ -295,6 +295,29 @@ fn gpui_sign_in_error_paints_on_the_sign_in_card(cx: &mut gpui_kit::TestAppConte
 }
 
 #[gpui_kit::test]
+fn gpui_continue_while_busy_keeps_the_sign_in_error(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::new(dir.path().to_path_buf());
+    let store = EncryptedStore::new(Box::new(MemoryStore::new(false)), None);
+    let session = PlannerSession::pat(store);
+    let mut state = PlannerState::new(paths, session, None, None);
+    state.session_loading = false;
+    let message = ado_core::Error::PatRejected.to_string();
+    state.sign_in_error = Some(message.clone());
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    view.update(cx, |view, cx| {
+        view.set_busy_for_test(true);
+        view.submit_pat_for_test(cx);
+        assert_eq!(
+            view.state.sign_in_error.as_deref(),
+            Some(message.as_str()),
+            "a refused submit must not clear the error while still signed out"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn gpui_sign_in_shell_renders(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
