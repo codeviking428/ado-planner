@@ -3227,7 +3227,9 @@ impl PlannerView {
         }
         // A taller window can leave the old scroll past the last row.
         let measured_h = self.state.gantt.viewport_h;
-        self.state.gantt.clamp_scroll(visible.rows.len(), measured_h);
+        self.state
+            .gantt
+            .clamp_scroll(visible.rows.len(), measured_h);
         let committed = self.state.gantt.snapshot();
         if let Some(pose) = self.animated_camera() {
             self.state.gantt.restore(pose);
