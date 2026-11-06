@@ -357,7 +357,8 @@ jobs:
             echo "$exe: $level"
             [ "$level" = 'requestedExecutionLevel level="requireAdministrator"' ]
           done
-          grep -qx 'isAdminRightsRequired: true' dist/electron/latest.yml
+          # electron-updater reads the flag from the installer's files[] entry.
+          grep -qxE '[[:space:]]+isAdminRightsRequired: true' dist/electron/latest.yml
 
       - name: Install, migrate, and uninstall
         shell: pwsh
