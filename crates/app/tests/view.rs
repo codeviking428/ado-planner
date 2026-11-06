@@ -16078,3 +16078,143 @@ fn empty_team_card_keeps_every_edge_inside_the_planner(cx: &mut gpui_kit::TestAp
         assert_empty_card_inside_planner(cx, size, "populated -> empty");
     }
 }
+
+fn fixture_view_at<'a>(
+    cx: &'a mut gpui_kit::TestAppContext,
+    dir: &tempfile::TempDir,
+    width: f32,
+    height: f32,
+) -> (gpui_kit::Entity<PlannerView>, &'a mut VisualTestContext) {
+    cx.update(gpui_kit::init);
+    let mut state = idle_state(dir);
+    state.nodes = mock_fixture_nodes();
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(width),
+        height: px(height),
+    });
+    draw(cx);
+    (view, cx)
+}
+
+fn switch_scale_and_fit(cx: &mut VisualTestContext, scale: &'static str) {
+    let button = cx.debug_bounds(scale).expect(scale);
+    cx.simulate_click(button.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+}
+
+fn assert_clearance(
+    cx: &mut VisualTestContext,
+    context: &str,
+    overlay: &'static str,
+    neighbours: &[&'static str],
+) {
+    let chip = cx
+        .debug_bounds(overlay)
+        .unwrap_or_else(|| panic!("{context}: {overlay}"));
+    for neighbour in neighbours {
+        let Some(other) = cx.debug_bounds(neighbour) else {
+            continue;
+        };
+        let gap = painted_min_gap(chip, other);
+        assert!(
+            gap + 0.1 >= 8.0,
+            "{context}: {overlay} must keep ≥8px from {neighbour}, gap={gap:.1}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn go_live_link_plates_clear_its_title_in_month_and_week(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    // 1920px keeps Go-live on screen after Auto fit in Month and Week.
+    let (_view, cx) = fixture_view_at(cx, &dir, 1920.0, 1080.0);
+    for scale in ["gantt-scale-Month", "gantt-scale-Week"] {
+        switch_scale_and_fit(cx, scale);
+        let diamond = cx.debug_bounds("gantt-bar-1013").expect("Go-live");
+        cx.simulate_mouse_move(diamond.center(), None, Modifiers::default());
+        draw(cx);
+        assert!(
+            cx.debug_bounds("gantt-bar-label-1013").is_some(),
+            "{scale}: Go-live must paint its outside title"
+        );
+        for handle in [
+            "gantt-link-handle-1013-link-start",
+            "gantt-link-handle-1013-link-end",
+            "gantt-link-dot-1013-link-start",
+            "gantt-link-dot-1013-link-end",
+        ] {
+            assert_clearance(cx, scale, handle, &["gantt-bar-label-1013"]);
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn persist_cart_and_cart_resize_chips_clear_their_neighbours(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = fixture_view_at(cx, &dir, 1280.0, 800.0);
+    for scale in ["gantt-scale-Year", "gantt-scale-Quarter"] {
+        switch_scale_and_fit(cx, scale);
+        let persist = cx.debug_bounds("gantt-bar-1003").expect("Persist cart");
+        cx.simulate_click(persist.center(), Modifiers::default());
+        draw(cx);
+        cx.simulate_mouse_move(persist.center(), None, Modifiers::default());
+        draw(cx);
+        for chip in ["gantt-hover-date-start", "gantt-hover-date-end"] {
+            assert_clearance(
+                cx,
+                scale,
+                chip,
+                &["gantt-bar-1002", "gantt-bar-label-1002", "gantt-bar-1001"],
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+
+        let cart = cx.debug_bounds("gantt-bar-1002").expect("Cart");
+        let grip = point(
+            cart.origin.x + cart.size.width - px(HANDLE_WIDTH + LINK_HANDLE_INSET / 2.0),
+            cart.origin.y + cart.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(grip, None, Modifiers::default());
+        draw(cx);
+        cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::default());
+        draw(cx);
+        let dragged = point(grip.x + px(10.0), grip.y);
+        cx.simulate_mouse_move(dragged, Some(MouseButton::Left), Modifiers::default());
+        draw(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.state
+                    .gantt
+                    .gesture
+                    .as_ref()
+                    .map(|gesture| gesture.kind),
+                Some(GestureKind::ResizeEnd),
+                "{scale}: precondition: Cart's end grip must start a resize"
+            );
+        });
+        for chip in ["gantt-drag-date-start", "gantt-drag-date-end"] {
+            assert_clearance(
+                cx,
+                scale,
+                chip,
+                &[
+                    "gantt-bar-1001",
+                    "gantt-bar-label-1001",
+                    "gantt-bar-1003",
+                    "gantt-bar-label-1003",
+                ],
+            );
+        }
+        cx.simulate_mouse_up(dragged, MouseButton::Left, Modifiers::default());
+        draw(cx);
+        cx.simulate_keystrokes("cmd-z");
+        draw(cx);
+    }
+}
