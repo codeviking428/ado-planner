@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use jiff::ToSpan;
 use jiff::civil::Date;
 use serde_json::{Value, json};
@@ -76,43 +78,75 @@ fn parse_compact_date(value: &str, fallback_year: Option<i16>) -> Option<Date> {
     Date::new(year, month, day).ok()
 }
 
-pub fn client_rollup(nodes: &[WorkItemNode], parent_id: i64) -> Option<(Date, Date)> {
-    let mut dates: Vec<(Date, Date)> = Vec::new();
-    let mut children: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
-    for (index, node) in nodes.iter().enumerate() {
-        if let Some(parent) = node.parent_id {
-            children.entry(parent).or_default().push(index);
-        }
-    }
+/// Id and parent → children lookups over one node slice, built once so each
+/// Rollup or child lookup walks only its subtree instead of the whole slice.
+/// Positions refer to the slice passed to [`HierarchyIndex::new`]; pass that
+/// same slice to the lookups.
+#[derive(Debug, Clone, Default)]
+pub struct HierarchyIndex {
+    by_id: HashMap<i64, usize>,
+    children: HashMap<i64, Vec<usize>>,
+}
 
-    fn walk(
-        nodes: &[WorkItemNode],
-        children: &std::collections::HashMap<i64, Vec<usize>>,
-        id: i64,
-        dates: &mut Vec<(Date, Date)>,
-    ) {
-        let Some(indexes) = children.get(&id) else {
-            return;
-        };
-        for &index in indexes {
-            let child = &nodes[index];
-            if let (Some(start), Some(target)) = (
-                parse_iso_date(child.start_date.as_deref()),
-                parse_iso_date(child.target_date.as_deref()),
-            ) {
-                dates.push((start, target));
+impl HierarchyIndex {
+    pub fn new(nodes: &[WorkItemNode]) -> Self {
+        let mut by_id = HashMap::with_capacity(nodes.len());
+        let mut children: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (index, node) in nodes.iter().enumerate() {
+            by_id.entry(node.id).or_insert(index);
+            if let Some(parent) = node.parent_id {
+                children.entry(parent).or_default().push(index);
             }
-            walk(nodes, children, child.id, dates);
         }
+        Self { by_id, children }
     }
 
-    walk(nodes, &children, parent_id, &mut dates);
-    if dates.is_empty() {
-        return None;
+    pub fn get<'a>(&self, nodes: &'a [WorkItemNode], id: i64) -> Option<&'a WorkItemNode> {
+        self.by_id.get(&id).and_then(|&index| nodes.get(index))
     }
-    let start = dates.iter().map(|(s, _)| *s).min()?;
-    let target = dates.iter().map(|(_, t)| *t).max()?;
-    Some((start, target))
+
+    pub fn children<'a>(
+        &'a self,
+        nodes: &'a [WorkItemNode],
+        id: i64,
+    ) -> impl Iterator<Item = &'a WorkItemNode> + 'a {
+        self.children
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| nodes.get(index))
+    }
+
+    /// Same as [`client_rollup`] without rebuilding the children map.
+    pub fn rollup(&self, nodes: &[WorkItemNode], parent_id: i64) -> Option<(Date, Date)> {
+        let mut span: Option<(Date, Date)> = None;
+        let mut stack = vec![parent_id];
+        // A parent cycle would otherwise loop forever.
+        let mut visits_left = nodes.len();
+        while let Some(id) = stack.pop() {
+            for child in self.children(nodes, id) {
+                if visits_left == 0 {
+                    return span;
+                }
+                visits_left -= 1;
+                if let (Some(start), Some(target)) = (
+                    parse_iso_date(child.start_date.as_deref()),
+                    parse_iso_date(child.target_date.as_deref()),
+                ) {
+                    span = Some(match span {
+                        Some((min, max)) => (min.min(start), max.max(target)),
+                        None => (start, target),
+                    });
+                }
+                stack.push(child.id);
+            }
+        }
+        span
+    }
+}
+
+pub fn client_rollup(nodes: &[WorkItemNode], parent_id: i64) -> Option<(Date, Date)> {
+    HierarchyIndex::new(nodes).rollup(nodes, parent_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +168,24 @@ pub fn gantt_bar_display(
     node: &WorkItemNode,
     nodes: &[WorkItemNode],
     iteration: Option<&IterationHint>,
+) -> GanttBarDisplay {
+    bar_display(node, iteration, || client_rollup(nodes, node.id))
+}
+
+/// [`gantt_bar_display`] with a prebuilt index over `nodes`.
+pub fn gantt_bar_display_indexed(
+    node: &WorkItemNode,
+    nodes: &[WorkItemNode],
+    index: &HierarchyIndex,
+    iteration: Option<&IterationHint>,
+) -> GanttBarDisplay {
+    bar_display(node, iteration, || index.rollup(nodes, node.id))
+}
+
+fn bar_display(
+    node: &WorkItemNode,
+    iteration: Option<&IterationHint>,
+    rollup: impl FnOnce() -> Option<(Date, Date)>,
 ) -> GanttBarDisplay {
     if !node.has_date_fields {
         return GanttBarDisplay {
@@ -170,7 +222,7 @@ pub fn gantt_bar_display(
             milestone: true,
         };
     }
-    if let Some((start, target)) = client_rollup(nodes, node.id) {
+    if let Some((start, target)) = rollup() {
         return GanttBarDisplay {
             kind: GanttBarKind::Unscheduled,
             start: Some(start),
@@ -381,6 +433,24 @@ pub fn dates_column_text(
     nodes: &[WorkItemNode],
     iteration: Option<&IterationHint>,
 ) -> String {
+    dates_text(node, iteration, || client_rollup(nodes, node.id))
+}
+
+/// [`dates_column_text`] with a prebuilt index over `nodes`.
+pub fn dates_column_text_indexed(
+    node: &WorkItemNode,
+    nodes: &[WorkItemNode],
+    index: &HierarchyIndex,
+    iteration: Option<&IterationHint>,
+) -> String {
+    dates_text(node, iteration, || index.rollup(nodes, node.id))
+}
+
+fn dates_text(
+    node: &WorkItemNode,
+    iteration: Option<&IterationHint>,
+    rollup: impl FnOnce() -> Option<(Date, Date)>,
+) -> String {
     if !node.has_date_fields {
         return "No Start/Target on type".into();
     }
@@ -390,7 +460,7 @@ pub fn dates_column_text(
     if !scheduled.is_empty() {
         return scheduled;
     }
-    if let Some((start, target)) = client_rollup(nodes, node.id) {
+    if let Some((start, target)) = rollup() {
         return format!(
             "Unscheduled · rollup {} → {}",
             compact_date(start),
@@ -595,6 +665,59 @@ mod tests {
         let (start, target) = client_rollup(&nodes, 1).unwrap();
         assert_eq!(iso_date_only(start), "2026-07-01T00:00:00Z");
         assert_eq!(iso_date_only(target), "2026-08-01T00:00:00Z");
+    }
+
+    #[test]
+    fn indexed_rollup_walks_grandchildren_like_client_rollup() {
+        let epic = node(1);
+        let mut feature = node(2);
+        feature.parent_id = Some(1);
+        let mut story = node(3);
+        story.parent_id = Some(2);
+        story.start_date = Some("2026-07-01T00:00:00Z".into());
+        story.target_date = Some("2026-07-09T00:00:00Z".into());
+        let mut task = node(4);
+        task.parent_id = Some(3);
+        task.start_date = Some("2026-07-05T00:00:00Z".into());
+        task.target_date = Some("2026-08-02T00:00:00Z".into());
+        let mut start_only = node(5);
+        start_only.parent_id = Some(2);
+        start_only.start_date = Some("2026-06-01T00:00:00Z".into());
+        let nodes = vec![epic, feature, story, task, start_only];
+        let index = HierarchyIndex::new(&nodes);
+        let span = Some((
+            Date::new(2026, 7, 1).unwrap(),
+            Date::new(2026, 8, 2).unwrap(),
+        ));
+        assert_eq!(client_rollup(&nodes, 1), span);
+        assert_eq!(index.rollup(&nodes, 1), span);
+        assert_eq!(index.rollup(&nodes, 4), None);
+        for node in &nodes {
+            assert_eq!(
+                gantt_bar_display_indexed(node, &nodes, &index, None),
+                gantt_bar_display(node, &nodes, None)
+            );
+            assert_eq!(
+                dates_column_text_indexed(node, &nodes, &index, None),
+                dates_column_text(node, &nodes, None)
+            );
+        }
+        let children: Vec<i64> = index.children(&nodes, 2).map(|n| n.id).collect();
+        assert_eq!(children, vec![3, 5]);
+        assert_eq!(index.get(&nodes, 4).map(|n| n.id), Some(4));
+        assert!(index.get(&nodes, 99).is_none());
+    }
+
+    #[test]
+    fn rollup_stops_on_a_parent_cycle() {
+        let mut a = node(1);
+        a.parent_id = Some(2);
+        a.start_date = Some("2026-07-01T00:00:00Z".into());
+        a.target_date = Some("2026-07-02T00:00:00Z".into());
+        let mut b = node(2);
+        b.parent_id = Some(1);
+        let nodes = vec![a, b];
+        assert!(client_rollup(&nodes, 2).is_some());
     }
 
     #[test]
