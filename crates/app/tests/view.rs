@@ -470,6 +470,133 @@ fn painted_tree_rows_and_bars_share_row_height(cx: &mut gpui_kit::TestAppContext
     );
 }
 
+/// `debug_bounds` takes `&'static str`; build the per-id selectors once.
+fn row_selectors(id: i64) -> (&'static str, &'static str) {
+    static SELECTORS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let all = SELECTORS.get_or_init(|| {
+        (0..=LARGE_HIERARCHY)
+            .map(|id| {
+                (
+                    format!("gantt-tree-row-{id}"),
+                    format!("gantt-row-band-{id}"),
+                )
+            })
+            .collect()
+    });
+    let (tree, band) = &all[id as usize];
+    (tree, band)
+}
+
+const LARGE_HIERARCHY: i64 = 2_000;
+
+/// Painted tree rows and timeline bands must be the same contiguous slice of
+/// the current rows, starting at the first visible row, each pair aligned.
+/// Returns how many rows painted.
+fn assert_panes_paint_the_row_window(
+    view: &Entity<PlannerView>,
+    cx: &mut VisualTestContext,
+) -> usize {
+    let (row_ids, first) = view.update(cx, |view, _| {
+        let rows = view.state.visible_rows();
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        (ids, view.state.gantt.first_visible_row_index())
+    });
+    let mut painted = Vec::new();
+    for id in 1..=LARGE_HIERARCHY {
+        let (tree, band) = row_selectors(id);
+        let tree = cx.debug_bounds(tree);
+        let band = cx.debug_bounds(band);
+        assert_eq!(
+            tree.is_some(),
+            band.is_some(),
+            "row {id}: tree and timeline must paint the same work items"
+        );
+        if let (Some(tree), Some(band)) = (tree, band) {
+            let dy = f32::from(tree.origin.y) - f32::from(band.origin.y);
+            assert!(dy.abs() < 2.0, "row {id}: tree/band y differ by {dy}");
+            painted.push((f32::from(tree.origin.y), id));
+        }
+    }
+    painted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let painted: Vec<i64> = painted.into_iter().map(|(_, id)| id).collect();
+    assert!(!painted.is_empty(), "some rows must paint");
+    assert_eq!(
+        painted,
+        row_ids[first..first + painted.len()].to_vec(),
+        "painted rows must be the current rows from the first visible row on"
+    );
+    painted.len()
+}
+
+#[gpui_kit::test]
+fn large_hierarchy_paints_only_the_row_window_in_both_panes(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_hierarchy(LARGE_HIERARCHY as usize);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let at_top = assert_panes_paint_the_row_window(&view, cx);
+    assert!(at_top < 30, "{at_top} rows painted for an 800px window");
+
+    let tree = cx.debug_bounds("gantt-tree-body").expect("tree body");
+    for _ in 0..30 {
+        cx.simulate_event(ScrollEvent {
+            position: tree.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-ROW_HEIGHT))),
+            ..Default::default()
+        });
+    }
+    draw(cx);
+    let first = view.update(cx, |view, _| view.state.gantt.first_visible_row_index());
+    assert!(
+        first >= 25,
+        "wheel must scroll past the first Epic, at {first}"
+    );
+    assert!(cx.debug_bounds("gantt-tree-row-1").is_none());
+    assert_panes_paint_the_row_window(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.state.gantt.toggle_expand(1);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("gantt-tree-row-2").is_none());
+    assert_panes_paint_the_row_window(&view, cx);
+
+    view.update(cx, |view, cx| {
+        for node in view.state.nodes.iter_mut().filter(|node| node.id % 3 == 0) {
+            node.state = "Closed".into();
+        }
+        view.state.prefs.planner.hidden_states = vec!["Closed".into()];
+        cx.notify();
+    });
+    draw(cx);
+    let filtered = assert_panes_paint_the_row_window(&view, cx);
+    // Epics (ids 1, 21, 41, …) stay as ancestors of matching Features.
+    for id in (3..=LARGE_HIERARCHY).step_by(3).filter(|id| id % 20 != 1) {
+        assert!(
+            cx.debug_bounds(row_selectors(id).0).is_none(),
+            "filtered-out row {id} must not stay painted"
+        );
+    }
+
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(1200.),
+    });
+    draw(cx);
+    let taller = assert_panes_paint_the_row_window(&view, cx);
+    assert!(
+        taller > filtered,
+        "a taller window must paint more rows ({taller} vs {filtered})"
+    );
+}
+
 #[gpui_kit::test]
 fn painted_rows_are_monday_height_at_1280x800(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);

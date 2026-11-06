@@ -65,8 +65,9 @@ async fn drag_patches_start_and_target() {
     let (_mock, mut state, _dir) = signed_in().await;
     let node = state
         .visible_nodes()
-        .into_iter()
+        .iter()
         .find(|n| n.start_date.is_some() && n.target_date.is_some() && n.has_date_fields)
+        .cloned()
         .expect("scheduled");
     let start = parse_iso_date(node.start_date.as_deref()).unwrap();
     let target = parse_iso_date(node.target_date.as_deref()).unwrap();

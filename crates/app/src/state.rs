@@ -1,14 +1,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use ado_client::{AdoClient, AdoRuntime, TokenSource};
 use ado_core::{
-    AssigneeFilter, Flavor, HierarchyResult, IdentityValue, IterationNode, Organization,
-    OverlayFilter, Project, ScopeSelection, SessionInfo, Team, WorkItemNode, apply_overlays,
-    build_clear_dates_patch, build_dates_patch, build_field_patch, build_replace_dates_patch,
-    choose_available, compact_date, identity_from_field, is_assignee_special, iso_date_only,
-    parent_relation_op, parse_iso_date, resolve_root_types, schedule_from_iteration,
+    AssigneeFilter, Flavor, HierarchyIndex, HierarchyResult, IdentityValue, IterationNode,
+    Organization, OverlayFilter, Project, ScopeSelection, SessionInfo, Team, WorkItemNode,
+    apply_overlays, build_clear_dates_patch, build_dates_patch, build_field_patch,
+    build_replace_dates_patch, choose_available, compact_date, identity_from_field,
+    is_assignee_special, iso_date_only, parent_relation_op, parse_iso_date, resolve_root_types,
+    schedule_from_iteration,
 };
 use ado_session::{LoginCreds, PlannerSession, SharedSession};
 use jiff::ToSpan;
@@ -20,7 +21,7 @@ use crate::cache::{CacheFreshness, QueryCache};
 use crate::error::AppError;
 use crate::form::FormDraft;
 use crate::gantt::{
-    GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView, VisibleRow,
+    BarLayout, GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView, VisibleRow,
     insert_index_for_child,
 };
 use crate::paths::AppPaths;
@@ -75,6 +76,98 @@ pub struct PlannerState {
     /// visual-test idle state (signed_in faked, no token) can toast a link
     /// without PATCHing.
     pub session_token_ready: bool,
+    visible: VisibleCache,
+}
+
+/// Overlay-filtered nodes, their [`HierarchyIndex`], and flattened rows,
+/// reused across frames while their inputs compare equal. Keyed by value, not
+/// by a revision counter, because `nodes` and prefs are public and mutated in
+/// many places.
+#[derive(Default)]
+struct VisibleCache(Mutex<Option<VisibleEntry>>);
+
+impl Clone for VisibleCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+struct VisibleEntry {
+    source: Vec<WorkItemNode>,
+    hierarchy_types: Option<Vec<String>>,
+    planner: ado_core::PlannerPrefs,
+    username: Option<String>,
+    nodes: Arc<Vec<WorkItemNode>>,
+    index: Arc<HierarchyIndex>,
+    rows: Option<(HashSet<i64>, Arc<Vec<VisibleRow>>)>,
+}
+
+/// Toolbar renders call this per frame; clone only the distinct values.
+fn sorted_distinct<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    values
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Overlay-filtered nodes with their [`HierarchyIndex`] and flattened rows.
+#[derive(Clone)]
+pub struct Visible {
+    pub nodes: Arc<Vec<WorkItemNode>>,
+    pub index: Arc<HierarchyIndex>,
+    pub rows: Arc<Vec<VisibleRow>>,
+}
+
+impl Visible {
+    pub fn layout_bars(&self, state: &PlannerState, viewport_h: f32) -> Vec<BarLayout> {
+        state.gantt.layout_bars_indexed(
+            &self.nodes,
+            &self.index,
+            &self.rows,
+            &state.iterations,
+            viewport_h,
+        )
+    }
+}
+
+/// `PartialEq` on the `fields` maps hashes every key; comparing entries in
+/// order is cheaper and only ever reports a reordered map as changed.
+fn same_nodes(a: &[WorkItemNode], b: &[WorkItemNode]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            let WorkItemNode {
+                id,
+                rev,
+                title,
+                work_item_type,
+                state,
+                assigned_to,
+                parent_id,
+                area_path,
+                iteration_path,
+                start_date,
+                target_date,
+                has_date_fields,
+                predecessors,
+                fields,
+            } = a;
+            *id == b.id
+                && *rev == b.rev
+                && *parent_id == b.parent_id
+                && *has_date_fields == b.has_date_fields
+                && *start_date == b.start_date
+                && *target_date == b.target_date
+                && *title == b.title
+                && *work_item_type == b.work_item_type
+                && *state == b.state
+                && *assigned_to == b.assigned_to
+                && *area_path == b.area_path
+                && *iteration_path == b.iteration_path
+                && *predecessors == b.predecessors
+                && fields.len() == b.fields.len()
+                && fields.iter().zip(&b.fields).all(|(a, b)| a == b)
+        })
 }
 
 /// Why this date PATCH was queued — so a failed persist can put history back.
@@ -203,6 +296,7 @@ impl PlannerState {
             team_views: HashMap::new(),
             shifted_children: HashMap::new(),
             session_token_ready: false,
+            visible: VisibleCache::default(),
             prefs,
         }
     }
@@ -269,18 +363,9 @@ impl PlannerState {
             .as_ref()
             .map(|h| h.types.clone())
             .unwrap_or_else(|| {
-                let mut types: Vec<_> = self
-                    .nodes
-                    .iter()
-                    .map(|n| n.work_item_type.clone())
-                    .collect();
-                types.sort();
-                types.dedup();
-                types
+                sorted_distinct(self.nodes.iter().map(|n| n.work_item_type.as_str()))
             });
-        let mut states: Vec<_> = self.nodes.iter().map(|n| n.state.clone()).collect();
-        states.sort();
-        states.dedup();
+        let states = self.states();
         let resolved = self.planner_root_types(&types);
         OverlayFilter {
             types: if self.prefs.planner.hidden_types.is_empty() {
@@ -316,8 +401,61 @@ impl PlannerState {
         }
     }
 
-    pub fn visible_nodes(&self) -> Vec<WorkItemNode> {
-        apply_overlays(&self.nodes, &self.overlay())
+    pub fn visible_nodes(&self) -> Arc<Vec<WorkItemNode>> {
+        self.visible().nodes
+    }
+
+    /// Visible nodes, their index, and rows from one cache check. Each check
+    /// compares every node, so a render takes one snapshot and passes it down.
+    pub fn visible(&self) -> Visible {
+        self.with_visible(|entry| {
+            let rows = match &entry.rows {
+                Some((collapsed, rows)) if *collapsed == self.gantt.collapsed => rows.clone(),
+                _ => {
+                    let rows = Arc::new(self.gantt.flatten(&entry.nodes));
+                    entry.rows = Some((self.gantt.collapsed.clone(), rows.clone()));
+                    rows
+                }
+            };
+            Visible {
+                nodes: entry.nodes.clone(),
+                index: entry.index.clone(),
+                rows,
+            }
+        })
+    }
+
+    /// Bars for the visible window of [`PlannerState::visible_rows`].
+    pub fn layout_visible_bars(&self, viewport_h: f32) -> Vec<BarLayout> {
+        self.visible().layout_bars(self, viewport_h)
+    }
+
+    fn with_visible<T>(&self, read: impl FnOnce(&mut VisibleEntry) -> T) -> T {
+        let mut cache = self
+            .visible
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let hierarchy_types = self.hierarchy.as_ref().map(|h| &h.types);
+        let fresh = cache.as_ref().is_some_and(|entry| {
+            entry.hierarchy_types.as_ref() == hierarchy_types
+                && entry.planner == self.prefs.planner
+                && entry.username == self.session_info.username
+                && same_nodes(&entry.source, &self.nodes)
+        });
+        if !fresh {
+            let nodes = apply_overlays(&self.nodes, &self.overlay());
+            *cache = Some(VisibleEntry {
+                source: self.nodes.clone(),
+                hierarchy_types: hierarchy_types.cloned(),
+                planner: self.prefs.planner.clone(),
+                username: self.session_info.username.clone(),
+                index: Arc::new(HierarchyIndex::new(&nodes)),
+                nodes: Arc::new(nodes),
+                rows: None,
+            });
+        }
+        read(cache.as_mut().expect("visible cache filled above"))
     }
 
     pub fn types(&self) -> Vec<String> {
@@ -327,22 +465,13 @@ impl PlannerState {
             .map(|h| h.types.clone())
             .unwrap_or_default();
         if types.is_empty() {
-            types = self
-                .nodes
-                .iter()
-                .map(|n| n.work_item_type.clone())
-                .collect();
-            types.sort();
-            types.dedup();
+            types = sorted_distinct(self.nodes.iter().map(|n| n.work_item_type.as_str()));
         }
         types
     }
 
     pub fn states(&self) -> Vec<String> {
-        let mut states: Vec<_> = self.nodes.iter().map(|n| n.state.clone()).collect();
-        states.sort();
-        states.dedup();
-        states
+        sorted_distinct(self.nodes.iter().map(|n| n.state.as_str()))
     }
 
     fn planner_root_types(&self, types: &[String]) -> Option<Vec<String>> {
@@ -962,7 +1091,7 @@ impl PlannerState {
         self.hierarchy = Some(result);
         if let Some(saved) = self.team_views.get(&self.prefs.planner.team).cloned() {
             self.gantt.restore(saved);
-            let rows = self.gantt.flatten(&self.visible_nodes()).len();
+            let rows = self.visible_rows().len();
             self.gantt.clamp_scroll(rows, self.gantt.viewport_h);
         } else if self.team_views.is_empty() {
             let width = self.gantt.timeline_width.max(800.0);
@@ -1007,8 +1136,8 @@ impl PlannerState {
         }
     }
 
-    pub fn visible_rows(&self) -> Vec<VisibleRow> {
-        self.gantt.flatten(&self.visible_nodes())
+    pub fn visible_rows(&self) -> Arc<Vec<VisibleRow>> {
+        self.visible().rows
     }
 
     pub async fn open_form(&mut self, id: i64) -> Result<(), AppError> {
@@ -2552,10 +2681,7 @@ impl PlannerState {
         origin_x: f32,
     ) -> Result<(), AppError> {
         let visible = self.visible_nodes();
-        let rows = self.gantt.flatten(&visible);
-        let bars = self
-            .gantt
-            .layout_bars(&visible, &rows, &self.iterations, 10_000.0);
+        let bars = self.layout_visible_bars(10_000.0);
         let Some(bar) = bars.into_iter().find(|bar| bar.id == bar_id) else {
             return Err(AppError::message("bar not found"));
         };
@@ -4323,6 +4449,70 @@ mod child_type_tests {
         assert_eq!(child_work_item_type(Some("Requirement"), &types), "Task");
         assert_eq!(child_work_item_type(Some("Issue"), &types), "Task");
         assert_eq!(child_work_item_type(Some("Epic"), &types), "Feature");
+    }
+}
+
+#[cfg(test)]
+mod visible_cache_tests {
+    use super::{PlannerState, fake_hierarchy};
+    use crate::paths::AppPaths;
+    use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn state(dir: &tempfile::TempDir) -> PlannerState {
+        let paths = AppPaths::new(dir.path().to_path_buf());
+        let store = EncryptedStore::new(Box::new(MemoryStore::new(false)), None);
+        let mut state = PlannerState::new(paths, PlannerSession::pat(store), None, None);
+        state.nodes = fake_hierarchy(60);
+        state
+    }
+
+    #[test]
+    fn unchanged_inputs_reuse_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir);
+        let first = state.visible();
+        let again = state.visible();
+        assert!(Arc::ptr_eq(&first.nodes, &again.nodes));
+        assert!(Arc::ptr_eq(&first.rows, &again.rows));
+        assert_eq!(first.rows.len(), 60);
+    }
+
+    #[test]
+    fn in_place_node_edits_refresh_visible_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state(&dir);
+        let before = state.visible_nodes();
+        state.nodes[3].title = "Renamed".into();
+        let renamed = state.visible_nodes();
+        assert!(!Arc::ptr_eq(&before, &renamed));
+        assert_eq!(renamed[3].title, "Renamed");
+        state.nodes[3]
+            .fields
+            .insert("Custom.Risk".into(), json!("High"));
+        assert_eq!(
+            state.visible_nodes()[3].fields.get("Custom.Risk"),
+            Some(&json!("High"))
+        );
+    }
+
+    #[test]
+    fn rows_follow_collapse_filters_and_root_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state(&dir);
+        assert_eq!(state.visible_rows().len(), 60);
+        state.gantt.toggle_expand(1);
+        assert_eq!(state.visible_rows().len(), 41, "Epic 1 hides 19 Features");
+        state.gantt.toggle_expand(1);
+        assert_eq!(state.visible_rows().len(), 60);
+        state.nodes[5].state = "Closed".into();
+        state.prefs.planner.hidden_states = vec!["Closed".into()];
+        let rows = state.visible_rows();
+        assert_eq!(rows.len(), 59);
+        assert!(rows.iter().all(|row| row.id != 6));
+        state.prefs.planner.root_types = Some(Some(Vec::new()));
+        assert!(state.visible_rows().is_empty());
     }
 }
 
