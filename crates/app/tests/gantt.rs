@@ -1496,6 +1496,7 @@ async fn failed_link_persist_discards_undo_history() {
             successor_id: 1005,
             predecessor_id: 1003,
             linked: true,
+            ..
         })
     ));
     let err = state.persist_added_dependency(1005, 1003).await;
@@ -1515,6 +1516,7 @@ async fn failed_link_persist_discards_undo_history() {
                 successor_id: 1005,
                 predecessor_id: 1003,
                 linked: true,
+                ..
             })
         ),
         "a failed persist must not leave an Added-link undo entry"
@@ -2585,6 +2587,7 @@ async fn looping_redo_keeps_history_and_sends_no_patch() {
         successor_id: 1005,
         predecessor_id: 1003,
         linked: true,
+        dates: Vec::new(),
     });
     make_persist_cart_wait_on_cart_ui(&mut state);
     let patches = mock.patch_count();
@@ -2610,6 +2613,7 @@ async fn looping_undo_of_a_removed_link_sends_no_patch() {
         successor_id: 1005,
         predecessor_id: 1003,
         linked: false,
+        dates: Vec::new(),
     });
     make_persist_cart_wait_on_cart_ui(&mut state);
     let patches = mock.patch_count();
