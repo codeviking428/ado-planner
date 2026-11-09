@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ado_core::{
-    ClashEnds, DEFAULT_BAR_DAYS, DependencyLink, GanttBarKind, HierarchyIndex, IterationHint,
-    IterationNode, WorkItemNode, clash_ends, compact_date, dates_column_text,
+    DEFAULT_BAR_DAYS, DependencyLink, GanttBarKind, HierarchyIndex, IterationHint, IterationNode,
+    WorkItemDates, WorkItemNode, clash_ends, compact_date, dates_column_text,
     dates_column_text_indexed, format_date_range, from_gantt_exclusive_end, gantt_bar_display,
     gantt_bar_display_indexed, iteration_hint_for_path, parse_iso_date, retest_clashes,
 };
@@ -2149,7 +2149,7 @@ impl GanttView {
 
     /// Dates the Clash rule reads for `node`: its own fields, or what a drop
     /// of the live drag or resize would write.
-    pub fn clash_ends_for(&self, node: &WorkItemNode) -> Option<ClashEnds> {
+    pub fn clash_ends_for(&self, node: &WorkItemNode) -> Option<WorkItemDates> {
         let moved = self.gesture.as_ref().filter(|gesture| {
             gesture.id == node.id
                 && gesture.kind != GestureKind::Link
@@ -2158,10 +2158,11 @@ impl GanttView {
         match moved {
             Some(gesture) if node.has_date_fields => {
                 let (start, target) = Self::gesture_patch_dates(gesture);
-                ClashEnds::from_dates(
-                    start.or_else(|| parse_iso_date(node.start_date.as_deref())),
-                    target.or_else(|| parse_iso_date(node.target_date.as_deref())),
-                )
+                let loaded = WorkItemDates::of(node);
+                Some(WorkItemDates {
+                    start: start.or(loaded.start),
+                    target: target.or(loaded.target),
+                })
             }
             _ => clash_ends(node),
         }
@@ -2197,7 +2198,7 @@ impl GanttView {
                 .filter_map(|&from| {
                     Some(ClashLine {
                         predecessor_id: from,
-                        starts: successor.start,
+                        starts: successor.start.or(successor.target)?,
                         predecessor_finishes: ends(from)?.target?,
                     })
                 })
