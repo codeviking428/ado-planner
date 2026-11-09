@@ -9,8 +9,8 @@ use ado_core::{
     Project, ScopeSelection, SessionInfo, Team, WorkItemDates, WorkItemNode, apply_overlays,
     build_clear_dates_patch, build_dates_patch, build_field_patch, build_replace_dates_patch,
     choose_available, compact_date, identity_from_field, is_assignee_special, iso_date_only,
-    links_touching, parent_relation_op, parse_iso_date, plan_cascade, resolve_root_types,
-    schedule_from_iteration, snap_later,
+    links_touching, parent_relation_op, parse_iso_date, plan_cascade_with_rollup,
+    resolve_root_types, schedule_from_iteration, snap_later,
 };
 use ado_session::{LoginCreds, PlannerSession, SharedSession};
 use jiff::ToSpan;
@@ -2949,7 +2949,7 @@ impl PlannerState {
             before,
             after: landed,
         };
-        let writes = plan_cascade(
+        let writes = plan_cascade_with_rollup(
             &self.nodes,
             &[change],
             self.cascade_mode(),
@@ -3833,7 +3833,7 @@ impl PlannerState {
         if !self.history_recording {
             return Vec::new();
         }
-        let writes = plan_cascade(&self.nodes, changes, self.cascade_mode(), trigger);
+        let writes = plan_cascade_with_rollup(&self.nodes, changes, self.cascade_mode(), trigger);
         let mut moves = Vec::with_capacity(writes.len());
         let mut changed = Vec::with_capacity(writes.len());
         for write in writes {
@@ -3981,7 +3981,8 @@ impl PlannerState {
         if moves.is_empty() {
             return;
         }
-        let suffix = successors_moved_suffix(moves.len());
+        let moved: Vec<i64> = moves.iter().map(|save| save.id).collect();
+        let suffix = cascade_moved_suffix(&self.nodes, root, &moved);
         let restores = moves.iter().map(|save| DateRestore {
             id: save.id,
             start_date: save.previous.start_date.clone(),
@@ -4262,7 +4263,7 @@ impl PlannerState {
     }
 
     /// A grouped date move's message: Shift-drag descendants of `first` as
-    /// children, the rest as Date cascade successors.
+    /// children, the rest as Rollup parents and Date cascade successors.
     fn group_message(
         &self,
         message: String,
@@ -4270,11 +4271,11 @@ impl PlannerState {
         others: impl Iterator<Item = i64>,
     ) -> String {
         let descendants: HashSet<i64> = descendant_ids(&self.nodes, first).into_iter().collect();
-        let (children, successors): (Vec<i64>, Vec<i64>) =
+        let (children, moved): (Vec<i64>, Vec<i64>) =
             others.partition(|id| descendants.contains(id));
         let mut message =
             named_dates_with_children(message, &self.item_title(first), children.len());
-        message.push_str(&successors_moved_suffix(successors.len()));
+        message.push_str(&cascade_moved_suffix(&self.nodes, first, &moved));
         message
     }
 
@@ -4528,13 +4529,42 @@ pub(crate) fn dates_moved_message(
     dates_range_message("Moved", title, start, target)
 }
 
-/// ` · 3 successors moved` for a change's Date cascade toast.
-fn successors_moved_suffix(count: usize) -> String {
-    match count {
+/// ` · 1 parent rolled up · 3 successors moved` for a change's Date cascade
+/// toast. `moved` holds every Work Item the cascade wrote; those that are an
+/// ancestor of `root` or of another moved Work Item are Rollup parents.
+fn cascade_moved_suffix(nodes: &[WorkItemNode], root: i64, moved: &[i64]) -> String {
+    let ancestors = ancestor_ids(nodes, std::iter::once(root).chain(moved.iter().copied()));
+    let parents = moved.iter().filter(|id| ancestors.contains(id)).count();
+    let mut suffix = match parents {
         0 => String::new(),
-        1 => " · 1 successor moved".into(),
-        _ => format!(" · {count} successors moved"),
+        1 => " · 1 parent rolled up".into(),
+        _ => format!(" · {parents} parents rolled up"),
+    };
+    match moved.len() - parents {
+        0 => {}
+        1 => suffix.push_str(" · 1 successor moved"),
+        successors => suffix.push_str(&format!(" · {successors} successors moved")),
     }
+    suffix
+}
+
+/// Every in-forest ancestor of `ids`. Stops at a parent cycle.
+fn ancestor_ids(nodes: &[WorkItemNode], ids: impl Iterator<Item = i64>) -> HashSet<i64> {
+    let parents: HashMap<i64, i64> = nodes
+        .iter()
+        .filter_map(|node| node.parent_id.map(|parent| (node.id, parent)))
+        .collect();
+    let mut out = HashSet::new();
+    for id in ids {
+        let mut current = id;
+        while let Some(&parent) = parents.get(&current) {
+            if !out.insert(parent) {
+                break;
+            }
+            current = parent;
+        }
+    }
+    out
 }
 
 fn named_dates_with_children(message: String, title: &str, extra_count: usize) -> String {
