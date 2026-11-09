@@ -300,8 +300,23 @@ async fn drag_preview_plans_the_cascade_and_counts_moves() {
 
     let (_mock, mut state, _dir) = signed_in(CascadeMode::Flexible).await;
     begin(&mut state, SUCC, GestureKind::Move, -3.0);
+    let gesture = state.gantt.gesture.clone().expect("dragging");
+    let chip = GanttView::drag_preview_text(&gesture);
+    assert!(
+        chip.starts_with("Jul 20 → Aug 3"),
+        "the chip shows where the snap lands: {chip}"
+    );
     let visible = state.visible();
     let bars = visible.layout_bars(&state, 10_000.0);
+    let bar = bars.iter().find(|bar| bar.id == SUCC).expect("#1012 bar");
+    let snapped_x = state
+        .gantt
+        .x_for_date(jiff::civil::Date::new(2026, 7, 20).unwrap());
+    assert!(
+        (bar.x - snapped_x).abs() < 1.0,
+        "the bar paints at the snapped Jul 20, x={} want {snapped_x}",
+        bar.x
+    );
     assert!(
         !visible
             .clash_marks(&state, &bars)

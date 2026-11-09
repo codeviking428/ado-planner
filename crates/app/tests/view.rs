@@ -7094,6 +7094,13 @@ fn a_drop_cascades_through_the_save_queue_and_undoes_in_one_step(
         mock_dates(&runtime, &mock, 1003).1.as_deref(),
         Some("2026-07-20")
     );
+    view.update(cx, |view, _| {
+        let message = view.state.toasts.last_message().unwrap_or_default();
+        assert!(
+            message.starts_with("Undone") && message.ends_with(" · 1 successor moved"),
+            "Ctrl+Z names the cascade it undid: {message}"
+        );
+    });
 }
 
 #[gpui_kit::test]

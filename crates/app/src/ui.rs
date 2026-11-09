@@ -5915,8 +5915,9 @@ impl PlannerView {
                         return None;
                     }
                     let text = crate::gantt::GanttView::drag_preview_text(gesture);
-                    let start_text = compact_date(gesture.live_start);
-                    let end_text = compact_date(gesture.live_target);
+                    let (shown_start, shown_target) = gesture.shown_dates();
+                    let start_text = compact_date(shown_start);
+                    let end_text = compact_date(shown_target);
                     let bar = bars.iter().find(|bar| bar.id == gesture.id);
                     let date_pill = |text: String, cx: &Context<Self>| {
                         div()

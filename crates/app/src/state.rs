@@ -1896,16 +1896,12 @@ impl PlannerState {
                 self.history.redo.push(HistoryEntry::DatesGroup {
                     items: items.clone(),
                 });
-                if let Some(first) = items.first() {
-                    let entry = HistoryEntry::Dates {
-                        id: first.id,
-                        before_start: first.before_start.clone(),
-                        before_target: first.before_target.clone(),
-                        after_start: first.after_start.clone(),
-                        after_target: first.after_target.clone(),
-                    };
-                    self.push_history_toast(&entry, true);
-                }
+                self.push_history_toast(
+                    &HistoryEntry::DatesGroup {
+                        items: items.clone(),
+                    },
+                    true,
+                );
                 let pending = self.pending_from_dates_group(items, true);
                 self.clear_selection_if_undo_empty();
                 pending
@@ -1966,16 +1962,12 @@ impl PlannerState {
                 self.history.undo.push(HistoryEntry::DatesGroup {
                     items: items.clone(),
                 });
-                if let Some(first) = items.first() {
-                    let entry = HistoryEntry::Dates {
-                        id: first.id,
-                        before_start: first.before_start.clone(),
-                        before_target: first.before_target.clone(),
-                        after_start: first.after_start.clone(),
-                        after_target: first.after_target.clone(),
-                    };
-                    self.push_history_toast(&entry, false);
-                }
+                self.push_history_toast(
+                    &HistoryEntry::DatesGroup {
+                        items: items.clone(),
+                    },
+                    false,
+                );
                 self.pending_from_dates_group(items, false)
             }
             _ => Vec::new(),

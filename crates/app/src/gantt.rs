@@ -440,6 +440,22 @@ pub struct Gesture {
     pub preview: Option<CascadePreview>,
 }
 
+impl Gesture {
+    /// The dates the bar paints at: the live dates, or where a Flexible
+    /// snap puts the drop.
+    pub fn shown_dates(&self) -> (Date, Date) {
+        let Some(snapped) = self.preview.as_ref().and_then(|preview| preview.snapped) else {
+            return (self.live_start, self.live_target);
+        };
+        let start = snapped.start.or(snapped.target).unwrap_or(self.live_start);
+        let shift = (start - self.live_start).get_days();
+        let target = snapped
+            .target
+            .unwrap_or_else(|| self.live_target.saturating_add(shift.days()));
+        (start, target.max(start))
+    }
+}
+
 /// A drop's Date cascade, planned once per live day rather than per frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CascadePreview {
@@ -1818,7 +1834,7 @@ impl GanttView {
                     .filter(|gesture| gesture.id == node.id && gesture.kind != GestureKind::Link);
                 let mut marker = false;
                 let (start, target) = if let Some(gesture) = live {
-                    (gesture.live_start, gesture.live_target)
+                    gesture.shown_dates()
                 } else if display.kind == GanttBarKind::NoFields {
                     // Keep "No dates" readable on Year/Quarter. A 16px box
                     // collapses the label to "…".
@@ -1872,7 +1888,8 @@ impl GanttView {
                     && live.as_ref().is_none_or(|gesture| !gesture.had_target);
                 let open_ended = start_only;
                 let label = if let Some(gesture) = live {
-                    format_date_range(Some(gesture.live_start), Some(gesture.live_target))
+                    let (start, target) = gesture.shown_dates();
+                    format_date_range(Some(start), Some(target))
                 } else {
                     dates_column_text_indexed(node, nodes, index, hint.as_ref())
                 };
@@ -2142,20 +2159,20 @@ impl GanttView {
     }
 
     fn drag_dates_text(gesture: &Gesture) -> String {
-        if gesture.live_start == gesture.live_target {
-            compact_date(gesture.live_start)
+        let (start, target) = gesture.shown_dates();
+        if start == target {
+            compact_date(start)
         } else {
-            let days = gesture
-                .live_target
-                .since((Unit::Day, gesture.live_start))
+            let days = target
+                .since((Unit::Day, start))
                 .map(|span| span.get_days())
                 .unwrap_or(0)
                 .max(0)
                 + 1;
             format!(
                 "{} → {} · {days}d",
-                compact_date(gesture.live_start),
-                compact_date(gesture.live_target)
+                compact_date(start),
+                compact_date(target)
             )
         }
     }
