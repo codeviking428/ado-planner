@@ -21,6 +21,18 @@ struct Pending {
     delay_ms: u64,
     failure: Option<(u16, String)>,
     retry_after: Option<u64>,
+    gate: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// Holds the request matched by [`AdoMock::hold_next`] until released, so a
+/// test decides when it completes instead of racing a wall-clock delay.
+#[derive(Clone)]
+pub struct MockGate(Arc<tokio::sync::Notify>);
+
+impl MockGate {
+    pub fn release(&self) {
+        self.0.notify_one();
+    }
 }
 
 struct AppState {
@@ -50,6 +62,7 @@ impl AdoMock {
             delay_ms,
             failure: None,
             retry_after: None,
+            gate: None,
         });
     }
 
@@ -59,6 +72,7 @@ impl AdoMock {
             delay_ms: 0,
             failure: Some((status, message.to_string())),
             retry_after: None,
+            gate: None,
         });
     }
 
@@ -69,16 +83,22 @@ impl AdoMock {
             delay_ms: 0,
             failure: Some((status, message.to_string())),
             retry_after: Some(seconds),
+            gate: None,
         });
     }
 
-    /// Hold the next matching request for `delay_ms`, then fail it.
-    pub fn fail_next_after(&self, path: &str, delay_ms: u64, status: u16, message: &str) {
+    /// Hold the next matching request until the returned gate is released,
+    /// then answer it normally or with `failure`.
+    pub fn hold_next(&self, path: &str, failure: Option<(u16, &str)>) -> MockGate {
+        let gate = Arc::new(tokio::sync::Notify::new());
         self.state.pending.lock().expect("pending").push(Pending {
             path: path.to_string(),
-            delay_ms,
-            failure: Some((status, message.to_string())),
+            delay_ms: 0,
+            failure: failure.map(|(status, message)| (status, message.to_string())),
+            retry_after: None,
+            gate: Some(gate.clone()),
         });
+        MockGate(gate)
     }
 
     /// Requests whose path and query contain `fragment`, reads included.
@@ -194,6 +214,9 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> Respo
             .map_or_else(|| path.clone(), ToString::to_string),
     );
     if let Some(pending) = take_pending(&state, &path).await {
+        if let Some(gate) = &pending.gate {
+            gate.notified().await;
+        }
         if pending.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(pending.delay_ms)).await;
         }

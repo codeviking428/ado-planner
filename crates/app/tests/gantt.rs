@@ -2807,19 +2807,18 @@ fn ui_escape_discards_unsaved_nudges(cx: &mut gpui_kit::TestAppContext) {
 
 /// Press once, let the 500 ms commit start a PATCH the mock holds (and
 /// optionally fails), then press `during` while that PATCH is in flight.
-fn nudge_during_a_slow_patch(
+/// The PATCH completes only when the test releases the returned gate.
+fn nudge_during_a_held_patch(
     view: &gpui_kit::Entity<ado_planner::ui::PlannerView>,
     cx: &mut gpui_kit::VisualTestContext,
     app: &MockApp,
     fails: bool,
     during: &str,
-) {
-    let path = format!("/workitems/{PERSIST_CART}");
-    if fails {
-        app.mock.fail_next_after(&path, 400, 503, "save failed");
-    } else {
-        app.mock.delay_next(&path, 400);
-    }
+) -> ado_mock::MockGate {
+    let failure = fails.then_some((503, "save failed"));
+    let gate = app
+        .mock
+        .hold_next(&format!("/workitems/{PERSIST_CART}"), failure);
     cx.simulate_keystrokes("right");
     idle(cx, NUDGE_IDLE_MS);
     assert!(
@@ -2828,6 +2827,7 @@ fn nudge_during_a_slow_patch(
     );
     cx.simulate_keystrokes(during);
     support::draw(cx);
+    gate
 }
 
 #[gpui_kit::test]
@@ -2835,7 +2835,8 @@ fn ui_nudges_during_an_in_flight_save_wait_for_their_own_idle(cx: &mut gpui_kit:
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
     let before = app.mock.patch_count();
-    nudge_during_a_slow_patch(&view, cx, &app, false, "right right");
+    let gate = nudge_during_a_held_patch(&view, cx, &app, false, "right right");
+    gate.release();
     settle(&view, cx, "the first Nudge PATCH", |_| true);
     assert_eq!(
         app.mock.patch_count(),
@@ -2871,7 +2872,8 @@ fn ui_escape_during_an_in_flight_save_drops_only_the_later_presses(
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
     let before = app.mock.patch_count();
-    nudge_during_a_slow_patch(&view, cx, &app, false, "right right escape");
+    let gate = nudge_during_a_held_patch(&view, cx, &app, false, "right right escape");
+    gate.release();
     settle(&view, cx, "the first Nudge PATCH", |_| true);
     idle(cx, NUDGE_IDLE_MS * 2);
     settle(&view, cx, "no PATCH for the discarded presses", |_| true);
@@ -2893,7 +2895,7 @@ fn ui_failed_save_drops_a_later_nudge_already_queued_behind_it(cx: &mut gpui_kit
     let (view, cx) = nudge_ready(cx, &app);
     let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
     let before = app.mock.patch_count();
-    nudge_during_a_slow_patch(&view, cx, &app, true, "right right");
+    let gate = nudge_during_a_held_patch(&view, cx, &app, true, "right right");
     idle(cx, NUDGE_IDLE_MS);
     view.read_with(cx, |view, _| {
         assert!(
@@ -2901,6 +2903,7 @@ fn ui_failed_save_drops_a_later_nudge_already_queued_behind_it(cx: &mut gpui_kit
             "the second batch must be committed and queued behind the in-flight PATCH"
         );
     });
+    gate.release();
     settle(&view, cx, "the failed first PATCH", |view| {
         view.state.toasts.last_error_message().is_some()
     });
@@ -2941,7 +2944,8 @@ fn ui_failed_save_drops_presses_made_while_it_was_in_flight(cx: &mut gpui_kit::T
     let (view, cx) = nudge_ready(cx, &app);
     let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
     let before = app.mock.patch_count();
-    nudge_during_a_slow_patch(&view, cx, &app, true, "right right");
+    let gate = nudge_during_a_held_patch(&view, cx, &app, true, "right right");
+    gate.release();
     settle(&view, cx, "the failed Nudge PATCH", |view| {
         view.state.toasts.last_error_message().is_some()
     });

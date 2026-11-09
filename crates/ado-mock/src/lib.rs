@@ -3,4 +3,4 @@
 mod fixtures;
 mod server;
 
-pub use server::{AdoMock, TOKEN_PATH, start};
+pub use server::{AdoMock, MockGate, TOKEN_PATH, start};
