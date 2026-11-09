@@ -606,6 +606,7 @@ impl PlannerView {
         });
         this.bind_sign_in_events(window, cx);
         this.bind_inline_input(cx);
+        this.bind_create_title_input(cx);
         this
     }
 
@@ -1039,6 +1040,21 @@ impl PlannerView {
         });
         self._subscriptions.push(filter);
         self._subscriptions.push(scope);
+    }
+
+    fn bind_create_title_input(&mut self, cx: &mut Context<Self>) {
+        let events = cx.subscribe(
+            &self.create_title_input,
+            |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(draft) = this.pending_create.as_mut()
+                    && draft.error.take().is_some()
+                {
+                    cx.notify();
+                }
+            },
+        );
+        self._subscriptions.push(events);
     }
 
     fn bind_inline_input(&mut self, cx: &mut Context<Self>) {
@@ -7986,7 +8002,12 @@ impl PlannerView {
                             })),
                     )
                     .when_some(draft.error.clone(), |el, error| {
-                        el.child(Label::new(error).text_xs().text_color(cx.theme().danger))
+                        el.child(
+                            div()
+                                .id("gantt-create-error")
+                                .debug_selector(|| "gantt-create-error".into())
+                                .child(Label::new(error).text_xs().text_color(cx.theme().danger)),
+                        )
                     })
                     .child(
                         h_flex()

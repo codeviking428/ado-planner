@@ -13523,6 +13523,16 @@ fn create_dialog_needs_a_title_and_cancel_closes_it(cx: &mut gpui_kit::TestAppCo
         cx.debug_bounds("gantt-create-dialog").is_some(),
         "Enter with an empty title must keep the dialog open"
     );
+    assert!(
+        cx.debug_bounds("gantt-create-error").is_some(),
+        "an empty title must explain why nothing was created"
+    );
+    cx.simulate_input("P");
+    draw(cx);
+    assert!(
+        cx.debug_bounds("gantt-create-error").is_none(),
+        "typing a title must clear the empty-title error"
+    );
     view.update(cx, |view, _| {
         assert_eq!(view.state.nodes.len(), before);
         assert!(view.state.history.undo.is_empty());
