@@ -35,6 +35,9 @@ const ROWS: usize = 5_000;
 const LAUNCHES: usize = 5;
 const IDLE_SETTLE: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// `RUST_LOG` filter for the app; when set, its log is echoed to stderr with
+/// the time since spawn, to see where a slow launch spends its time.
+const LOG_ENV: &str = "ADO_PLANNER_LAUNCH_LOG";
 
 fn speed_tests_enabled() -> bool {
     std::env::var("ADO_PLANNER_SPEED_TESTS")
@@ -134,7 +137,10 @@ fn launch(xdg_data_home: &Path, mock_url: &str) -> Launch {
             .env("ADO_PLANNER_ADO_BASE_URL", mock_url)
             .env("ADO_PLANNER_VSSPS_URL", mock_url)
             .env(startup_probe::ENV, "1")
-            .env("RUST_LOG", "warn")
+            .env(
+                "RUST_LOG",
+                std::env::var(LOG_ENV).unwrap_or_else(|_| "warn".into()),
+            )
             .env_remove("ENTRA_CLIENT_ID")
             .env_remove("MAIN_VITE_ENTRA_CLIENT_ID")
             .stdout(Stdio::piped())
@@ -145,7 +151,11 @@ fn launch(xdg_data_home: &Path, mock_url: &str) -> Launch {
     let stdout = child.0.stdout.take().expect("stdout");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let echo = std::env::var(LOG_ENV).is_ok();
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if echo {
+                eprintln!("{:>9.1?} {line}", started.elapsed());
+            }
             if tx.send((line, started.elapsed())).is_err() {
                 break;
             }

@@ -31,7 +31,7 @@ status=0
 for run in $(seq 1 "$runs"); do
   echo "::group::speed budgets, run $run of $runs"
   xvfb-run -a -s "-screen 0 1280x800x24" \
-    cargo test --release --locked -p ado-planner --test speed --test launch \
+    cargo test --release --locked -p ado-planner --no-fail-fast --test speed --test launch \
     -- --nocapture --test-threads 1 || status=1
   echo "::endgroup::"
 done
