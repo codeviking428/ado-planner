@@ -191,6 +191,8 @@ pub struct PlannerView {
     skip_saving_hold: bool,
     date_save_busy: HashSet<i64>,
     date_save_queue: VecDeque<PendingDateSave>,
+    /// Bumped on every Nudge so only the timer armed by the last press saves.
+    nudge_gen: u64,
     /// Optimistic links waiting for `persist_added_dependency` while
     /// `spawn_state` holds `io_busy`. Lives on the view so `adopt_spawned`
     /// cannot drop the pair.
@@ -573,6 +575,7 @@ impl PlannerView {
             skip_saving_hold: false,
             date_save_busy: HashSet::new(),
             date_save_queue: VecDeque::new(),
+            nudge_gen: 0,
             link_save_queue: VecDeque::new(),
             pending_team: None,
             update_checked: false,
@@ -10983,6 +10986,14 @@ impl PlannerView {
         self.io_busy
     }
 
+    /// Any planner, date or link save still running or queued.
+    pub fn io_pending(&self) -> bool {
+        self.io_busy
+            || !self.date_save_busy.is_empty()
+            || !self.date_save_queue.is_empty()
+            || !self.link_save_queue.is_empty()
+    }
+
     pub fn set_busy_for_test(&mut self, busy: bool) {
         self.io_busy = busy;
         if busy && self.saving_shown_at.is_none() {
@@ -11457,21 +11468,23 @@ impl PlannerView {
     }
 
     fn schedule_nudge_flush(&mut self, cx: &mut Context<Self>) {
+        self.nudge_gen += 1;
+        let nudge_gen = self.nudge_gen;
+        cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(NUDGE_IDLE_MS))
                 .await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, cx| {
-                    if this
-                        .state
-                        .nudge_is_idle(Duration::from_millis(NUDGE_IDLE_MS))
-                    {
-                        this.spawn_state(cx, |mut state| async move {
-                            let result = state.flush_nudge().await;
-                            (state, result)
-                        });
+                    if this.nudge_gen != nudge_gen {
+                        return;
                     }
+                    if let Some(save) = this.state.commit_nudge_now() {
+                        this.note_toasts_changed(cx);
+                        this.enqueue_date_save(cx, save);
+                    }
+                    cx.notify();
                 });
             }
         })

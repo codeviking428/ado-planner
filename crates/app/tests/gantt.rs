@@ -1,11 +1,15 @@
+mod support;
+
 use ado_core::{START_DATE_FIELD, TARGET_DATE_FIELD, parse_iso_date};
-use ado_planner::gantt::{GanttScale, GanttView, GestureKind, NudgeAxis};
+use ado_planner::gantt::{GanttScale, GanttView, GestureKind, NUDGE_IDLE_MS, NudgeAxis};
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{DateSaveRole, PlannerState, fake_hierarchy};
 use ado_planner::toasts::{HistoryEntry, ToastKind, UndoAction};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use jiff::ToSpan;
 use jiff::civil::Date;
+use std::time::Duration;
+use support::{MockApp, date_only, node_dates, select_bar, settle};
 
 async fn signed_in() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
     let mock = ado_mock::start().await;
@@ -2645,4 +2649,183 @@ async fn link_whose_walk_leaves_loaded_work_items_still_patches() {
         .expect("link persists");
     assert_eq!(mock.patch_count(), patches + 1);
     assert!(loop_toasts(&state).is_empty());
+}
+
+const PERSIST_CART: i64 = 1003;
+
+fn nudge_ready<'a>(
+    cx: &'a mut gpui_kit::TestAppContext,
+    app: &MockApp,
+) -> (
+    gpui_kit::Entity<ado_planner::ui::PlannerView>,
+    &'a mut gpui_kit::VisualTestContext,
+) {
+    let mut state = app.signed_in();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = support::open(cx, state);
+    select_bar(cx, "gantt-bar-1003");
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.state.gantt.selected_id, Some(PERSIST_CART));
+    });
+    (view, cx)
+}
+
+fn idle(cx: &mut gpui_kit::VisualTestContext, ms: u64) {
+    cx.executor().advance_clock(Duration::from_millis(ms));
+    cx.run_until_parked();
+    support::draw(cx);
+}
+
+#[gpui_kit::test]
+fn ui_five_right_presses_send_one_patch_after_500ms_idle(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let before = app.mock.patch_count();
+    for _ in 0..5 {
+        cx.simulate_keystrokes("right");
+        idle(cx, 100);
+    }
+    view.read_with(cx, |view, _| {
+        let (start, target) = node_dates(view, PERSIST_CART);
+        assert_eq!(date_only(start.as_deref()), Some("2026-07-11"));
+        assert_eq!(date_only(target.as_deref()), Some("2026-07-25"));
+    });
+    assert_eq!(
+        app.mock.patch_count(),
+        before,
+        "presses 100ms apart must keep coalescing"
+    );
+    idle(cx, NUDGE_IDLE_MS - 101);
+    assert_eq!(
+        app.mock.patch_count(),
+        before,
+        "no PATCH before 500ms without a press"
+    );
+    idle(cx, 1);
+    settle(&view, cx, "the coalesced Nudge PATCH", |_| true);
+    assert_eq!(
+        app.mock.patch_count(),
+        before + 1,
+        "five presses must send one PATCH"
+    );
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-11")
+    );
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, TARGET_DATE_FIELD).as_deref()),
+        Some("2026-07-25")
+    );
+    view.read_with(cx, |view, _| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        assert_eq!(date_only(start.as_deref()), Some("2026-07-11"));
+        assert!(view.state.gantt.pending_nudge.is_none());
+        assert!(
+            view.state
+                .toasts
+                .last_message()
+                .is_some_and(|message| message.contains("Persist cart")),
+            "the saved Nudge must toast like a drag, got {:?}",
+            view.state.toasts.last_message()
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn ui_shift_and_alt_nudges_move_one_edge(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    cx.simulate_keystrokes("shift-right shift-right alt-left");
+    idle(cx, NUDGE_IDLE_MS);
+    settle(&view, cx, "the edge Nudge PATCH", |_| true);
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-05"),
+        "Alt+← moves Start only"
+    );
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, TARGET_DATE_FIELD).as_deref()),
+        Some("2026-07-22"),
+        "Shift+→ moves Target only"
+    );
+}
+
+#[gpui_kit::test]
+fn ui_failed_nudge_patch_rolls_back_and_toasts(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
+    app.mock
+        .fail_next(&format!("/workitems/{PERSIST_CART}"), 503, "save failed");
+    cx.simulate_keystrokes("right right right");
+    view.read_with(cx, |view, _| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        assert_eq!(date_only(start.as_deref()), Some("2026-07-09"));
+    });
+    idle(cx, NUDGE_IDLE_MS);
+    settle(&view, cx, "the failed Nudge PATCH", |view| {
+        view.state.toasts.last_error_message().is_some()
+    });
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            node_dates(view, PERSIST_CART),
+            original,
+            "a failed PATCH must restore the dates from before the first press"
+        );
+        assert!(view.state.gantt.pending_nudge.is_none());
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .all(|toast| toast.undo.is_none()),
+            "a rolled-back Nudge must not leave an Undo for a change that never saved"
+        );
+    });
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-06"),
+        "the mock keeps the original Start"
+    );
+}
+
+#[gpui_kit::test]
+fn ui_escape_discards_unsaved_nudges(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
+    let before = app.mock.patch_count();
+    cx.simulate_keystrokes("right right escape");
+    idle(cx, NUDGE_IDLE_MS * 2);
+    settle(&view, cx, "the discarded Nudge", |_| true);
+    assert_eq!(app.mock.patch_count(), before, "Escape must drop the PATCH");
+    view.read_with(cx, |view, _| {
+        assert_eq!(node_dates(view, PERSIST_CART), original);
+        assert!(view.state.gantt.pending_nudge.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn ui_nudges_during_an_in_flight_save_are_saved_too(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let before = app.mock.patch_count();
+    app.mock
+        .delay_next(&format!("/workitems/{PERSIST_CART}"), 300);
+    cx.simulate_keystrokes("right");
+    idle(cx, NUDGE_IDLE_MS);
+    cx.simulate_keystrokes("right right");
+    idle(cx, NUDGE_IDLE_MS);
+    settle(&view, cx, "both Nudge PATCHes", |_| {
+        app.mock.patch_count() >= before + 2
+    });
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-09"),
+        "presses made while the first PATCH was in flight must still save"
+    );
+    view.read_with(cx, |view, _| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        assert_eq!(date_only(start.as_deref()), Some("2026-07-09"));
+    });
 }

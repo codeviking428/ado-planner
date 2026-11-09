@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
 
 use ado_client::{AdoClient, AdoRuntime, TokenSource};
 use ado_core::{
@@ -67,7 +66,6 @@ pub struct PlannerState {
     pub history: EditHistory,
     pub updater: Updater,
     pub copied: Option<String>,
-    last_nudge_at: Option<Instant>,
     history_recording: bool,
     team_views: HashMap<String, SavedGanttView>,
     /// Child date restores from a Shift-move, applied to the parent toast
@@ -311,7 +309,6 @@ impl PlannerState {
             history: EditHistory::default(),
             updater: Updater::from_env(),
             copied: None,
-            last_nudge_at: None,
             history_recording: true,
             team_views: HashMap::new(),
             shifted_children: HashMap::new(),
@@ -3054,7 +3051,6 @@ impl PlannerState {
                 let start = pending.had_start.then_some(pending.start);
                 let target = pending.had_target.then_some(pending.target);
                 let _ = self.apply_optimistic_partial(pending.id, start, target);
-                self.last_nudge_at = Some(Instant::now());
                 Ok(())
             }
             Err(message) => {
@@ -3064,27 +3060,62 @@ impl PlannerState {
         }
     }
 
-    pub fn nudge_is_idle(&self, idle: Duration) -> bool {
-        self.last_nudge_at.is_some_and(|at| at.elapsed() >= idle)
-            && self.gantt.pending_nudge.is_some()
-    }
-
-    pub async fn flush_nudge(&mut self) -> Result<(), AppError> {
-        let Some(pending) = self.gantt.pending_nudge.take() else {
-            return Ok(());
-        };
-        self.last_nudge_at = None;
+    /// Turn the coalesced Nudge into a date save, like a finished drag:
+    /// dates stay applied, undo and the toast are recorded, and the caller
+    /// persists it. `None` when nothing is pending or the presses cancel out.
+    pub fn commit_nudge_now(&mut self) -> Option<PendingDateSave> {
+        let pending = self.gantt.pending_nudge.take()?;
         self.restore_nudge(&pending);
         let start = pending.had_start.then_some(pending.start);
         let target = pending.had_target.then_some(pending.target);
-        self.save_partial_dates(pending.id, start, target).await
+        let previous = self.nodes.iter().find(|node| node.id == pending.id)?;
+        if !previous.has_date_fields {
+            return None;
+        }
+        let after_start = start
+            .map(iso_date_only)
+            .or_else(|| previous.start_date.clone());
+        let after_target = target
+            .map(iso_date_only)
+            .or_else(|| previous.target_date.clone());
+        if after_start == previous.start_date && after_target == previous.target_date {
+            return None;
+        }
+        let previous = self.apply_optimistic_partial(pending.id, start, target)?;
+        if self.history_recording {
+            self.record_dates(
+                pending.id,
+                &previous,
+                after_start.clone(),
+                after_target.clone(),
+            );
+        }
+        let save = PendingDateSave {
+            id: pending.id,
+            start,
+            target,
+            after_start,
+            after_target,
+            rev: previous.rev,
+            previous,
+            role: DateSaveRole::Commit,
+            cascade: Vec::new(),
+        };
+        self.offer_local_date_commit_toast(&save);
+        Some(save)
+    }
+
+    pub async fn flush_nudge(&mut self) -> Result<(), AppError> {
+        match self.commit_nudge_now() {
+            Some(save) => self.persist_pending_dates(save).await,
+            None => Ok(()),
+        }
     }
 
     pub fn discard_nudge(&mut self) {
         if let Some(nudge) = self.gantt.pending_nudge.take() {
             self.restore_nudge(&nudge);
         }
-        self.last_nudge_at = None;
     }
 
     pub async fn clear_dates(&mut self, id: i64) -> Result<(), AppError> {
