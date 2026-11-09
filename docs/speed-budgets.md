@@ -2,14 +2,14 @@
 
 The `Speed budgets` CI job fails a pull request when the Rust app regresses past one of these budgets ([#53](https://github.com/codeviking428/ado-planner/issues/53)). Frame-by-frame history is in [performance.md](performance.md).
 
-| Budget                            |       #53 target | CI fails above | Hosted runners measured | Target met           |
-| --------------------------------- | ---------------: | -------------: | ----------------------: | -------------------- |
-| First frame after launch          |           300 ms |         300 ms |              128–152 ms | yes                  |
-| Gantt from warm cache, 5,000 rows |           500 ms |         650 ms |              432–505 ms | on one runner of two |
-| Scroll frame, 5,000 rows          | 16.7 ms (60 fps) |          46 ms |            35.8–36.5 ms | no                   |
-| Drag frame, 5,000 rows            | 16.7 ms (60 fps) |          29 ms |            22.9–23.2 ms | no                   |
-| Idle memory                       |           150 MB | 150 MB private |      128–137 MB private | yes                  |
-| Idle memory, all resident         |                — |         350 MB |              269–279 MB | —                    |
+| Budget                            |       #53 target | CI fails above | Hosted runners measured | Target met             |
+| --------------------------------- | ---------------: | -------------: | ----------------------: | ---------------------- |
+| First frame after launch          |           300 ms |         300 ms |              128–161 ms | yes                    |
+| Gantt from warm cache, 5,000 rows |           500 ms |         850 ms |              432–641 ms | on one runner of three |
+| Scroll frame, 5,000 rows          | 16.7 ms (60 fps) |          56 ms |            35.8–44.3 ms | no                     |
+| Drag frame, 5,000 rows            | 16.7 ms (60 fps) |          39 ms |            22.9–30.5 ms | no                     |
+| Idle memory                       |           150 MB | 150 MB private |      128–137 MB private | yes                    |
+| Idle memory, all resident         |                — |         350 MB |              269–279 MB | —                      |
 
 The Electron app's numbers are not measured here. Jonathan compares them by hand in his parity pass.
 
@@ -32,7 +32,7 @@ The job runs on GitHub's `ubuntu-latest` (Ubuntu 26.04) under Xvfb, with Mesa's 
 
 ## How the budgets were chosen
 
-The suite ran three times on each of two hosted runners, on 2026-11-09, for commits `8dd110b` and `678134e` of [#126](https://github.com/codeviking428/ado-planner/pull/126). Each row is the median of one run:
+The suite ran three times on each of two hosted runners (A, B), and once on a third (C), on 2026-11-09, for commits `8dd110b`, `678134e` and `44ef4ac` of [#126](https://github.com/codeviking428/ado-planner/pull/126). Each row is the median of one run:
 
 | Runner | Run | First frame |    Gantt |  Private | All resident |  Scroll |    Drag |
 | ------ | --: | ----------: | -------: | -------: | -----------: | ------: | ------: |
@@ -42,17 +42,20 @@ The suite ran three times on each of two hosted runners, on 2026-11-09, for comm
 | B      |   1 |    128.3 ms | 432.3 ms | 128.1 MB |     269.5 MB | 35.8 ms | 23.0 ms |
 | B      |   2 |    128.5 ms | 433.8 ms | 130.7 MB |     271.8 MB | 35.9 ms | 22.9 ms |
 | B      |   3 |    128.6 ms | 433.1 ms | 132.8 MB |     273.5 MB | 36.5 ms | 23.2 ms |
+| C      |   1 |    161.0 ms | 641.1 ms | 129.7 MB |     271.4 MB | 44.3 ms | 30.5 ms |
 
 On runner A, a failed launch budget stopped `cargo test` before the frame budgets ran; the job now passes `--no-fail-fast`.
 
-Runs on the same runner agreed within 3%. The two runners differed by about 17%. Each budget is therefore the slowest median above plus 25%, rounded up. Where #53's target is stricter than that, the target is the budget. That gives:
+Runs on the same runner agreed within 3%, but runners differ a lot: C was 25–50% slower than B on every measurement, including ones this PR does not touch (hover at 1,000 rows: 18.7 ms against 11.9 ms). The first calibration set the budgets from A and B only, and C failed the drag budget by 1.5 ms. Each budget is therefore the slowest median above plus 25%, rounded up. Where #53's target is stricter than that, the target is the budget. That gives:
 
-- **First frame:** 152 ms + 25% is 190 ms, so the 300 ms target applies.
-- **Gantt:** 505 ms + 25% is 631 ms, so the budget is 650 ms.
-- **Scroll:** 36.5 ms + 25% is 45.6 ms, so the budget is 46 ms.
-- **Drag:** 23.2 ms + 25% is 29.0 ms, so the budget is 29 ms.
+- **First frame:** 161 ms + 25% is 201 ms, so the 300 ms target applies.
+- **Gantt:** 641 ms + 25% is 801 ms, so the budget is 850 ms.
+- **Scroll:** 44.3 ms + 25% is 55.4 ms, so the budget is 56 ms.
+- **Drag:** 30.5 ms + 25% is 38.1 ms, so the budget is 39 ms.
 - **All resident memory:** 279 MB + 25% is 348 MB, so the budget is 350 MB.
-- **Private memory** does not scale with runner speed. The 150 MB target leaves 9% over the slowest median and 5% over the worst single launch (142.6 MB), so it stays.
+- **Private memory** does not scale with runner speed. The 150 MB target leaves 9% over the slowest median and 5% over the worst single launch (143.3 MB), so it stays.
+
+On a runner as fast as B, the timing budgets sit 1.5 to 2.3 times above its medians, so they catch large regressions, not small ones. If a slower runner than C fails a budget with no code change, add its run to the table and apply the same rule.
 
 A budget fails when the median of a run is over it, not a single launch or frame.
 

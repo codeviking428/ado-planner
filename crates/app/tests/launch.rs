@@ -23,11 +23,11 @@ use serde_json::{Value, json};
 // Budgets: the slowest median seen on a hosted runner plus 25%, or #53's
 // target where that is stricter. docs/speed-budgets.md has the runs.
 
-/// Spawn to first presented frame. #53's target; runners measured 128–152 ms.
+/// Spawn to first presented frame. #53's target; runners measured 128–161 ms.
 const FIRST_FRAME_BUDGET: Duration = Duration::from_millis(300);
 /// Spawn to the Gantt painting a 5,000-row Team, with a warm query cache and a
-/// saved Session. Runners measured 432–505 ms against #53's 500 ms target.
-const GANTT_BUDGET: Duration = Duration::from_millis(650);
+/// saved Session. Runners measured 432–641 ms against #53's 500 ms target.
+const GANTT_BUDGET: Duration = Duration::from_millis(850);
 /// Private memory 2 s after that Gantt paints. #53's target; runners
 /// measured 128–137 MB, and memory does not scale with runner speed.
 const IDLE_PRIVATE_BUDGET_MB: f64 = 150.0;
