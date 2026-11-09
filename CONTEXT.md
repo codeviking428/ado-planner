@@ -1,6 +1,6 @@
 # ADO Planner
 
-A Monday-lite Electron app for viewing an Azure DevOps Team's Work Item Hierarchy on a Gantt.
+A Monday-lite native desktop app, written in Rust with GPUI, for viewing an Azure DevOps Team's Work Item Hierarchy on a Gantt.
 
 ## Language
 

@@ -1,6 +1,6 @@
 # UI improvements
 
-Running list for bringing ADO Planner to professional-grade (Monday-class) polish. Check items off as they land; add follow-ups from Playwright screenshots.
+Running list for bringing ADO Planner to professional-grade (Monday-class) polish. Check items off as they land; add follow-ups from screenshots (see `docs/agents/dev-session.md`).
 
 ## Layout and hierarchy
 

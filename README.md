@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="resources/icon.png" width="96" height="96" alt="ADO Planner">
+  <img src="assets/icons/png/512x512.png" width="96" height="96" alt="ADO Planner">
 </p>
 
 <h1 align="center">ADO Planner</h1>
@@ -22,8 +22,6 @@
 <p align="center">
   <a href="https://github.com/codeviking428/ado-planner/releases/latest"><strong>Download for Windows or Linux</strong></a>
   ·
-  <a href="#install-with-npm">Install with npm</a>
-  ·
   <a href="#sign-in">Sign in</a>
 </p>
 
@@ -42,30 +40,23 @@ No browser tabs, no CSV round-trips, no second tool that drifts out of date.
 
 ## Install
 
-### Windows & Linux (the usual way)
+### Windows & Linux
 
 1. Open the <a href="https://github.com/codeviking428/ado-planner/releases/latest">latest release</a>.
-2. **Windows:** download `ado-planner-electron-*-setup.exe` and run it. It installs for all users to `C:\Program Files\ado-planner` and asks for admin rights (UAC). You'll get a Start Menu and desktop shortcut. An older per-user install is removed; your settings stay.
-3. **Linux:** download `ado-planner-electron-*.AppImage`, mark it executable (`chmod +x ado-planner-electron-*.AppImage`), and run it.
+2. **Windows:** download `ado-planner-v*-x86_64-setup.exe` and run it. It installs for all users to `C:\Program Files\ADO Planner` and asks for admin rights (UAC). You'll get a Start Menu and desktop shortcut. An older install is removed, including the Electron app.
+3. **Linux:** download `ado-planner-v*-x86_64.AppImage`, mark it executable (`chmod +x ado-planner-v*-x86_64.AppImage`), and run it. It needs glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+).
 
-Each release also carries the native Rust app, which is replacing Electron ([ADR 0001](docs/adr/0001-rewrite-in-rust-gpui.md)): `ado-planner-v*-x86_64-setup.exe` (installs to `C:\Program Files\ADO Planner`, admin rights required), `ado-planner-v*-x86_64.AppImage`, and plain binaries in `ado-planner-v*-<target>.zip` / `.tar.gz`. `SHA256SUMS` covers every file.
+Each release also carries plain binaries in `ado-planner-v*-<target>.zip` / `.tar.gz`. `SHA256SUMS` covers every file.
 
-The installed app checks for updates on launch. Yes downloads, installs, and restarts; No snoozes until next time.
+The installed app checks for updates on launch. Yes downloads, installs, and restarts; No snoozes until next time. Each update is signed, and the app installs only updates signed with the release key.
 
 macOS is not published yet. See [Publishing for Mac](#publishing-for-mac).
 
-### Install with npm
+### Coming from the Electron app
 
-If you already have [Node.js 20+](https://nodejs.org) (and Git), install the app globally from this repo:
+Before 1.0.0, ADO Planner was an Electron app. It offers the native app as its next update: say Yes, and on Windows the installer replaces the Electron app; on Linux the new AppImage replaces the old one. You can also download the installer above. Either way, **sign in again** once and pick your Org, Project, Team, filters, and Flavor again: the native app can't read the Electron app's saved sign-in or settings.
 
-```bash
-npm install -g github:codeviking428/ado-planner
-ado-planner
-```
-
-That's it — no clone, no `pnpm`, no build step on your side. Update with the same command; remove with `npm uninstall -g ado-planner`.
-
-> The npm install talks to Azure DevOps the same way the installer does. It does **not** auto-update itself — re-run the `npm install -g` command when you want a new version.
+The `npm install -g github:codeviking428/ado-planner` install no longer works. Remove it with `npm uninstall -g ado-planner` and use a download above.
 
 ## Sign in
 
@@ -80,7 +71,7 @@ If no Entra app ID is configured (the default), ADO Planner asks for a PAT at st
 3. Enter the organization URL, such as `https://dev.azure.com/contoso`.
 4. Paste the token into the sign-in screen and click **Continue**.
 
-The token is stored with Electron `safeStorage` on your machine. On Linux without a secret store it stays in memory only, so you'll paste it again next launch. **Log out** wipes it.
+The token is encrypted on disk with a key kept in the OS credential store (Windows Credential Manager, macOS Keychain, or the Secret Service on Linux). Without a credential store it stays in memory only, so you'll paste it again next launch. **Log out** wipes it.
 
 ### Entra work/school SSO — one-time admin setup
 
@@ -88,16 +79,16 @@ An Entra admin registers **one public-client app** for the whole org. It is not 
 
 1. [Entra admin center](https://entra.microsoft.com) → **App registrations → New registration**.
 2. Supported account types: **Accounts in any organizational directory** (not personal Microsoft accounts).
-3. **Add a platform → Mobile and desktop applications**, redirect URI `http://localhost`.
+3. **Add a platform → Mobile and desktop applications**, redirect URIs `http://localhost` and `http://127.0.0.1`. The app listens on a random loopback port.
 4. **Authentication → Allow public client flows: Yes**.
 5. **API permissions → Azure DevOps** (delegated, not Microsoft Graph):
    - `vso.work` + `vso.work_write` — hierarchy, drag-to-save, form save
    - `vso.project` — projects and Teams
    - `vso.profile` — organization listing
 6. Do **not** add a client secret.
-7. Put the Application (client) ID in `ENTRA_CLIENT_ID` / `MAIN_VITE_ENTRA_CLIENT_ID` (see [Development](#development)).
+7. Set the Application (client) ID in the `ENTRA_CLIENT_ID` environment variable for the app (see [Development](#development)).
 
-Sign-in opens the system browser (MSAL public client, PKCE, loopback). The Session is stored with `safeStorage`; on Linux `basic_text` it is memory-only.
+Sign-in opens the system browser (OAuth authorization code with PKCE, loopback redirect). The Session is stored like the PAT above.
 
 ## Using ADO Planner
 
@@ -125,52 +116,48 @@ The Work Item dialog uses that type's layout pages as tabs. Edit, **Save**, done
 
 ## Development
 
-Contributors working on the app itself:
+Contributors working on the app itself need the Rust toolchain from `rust-toolchain.toml` ([rustup](https://rustup.rs) installs it on first use). On Linux, also install the GPUI libraries:
+
+```bash
+sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan-dev cmake pkg-config libfontconfig1-dev libfreetype6-dev clang
+```
 
 ```bash
 git clone https://github.com/codeviking428/ado-planner.git
 cd ado-planner
-pnpm install
-cp .env.example .env   # set ENTRA_CLIENT_ID, or leave empty for the PAT prompt
-pnpm dev
+cargo run -p ado-planner
 ```
 
-| Variable                                        | Purpose                                                            |
-| ----------------------------------------------- | ------------------------------------------------------------------ |
-| `ENTRA_CLIENT_ID` / `MAIN_VITE_ENTRA_CLIENT_ID` | Public Entra client ID for SSO. Leave empty to fall back to a PAT. |
+| Variable                                             | Purpose                                                                          |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `ENTRA_CLIENT_ID`                                    | Public Entra client ID for SSO. Leave unset to sign in with a PAT.               |
+| `ADO_PLANNER_ADO_BASE_URL` / `ADO_PLANNER_VSSPS_URL` | Point the app at another Azure DevOps endpoint, such as the mock below.          |
+| `ADO_PLANNER_DATA_DIR`                               | Keep prefs, cache, and the Session somewhere other than the default data folder. |
+| `RUST_LOG`                                           | Log filter, such as `debug` or `ado_planner=trace`. Defaults to `info`.          |
 
 ```bash
-pnpm test          # Vitest
-pnpm typecheck
-pnpm lint
-pnpm format
-pnpm e2e           # Playwright `_electron` against a loopback ADO mock
-pnpm build:win     # NSIS installer (all users, Program Files)
-pnpm build:linux   # AppImage
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace     # Linux without a desktop: xvfb-run -a cargo nextest run --workspace
+cargo deny check
+cargo run -p ado-mock             # loopback Azure DevOps mock; prints the env vars to point the app at it
 ```
 
-Linux e2e without a desktop session: `xvfb-run -a pnpm e2e`.
+[lefthook](https://lefthook.dev/installation/) runs `cargo fmt` before each commit and the checks above before each push; run `lefthook install` once after cloning.
 
-Every PR (and every push to `master`) runs lint, typecheck, Vitest, `electron-vite` build, and Playwright `_electron` e2e under Xvfb. Those e2e tests drive the packaged Electron app against a loopback ADO mock — they do not need Playwright’s Chromium/Chrome browsers.
+Every PR (and every push to `master`) runs fmt, clippy, nextest, build, and `cargo deny` on Linux, Windows, and macOS. The tests drive the app against `crates/ado-mock`, which serves the JSON in `crates/ado-mock/fixtures`.
 
-Releases go through a release PR: merging it tags `vX.Y.Z` and publishes the Electron and Rust builds to one GitHub Release. Both apps auto-update from that release. See [docs/RELEASING.md](docs/RELEASING.md).
+Releases go through a release PR: merging it tags `vX.Y.Z` and publishes the installers to a GitHub Release, which the app updates from. See [docs/RELEASING.md](docs/RELEASING.md).
 
 ### Publishing for Mac
 
-Off for now. An unsigned `.dmg` is not a product we want to ship — Gatekeeper blocks it, and `electron-updater` on macOS expects a signed build. When we turn it back on:
+Off for now. An unsigned `.dmg` is not a product we want to ship: Gatekeeper blocks it. When we turn it back on:
 
 1. Enroll in the [Apple Developer Program](https://developer.apple.com/programs/) (~$99/year).
 2. Create a **Developer ID Application** certificate (not Apple Development / Mac App Store).
-3. Export the cert + private key as a `.p12` and add repo secrets:
-   - `CSC_LINK` — base64 of the `.p12` (or a URL electron-builder accepts)
-   - `CSC_KEY_PASSWORD` — password for that `.p12`
-   - `APPLE_ID` — Apple ID used for notarization
-   - `APPLE_APP_SPECIFIC_PASSWORD` — [app-specific password](https://support.apple.com/en-us/102654)
-   - `APPLE_TEAM_ID` — 10-character Team ID
-4. Re-add the `macos-latest` / `--mac` matrix entry in `.github/workflows/release.yml` (config for a universal DMG + zip is already in `electron-builder.yml`).
+3. Add the certificate and notarization credentials as repo secrets, as [cargo-packager's macOS signing](https://docs.crabnebula.dev/packager/) expects.
+4. Add a `macos-latest` entry with the `dmg` and `app` formats to the `rust` matrix in `.github/workflows/release.yml`; `write-rust-latest-json.py` already maps `.app.tar.gz` updates.
 5. No personal Mac is required to _build_ — GitHub’s `macos-latest` runner is enough. The Apple account is required to _sign and notarize_.
-
-[electron-builder code signing](https://www.electron.build/code-signing) · [notarization](https://www.electron.build/code-signing#notarization)
 
 ## Spec
 
