@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use ado_core::UpdaterPrompt;
 
 const DEFAULT_ENDPOINT: &str =
@@ -19,6 +21,31 @@ pub struct Updater {
     snoozed: bool,
     pubkey: String,
     endpoint: String,
+    executable_path: Option<PathBuf>,
+}
+
+/// An update whose bytes passed the minisign check against the built-in key.
+pub struct VerifiedUpdate {
+    update: cargo_packager_updater::Update,
+    bytes: Vec<u8>,
+}
+
+impl VerifiedUpdate {
+    pub fn version(&self) -> &str {
+        &self.update.version
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Replaces the AppImage in place on Linux. On Windows this starts the
+    /// NSIS installer with `/P /R` and exits the process.
+    pub fn install(self) -> Result<(), String> {
+        self.update
+            .install(self.bytes)
+            .map_err(|err| err.to_string())
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -44,20 +71,56 @@ fn endpoint() -> String {
     COMPILED_ENDPOINT.to_string()
 }
 
+fn parse_version(version: &str) -> cargo_packager_updater::semver::Version {
+    version
+        .parse()
+        .unwrap_or_else(|_| "0.1.0".parse().expect("semver"))
+}
+
 impl Updater {
     pub fn from_env() -> Self {
+        Self::new(endpoint(), pubkey())
+    }
+
+    pub fn new(endpoint: impl Into<String>, pubkey: impl Into<String>) -> Self {
         Self {
             prompt: None,
             snoozed: false,
-            pubkey: pubkey(),
-            endpoint: endpoint(),
+            pubkey: pubkey.into(),
+            endpoint: endpoint.into(),
+            executable_path: None,
         }
+    }
+
+    /// The file a Linux update replaces. Defaults to `$APPIMAGE`, then the
+    /// running executable.
+    pub fn with_executable_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.executable_path = Some(path.into());
+        self
     }
 
     pub fn inject(&mut self, prompt: UpdaterPrompt) {
         if !self.snoozed {
             self.prompt = Some(prompt);
         }
+    }
+
+    fn packager(&self, current_version: &str) -> Result<cargo_packager_updater::Updater, String> {
+        let endpoint = self
+            .endpoint
+            .parse()
+            .map_err(|_| "invalid updater endpoint".to_string())?;
+        let config = cargo_packager_updater::Config {
+            endpoints: vec![endpoint],
+            pubkey: self.pubkey.clone(),
+            ..Default::default()
+        };
+        let mut builder =
+            cargo_packager_updater::UpdaterBuilder::new(parse_version(current_version), config);
+        if let Some(path) = &self.executable_path {
+            builder = builder.executable_path(path);
+        }
+        builder.build().map_err(|err| err.to_string())
     }
 
     pub fn check_blocking(
@@ -67,18 +130,10 @@ impl Updater {
         if self.snoozed || self.pubkey.trim().is_empty() {
             return Ok(self.prompt.clone());
         }
-        let Ok(endpoint) = self.endpoint.parse() else {
+        let Ok(packager) = self.packager(current_version) else {
             return Ok(None);
         };
-        let config = cargo_packager_updater::Config {
-            endpoints: vec![endpoint],
-            pubkey: self.pubkey.clone(),
-            ..Default::default()
-        };
-        let version = current_version
-            .parse()
-            .unwrap_or_else(|_| "0.1.0".parse().expect("semver"));
-        match cargo_packager_updater::check_update(version, config) {
+        match packager.check() {
             Ok(Some(update)) => {
                 let prompt = UpdaterPrompt {
                     version: update.version.clone(),
@@ -92,36 +147,34 @@ impl Updater {
         }
     }
 
+    /// Fetches the feed again and downloads the announced build. Returns an
+    /// error if its signature does not match the built-in key.
+    pub fn download_blocking(
+        &self,
+        current_version: &str,
+    ) -> Result<Option<VerifiedUpdate>, String> {
+        let packager = self.packager(current_version)?;
+        let Some(update) = packager.check().map_err(|err| err.to_string())? else {
+            return Ok(None);
+        };
+        let bytes = update.download().map_err(|err| err.to_string())?;
+        Ok(Some(VerifiedUpdate { update, bytes }))
+    }
+
     pub fn apply(&mut self) -> Result<(), String> {
+        self.apply_from(env!("CARGO_PKG_VERSION"))
+    }
+
+    pub fn apply_from(&mut self, current_version: &str) -> Result<(), String> {
         if self.pubkey.trim().is_empty() {
             self.prompt = None;
             return Ok(());
         }
-        let Some(prompt) = self.prompt.clone() else {
+        if self.prompt.is_none() {
             return Ok(());
-        };
-        let _requested = prompt.version;
-        let Ok(endpoint) = self.endpoint.parse() else {
-            return Err("invalid updater endpoint".into());
-        };
-        let config = cargo_packager_updater::Config {
-            endpoints: vec![endpoint],
-            pubkey: self.pubkey.clone(),
-            ..Default::default()
-        };
-        let updater = cargo_packager_updater::UpdaterBuilder::new(
-            env!("CARGO_PKG_VERSION")
-                .parse()
-                .unwrap_or_else(|_| "0.1.0".parse().expect("semver")),
-            config,
-        )
-        .build()
-        .map_err(|err| err.to_string())?;
-        let update = updater.check().map_err(|err| err.to_string())?;
-        if let Some(update) = update {
-            update
-                .download_and_install()
-                .map_err(|err| err.to_string())?;
+        }
+        if let Some(update) = self.download_blocking(current_version)? {
+            update.install()?;
         }
         Ok(())
     }
