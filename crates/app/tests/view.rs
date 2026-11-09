@@ -21,11 +21,12 @@ use ado_planner::ui::{
     typed_dates_error, typed_dates_error_in,
 };
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::calendar::Date as PickerDate;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, PinchEvent, ScrollDelta, ScrollEvent,
-    TouchPhase, VisualTestContext, point, px,
+    AppContext as _, Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, PinchEvent,
+    ScrollDelta, ScrollEvent, TouchPhase, VisualTestContext, point, px,
 };
 use jiff::ToSpan;
 use jiff::civil::Date;
@@ -596,6 +597,193 @@ fn large_hierarchy_paints_only_the_row_window_in_both_panes(cx: &mut gpui_kit::T
         taller > filtered,
         "a taller window must paint more rows ({taller} vs {filtered})"
     );
+}
+
+/// Row tooltips live in the window `Root`'s tooltip overlay, which
+/// `add_window_view` does not mount. Opens the view the way `start_app` does.
+fn open_in_root(
+    cx: &mut gpui_kit::TestAppContext,
+    state: PlannerState,
+) -> (Entity<PlannerView>, VisualTestContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        // Tooltips fade in on wall-clock time; the test clock is simulated.
+        cx.set_reduce_motion(true);
+    });
+    let (window, view) = cx.update(|cx| {
+        gpui_kit::open_window(Default::default(), cx, |window, cx| {
+            cx.new(|cx| PlannerView::for_state(window, cx, state))
+        })
+        .expect("window")
+    });
+    (view, VisualTestContext::from_window(window, cx))
+}
+
+/// Lets a tooltip's show delay run out, then paints.
+fn settle(cx: &mut VisualTestContext) {
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    draw(cx);
+}
+
+/// Painted tooltip chips: popover-filled and shorter than a row. Rows and
+/// headers share the popover fill but are at least a row tall.
+fn painted_tooltips(cx: &mut VisualTestContext) -> Vec<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    cx.update(|window, cx| {
+        let popover: gpui_kit::Background = cx.theme().popover.into();
+        let scale = window.scale_factor();
+        window
+            .painted_quads()
+            .iter()
+            .filter(|quad| quad.background == popover)
+            .map(|quad| {
+                gpui_kit::Bounds::new(
+                    point(
+                        px(quad.bounds.origin.x.0 / scale),
+                        px(quad.bounds.origin.y.0 / scale),
+                    ),
+                    gpui_kit::size(
+                        px(quad.bounds.size.width.0 / scale),
+                        px(quad.bounds.size.height.0 / scale),
+                    ),
+                )
+            })
+            .filter(|bounds| f32::from(bounds.size.height) < ROW_HEIGHT)
+            .collect()
+    })
+}
+
+/// The painted title of the row under `pointer`, with its work item id.
+fn title_under(
+    view: &Entity<PlannerView>,
+    cx: &mut VisualTestContext,
+    pointer: gpui_kit::Point<gpui_kit::Pixels>,
+) -> (i64, gpui_kit::Bounds<gpui_kit::Pixels>) {
+    let window: Vec<i64> = view.update(cx, |view, _| {
+        let rows = view.state.visible_rows();
+        let first = view.state.gantt.first_visible_row_index();
+        rows.iter().skip(first).take(40).map(|row| row.id).collect()
+    });
+    window
+        .into_iter()
+        .find_map(|id| {
+            debug_bounds_of(cx, format!("gantt-title-{id}"))
+                .filter(|title| title.contains(&pointer))
+                .map(|title| (id, title))
+        })
+        .expect("a painted title under the pointer")
+}
+
+/// Every painted tooltip must be the one for the row under the still
+/// pointer, at `gap` above that row's current title.
+fn assert_tooltip_tracks_row(
+    view: &Entity<PlannerView>,
+    cx: &mut VisualTestContext,
+    pointer: gpui_kit::Point<gpui_kit::Pixels>,
+    gap: f32,
+    case: &str,
+) -> usize {
+    let (id, title) = title_under(view, cx, pointer);
+    let tips = painted_tooltips(cx);
+    assert!(tips.len() <= 1, "{case}: {} tooltips painted", tips.len());
+    for tip in &tips {
+        let tip_gap = f32::from(title.origin.y) - painted_bottom(*tip);
+        assert!(
+            (tip_gap - gap).abs() < 1.0,
+            "{case}: tooltip at y={} sits {tip_gap}px above #{id}'s title at y={}, \
+             not {gap}px: it was left where an earlier row was painted",
+            f32::from(tip.origin.y),
+            f32::from(title.origin.y),
+        );
+    }
+    tips.len()
+}
+
+/// #76: a "Coding standard" title showed above row #5687 after scrolling.
+/// The tooltip overlay keeps the bounds a trigger had on hover-enter, and a
+/// row that moves under a still pointer never leaves hover.
+#[gpui_kit::test]
+fn row_tooltip_does_not_stay_behind_when_rows_move(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_hierarchy(LARGE_HIERARCHY as usize);
+    state.nodes[7].title = "Coding standard".into();
+    let (view, mut vcx) = open_in_root(cx, state);
+    let cx = &mut vcx;
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    draw(cx);
+    let title = cx.debug_bounds("gantt-title-8").expect("title of #8");
+    let pointer = title.center();
+    // A real pointer arrives in several moves; the first only enters the row.
+    cx.simulate_mouse_move(
+        point(pointer.x - px(1.), pointer.y),
+        None,
+        Modifiers::default(),
+    );
+    settle(cx);
+    cx.simulate_mouse_move(pointer, None, Modifiers::default());
+    settle(cx);
+    let tips = painted_tooltips(cx);
+    assert_eq!(tips.len(), 1, "hovering a title shows its tooltip");
+    let gap = f32::from(title.origin.y) - painted_bottom(tips[0]);
+    assert!(
+        gap >= 0.0,
+        "the title tooltip sits above the row, gap {gap}"
+    );
+
+    let scroll = |cx: &mut VisualTestContext, dy: f32| {
+        cx.simulate_event(ScrollEvent {
+            position: pointer,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-dy))),
+            ..Default::default()
+        });
+        draw(cx);
+    };
+    // Less than a row: #8 moves up but stays under the pointer.
+    scroll(cx, 12.0);
+    assert_eq!(title_under(&view, cx, pointer).0, 8);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "12px wheel");
+    settle(cx);
+    assert_eq!(
+        assert_tooltip_tracks_row(&view, cx, pointer, gap, "12px wheel, settled"),
+        1,
+        "the resting pointer gets the tooltip back"
+    );
+    for (dy, case) in [
+        (-8.0, "8px wheel up"),
+        (ROW_HEIGHT + 10.0, "a row and a bit"),
+        (3.0 * ROW_HEIGHT - 6.0, "most of three rows"),
+    ] {
+        scroll(cx, dy);
+        assert_tooltip_tracks_row(&view, cx, pointer, gap, case);
+        settle(cx);
+        assert_tooltip_tracks_row(&view, cx, pointer, gap, case);
+    }
+
+    view.update(cx, |view, cx| {
+        view.state.gantt.toggle_expand(1);
+        cx.notify();
+    });
+    draw(cx);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "collapse above");
+    settle(cx);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "collapse above, settled");
+
+    view.update(cx, |view, cx| {
+        for node in view.state.nodes.iter_mut().filter(|node| node.id % 3 == 0) {
+            node.state = "Closed".into();
+        }
+        view.state.prefs.planner.hidden_states = vec!["Closed".into()];
+        cx.notify();
+    });
+    draw(cx);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "State filter");
+    settle(cx);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "State filter, settled");
 }
 
 #[gpui_kit::test]
