@@ -3376,6 +3376,65 @@ fn auto_fit_toolbar_button_fits_the_span(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn year_month_auto_fit_paints_consecutive_month_ticks(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = mock_fixture_nodes();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let before_ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    for selector in ["gantt-scale-Year", "gantt-scale-Month", "gantt-auto-fit"] {
+        let button = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(button.center(), Modifiers::default());
+        draw(cx);
+    }
+    view.update(cx, |view, _| {
+        let gantt = &view.state.gantt;
+        assert_eq!(gantt.scale, GanttScale::Month);
+        assert_eq!(gantt.origin, Date::new(2026, 6, 29).unwrap());
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        assert!(
+            (ppd - before_ppd).abs() < 0.01,
+            "Auto fit must keep the month width, {before_ppd} vs {ppd} px/day"
+        );
+        let labels: Vec<String> = gantt
+            .header_tick_labels(gantt.timeline_width)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(
+            &labels[..2],
+            ["Jul", "Aug"],
+            "a two-day June sliver must not hide Jul and make Jun→Aug read as one month"
+        );
+        let title = gantt.viewport_range_title();
+        assert!(
+            title.starts_with("Jul"),
+            "toolbar must name the first painted month, got {title:?}"
+        );
+    });
+    let jul = cx.debug_bounds("gantt-tick-0").expect("Jul tick");
+    let aug = cx.debug_bounds("gantt-tick-1").expect("Aug tick");
+    let spacing = f32::from(aug.origin.x - jul.origin.x);
+    let jul_width = view.update(cx, |view, _| {
+        view.state
+            .gantt
+            .period_width(Date::new(2026, 7, 1).unwrap())
+    });
+    assert!(
+        (spacing - jul_width).abs() < 1.0,
+        "painted Jul→Aug ticks must be one month apart, {spacing} vs {jul_width}"
+    );
+}
+
+#[gpui_kit::test]
 fn day_zoom_shows_today_label_and_year_in_the_header(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let dir = tempfile::tempdir().unwrap();
@@ -13588,9 +13647,11 @@ fn enter_after_create_does_not_open_details(cx: &mut gpui_kit::TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.set_create_title("Refunds", window, cx));
     });
+    // Enter spawns the mock create on ado-client; its reply can land during
+    // the draw below, so parking must be allowed before the keystroke.
+    allow_ado_client_wake(cx);
     cx.simulate_keystrokes("enter");
     draw(cx);
-    allow_ado_client_wake(cx);
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     let mut created = false;
     while std::time::Instant::now() < deadline {
