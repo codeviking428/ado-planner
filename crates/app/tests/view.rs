@@ -1855,6 +1855,25 @@ fn sign_in_shell_still_renders(cx: &mut gpui_kit::TestAppContext) {
     state.session_loading = false;
     let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);
+    assert!(cx.debug_bounds("sign-in-error").is_none());
+}
+
+#[gpui_kit::test]
+fn sign_in_card_shows_the_sign_in_error(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::new(dir.path().to_path_buf());
+    let store = EncryptedStore::new(Box::new(MemoryStore::new(false)), None);
+    let session = PlannerSession::pat(store);
+    let mut state = PlannerState::new(paths, session, None, None);
+    state.session_loading = false;
+    state.sign_in_error = Some(ado_core::Error::PatRejected.to_string());
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("sign-in-error").is_some(),
+        "a rejected PAT must show an inline error on the sign-in card"
+    );
 }
 
 #[gpui_kit::test]
