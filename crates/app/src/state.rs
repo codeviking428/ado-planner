@@ -3137,10 +3137,14 @@ impl PlannerState {
     }
 
     pub async fn flush_nudge(&mut self) -> Result<(), AppError> {
-        match self.commit_nudge_now() {
-            Some(save) => self.persist_pending_dates(save).await,
-            None => Ok(()),
-        }
+        let Some(mut save) = self.commit_nudge_now() else {
+            return Ok(());
+        };
+        self.cascade_committed(&mut save);
+        let moves = save.cascade.clone();
+        self.persist_pending_dates(save).await?;
+        self.persist_cascade(moves).await;
+        Ok(())
     }
 
     pub fn discard_nudge(&mut self) {
@@ -3922,6 +3926,7 @@ impl PlannerState {
                 previous,
                 role: DateSaveRole::Cascade,
                 cascade: Vec::new(),
+                absorbed: Vec::new(),
             });
         }
         if moves.is_empty() {

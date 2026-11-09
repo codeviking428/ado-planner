@@ -11635,7 +11635,8 @@ impl PlannerView {
                     if this.nudge_gen != nudge_gen {
                         return;
                     }
-                    if let Some(save) = this.state.commit_nudge_now() {
+                    if let Some(mut save) = this.state.commit_nudge_now() {
+                        this.state.cascade_committed(&mut save);
                         this.note_toasts_changed(cx);
                         this.enqueue_date_save(cx, save);
                     }

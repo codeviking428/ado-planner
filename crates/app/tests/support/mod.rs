@@ -76,6 +76,16 @@ impl MockApp {
         )
     }
 
+    /// PATCHes the mock accepted for one work item.
+    pub fn patches_to(&self, id: i64) -> usize {
+        let suffix = format!("/workitems/{id}");
+        self.mock
+            .mutating_writes()
+            .iter()
+            .filter(|(method, path)| method == "PATCH" && path.ends_with(&suffix))
+            .count()
+    }
+
     pub fn mock_field(&self, id: i64, field: &str) -> Option<String> {
         self.runtime.block_on(async {
             self.mock

@@ -2652,6 +2652,8 @@ async fn link_whose_walk_leaves_loaded_work_items_still_patches() {
 }
 
 const PERSIST_CART: i64 = 1003;
+/// Depends on Persist cart in the fixture, so Persist cart's moves cascade to it.
+const UNPARENTED_SPIKE: i64 = 1012;
 
 fn nudge_ready<'a>(
     cx: &'a mut gpui_kit::TestAppContext,
@@ -2680,7 +2682,7 @@ fn idle(cx: &mut gpui_kit::VisualTestContext, ms: u64) {
 fn ui_five_right_presses_send_one_patch_after_500ms_idle(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
-    let before = app.mock.patch_count();
+    let before = app.patches_to(PERSIST_CART);
     for _ in 0..5 {
         cx.simulate_keystrokes("right");
         idle(cx, 100);
@@ -2691,22 +2693,41 @@ fn ui_five_right_presses_send_one_patch_after_500ms_idle(cx: &mut gpui_kit::Test
         assert_eq!(date_only(target.as_deref()), Some("2026-07-25"));
     });
     assert_eq!(
-        app.mock.patch_count(),
+        app.patches_to(PERSIST_CART),
         before,
         "presses 100ms apart must keep coalescing"
     );
     idle(cx, NUDGE_IDLE_MS - 101);
     assert_eq!(
-        app.mock.patch_count(),
+        app.patches_to(PERSIST_CART),
         before,
         "no PATCH before 500ms without a press"
     );
     idle(cx, 1);
     settle(&view, cx, "the coalesced Nudge PATCH", |_| true);
     assert_eq!(
-        app.mock.patch_count(),
+        app.patches_to(PERSIST_CART),
         before + 1,
         "five presses must send one PATCH"
+    );
+    assert_eq!(
+        app.patches_to(UNPARENTED_SPIKE),
+        1,
+        "the Flexible Date cascade moves the Dependency successor once"
+    );
+    assert_eq!(
+        (
+            date_only(
+                app.mock_field(UNPARENTED_SPIKE, START_DATE_FIELD)
+                    .as_deref()
+            ),
+            date_only(
+                app.mock_field(UNPARENTED_SPIKE, TARGET_DATE_FIELD)
+                    .as_deref()
+            ),
+        ),
+        (Some("2026-07-25"), Some("2026-08-08")),
+        "#1012 follows #1003's new Target, as in tests/cascade.rs"
     );
     assert_eq!(
         date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
@@ -2755,6 +2776,7 @@ fn ui_failed_nudge_patch_rolls_back_and_toasts(cx: &mut gpui_kit::TestAppContext
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
     let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
+    let successor = view.read_with(cx, |view, _| node_dates(view, UNPARENTED_SPIKE));
     app.mock
         .fail_next(&format!("/workitems/{PERSIST_CART}"), 503, "save failed");
     cx.simulate_keystrokes("right right right");
@@ -2773,6 +2795,11 @@ fn ui_failed_nudge_patch_rolls_back_and_toasts(cx: &mut gpui_kit::TestAppContext
             "a failed PATCH must restore the dates from before the first press"
         );
         assert!(view.state.gantt.pending_nudge.is_none());
+        assert_eq!(
+            node_dates(view, UNPARENTED_SPIKE),
+            successor,
+            "the Date cascade's optimistic move on the successor rolls back too"
+        );
         assert!(
             view.state
                 .toasts
@@ -2794,11 +2821,15 @@ fn ui_escape_discards_unsaved_nudges(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
     let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
-    let before = app.mock.patch_count();
+    let before = app.patches_to(PERSIST_CART);
     cx.simulate_keystrokes("right right escape");
     idle(cx, NUDGE_IDLE_MS * 2);
     settle(&view, cx, "the discarded Nudge", |_| true);
-    assert_eq!(app.mock.patch_count(), before, "Escape must drop the PATCH");
+    assert_eq!(
+        app.patches_to(PERSIST_CART),
+        before,
+        "Escape must drop the PATCH"
+    );
     view.read_with(cx, |view, _| {
         assert_eq!(node_dates(view, PERSIST_CART), original);
         assert!(view.state.gantt.pending_nudge.is_none());
@@ -2834,12 +2865,12 @@ fn nudge_during_a_held_patch(
 fn ui_nudges_during_an_in_flight_save_wait_for_their_own_idle(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
-    let before = app.mock.patch_count();
+    let before = app.patches_to(PERSIST_CART);
     let gate = nudge_during_a_held_patch(&view, cx, &app, false, "right right");
     gate.release();
     settle(&view, cx, "the first Nudge PATCH", |_| true);
     assert_eq!(
-        app.mock.patch_count(),
+        app.patches_to(PERSIST_CART),
         before + 1,
         "later presses must not save the moment the first PATCH returns"
     );
@@ -2851,7 +2882,7 @@ fn ui_nudges_during_an_in_flight_save_wait_for_their_own_idle(cx: &mut gpui_kit:
     idle(cx, NUDGE_IDLE_MS);
     settle(&view, cx, "the second Nudge PATCH", |_| true);
     assert_eq!(
-        app.mock.patch_count(),
+        app.patches_to(PERSIST_CART),
         before + 2,
         "one PATCH per idle batch"
     );
@@ -2862,7 +2893,7 @@ fn ui_nudges_during_an_in_flight_save_wait_for_their_own_idle(cx: &mut gpui_kit:
     );
     idle(cx, NUDGE_IDLE_MS * 2);
     settle(&view, cx, "no stray PATCH", |_| true);
-    assert_eq!(app.mock.patch_count(), before + 2);
+    assert_eq!(app.patches_to(PERSIST_CART), before + 2);
 }
 
 #[gpui_kit::test]
@@ -2871,13 +2902,13 @@ fn ui_escape_during_an_in_flight_save_drops_only_the_later_presses(
 ) {
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
-    let before = app.mock.patch_count();
+    let before = app.patches_to(PERSIST_CART);
     let gate = nudge_during_a_held_patch(&view, cx, &app, false, "right right escape");
     gate.release();
     settle(&view, cx, "the first Nudge PATCH", |_| true);
     idle(cx, NUDGE_IDLE_MS * 2);
     settle(&view, cx, "no PATCH for the discarded presses", |_| true);
-    assert_eq!(app.mock.patch_count(), before + 1);
+    assert_eq!(app.patches_to(PERSIST_CART), before + 1);
     assert_eq!(
         date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
         Some("2026-07-07")
@@ -2894,7 +2925,7 @@ fn ui_failed_save_drops_a_later_nudge_already_queued_behind_it(cx: &mut gpui_kit
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
     let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
-    let before = app.mock.patch_count();
+    let before = app.patches_to(PERSIST_CART);
     let gate = nudge_during_a_held_patch(&view, cx, &app, true, "right right");
     idle(cx, NUDGE_IDLE_MS);
     view.read_with(cx, |view, _| {
@@ -2910,7 +2941,7 @@ fn ui_failed_save_drops_a_later_nudge_already_queued_behind_it(cx: &mut gpui_kit
     idle(cx, NUDGE_IDLE_MS * 2);
     settle(&view, cx, "no PATCH for the queued batch", |_| true);
     assert_eq!(
-        app.mock.patch_count(),
+        app.patches_to(PERSIST_CART),
         before,
         "a save built on dates that never saved must not be sent"
     );
@@ -2951,13 +2982,19 @@ fn ui_failed_save_drops_coalesced_batches_queued_behind_it(cx: &mut gpui_kit::Te
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
     let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
-    let before = app.mock.patch_count();
+    let successor = view.read_with(cx, |view, _| node_dates(view, UNPARENTED_SPIKE));
+    let before = app.patches_to(PERSIST_CART);
     let gate = nudge_during_a_held_patch(&view, cx, &app, true, "right right");
     queue_two_batches_behind(cx);
     view.read_with(cx, |view, _| {
         let (start, _) = node_dates(view, PERSIST_CART);
         assert_eq!(date_only(start.as_deref()), Some("2026-07-10"));
         assert!(view.state.gantt.pending_nudge.is_none() && view.io_pending());
+        assert_ne!(
+            node_dates(view, UNPARENTED_SPIKE),
+            successor,
+            "the Date cascade moved the successor ahead of the save"
+        );
     });
     gate.release();
     settle(&view, cx, "the failed first PATCH", |view| {
@@ -2965,9 +3002,14 @@ fn ui_failed_save_drops_coalesced_batches_queued_behind_it(cx: &mut gpui_kit::Te
     });
     idle(cx, NUDGE_IDLE_MS * 2);
     settle(&view, cx, "no PATCH for the coalesced batches", |_| true);
-    assert_eq!(app.mock.patch_count(), before);
+    assert_eq!(app.patches_to(PERSIST_CART), before);
     view.read_with(cx, |view, _| {
         assert_eq!(node_dates(view, PERSIST_CART), original);
+        assert_eq!(
+            node_dates(view, UNPARENTED_SPIKE),
+            successor,
+            "cascade moves from every dropped batch roll back"
+        );
         assert!(view.state.history.undo.is_empty());
     });
 }
@@ -2976,7 +3018,7 @@ fn ui_failed_save_drops_coalesced_batches_queued_behind_it(cx: &mut gpui_kit::Te
 fn ui_failed_coalesced_save_rolls_back_to_the_last_saved_dates(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
-    let before = app.mock.patch_count();
+    let before = app.patches_to(PERSIST_CART);
     let gate = nudge_during_a_held_patch(&view, cx, &app, false, "right right");
     app.mock
         .fail_next(&format!("/workitems/{PERSIST_CART}"), 503, "save failed");
@@ -2991,7 +3033,7 @@ fn ui_failed_coalesced_save_rolls_back_to_the_last_saved_dates(cx: &mut gpui_kit
     idle(cx, NUDGE_IDLE_MS * 2);
     settle(&view, cx, "no PATCH after the failure", |_| true);
     assert_eq!(
-        app.mock.patch_count(),
+        app.patches_to(PERSIST_CART),
         before + 1,
         "only the first batch saved"
     );
@@ -3019,7 +3061,7 @@ fn ui_failed_save_drops_presses_made_while_it_was_in_flight(cx: &mut gpui_kit::T
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
     let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
-    let before = app.mock.patch_count();
+    let before = app.patches_to(PERSIST_CART);
     let gate = nudge_during_a_held_patch(&view, cx, &app, true, "right right");
     gate.release();
     settle(&view, cx, "the failed Nudge PATCH", |view| {
@@ -3035,7 +3077,7 @@ fn ui_failed_save_drops_presses_made_while_it_was_in_flight(cx: &mut gpui_kit::T
         );
         assert!(view.state.gantt.pending_nudge.is_none());
     });
-    assert_eq!(app.mock.patch_count(), before);
+    assert_eq!(app.patches_to(PERSIST_CART), before);
 }
 
 const CART: i64 = 1002;
