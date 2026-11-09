@@ -6,6 +6,8 @@ Install-test the Rust and Electron NSIS installers on a Windows runner.
 For each app: install the last per-user release (v0.2.1), install the new
 per-machine build over it, and check that it lands in Program Files, that the
 per-user copy is gone, and that user data survives. Then uninstall it.
+For the Rust app, also start the installed baseline and update it the way its
+updater does: the new installer with /P /R while the old app runs.
 GitHub's Windows runners run as an administrator with UAC off, so this covers
 paths, registry, and migration, not the UAC prompt itself.
 
@@ -82,6 +84,40 @@ Invoke-Installer "$rustMachine\uninstall.exe" @('/S', "_?=$rustMachine")
 Assert (-not (Test-Path "$rustMachine\ado-planner.exe")) 'uninstall removes the app'
 Assert (-not (Test-Path "HKLM:\$rustKey")) 'uninstall removes the HKLM entry'
 Assert (Test-Path $marker) 'uninstall keeps user data'
+Remove-Item -Recurse -Force $rustMachine -ErrorAction SilentlyContinue
+
+Write-Output '== Rust: update the running baseline the way its updater does'
+Invoke-Installer (Get-Baseline "ado-planner-$BaselineTag-x86_64-setup.exe") @('/S')
+$old = Start-Process -FilePath "$rustUser\ado-planner.exe" -PassThru
+Start-Sleep -Seconds 5
+Assert (-not $old.HasExited) "baseline $BaselineTag app is running"
+
+# cargo-packager-updater starts the downloaded installer with /P /R (passive,
+# then relaunch). Wait on the installer alone: Start-Process -Wait would also
+# wait for the relaunched app.
+$installer = Start-Process -FilePath (Resolve-Path $RustInstaller) -ArgumentList '/P', '/R' -PassThru
+$null = $installer.Handle
+Assert ($installer.WaitForExit(300000)) 'passive installer finishes within 5 minutes'
+Assert ($installer.ExitCode -eq 0) "passive installer exits 0 (got $($installer.ExitCode))"
+Assert ($old.WaitForExit(10000)) "installer closes the running $BaselineTag app"
+Assert ((Get-ItemProperty "HKLM:\$rustKey").DisplayVersion -eq $Version) "HKLM uninstall entry has version $Version"
+Assert (-not (Test-Path "$rustUser\ado-planner.exe")) 'per-user program files are gone'
+$got = Get-StdoutLine "$rustMachine\ado-planner.exe" '--version'
+Assert ($got -eq "ado-planner $Version") "updated ado-planner.exe --version prints 'ado-planner $Version' (got '$got')"
+Assert (Test-Path $marker) "user data in $dataDir survives"
+
+$relaunched = $null
+for ($i = 0; $i -lt 15 -and $null -eq $relaunched; $i++) {
+  Start-Sleep -Seconds 2
+  $relaunched = Get-Process -Name 'ado-planner' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -eq "$rustMachine\ado-planner.exe" }
+}
+Assert ($null -ne $relaunched) "installer restarts the app from $rustMachine"
+$relaunched | Stop-Process -Force
+$relaunched | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+
+Invoke-Installer "$rustMachine\uninstall.exe" @('/S', "_?=$rustMachine")
+Assert (-not (Test-Path "$rustMachine\ado-planner.exe")) 'uninstall removes the updated app'
 Remove-Item -Recurse -Force $rustMachine -ErrorAction SilentlyContinue
 
 Write-Output '== Electron: per-user baseline, then per-machine install'

@@ -282,7 +282,7 @@ jobs:
           - name: Linux
             os: ubuntu-latest
             args: --linux AppImage
-          # macOS is off until we have Apple signing. See README → Publishing for Mac.
+          # No macOS build: the product does not support it.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

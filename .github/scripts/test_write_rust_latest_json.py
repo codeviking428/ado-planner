@@ -14,92 +14,66 @@ assert _SPEC is not None and _SPEC.loader is not None
 _MOD = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MOD)
 collect = _MOD.collect
-darwin_arch = _MOD.darwin_arch
 platform_for = _MOD.platform_for
 
 
-class DarwinArchTests(unittest.TestCase):
-    def test_unlabeled_defaults_to_aarch64(self) -> None:
-        self.assertEqual(darwin_arch("ado planner.app.tar.gz"), "aarch64")
-
-    def test_explicit_arm(self) -> None:
-        self.assertEqual(darwin_arch("ado-planner_0.2.0_aarch64.app.tar.gz"), "aarch64")
-        self.assertEqual(darwin_arch("ado-planner_0.2.0_arm64.dmg"), "aarch64")
-
-    def test_explicit_intel(self) -> None:
-        self.assertEqual(darwin_arch("ado-planner_0.2.0_x86_64.app.tar.gz"), "x86_64")
-        self.assertEqual(darwin_arch("ado-planner_0.2.0_x64.app.tar.gz"), "x86_64")
-
-
 class PlatformForTests(unittest.TestCase):
-    def test_app_tarball_emits_darwin_and_macos_keys(self) -> None:
-        mapped = platform_for(Path("ADO Planner.app.tar.gz"))
-        self.assertIsNotNone(mapped)
-        assert mapped is not None
-        keys, fmt = mapped
-        self.assertEqual(fmt, "app")
-        self.assertEqual(keys, ["darwin-aarch64", "macos-aarch64"])
+    def test_nsis_installer(self) -> None:
+        self.assertEqual(
+            platform_for(Path("ado-planner-v0.3.0-x86_64-setup.exe")),
+            (["windows-x86_64"], "nsis"),
+        )
 
-    def test_intel_tarball(self) -> None:
-        mapped = platform_for(Path("ADO Planner_0.2.0_x86_64.app.tar.gz"))
-        self.assertIsNotNone(mapped)
-        assert mapped is not None
-        keys, fmt = mapped
-        self.assertEqual(fmt, "app")
-        self.assertEqual(keys, ["darwin-x86_64", "macos-x86_64"])
+    def test_appimage(self) -> None:
+        self.assertEqual(
+            platform_for(Path("ado-planner-v0.3.0-x86_64.AppImage")),
+            (["linux-x86_64"], "appimage"),
+        )
 
-    def test_dmg_is_not_an_updater_artifact(self) -> None:
+    def test_macos_artifacts_are_not_updater_artifacts(self) -> None:
+        self.assertIsNone(platform_for(Path("ADO Planner.app.tar.gz")))
         self.assertIsNone(platform_for(Path("ADO Planner.dmg")))
-        self.assertIsNone(platform_for(Path("ADO Planner_aarch64.dmg")))
+
+    def test_signatures_are_not_artifacts(self) -> None:
+        self.assertIsNone(platform_for(Path("ado-planner-v0.3.0-x86_64.AppImage.sig")))
 
 
 class CollectTests(unittest.TestCase):
-    def test_prefers_signed_app_tarball_and_skips_dmg(self) -> None:
+    def test_skips_unsigned_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp)
-            tarball = dist / "ADO Planner.app.tar.gz"
-            dmg = dist / "ADO Planner.dmg"
-            tarball.write_bytes(b"tar")
-            dmg.write_bytes(b"dmg")
-            tarball.with_name(tarball.name + ".sig").write_text("sig-tar\n", encoding="utf-8")
-            dmg.with_name(dmg.name + ".sig").write_text("sig-dmg\n", encoding="utf-8")
+            (dist / "ado-planner-v0.3.0-x86_64.AppImage").write_bytes(b"bin")
 
-            platforms = collect(dist, "codeviking428/ado-planner", "v0.2.0")
+            platforms = collect(dist, "org/repo", "v0.3.0")
 
-        self.assertEqual(set(platforms), {"darwin-aarch64", "macos-aarch64"})
-        for entry in platforms.values():
-            self.assertTrue(entry["url"].endswith("ADO%20Planner.app.tar.gz"))
-            self.assertEqual(entry["format"], "app")
-            self.assertEqual(entry["signature"], "sig-tar")
+        self.assertEqual(platforms, {})
 
     def test_full_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp)
-            files = {
-                "ado-planner-setup.nsis.zip": "nsis",
-                "ado-planner.AppImage.tar.gz": "appimage",
-                "ADO Planner.app.tar.gz": "mac",
-            }
+            files = [
+                "ado-planner-v1.0.0-x86_64-setup.exe",
+                "ado-planner-v1.0.0-x86_64.AppImage",
+                "ADO Planner.app.tar.gz",
+                "ADO Planner.dmg",
+            ]
             for name in files:
                 path = dist / name
                 path.write_bytes(b"bin")
-                path.with_name(name + ".sig").write_text(f"sig-{name}", encoding="utf-8")
+                path.with_name(name + ".sig").write_text(f"sig-{name}\n", encoding="utf-8")
 
             platforms = collect(dist, "org/repo", "v1.0.0")
 
+        self.assertEqual(set(platforms), {"windows-x86_64", "linux-x86_64"})
         self.assertEqual(
-            set(platforms),
+            platforms["windows-x86_64"],
             {
-                "windows-x86_64",
-                "linux-x86_64",
-                "darwin-aarch64",
-                "macos-aarch64",
+                "url": "https://github.com/org/repo/releases/download/v1.0.0/ado-planner-v1.0.0-x86_64-setup.exe",
+                "signature": "sig-ado-planner-v1.0.0-x86_64-setup.exe",
+                "format": "nsis",
             },
         )
-        self.assertEqual(platforms["windows-x86_64"]["format"], "nsis")
         self.assertEqual(platforms["linux-x86_64"]["format"], "appimage")
-        self.assertEqual(platforms["darwin-aarch64"]["format"], "app")
-        self.assertEqual(platforms["macos-aarch64"], platforms["darwin-aarch64"])
 
 
 if __name__ == "__main__":
