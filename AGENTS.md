@@ -14,7 +14,7 @@ Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agent
 
 ### Dev session
 
-CDP / HMR / mocks: probe `127.0.0.1:9222` and attach to the user's `pnpm dev` window to see what they see; use Playwright e2e with mocks for scripted iteration. See `docs/agents/dev-session.md`.
+GPUI tests against `ado-mock` for scripted iteration; `cargo run -p ado-mock` plus `cargo run -p ado-planner` under Xvfb to see the real window. See `docs/agents/dev-session.md`.
 
 ## Git
 
@@ -35,7 +35,7 @@ The type sets the SemVer bump of the next release:
 
 Pick the type for the change you want released. For example, `ci: Rust CI/CD release pipeline` ships nothing, while `feat: show the version on the sign-in card` bumps minor.
 
-Don't edit versions (`Cargo.toml`, `Cargo.lock`, `package.json`) or `CHANGELOG.md` by hand. The release PR, `chore(release): vX.Y.Z`, owns them. See `docs/RELEASING.md`.
+Don't edit versions (`Cargo.toml`, `Cargo.lock`) or `CHANGELOG.md` by hand. The release PR, `chore(release): vX.Y.Z`, owns them. See `docs/RELEASING.md`.
 
 ### Worktree branches
 

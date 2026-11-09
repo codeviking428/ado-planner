@@ -1,18 +1,5 @@
 pre-commit:
-  # Sequential: prettier and oxfmt both write staged files; parallel races on Windows.
-  parallel: false
   commands:
-    oxlint:
-      glob: '*.{js,ts,tsx}'
-      run: pnpm oxlint {staged_files}
-    prettier:
-      glob: '*.{js,ts,tsx,json,yml,yaml,md,css}'
-      run: pnpm prettier --write {staged_files}
-      stage_fixed: true
-    oxfmt:
-      glob: '*.{js,ts,tsx}'
-      run: pnpm oxfmt {staged_files}
-      stage_fixed: true
     rustfmt:
       glob: '*.rs'
       run: cargo fmt -- {staged_files}

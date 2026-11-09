@@ -511,6 +511,48 @@ Section MigratePerUserInstall
 SectionEnd
 !endif
 ; <<< ado-planner
+; >>> ado-planner: remove the Electron app (releases before 1.0.0), per-user or
+; per-machine, which this app replaces. Its update prompt runs this installer
+; (.github/scripts/write-electron-feed.py). Its uninstaller keeps app data in
+; %APPDATA%\ado-planner. This runs before Install because that uninstaller
+; deletes shortcuts named like the ones Install creates.
+!if "${INSTALLMODE}" == "perMachine"
+Function RemoveElectronInstall
+  StrCpy $R7 0
+  electron_loop:
+    EnumRegKey $R6 SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall" $R7
+    StrCmp $R6 "" electron_done
+    IntOp $R7 $R7 + 1
+    ReadRegStr $R8 SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R6" "QuietUninstallString"
+    ; electron-builder writes "<dir>\Uninstall ado-planner.exe" /<mode> /S
+    StrCpy $R9 $R8 1
+    StrCmp $R9 '"' 0 electron_loop
+    ${StrLoc} $R9 $R8 "\Uninstall ado-planner.exe$\"" ">"
+    StrCmp $R9 "" electron_loop
+    IntOp $R9 $R9 - 1
+    StrCpy $R5 $R8 $R9 1
+    DetailPrint "Removing the Electron app in $R5"
+    ClearErrors
+    ; _?= runs the uninstaller in place, so ExecWait waits for it.
+    ExecWait '$R8 _?=$R5' $9
+    ${If} ${Errors}
+    ${OrIf} $9 != 0
+      DetailPrint "Could not remove the Electron app (exit $9); remove it in Settings > Apps"
+    ${Else}
+      Delete "$R5\Uninstall ado-planner.exe"
+      RMDir "$R5"
+    ${EndIf}
+  electron_done:
+FunctionEnd
+
+Section MigrateElectronInstall
+  SetShellVarContext current
+  Call RemoveElectronInstall
+  SetShellVarContext all
+  Call RemoveElectronInstall
+SectionEnd
+!endif
+; <<< ado-planner
 Section Install
   SetOutPath $INSTDIR
 

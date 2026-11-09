@@ -39,9 +39,12 @@ fn main() {
         return;
     }
 
+    let data_dir = std::env::var_os("ADO_PLANNER_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(AppPaths::default_dir);
     let ado_base = std::env::var("ADO_PLANNER_ADO_BASE_URL").ok();
     let vssps_base = std::env::var("ADO_PLANNER_VSSPS_URL").ok();
-    start_app(Some(AppPaths::default_dir()), ado_base, vssps_base);
+    start_app(Some(data_dir), ado_base, vssps_base);
     drop(instance);
 }
 

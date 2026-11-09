@@ -30,7 +30,7 @@ on:
       - assets/icons/**
       - crates/app/Cargo.toml
       - crates/app/build.rs
-      - electron-builder.yml
+      - crates/app/packaging/**
       - cliff.toml
 
 concurrency:
@@ -43,7 +43,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
 
 jobs:
   meta:
@@ -269,68 +268,11 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  electron:
-    name: Electron ${{ matrix.name }}
-    needs: meta
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows
-            os: windows-latest
-            args: --win nsis
-          - name: Linux
-            os: ubuntu-latest
-            args: --linux AppImage
-          # macOS is off until we have Apple signing. See README → Publishing for Mac.
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.30.3
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install
-        run: pnpm install --frozen-lockfile
-
-      - name: Build
-        run: pnpm build && pnpm exec electron-builder ${{ matrix.args }} --publish never
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-
-      - name: Check packaged icons
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_OS" = Windows ]; then
-            python .github/scripts/icons.py check-exe dist/win-unpacked/ado-planner.exe
-            python .github/scripts/icons.py check-exe --group-id 103 dist/*-setup.exe
-          else
-            appimage="$(realpath dist/*.AppImage)"
-            chmod +x "$appimage"
-            (cd "$RUNNER_TEMP" && "$appimage" --appimage-extract >/dev/null)
-            python3 .github/scripts/icons.py check-appdir "$RUNNER_TEMP/squashfs-root"
-          fi
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: electron-${{ matrix.name }}
-          path: |
-            dist/*.exe
-            dist/*.blockmap
-            dist/*.AppImage
-            dist/latest*.yml
-          if-no-files-found: error
-
-  # Installs the last per-user release, then this build, on a clean runner.
+  # Installs the last per-user release, then this build, on a clean runner, and
+  # checks that this build replaces an installed Electron app.
   windows-installers:
     name: Windows installers
-    needs: [meta, rust, electron]
+    needs: [meta, rust]
     runs-on: windows-latest
     env:
       TAG: ${{ needs.meta.outputs.tag }}
@@ -343,22 +285,14 @@ jobs:
           name: rust-x86_64-pc-windows-msvc
           path: dist/rust
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: electron-Windows
-          path: dist/electron
-
-      - name: Elevation in installers and update feed
+      - name: Elevation in installer
         shell: bash
         run: |
           set -euo pipefail
-          for exe in "dist/rust/ado-planner-$TAG-x86_64-setup.exe" "dist/electron/ado-planner-electron-$VERSION-setup.exe"; do
-            level="$(grep -aoE 'requestedExecutionLevel level="[A-Za-z]+"' "$exe" | sort -u)"
-            echo "$exe: $level"
-            [ "$level" = 'requestedExecutionLevel level="requireAdministrator"' ]
-          done
-          # electron-updater reads the flag from the installer's files[] entry.
-          grep -qxE '[[:space:]]+isAdminRightsRequired: true' dist/electron/latest.yml
+          exe="dist/rust/ado-planner-$TAG-x86_64-setup.exe"
+          level="$(grep -aoE 'requestedExecutionLevel level="[A-Za-z]+"' "$exe" | sort -u)"
+          echo "$exe: $level"
+          [ "$level" = 'requestedExecutionLevel level="requireAdministrator"' ]
 
       - name: Install, migrate, and uninstall
         shell: pwsh
@@ -366,10 +300,9 @@ jobs:
           ./.github/scripts/test-windows-installers.ps1
           -Version $env:VERSION
           -RustInstaller "dist/rust/ado-planner-$env:TAG-x86_64-setup.exe"
-          -ElectronInstaller "dist/electron/ado-planner-electron-$env:VERSION-setup.exe"
 
   publish:
-    needs: [meta, rust, electron, windows-installers]
+    needs: [meta, rust, windows-installers]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -383,12 +316,6 @@ jobs:
         with:
           pattern: rust-*
           path: dist/rust
-          merge-multiple: true
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: electron-*
-          path: dist/electron
           merge-multiple: true
 
       - name: Install minisign
@@ -431,11 +358,19 @@ jobs:
               { echo "::error::latest.json has no signed $platform entry"; exit 1; }
           done
 
+      # Installed Electron builds still poll latest.yml and latest-linux.yml.
+      # These feeds offer them the Rust installers. See docs/RELEASING.md.
+      - name: Write Electron migration feeds
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/write-electron-feed.py --dist dist/rust --tag "$TAG" --version "$VERSION"
+          cat dist/rust/latest.yml dist/rust/latest-linux.yml
+
       - name: Checksums
         run: |
           set -euo pipefail
           mkdir -p dist/release
-          cp dist/rust/* dist/electron/* dist/release/
+          cp dist/rust/* dist/release/
           cd dist/release
           sha256sum -- * >"$RUNNER_TEMP/SHA256SUMS"
           mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS

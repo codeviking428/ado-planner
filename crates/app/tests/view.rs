@@ -127,7 +127,7 @@ fn draw(cx: &mut VisualTestContext) {
     });
 }
 
-/// `e2e/fixtures/work-items.json` plus the live Persist cart → Go-live link.
+/// `crates/ado-mock/fixtures/work-items.json` plus the live Persist cart → Go-live link.
 fn mock_fixture_nodes() -> Vec<WorkItemNode> {
     fn item(
         id: i64,
