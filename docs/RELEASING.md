@@ -51,7 +51,14 @@ Both Windows installers install for all users and ask UAC for admin rights: the 
 
 The Linux binaries are built on Ubuntu 22.04 and need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+). The release stops if a build needs a newer glibc.
 
+Neither app ships for macOS. That is a product decision, not a missing signing setup.
+
 Both updaters read the release GitHub marks as latest. The Rust app fetches `releases/latest/download/latest.json` and checks each download against the minisign public key built into the binary. Before publishing, the job verifies every `.sig` against that key with `minisign`, so a mismatched key pair stops the release.
+
+Two tests cover updating an older build to a newer one, and neither needs the real key:
+
+- `crates/app/tests/updater.rs` runs in CI on Linux and Windows. It serves a `latest.json` and an artifact on localhost, signs them with a key generated for the run, and drives the updater from 0.2.1: the check offers this version, the download passes the signature check, and on Linux Yes replaces a stand-in AppImage. A tampered download, a signature from another key, and Later all leave the old build in place.
+- The **Windows installers** job starts the installed v0.2.1 app, then runs the new installer with the `/P /R` arguments the updater passes. It checks that the old app was closed, that the new version is installed for all users, and that the installer restarted the app.
 
 ### Other ways in
 
@@ -89,6 +96,5 @@ Repository settings:
 
 ## Not covered yet
 
-- macOS: neither app ships for Mac until Apple signing exists. See README → Publishing for Mac.
 - Windows Authenticode signing: installers are not code-signed, so SmartScreen warns on first run. Updater signatures are separate and are checked.
 - After the Rust app reaches parity, delete the `electron` job in `release.yml`, `electron-builder.yml`, and the `package.json` handling in `release-version.sh`.
