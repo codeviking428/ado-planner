@@ -123,9 +123,8 @@ jobs:
 
   speed:
     name: Speed budgets
+    # Budgets are calibrated on this image; see docs/speed-budgets.md.
     runs-on: ubuntu-latest
-    # Calibration: collect runner numbers before the budgets are set.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -149,7 +148,7 @@ jobs:
         run: cargo test --release --locked -p ado-planner --test speed --test launch --no-run
 
       - name: Budgets
-        run: dbus-run-session -- .github/scripts/speed-budgets.sh 3
+        run: dbus-run-session -- .github/scripts/speed-budgets.sh
 
   workflows:
     name: Workflows and release scripts
