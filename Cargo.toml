@@ -6,7 +6,7 @@ members = ["crates/*"]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/codeviking428/ado-planner"
-version = "0.3.0"
+version = "0.4.0"
 rust-version = "1.99.1"
 
 [workspace.dependencies]

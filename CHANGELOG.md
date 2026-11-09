@@ -4,6 +4,23 @@ All notable changes to ADO Planner. The release PR generates each entry from
 Conventional Commits; edit the wording in that PR before merging. See
 [docs/RELEASING.md](docs/RELEASING.md).
 
+## [0.4.0](https://github.com/codeviking428/ado-planner/releases/tag/v0.4.0) - 2026-11-09
+
+### Features
+
+- **gantt:** Pinch zoom and the no-match empty state ([#111](https://github.com/codeviking428/ado-planner/pull/111))
+- **gantt:** Refuse a Dependency that would make a loop ([#121](https://github.com/codeviking428/ado-planner/pull/121))
+- **core:** Plan Date cascade for Flexible, Strict and No-action ([#120](https://github.com/codeviking428/ado-planner/pull/120))
+- **gantt:** Show schedule Clashes on arrows and bars, with a Show arrows toggle ([#123](https://github.com/codeviking428/ado-planner/pull/123))
+- **form:** Search identities as you type in the Work Item form ([#117](https://github.com/codeviking428/ado-planner/pull/117))
+- **gantt:** Run Date cascade on date changes and new Dependencies, with a Cascade mode setting ([#127](https://github.com/codeviking428/ado-planner/pull/127))
+- **gantt:** Write Hierarchy Rollup to parents and cascade their successors ([#128](https://github.com/codeviking428/ado-planner/pull/128))
+
+### Bug fixes
+
+- **session:** Re-prompt sign-in when the Entra refresh is rejected ([#118](https://github.com/codeviking428/ado-planner/pull/118))
+- **gantt:** Stop row tooltips staying behind when rows move ([#124](https://github.com/codeviking428/ado-planner/pull/124))
+
 ## [0.3.0](https://github.com/codeviking428/ado-planner/releases/tag/v0.3.0) - 2026-11-09
 
 ### Features
