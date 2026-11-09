@@ -12,6 +12,7 @@ pub mod html_field;
 pub mod organization_url;
 pub mod overlays;
 pub mod planner_prefs;
+pub mod rollup;
 pub mod root_types;
 pub mod team_members;
 pub mod types;
@@ -54,6 +55,7 @@ pub use overlays::apply_overlays;
 pub use planner_prefs::{
     PlannerPrefs, choose_available, parse_planner_prefs, serialize_planner_prefs,
 };
+pub use rollup::plan_cascade_with_rollup;
 pub use root_types::{BacklogLevel, resolve_root_types, top_backlog_types_from_levels};
 pub use team_members::{TeamMemberIdentityRow, map_team_member_identities};
 pub use types::*;
