@@ -213,6 +213,9 @@ pub struct PendingDateSave {
     /// Shift-drag descendants owned by this persist. Bound to the save so a
     /// later parent move cannot overwrite or discard them.
     pub cascade: Vec<PendingDateSave>,
+    /// Unsent Commit saves this one replaced in the queue. Their dates never
+    /// reached Azure DevOps, so a failure of this save also drops their Undo.
+    pub absorbed: Vec<PendingDateSave>,
 }
 
 impl PendingDateSave {
@@ -224,9 +227,21 @@ impl PendingDateSave {
         })
     }
 
-    pub fn adopt_cascade_from_superseded(&mut self, dropped: PendingDateSave) {
+    pub fn adopt_cascade_from_superseded(&mut self, mut dropped: PendingDateSave) {
         if self.cascade.is_empty() && !dropped.cascade.is_empty() {
-            self.cascade = dropped.cascade;
+            self.cascade = std::mem::take(&mut dropped.cascade);
+        }
+        // A Commit built on the dropped save's dates must roll back to what
+        // that save started from, since the dropped dates are never sent.
+        if self.role == DateSaveRole::Commit
+            && dropped.role == DateSaveRole::Commit
+            && self.previous.start_date == dropped.after_start
+            && self.previous.target_date == dropped.after_target
+        {
+            self.previous = dropped.previous.clone();
+            self.absorbed.append(&mut dropped.absorbed);
+            dropped.cascade.clear();
+            self.absorbed.push(dropped);
         }
     }
 }
@@ -1730,6 +1745,7 @@ impl PlannerState {
             previous: persisted.clone(),
             role: DateSaveRole::Commit,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         }
     }
 
@@ -1761,6 +1777,7 @@ impl PlannerState {
             previous,
             role: DateSaveRole::Commit,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         self.offer_local_date_commit_toast(&pending);
         Some(pending)
@@ -1809,6 +1826,7 @@ impl PlannerState {
             previous,
             role: DateSaveRole::Commit,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         self.offer_local_date_commit_toast(&pending);
         Some(pending)
@@ -1883,6 +1901,7 @@ impl PlannerState {
                     previous,
                     role: DateSaveRole::Undo,
                     cascade: Vec::new(),
+                    absorbed: Vec::new(),
                 }]
             }
             Some(HistoryEntry::DatesGroup { items }) => {
@@ -1949,6 +1968,7 @@ impl PlannerState {
                     previous,
                     role: DateSaveRole::Redo,
                     cascade: Vec::new(),
+                    absorbed: Vec::new(),
                 }]
             }
             Some(HistoryEntry::DatesGroup { items }) => {
@@ -2011,6 +2031,7 @@ impl PlannerState {
                 previous,
                 role,
                 cascade: Vec::new(),
+                absorbed: Vec::new(),
             });
         }
         out
@@ -3100,6 +3121,7 @@ impl PlannerState {
             previous,
             role: DateSaveRole::Commit,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         self.offer_local_date_commit_toast(&save);
         Some(save)
@@ -3440,6 +3462,7 @@ impl PlannerState {
                 previous,
                 role,
                 cascade: Vec::new(),
+                absorbed: Vec::new(),
             });
         }
         out
@@ -4192,6 +4215,7 @@ impl PlannerState {
                 previous,
                 role: DateSaveRole::Cascade,
                 cascade: Vec::new(),
+                absorbed: Vec::new(),
             });
             child_changes.push(change);
         }
@@ -5764,6 +5788,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         let kids = state.shift_children_with_committed_move(&pending);
         assert!(
@@ -5818,6 +5843,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         let kids = state.shift_children_with_committed_move(&pending);
         assert!(!kids.is_empty());
@@ -5870,6 +5896,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         let kids = state.shift_children_with_committed_move(&pending);
         let child_before = kids
@@ -5933,9 +5960,11 @@ mod toast_copy_tests {
                         role: super::DateSaveRole::Cascade,
                         rev: 1,
                         cascade: Vec::new(),
+                        absorbed: Vec::new(),
                     }]
                 })
                 .unwrap_or_default(),
+            absorbed: Vec::new(),
         }
     }
 
@@ -6025,6 +6054,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         pending.cascade = state.shift_children_with_committed_move(&pending);
         let later_start = Date::new(2026, 7, 12).unwrap();
@@ -6084,6 +6114,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         first.cascade = state.shift_children_with_committed_move(&first);
         let later_start = Date::new(2026, 7, 12).unwrap();
@@ -6099,6 +6130,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         second.cascade = state.shift_children_with_committed_move(&second);
         let later_child = state

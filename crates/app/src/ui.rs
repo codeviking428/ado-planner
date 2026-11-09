@@ -10640,7 +10640,16 @@ impl PlannerView {
                     match result {
                         Ok(()) => {
                             this.state.gantt.move_failures.remove(&id);
-                            if !still_after && nudging {
+                            // A pending Nudge or a queued save will write the live
+                            // dates; give it the rev this PATCH produced.
+                            let superseded_locally = nudging
+                                || this.state.nodes.iter().any(|node| {
+                                    node.id == id
+                                        && this.date_save_queue.iter().any(|queued| {
+                                            queued.live_dates_match(std::slice::from_ref(node))
+                                        })
+                                });
+                            if !still_after && superseded_locally {
                                 if let Some(rev) = working
                                     .nodes
                                     .iter()
@@ -10716,11 +10725,25 @@ impl PlannerView {
                                     && &node.target_date == tip_target
                             });
                             if live_at_tip {
+                                let live_rev = this
+                                    .state
+                                    .nodes
+                                    .iter()
+                                    .find(|node| node.id == id)
+                                    .map(|node| node.rev);
                                 this.state.restore_node(previous);
-                                for save in chained.iter().rev() {
-                                    this.state.revert_date_save_history(save);
+                                // Dates roll back; the rev stays whatever the last
+                                // successful PATCH for this item produced.
+                                if let Some(rev) = live_rev
+                                    && let Some(live) =
+                                        this.state.nodes.iter_mut().find(|node| node.id == id)
+                                {
+                                    live.rev = live.rev.max(rev);
                                 }
-                                this.state.revert_date_save_history(&revert);
+                                for save in chained.iter().rev() {
+                                    this.revert_date_save_with_absorbed(save);
+                                }
+                                this.revert_date_save_with_absorbed(&revert);
                                 this.state.restore_date_save_failed(&revert);
                                 for reason in
                                     working.gantt.move_failures.get(&id).into_iter().flatten()
@@ -10750,6 +10773,13 @@ impl PlannerView {
             });
         })
         .detach();
+    }
+
+    fn revert_date_save_with_absorbed(&mut self, save: &PendingDateSave) {
+        self.state.revert_date_save_history(save);
+        for absorbed in save.absorbed.iter().rev() {
+            self.state.revert_date_save_history(absorbed);
+        }
     }
 
     /// Remove queued Commit saves for `failed.id` that start from the dates

@@ -2938,6 +2938,82 @@ fn ui_failed_save_drops_a_later_nudge_already_queued_behind_it(cx: &mut gpui_kit
     );
 }
 
+/// Commit two more batches behind the held first PATCH. The third batch
+/// replaces the second in the save queue before anything is sent.
+fn queue_two_batches_behind(cx: &mut gpui_kit::VisualTestContext) {
+    idle(cx, NUDGE_IDLE_MS);
+    cx.simulate_keystrokes("right");
+    idle(cx, NUDGE_IDLE_MS);
+}
+
+#[gpui_kit::test]
+fn ui_failed_save_drops_coalesced_batches_queued_behind_it(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
+    let before = app.mock.patch_count();
+    let gate = nudge_during_a_held_patch(&view, cx, &app, true, "right right");
+    queue_two_batches_behind(cx);
+    view.read_with(cx, |view, _| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        assert_eq!(date_only(start.as_deref()), Some("2026-07-10"));
+        assert!(view.state.gantt.pending_nudge.is_none() && view.io_pending());
+    });
+    gate.release();
+    settle(&view, cx, "the failed first PATCH", |view| {
+        view.state.toasts.last_error_message().is_some()
+    });
+    idle(cx, NUDGE_IDLE_MS * 2);
+    settle(&view, cx, "no PATCH for the coalesced batches", |_| true);
+    assert_eq!(app.mock.patch_count(), before);
+    view.read_with(cx, |view, _| {
+        assert_eq!(node_dates(view, PERSIST_CART), original);
+        assert!(view.state.history.undo.is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn ui_failed_coalesced_save_rolls_back_to_the_last_saved_dates(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let before = app.mock.patch_count();
+    let gate = nudge_during_a_held_patch(&view, cx, &app, false, "right right");
+    app.mock
+        .fail_next(&format!("/workitems/{PERSIST_CART}"), 503, "save failed");
+    queue_two_batches_behind(cx);
+    gate.release();
+    settle(
+        &view,
+        cx,
+        "the first PATCH and the failed coalesced one",
+        |view| view.state.toasts.last_error_message().is_some(),
+    );
+    idle(cx, NUDGE_IDLE_MS * 2);
+    settle(&view, cx, "no PATCH after the failure", |_| true);
+    assert_eq!(
+        app.mock.patch_count(),
+        before + 1,
+        "only the first batch saved"
+    );
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-07")
+    );
+    view.read_with(cx, |view, _| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        assert_eq!(
+            date_only(start.as_deref()),
+            Some("2026-07-07"),
+            "the bar returns to the dates the first PATCH saved, not the dropped batch"
+        );
+        assert_eq!(
+            view.state.history.undo.len(),
+            1,
+            "only the saved batch stays on the Undo stack"
+        );
+    });
+}
+
 #[gpui_kit::test]
 fn ui_failed_save_drops_presses_made_while_it_was_in_flight(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
