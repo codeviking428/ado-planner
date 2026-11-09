@@ -3753,24 +3753,20 @@ impl PlannerState {
     }
 
     pub fn copy_link(&mut self, id: i64) -> Option<String> {
-        let scope = self.scope()?;
-        let url =
-            crate::form::ado_edit_url_on(self.client.ado_base(), &scope.org, &scope.project, id);
+        let url = self.ado_url(id)?;
         self.copied = Some(url.clone());
         self.toasts.push(ToastKind::Success, "Copied link");
         Some(url)
     }
 
-    pub fn open_in_ado(&self, id: i64) {
-        if let Some(scope) = self.scope() {
-            let url = crate::form::ado_edit_url_on(
-                self.client.ado_base(),
-                &scope.org,
-                &scope.project,
-                id,
-            );
-            let _ = open::that(url);
-        }
+    pub fn ado_url(&self, id: i64) -> Option<String> {
+        let scope = self.scope()?;
+        Some(crate::form::ado_edit_url_on(
+            self.client.ado_base(),
+            &scope.org,
+            &scope.project,
+            id,
+        ))
     }
 
     pub fn copy_toast(&mut self, id: u64) {

@@ -8838,11 +8838,11 @@ impl PlannerView {
             .child(self.menu_item("Delete", cx, move |this, cx| {
                 this.request_delete(id, cx);
             }))
-            .child(
-                self.menu_item("Open in Azure DevOps", cx, move |this, _cx| {
-                    this.state.open_in_ado(id);
-                }),
-            )
+            .child(self.menu_item("Open in Azure DevOps", cx, move |this, cx| {
+                if let Some(url) = this.state.ado_url(id) {
+                    cx.open_url(&url);
+                }
+            }))
             .child(self.menu_item("Copy ID", cx, move |this, cx| {
                 let text = this.state.copy_id(id);
                 this.write_clipboard(cx, text);
@@ -9297,9 +9297,7 @@ impl PlannerView {
                                 .child(
                                     Button::new(SharedString::from(format!("edit-ado-{id}")))
                                         .label("Edit in Azure DevOps")
-                                        .on_click(move |_, _, _| {
-                                            let _ = open::that(&url);
-                                        }),
+                                        .on_click(move |_, _, cx| cx.open_url(&url)),
                                 ),
                         )
                         .into_any_element()

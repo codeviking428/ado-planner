@@ -161,7 +161,6 @@ dependencies = [
  "image",
  "jiff",
  "minisign",
- "open",
  "postcard",
  "serde",
  "serde_json",
