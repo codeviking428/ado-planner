@@ -191,6 +191,8 @@ pub struct PlannerView {
     skip_saving_hold: bool,
     date_save_busy: HashSet<i64>,
     date_save_queue: VecDeque<PendingDateSave>,
+    /// Bumped on every Nudge so only the timer armed by the last press saves.
+    nudge_gen: u64,
     /// Optimistic links waiting for `persist_added_dependency` while
     /// `spawn_state` holds `io_busy`. Lives on the view so `adopt_spawned`
     /// cannot drop the pair.
@@ -573,6 +575,7 @@ impl PlannerView {
             skip_saving_hold: false,
             date_save_busy: HashSet::new(),
             date_save_queue: VecDeque::new(),
+            nudge_gen: 0,
             link_save_queue: VecDeque::new(),
             pending_team: None,
             update_checked: false,
@@ -2648,10 +2651,30 @@ impl PlannerView {
         .detach();
     }
 
+    /// An unsaved Nudge is the newest edit but is not on the history stack yet.
+    /// Ctrl+Z and redo drop it first, as Escape does, so they never rewrite a
+    /// bar that a pending Nudge still owns.
+    fn discard_pending_nudge(&mut self) -> bool {
+        if self.state.gantt.pending_nudge.is_none() {
+            return false;
+        }
+        self.state.discard_nudge();
+        self.nudge_gen += 1;
+        true
+    }
+
     fn undo_last(&mut self, cx: &mut Context<Self>) {
         self.clear_hover_after_history(cx);
         self.state.gantt.context_menu = None;
-        if self.history_hotkey_is_duplicate(true) || self.state.history.undo.is_empty() {
+        if self.history_hotkey_is_duplicate(true) {
+            cx.notify();
+            return;
+        }
+        if self.discard_pending_nudge() {
+            self.request_repaint(None, cx);
+            return;
+        }
+        if self.state.history.undo.is_empty() {
             cx.notify();
             return;
         }
@@ -2684,6 +2707,7 @@ impl PlannerView {
             cx.notify();
             return;
         }
+        self.discard_pending_nudge();
         let pending = self.state.redo_date_stack_now();
         if !pending.is_empty() {
             self.queue_form_dates_from_draft();
@@ -2884,21 +2908,44 @@ impl PlannerView {
                                 .gap_3()
                                 .child(Label::new("Organization"))
                                 .child(
-                                    Input::new(&self.org_input)
-                                        .id("organization-input")
-                                        .disabled(busy),
+                                    div()
+                                        .id("sign-in-org")
+                                        .debug_selector(|| "sign-in-org".into())
+                                        .child(
+                                            Input::new(&self.org_input)
+                                                .id("organization-input")
+                                                .disabled(busy),
+                                        ),
                                 )
                                 .child(Label::new("Personal access token"))
-                                .child(Input::new(&self.pat_input).id("pat-input").disabled(busy))
+                                .child(
+                                    div()
+                                        .id("sign-in-pat")
+                                        .debug_selector(|| "sign-in-pat".into())
+                                        .child(
+                                            Input::new(&self.pat_input)
+                                                .id("pat-input")
+                                                .disabled(busy),
+                                        ),
+                                )
                                 .when_some(error.take(), |el, error| el.child(error))
                                 .child(
-                                    Button::new("sign-in")
-                                        .primary()
-                                        .label(if busy { "Signing in…" } else { "Continue" })
-                                        .loading(busy)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.submit_pat(cx);
-                                        })),
+                                    div()
+                                        .id("sign-in-continue")
+                                        .debug_selector(|| "sign-in-continue".into())
+                                        .child(
+                                            Button::new("sign-in")
+                                                .primary()
+                                                .label(if busy {
+                                                    "Signing in…"
+                                                } else {
+                                                    "Continue"
+                                                })
+                                                .loading(busy)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.submit_pat(cx);
+                                                })),
+                                        ),
                                 ),
                         )
                     })
@@ -3300,32 +3347,44 @@ impl PlannerView {
             "state-filter" => self.state.prefs.planner.hidden_states.clone(),
             _ => self.state.hidden_roots(),
         };
-        let trigger = div().w(px(120.)).flex_shrink_0().overflow_hidden().child(
-            Button::new(id)
-                .label(caption)
-                .tooltip(tooltip)
-                .selected(open || hidden > 0)
-                .when(open || hidden > 0, |btn| btn.primary())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_scope = None;
-                    this.open_flavor = false;
-                    this.toolbar_more_open = false;
-                    this.state.gantt.context_menu = None;
-                    this.dismiss_empty_timeline_hint();
-                    this.open_filter = if this.open_filter == Some(id) {
-                        None
-                    } else {
-                        Some(id)
-                    };
-                    this.filter_query.update(cx, |input, cx| {
-                        input.set_value("", window, cx);
-                    });
-                    if this.open_filter == Some(id) {
-                        Self::focus_input(&this.filter_query, window, cx);
-                    }
-                    cx.notify();
-                })),
-        );
+        let caption_selector = format!("filter-caption-{caption}");
+        let trigger = div()
+            .id(SharedString::from(format!("{id}-trigger")))
+            .debug_selector(move || format!("{id}-trigger"))
+            .w(px(120.))
+            .flex_shrink_0()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id(SharedString::from(caption_selector.clone()))
+                    .debug_selector(move || caption_selector.clone())
+                    .child(
+                        Button::new(id)
+                            .label(caption)
+                            .tooltip(tooltip)
+                            .selected(open || hidden > 0)
+                            .when(open || hidden > 0, |btn| btn.primary())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_scope = None;
+                                this.open_flavor = false;
+                                this.toolbar_more_open = false;
+                                this.state.gantt.context_menu = None;
+                                this.dismiss_empty_timeline_hint();
+                                this.open_filter = if this.open_filter == Some(id) {
+                                    None
+                                } else {
+                                    Some(id)
+                                };
+                                this.filter_query.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                                if this.open_filter == Some(id) {
+                                    Self::focus_input(&this.filter_query, window, cx);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
         let mut popup = Popup::new(format!("{id}-popup"), trigger).offset(px(12.));
         if open {
             popup = popup.content(self.filter_menu(id, items, hidden_set, cx));
@@ -3350,28 +3409,38 @@ impl PlannerView {
                     .w_full(),
             )
             .child(
-                Button::new(SharedString::from(format!("show-all-{id}")))
-                    .label("Show all")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        match id {
-                            "type-filter" => this.state.show_all_types(),
-                            "state-filter" => this.state.show_all_states(),
-                            _ => this.state.show_all_roots(),
-                        }
-                        this.drop_tooltips_for_reload(cx);
-                    })),
+                div()
+                    .id(SharedString::from(format!("{id}-show-all")))
+                    .debug_selector(move || format!("{id}-show-all"))
+                    .child(
+                        Button::new(SharedString::from(format!("show-all-{id}")))
+                            .label("Show all")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match id {
+                                    "type-filter" => this.state.show_all_types(),
+                                    "state-filter" => this.state.show_all_states(),
+                                    _ => this.state.show_all_roots(),
+                                }
+                                this.drop_tooltips_for_reload(cx);
+                            })),
+                    ),
             )
             .child(
-                Button::new(SharedString::from(format!("hide-all-{id}")))
-                    .label("Hide all")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        match id {
-                            "type-filter" => this.state.hide_all_types(),
-                            "state-filter" => this.state.hide_all_states(),
-                            _ => this.state.hide_all_roots(),
-                        }
-                        cx.notify();
-                    })),
+                div()
+                    .id(SharedString::from(format!("{id}-hide-all")))
+                    .debug_selector(move || format!("{id}-hide-all"))
+                    .child(
+                        Button::new(SharedString::from(format!("hide-all-{id}")))
+                            .label("Hide all")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match id {
+                                    "type-filter" => this.state.hide_all_types(),
+                                    "state-filter" => this.state.hide_all_states(),
+                                    _ => this.state.hide_all_roots(),
+                                }
+                                cx.notify();
+                            })),
+                    ),
             )
             .when(filtered.is_empty(), |el| {
                 el.child(
@@ -3383,8 +3452,10 @@ impl PlannerView {
             .children(filtered.into_iter().map(|item| {
                 let checked = !hidden.contains(&item);
                 let item_click = item.clone();
+                let item_selector = format!("{id}-item-{item}");
                 h_flex()
                     .id(SharedString::from(format!("filter-item-{item}")))
+                    .debug_selector(move || item_selector.clone())
                     .w_full()
                     .min_w(px(220.))
                     .gap_2()
@@ -3479,6 +3550,7 @@ impl PlannerView {
         if self.state.scope().is_none() {
             return v_flex()
                 .id("choose-team")
+                .debug_selector(|| "choose-team".into())
                 .size_full()
                 .items_center()
                 .justify_center()
@@ -8731,7 +8803,7 @@ impl PlannerView {
             .into_any_element()
     }
 
-    fn render_context_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_context_menu(&mut self, window_h: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(target) = self.state.gantt.context_menu else {
             return div().into_any_element();
         };
@@ -8739,12 +8811,14 @@ impl PlannerView {
         let from_row = !target.from_bar;
         let link = target.link;
         let menu_w = 240.0;
+        let items = 11 + usize::from(link.is_some()) + if from_row { 2 } else { 0 };
+        let menu_h = context_menu_height(items);
         let x = target
             .x
             .clamp(8.0, (self.state.gantt.viewport_w - menu_w).max(8.0));
-        let y = target
-            .y
-            .clamp(72.0, (self.state.gantt.viewport_h + 64.0).max(72.0));
+        let y = target.y.clamp(72.0, (window_h - menu_h - 8.0).max(72.0));
+        // Below the header there may not be room for every item; scroll then.
+        let max_h = (window_h - y - 8.0).max(context_menu_height(1));
         v_flex()
             .id("gantt-context-menu")
             .debug_selector(|| "gantt-context-menu".into())
@@ -8763,6 +8837,8 @@ impl PlannerView {
             .left(px(x))
             .top(px(y))
             .w(px(menu_w))
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .p_1()
             .gap_1()
             .border_1()
@@ -8787,11 +8863,11 @@ impl PlannerView {
             .child(self.menu_item("Delete", cx, move |this, cx| {
                 this.request_delete(id, cx);
             }))
-            .child(
-                self.menu_item("Open in Azure DevOps", cx, move |this, _cx| {
-                    this.state.open_in_ado(id);
-                }),
-            )
+            .child(self.menu_item("Open in Azure DevOps", cx, move |this, cx| {
+                if let Some(url) = this.state.ado_url(id) {
+                    cx.open_url(&url);
+                }
+            }))
             .child(self.menu_item("Copy ID", cx, move |this, cx| {
                 let text = this.state.copy_id(id);
                 this.write_clipboard(cx, text);
@@ -8859,6 +8935,7 @@ impl PlannerView {
         div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector.clone())
+            .flex_shrink_0()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -9246,9 +9323,7 @@ impl PlannerView {
                                 .child(
                                     Button::new(SharedString::from(format!("edit-ado-{id}")))
                                         .label("Edit in Azure DevOps")
-                                        .on_click(move |_, _, _| {
-                                            let _ = open::that(&url);
-                                        }),
+                                        .on_click(move |_, _, cx| cx.open_url(&url)),
                                 ),
                         )
                         .into_any_element()
@@ -10533,7 +10608,11 @@ impl PlannerView {
                 self.state.discard_stale_date_save(&pending);
                 continue;
             };
-            if live.start_date != pending.after_start || live.target_date != pending.after_target {
+            // A Nudge still coalescing on top of this save does not make it
+            // stale; its own commit builds on these dates.
+            if self.state.dates_before_nudge(live)
+                != (pending.after_start.clone(), pending.after_target.clone())
+            {
                 self.state.discard_stale_date_save(&pending);
                 continue;
             }
@@ -10580,10 +10659,38 @@ impl PlannerView {
                             && node.start_date == after_start
                             && node.target_date == after_target
                     });
+                    // Presses since this PATCH started are still coalescing;
+                    // the Nudge timer saves them, and Escape can still drop them.
+                    let nudging = this
+                        .state
+                        .gantt
+                        .pending_nudge
+                        .as_ref()
+                        .is_some_and(|nudge| nudge.id == id);
                     match result {
                         Ok(()) => {
                             this.state.gantt.move_failures.remove(&id);
-                            if still_after {
+                            // A pending Nudge or a queued save will write the live
+                            // dates; give it the rev this PATCH produced.
+                            let superseded_locally = nudging
+                                || this.state.nodes.iter().any(|node| {
+                                    node.id == id
+                                        && this.date_save_queue.iter().any(|queued| {
+                                            queued.live_dates_match(std::slice::from_ref(node))
+                                        })
+                                });
+                            if !still_after && superseded_locally {
+                                if let Some(rev) = working
+                                    .nodes
+                                    .iter()
+                                    .find(|node| node.id == id)
+                                    .map(|n| n.rev)
+                                    && let Some(live) =
+                                        this.state.nodes.iter_mut().find(|node| node.id == id)
+                                {
+                                    live.rev = rev;
+                                }
+                            } else if still_after {
                                 if let Some(rev) = working
                                     .nodes
                                     .iter()
@@ -10630,9 +10737,43 @@ impl PlannerView {
                             }
                         }
                         Err(err) => {
-                            if still_after {
+                            if nudging {
+                                this.state.discard_nudge();
+                                this.nudge_gen += 1;
+                            }
+                            // Edits made on top of the failed dates were never
+                            // saved either; drop their queued saves with it.
+                            let chained = this.take_chained_date_saves(&revert);
+                            let (tip_start, tip_target) = chained
+                                .last()
+                                .map_or((&after_start, &after_target), |save| {
+                                    (&save.after_start, &save.after_target)
+                                });
+                            let live_at_tip = this.state.nodes.iter().any(|node| {
+                                node.id == id
+                                    && &node.start_date == tip_start
+                                    && &node.target_date == tip_target
+                            });
+                            if live_at_tip {
+                                let live_rev = this
+                                    .state
+                                    .nodes
+                                    .iter()
+                                    .find(|node| node.id == id)
+                                    .map(|node| node.rev);
                                 this.state.restore_node(previous);
-                                this.state.revert_date_save_history(&revert);
+                                // Dates roll back; the rev stays whatever the last
+                                // successful PATCH for this item produced.
+                                if let Some(rev) = live_rev
+                                    && let Some(live) =
+                                        this.state.nodes.iter_mut().find(|node| node.id == id)
+                                {
+                                    live.rev = live.rev.max(rev);
+                                }
+                                for save in chained.iter().rev() {
+                                    this.revert_date_save_with_absorbed(save);
+                                }
+                                this.revert_date_save_with_absorbed(&revert);
                                 this.state.restore_date_save_failed(&revert);
                                 for reason in
                                     working.gantt.move_failures.get(&id).into_iter().flatten()
@@ -10643,8 +10784,16 @@ impl PlannerView {
                                     this.state.toasts.dismiss_undo();
                                 }
                             }
+                            // Newest first, so a child already restored to an
+                            // earlier drag's dates still matches that drag's cascade.
+                            for save in chained.iter().rev() {
+                                this.restore_cascades_with_absorbed(save);
+                            }
                             if role == DateSaveRole::Commit {
                                 this.restore_matching_cascade(&kids);
+                                for absorbed in revert.absorbed.iter().rev() {
+                                    this.restore_matching_cascade(&absorbed.cascade);
+                                }
                             }
                             if let Some(msg) = working.toasts.last_error_message() {
                                 this.state.toasts.push(ToastKind::Error, msg.to_string());
@@ -10659,6 +10808,45 @@ impl PlannerView {
             });
         })
         .detach();
+    }
+
+    fn restore_cascades_with_absorbed(&mut self, save: &PendingDateSave) {
+        self.restore_matching_cascade(&save.cascade);
+        for absorbed in save.absorbed.iter().rev() {
+            self.restore_matching_cascade(&absorbed.cascade);
+        }
+    }
+
+    fn revert_date_save_with_absorbed(&mut self, save: &PendingDateSave) {
+        self.state.revert_date_save_history(save);
+        for absorbed in save.absorbed.iter().rev() {
+            self.state.revert_date_save_history(absorbed);
+        }
+    }
+
+    /// Remove queued Commit saves for `failed.id` that start from the dates
+    /// `failed` would have written, following the chain in queue order.
+    fn take_chained_date_saves(&mut self, failed: &PendingDateSave) -> Vec<PendingDateSave> {
+        let mut start = failed.after_start.clone();
+        let mut target = failed.after_target.clone();
+        let mut chained = Vec::new();
+        let mut index = 0;
+        while index < self.date_save_queue.len() {
+            let save = &self.date_save_queue[index];
+            if save.id == failed.id
+                && save.role == DateSaveRole::Commit
+                && save.previous.start_date == start
+                && save.previous.target_date == target
+            {
+                let save = self.date_save_queue.remove(index).expect("queued save");
+                start = save.after_start.clone();
+                target = save.after_target.clone();
+                chained.push(save);
+            } else {
+                index += 1;
+            }
+        }
+        chained
     }
 
     fn enqueue_matching_cascade(&mut self, cx: &mut Context<Self>, kids: Vec<PendingDateSave>) {
@@ -10981,6 +11169,14 @@ impl PlannerView {
 
     pub fn is_busy(&self) -> bool {
         self.io_busy
+    }
+
+    /// Any planner, date or link save still running or queued.
+    pub fn io_pending(&self) -> bool {
+        self.io_busy
+            || !self.date_save_busy.is_empty()
+            || !self.date_save_queue.is_empty()
+            || !self.link_save_queue.is_empty()
     }
 
     pub fn set_busy_for_test(&mut self, busy: bool) {
@@ -11457,26 +11653,36 @@ impl PlannerView {
     }
 
     fn schedule_nudge_flush(&mut self, cx: &mut Context<Self>) {
+        self.nudge_gen += 1;
+        let nudge_gen = self.nudge_gen;
+        cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(NUDGE_IDLE_MS))
                 .await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, cx| {
-                    if this
-                        .state
-                        .nudge_is_idle(Duration::from_millis(NUDGE_IDLE_MS))
-                    {
-                        this.spawn_state(cx, |mut state| async move {
-                            let result = state.flush_nudge().await;
-                            (state, result)
-                        });
+                    if this.nudge_gen != nudge_gen {
+                        return;
                     }
+                    if let Some(mut save) = this.state.commit_nudge_now() {
+                        this.state.cascade_committed(&mut save);
+                        this.note_toasts_changed(cx);
+                        this.enqueue_date_save(cx, save);
+                    }
+                    cx.notify();
                 });
             }
         })
         .detach();
     }
+}
+
+/// Painted height of the right-click menu: 32px items, 4px gaps, 4px padding
+/// and a 1px border on each side.
+fn context_menu_height(items: usize) -> f32 {
+    let items = items as f32;
+    items * 32.0 + (items - 1.0).max(0.0) * 4.0 + 10.0
 }
 
 fn this_type(state: &PlannerState, id: i64) -> Option<String> {
@@ -12817,7 +13023,7 @@ impl Render for PlannerView {
                                         }),
                                 )
                             })
-                            .child(self.render_context_menu(cx))
+                            .child(self.render_context_menu(viewport_h, cx))
                             .child(self.render_dates_popover(cx))
                             .child(self.render_form(cx))
                             .child(self.render_delete_confirm(cx))

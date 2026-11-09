@@ -7057,6 +7057,9 @@ fn drop_persist_cart_later(
     drag_bar_by(&view, cx, "gantt-bar-1003", 5.0);
     assert!(drag_chip(&view, cx).ends_with(" · moves 3"));
     let bar = cx.debug_bounds("gantt-bar-1003").expect("bar");
+    // The drop spawns the PATCH on ado-client; its reply can land during the
+    // draw below, so parking must be allowed before the mouse-up.
+    allow_ado_client_wake(cx);
     cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
     draw(cx);
     (runtime, mock, view, cx)

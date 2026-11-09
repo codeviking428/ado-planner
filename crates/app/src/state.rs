@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
 
 use ado_client::{AdoClient, AdoRuntime, TokenSource};
 use ado_core::{
@@ -67,7 +66,6 @@ pub struct PlannerState {
     pub history: EditHistory,
     pub updater: Updater,
     pub copied: Option<String>,
-    last_nudge_at: Option<Instant>,
     history_recording: bool,
     team_views: HashMap<String, SavedGanttView>,
     /// Child date restores from a Shift-move, applied to the parent toast
@@ -215,6 +213,9 @@ pub struct PendingDateSave {
     /// Shift-drag descendants owned by this persist. Bound to the save so a
     /// later parent move cannot overwrite or discard them.
     pub cascade: Vec<PendingDateSave>,
+    /// Unsent Commit saves this one replaced in the queue. Their dates never
+    /// reached Azure DevOps, so a failure of this save also drops their Undo.
+    pub absorbed: Vec<PendingDateSave>,
 }
 
 impl PendingDateSave {
@@ -226,9 +227,30 @@ impl PendingDateSave {
         })
     }
 
-    pub fn adopt_cascade_from_superseded(&mut self, dropped: PendingDateSave) {
+    pub fn adopt_cascade_from_superseded(&mut self, mut dropped: PendingDateSave) {
         if self.cascade.is_empty() && !dropped.cascade.is_empty() {
-            self.cascade = dropped.cascade;
+            self.cascade = std::mem::take(&mut dropped.cascade);
+        }
+        // A Commit built on the dropped save's dates must roll back to what
+        // that save started from, since the dropped dates are never sent.
+        if self.role == DateSaveRole::Commit
+            && dropped.role == DateSaveRole::Commit
+            && self.previous.start_date == dropped.after_start
+            && self.previous.target_date == dropped.after_target
+        {
+            self.previous = dropped.previous.clone();
+            // Same for Shift-drag children the dropped save had already moved.
+            for child in &mut self.cascade {
+                if let Some(earlier) = dropped.cascade.iter().find(|earlier| {
+                    earlier.id == child.id
+                        && earlier.after_start == child.previous.start_date
+                        && earlier.after_target == child.previous.target_date
+                }) {
+                    child.previous = earlier.previous.clone();
+                }
+            }
+            self.absorbed.append(&mut dropped.absorbed);
+            self.absorbed.push(dropped);
         }
     }
 }
@@ -311,7 +333,6 @@ impl PlannerState {
             history: EditHistory::default(),
             updater: Updater::from_env(),
             copied: None,
-            last_nudge_at: None,
             history_recording: true,
             team_views: HashMap::new(),
             shifted_children: HashMap::new(),
@@ -1477,6 +1498,35 @@ impl PlannerState {
         }
     }
 
+    /// `node`'s dates without a Nudge that is still coalescing on it, i.e.
+    /// what the bar shows again if that Nudge is discarded.
+    pub fn dates_before_nudge(&self, node: &WorkItemNode) -> (Option<String>, Option<String>) {
+        let live = (node.start_date.clone(), node.target_date.clone());
+        let Some(nudge) = self
+            .gantt
+            .pending_nudge
+            .as_ref()
+            .filter(|nudge| nudge.id == node.id)
+        else {
+            return live;
+        };
+        let shown = (
+            nudge.had_start.then(|| iso_date_only(nudge.start)),
+            nudge.had_target.then(|| iso_date_only(nudge.target)),
+        );
+        // Only while the bar still shows the Nudge; anything that rewrote the
+        // node since (an undo, a picker) is the real live state.
+        if live != shown {
+            return live;
+        }
+        (
+            nudge.had_start.then(|| iso_date_only(nudge.original_start)),
+            nudge
+                .had_target
+                .then(|| iso_date_only(nudge.original_target)),
+        )
+    }
+
     fn restore_nudge(&mut self, pending: &PendingNudge) {
         self.restore_partial_dates(
             pending.id,
@@ -1733,6 +1783,7 @@ impl PlannerState {
             previous: persisted.clone(),
             role: DateSaveRole::Commit,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         }
     }
 
@@ -1764,6 +1815,7 @@ impl PlannerState {
             previous,
             role: DateSaveRole::Commit,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         self.offer_local_date_commit_toast(&pending);
         Some(pending)
@@ -1812,6 +1864,7 @@ impl PlannerState {
             previous,
             role: DateSaveRole::Commit,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         self.offer_local_date_commit_toast(&pending);
         Some(pending)
@@ -1886,6 +1939,7 @@ impl PlannerState {
                     previous,
                     role: DateSaveRole::Undo,
                     cascade: Vec::new(),
+                    absorbed: Vec::new(),
                 }]
             }
             Some(HistoryEntry::DatesGroup { items }) => {
@@ -1952,6 +2006,7 @@ impl PlannerState {
                     previous,
                     role: DateSaveRole::Redo,
                     cascade: Vec::new(),
+                    absorbed: Vec::new(),
                 }]
             }
             Some(HistoryEntry::DatesGroup { items }) => {
@@ -2014,6 +2069,7 @@ impl PlannerState {
                 previous,
                 role,
                 cascade: Vec::new(),
+                absorbed: Vec::new(),
             });
         }
         out
@@ -2034,7 +2090,9 @@ impl PlannerState {
         else {
             return Ok(());
         };
-        if node.start_date != pending.after_start || node.target_date != pending.after_target {
+        if self.dates_before_nudge(&node)
+            != (pending.after_start.clone(), pending.after_target.clone())
+        {
             self.restore_matching_commit_cascade(&pending);
             return Ok(());
         }
@@ -3054,7 +3112,6 @@ impl PlannerState {
                 let start = pending.had_start.then_some(pending.start);
                 let target = pending.had_target.then_some(pending.target);
                 let _ = self.apply_optimistic_partial(pending.id, start, target);
-                self.last_nudge_at = Some(Instant::now());
                 Ok(())
             }
             Err(message) => {
@@ -3064,27 +3121,67 @@ impl PlannerState {
         }
     }
 
-    pub fn nudge_is_idle(&self, idle: Duration) -> bool {
-        self.last_nudge_at.is_some_and(|at| at.elapsed() >= idle)
-            && self.gantt.pending_nudge.is_some()
-    }
-
-    pub async fn flush_nudge(&mut self) -> Result<(), AppError> {
-        let Some(pending) = self.gantt.pending_nudge.take() else {
-            return Ok(());
-        };
-        self.last_nudge_at = None;
+    /// Turn the coalesced Nudge into a date save, like a finished drag:
+    /// dates stay applied, undo and the toast are recorded, and the caller
+    /// persists it. `None` when nothing is pending or the presses cancel out.
+    pub fn commit_nudge_now(&mut self) -> Option<PendingDateSave> {
+        let pending = self.gantt.pending_nudge.take()?;
         self.restore_nudge(&pending);
         let start = pending.had_start.then_some(pending.start);
         let target = pending.had_target.then_some(pending.target);
-        self.save_partial_dates(pending.id, start, target).await
+        let previous = self.nodes.iter().find(|node| node.id == pending.id)?;
+        if !previous.has_date_fields {
+            return None;
+        }
+        let after_start = start
+            .map(iso_date_only)
+            .or_else(|| previous.start_date.clone());
+        let after_target = target
+            .map(iso_date_only)
+            .or_else(|| previous.target_date.clone());
+        if after_start == previous.start_date && after_target == previous.target_date {
+            return None;
+        }
+        let previous = self.apply_optimistic_partial(pending.id, start, target)?;
+        if self.history_recording {
+            self.record_dates(
+                pending.id,
+                &previous,
+                after_start.clone(),
+                after_target.clone(),
+            );
+        }
+        let save = PendingDateSave {
+            id: pending.id,
+            start,
+            target,
+            after_start,
+            after_target,
+            rev: previous.rev,
+            previous,
+            role: DateSaveRole::Commit,
+            cascade: Vec::new(),
+            absorbed: Vec::new(),
+        };
+        self.offer_local_date_commit_toast(&save);
+        Some(save)
+    }
+
+    pub async fn flush_nudge(&mut self) -> Result<(), AppError> {
+        let Some(mut save) = self.commit_nudge_now() else {
+            return Ok(());
+        };
+        self.cascade_committed(&mut save);
+        let moves = save.cascade.clone();
+        self.persist_pending_dates(save).await?;
+        self.persist_cascade(moves).await;
+        Ok(())
     }
 
     pub fn discard_nudge(&mut self) {
         if let Some(nudge) = self.gantt.pending_nudge.take() {
             self.restore_nudge(&nudge);
         }
-        self.last_nudge_at = None;
     }
 
     pub async fn clear_dates(&mut self, id: i64) -> Result<(), AppError> {
@@ -3409,6 +3506,7 @@ impl PlannerState {
                 previous,
                 role,
                 cascade: Vec::new(),
+                absorbed: Vec::new(),
             });
         }
         out
@@ -3722,24 +3820,20 @@ impl PlannerState {
     }
 
     pub fn copy_link(&mut self, id: i64) -> Option<String> {
-        let scope = self.scope()?;
-        let url =
-            crate::form::ado_edit_url_on(self.client.ado_base(), &scope.org, &scope.project, id);
+        let url = self.ado_url(id)?;
         self.copied = Some(url.clone());
         self.toasts.push(ToastKind::Success, "Copied link");
         Some(url)
     }
 
-    pub fn open_in_ado(&self, id: i64) {
-        if let Some(scope) = self.scope() {
-            let url = crate::form::ado_edit_url_on(
-                self.client.ado_base(),
-                &scope.org,
-                &scope.project,
-                id,
-            );
-            let _ = open::that(url);
-        }
+    pub fn ado_url(&self, id: i64) -> Option<String> {
+        let scope = self.scope()?;
+        Some(crate::form::ado_edit_url_on(
+            self.client.ado_base(),
+            &scope.org,
+            &scope.project,
+            id,
+        ))
     }
 
     pub fn copy_toast(&mut self, id: u64) {
@@ -3863,6 +3957,7 @@ impl PlannerState {
                 previous,
                 role: DateSaveRole::Cascade,
                 cascade: Vec::new(),
+                absorbed: Vec::new(),
             });
         }
         if moves.is_empty() {
@@ -4165,6 +4260,7 @@ impl PlannerState {
                 previous,
                 role: DateSaveRole::Cascade,
                 cascade: Vec::new(),
+                absorbed: Vec::new(),
             });
             child_changes.push(change);
         }
@@ -5737,6 +5833,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         let kids = state.shift_children_with_committed_move(&pending);
         assert!(
@@ -5791,6 +5888,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         let kids = state.shift_children_with_committed_move(&pending);
         assert!(!kids.is_empty());
@@ -5843,6 +5941,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         let kids = state.shift_children_with_committed_move(&pending);
         let child_before = kids
@@ -5906,9 +6005,11 @@ mod toast_copy_tests {
                         role: super::DateSaveRole::Cascade,
                         rev: 1,
                         cascade: Vec::new(),
+                        absorbed: Vec::new(),
                     }]
                 })
                 .unwrap_or_default(),
+            absorbed: Vec::new(),
         }
     }
 
@@ -5936,6 +6037,80 @@ mod toast_copy_tests {
             non_shift.cascade[0].after_start.as_deref(),
             Some("2026-07-12T00:00:00Z"),
             "a later non-Shift parent persist must still persist the Shift-drag children"
+        );
+    }
+
+    #[test]
+    fn a_later_shift_drag_rolls_its_children_back_past_the_dropped_drag() {
+        let first = commit_save(
+            "2026-07-09T00:00:00Z",
+            "2026-07-23T00:00:00Z",
+            Some("2026-07-09T00:00:00Z"),
+        );
+        let mut second = commit_save(
+            "2026-07-12T00:00:00Z",
+            "2026-07-26T00:00:00Z",
+            Some("2026-07-12T00:00:00Z"),
+        );
+        second.previous.start_date = first.after_start.clone();
+        second.previous.target_date = first.after_target.clone();
+        second.cascade[0].previous.start_date = first.cascade[0].after_start.clone();
+        second.cascade[0].previous.target_date = first.cascade[0].after_target.clone();
+        let original_child = first.cascade[0].previous.clone();
+        second.adopt_cascade_from_superseded(first);
+        assert_eq!(
+            second.cascade[0].previous.start_date, original_child.start_date,
+            "the dropped drag's child dates were never sent, so the survivor rolls back past them"
+        );
+        assert_eq!(
+            second.absorbed.len(),
+            1,
+            "the dropped drag stays with the survivor"
+        );
+        assert_eq!(
+            second.absorbed[0].cascade.len(),
+            1,
+            "its children stay too, so a rollback can restore them"
+        );
+    }
+
+    #[test]
+    fn dates_before_nudge_looks_past_the_nudge_only_while_the_bar_shows_it() {
+        use jiff::civil::date;
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("dates-before-nudge")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        let mut node = super::fake_hierarchy(1).remove(0);
+        node.start_date = Some("2026-07-09T00:00:00Z".into());
+        node.target_date = Some("2026-07-23T00:00:00Z".into());
+        state.gantt.pending_nudge = Some(crate::gantt::PendingNudge {
+            id: node.id,
+            start: date(2026, 7, 9),
+            target: date(2026, 7, 23),
+            original_start: date(2026, 7, 6),
+            original_target: date(2026, 7, 20),
+            original_rev: node.rev,
+            had_start: true,
+            had_target: true,
+        });
+        assert_eq!(
+            state.dates_before_nudge(&node),
+            (
+                Some("2026-07-06T00:00:00Z".into()),
+                Some("2026-07-20T00:00:00Z".into())
+            )
+        );
+        node.start_date = Some("2026-07-01T00:00:00Z".into());
+        assert_eq!(
+            state.dates_before_nudge(&node).0.as_deref(),
+            Some("2026-07-01T00:00:00Z"),
+            "a node rewritten under the Nudge reports its live dates"
         );
     }
 
@@ -5998,6 +6173,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         pending.cascade = state.shift_children_with_committed_move(&pending);
         let later_start = Date::new(2026, 7, 12).unwrap();
@@ -6057,6 +6233,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         first.cascade = state.shift_children_with_committed_move(&first);
         let later_start = Date::new(2026, 7, 12).unwrap();
@@ -6072,6 +6249,7 @@ mod toast_copy_tests {
             role: super::DateSaveRole::Commit,
             rev: 1,
             cascade: Vec::new(),
+            absorbed: Vec::new(),
         };
         second.cascade = state.shift_children_with_committed_move(&second);
         let later_child = state
