@@ -12,9 +12,9 @@ use ado_planner::paths::AppPaths;
 use ado_planner::state::PlannerState;
 use ado_planner::ui::PlannerView;
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
+use dataset::ado_shaped_hierarchy;
 use gpui_kit::{Modifiers, MouseButton, ScrollDelta, ScrollEvent, VisualTestContext, point, px};
 use jiff::civil::Date;
-use dataset::ado_shaped_hierarchy;
 
 // Budgets: the slowest median seen on a hosted runner plus 25%. Both are
 // over #53's 60 fps (16.7 ms); docs/speed-budgets.md has the runs.
