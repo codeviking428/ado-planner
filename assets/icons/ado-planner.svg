@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="ADO Planner">
+  <defs>
+    <linearGradient id="bg" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E1A33"/>
+      <stop offset="100%" stop-color="#12101C"/>
+    </linearGradient>
+    <linearGradient id="bar1" x1="24" y1="0" x2="54" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7DF9FF"/>
+      <stop offset="100%" stop-color="#22D3EE"/>
+    </linearGradient>
+    <linearGradient id="bar2" x1="24" y1="0" x2="46" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#C4B5FD"/>
+      <stop offset="100%" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="bar3" x1="24" y1="0" x2="50" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#A5B4FC"/>
+      <stop offset="100%" stop-color="#6366F1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App tile -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)"/>
+  <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="13.25" fill="none" stroke="#3B3460" stroke-width="1.5"/>
+
+  <!-- Hierarchy stem + elbows (planning tree) -->
+  <path d="M17 17v30M17 17h7M17 32h7M17 47h7"
+        fill="none" stroke="#7C6BF0" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Hierarchy nodes -->
+  <circle cx="17" cy="17" r="4.5" fill="#DDD6FE"/>
+  <circle cx="17" cy="32" r="4.5" fill="#A78BFA"/>
+  <circle cx="17" cy="47" r="4.5" fill="#67E8F9"/>
+
+  <!-- Gantt / timeline bars -->
+  <rect x="24" y="12" width="30" height="10" rx="5" fill="url(#bar1)"/>
+  <rect x="24" y="27" width="20" height="10" rx="5" fill="url(#bar2)"/>
+  <rect x="24" y="42" width="26" height="10" rx="5" fill="url(#bar3)"/>
+
+  <!-- Milestone marker on middle bar -->
+  <path d="M40 32l3.5-3.5L47 32l-3.5 3.5z" fill="#F8FAFC"/>
+</svg>

@@ -5,6 +5,7 @@ directories:
 files:
   - '!**/.vscode/*'
   - '!src/*'
+  - '!assets/*'
   - '!e2e/*'
   - '!docs/*'
   - '!scripts/*'
@@ -17,6 +18,7 @@ asarUnpack:
   - resources/**
 forceCodeSigning: false
 win:
+  icon: assets/icons/ado-planner.ico
   executableName: ado-planner
 nsis:
   oneClick: false
@@ -25,11 +27,15 @@ nsis:
   # writes isAdminRightsRequired to latest.yml so electron-updater elevates,
   # and starts the app unelevated after installing.
   perMachine: true
+  # The default is already true, but electron-builder only writes
+  # isAdminRightsRequired when this is set explicitly.
+  packElevateHelper: true
   artifactName: ${name}-electron-${version}-setup.${ext}
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
   createDesktopShortcut: always
 mac:
+  icon: assets/icons/ado-planner.icns
   category: public.app-category.developer-tools
   hardenedRuntime: true
   gatekeeperAssess: false
@@ -45,6 +51,11 @@ mac:
 dmg:
   artifactName: ${name}-electron-${version}.${ext}
 linux:
+  # Files named <size>x<size>.png, installed into the hicolor theme.
+  icon: assets/icons/png
+  # StartupWMClass and the Wayland app_id come from desktopName, so docks
+  # pair the running window with this launcher and its icon.
+  syncDesktopName: true
   target:
     - AppImage
   maintainer: ado-planner

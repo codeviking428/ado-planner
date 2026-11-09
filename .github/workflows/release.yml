@@ -27,7 +27,9 @@ on:
     paths:
       - .github/workflows/release.yml
       - .github/scripts/**
+      - assets/icons/**
       - crates/app/Cargo.toml
+      - crates/app/build.rs
       - electron-builder.yml
       - cliff.toml
 
@@ -211,6 +213,20 @@ jobs:
             exit 1
           fi
 
+      - name: Check packaged icons
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            python .github/scripts/icons.py check-exe target/release/ado-planner.exe
+            python .github/scripts/icons.py check-exe --group-id 103 release/rust/*-setup.exe
+          else
+            appimage="$(realpath release/rust/*.AppImage)"
+            chmod +x "$appimage"
+            (cd "$RUNNER_TEMP" && "$appimage" --appimage-extract >/dev/null)
+            python3 .github/scripts/icons.py check-appdir "$RUNNER_TEMP/squashfs-root" --require-svg
+          fi
+
       - name: Collect assets
         shell: bash
         run: |
@@ -287,6 +303,20 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
+      - name: Check packaged icons
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            python .github/scripts/icons.py check-exe dist/win-unpacked/ado-planner.exe
+            python .github/scripts/icons.py check-exe --group-id 103 dist/*-setup.exe
+          else
+            appimage="$(realpath dist/*.AppImage)"
+            chmod +x "$appimage"
+            (cd "$RUNNER_TEMP" && "$appimage" --appimage-extract >/dev/null)
+            python3 .github/scripts/icons.py check-appdir "$RUNNER_TEMP/squashfs-root"
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: electron-${{ matrix.name }}
@@ -327,7 +357,8 @@ jobs:
             echo "$exe: $level"
             [ "$level" = 'requestedExecutionLevel level="requireAdministrator"' ]
           done
-          grep -qx 'isAdminRightsRequired: true' dist/electron/latest.yml
+          # electron-updater reads the flag from the installer's files[] entry.
+          grep -qxE '[[:space:]]+isAdminRightsRequired: true' dist/electron/latest.yml
 
       - name: Install, migrate, and uninstall
         shell: pwsh
