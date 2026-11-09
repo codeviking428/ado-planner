@@ -3101,6 +3101,41 @@ fn ui_failed_coalesced_save_rolls_back_to_the_last_saved_dates(cx: &mut gpui_kit
 }
 
 #[gpui_kit::test]
+fn ui_queued_batch_still_saves_under_a_newer_unsaved_nudge(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let before = app.patches_to(PERSIST_CART);
+    let gate = nudge_during_a_held_patch(&view, cx, &app, false, "right right");
+    idle(cx, NUDGE_IDLE_MS);
+    cx.simulate_keystrokes("right");
+    support::draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.state.gantt.pending_nudge.is_some() && view.io_pending());
+    });
+    gate.release();
+    settle(&view, cx, "the first PATCH and the queued batch", |_| {
+        app.patches_to(PERSIST_CART) >= before + 2
+    });
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-09"),
+        "the queued second batch is saved, not dropped as stale"
+    );
+    cx.simulate_keystrokes("escape");
+    idle(cx, NUDGE_IDLE_MS * 2);
+    settle(&view, cx, "the discarded third batch", |_| true);
+    assert_eq!(app.patches_to(PERSIST_CART), before + 2);
+    view.read_with(cx, |view, _| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        assert_eq!(
+            date_only(start.as_deref()),
+            Some("2026-07-09"),
+            "Escape returns to dates Azure DevOps has"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn ui_failed_save_drops_presses_made_while_it_was_in_flight(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);

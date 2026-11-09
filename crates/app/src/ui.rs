@@ -10587,7 +10587,11 @@ impl PlannerView {
                 self.state.discard_stale_date_save(&pending);
                 continue;
             };
-            if live.start_date != pending.after_start || live.target_date != pending.after_target {
+            // A Nudge still coalescing on top of this save does not make it
+            // stale; its own commit builds on these dates.
+            if self.state.dates_before_nudge(live)
+                != (pending.after_start.clone(), pending.after_target.clone())
+            {
                 self.state.discard_stale_date_save(&pending);
                 continue;
             }

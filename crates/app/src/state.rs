@@ -1498,6 +1498,20 @@ impl PlannerState {
         }
     }
 
+    /// `node`'s dates without a Nudge that is still coalescing on it, i.e.
+    /// what the bar shows again if that Nudge is discarded.
+    pub fn dates_before_nudge(&self, node: &WorkItemNode) -> (Option<String>, Option<String>) {
+        match &self.gantt.pending_nudge {
+            Some(nudge) if nudge.id == node.id => (
+                nudge.had_start.then(|| iso_date_only(nudge.original_start)),
+                nudge
+                    .had_target
+                    .then(|| iso_date_only(nudge.original_target)),
+            ),
+            _ => (node.start_date.clone(), node.target_date.clone()),
+        }
+    }
+
     fn restore_nudge(&mut self, pending: &PendingNudge) {
         self.restore_partial_dates(
             pending.id,
@@ -2061,7 +2075,9 @@ impl PlannerState {
         else {
             return Ok(());
         };
-        if node.start_date != pending.after_start || node.target_date != pending.after_target {
+        if self.dates_before_nudge(&node)
+            != (pending.after_start.clone(), pending.after_target.clone())
+        {
             self.restore_matching_commit_cascade(&pending);
             return Ok(());
         }
