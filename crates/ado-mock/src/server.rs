@@ -154,6 +154,11 @@ impl AdoMock {
             .cloned()
     }
 
+    /// Serves `items` (ADO work item JSON) instead of the fixture backlog.
+    pub async fn set_work_items(&self, items: Vec<Value>) {
+        *self.state.items.lock().await = items;
+    }
+
     pub async fn close(mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -420,15 +425,19 @@ async fn route(
     }
     if path.contains("/workitemsbatch") && *method == Method::POST {
         let body = read_json(req).await?;
-        let ids = body
+        let ids: std::collections::HashSet<i64> = body
             .get("ids")
             .and_then(Value::as_array)
-            .cloned()
+            .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
             .unwrap_or_default();
         let items = state.items.lock().await;
         let selected: Vec<Value> = items
             .iter()
-            .filter(|item| ids.contains(item.get("id").unwrap_or(&Value::Null)))
+            .filter(|item| {
+                item.get("id")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|id| ids.contains(&id))
+            })
             .cloned()
             .collect();
         return Ok(json_response(StatusCode::OK, json!({ "value": selected })));

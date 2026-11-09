@@ -14769,9 +14769,10 @@ fn add_child_dialog_creates_on_the_mock_with_the_typed_title(cx: &mut gpui_kit::
         view.update(cx, |view, cx| view.set_create_title("Payments", window, cx));
     });
     let create = cx.debug_bounds("gantt-create-confirm").expect("Create");
+    // Create starts the request; its reply can land during the next draw.
+    allow_ado_client_wake(cx);
     cx.simulate_click(create.center(), Modifiers::default());
     draw(cx);
-    allow_ado_client_wake(cx);
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     let mut created = None;
     while std::time::Instant::now() < deadline {

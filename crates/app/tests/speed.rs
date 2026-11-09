@@ -1,196 +1,36 @@
+//! Frame budgets from #53, measured on a real `PlannerView` in the GPUI test
+//! platform. Launch, first-frame and memory budgets are in `launch.rs`;
+//! `docs/speed-budgets.md` says how every budget was chosen.
+
+mod dataset;
+
 use std::time::{Duration, Instant};
 
-use ado_core::{HierarchyResult, IdentityValue, SessionInfo, WorkItemNode};
-use ado_planner::gantt::GanttView;
+use ado_core::{GanttBarKind, HierarchyResult, SessionInfo, WorkItemNode};
+use ado_planner::gantt::{GanttView, ROW_HEIGHT, TIMELINE_HEADER_H};
 use ado_planner::paths::AppPaths;
-use ado_planner::state::{PlannerState, fake_hierarchy};
+use ado_planner::state::PlannerState;
 use ado_planner::ui::PlannerView;
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
-use gpui_kit::{Modifiers, ScrollDelta, ScrollEvent, VisualTestContext, point, px};
+use dataset::ado_shaped_hierarchy;
+use gpui_kit::{Modifiers, MouseButton, ScrollDelta, ScrollEvent, VisualTestContext, point, px};
 use jiff::civil::Date;
-use serde_json::json;
+
+// Budgets: the slowest median seen on a hosted runner plus 25%. Both are
+// over #53's 60 fps (16.7 ms); docs/speed-budgets.md has the runs.
+
+/// Median wheel-scroll frame at 5,000 rows. Runners measured 35.8–44.3 ms.
+const SCROLL_BUDGET: Duration = Duration::from_millis(56);
+/// Median bar-drag frame at 5,000 rows. Runners measured 22.9–30.5 ms.
+const DRAG_BUDGET: Duration = Duration::from_millis(39);
+const BUDGET_ROWS: usize = 5_000;
+/// Measured runs per budget; the budget takes the median of their medians.
+const BUDGET_RUNS: usize = 3;
 
 fn speed_tests_enabled() -> bool {
     std::env::var("ADO_PLANNER_SPEED_TESTS")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-}
-
-#[test]
-fn gantt_from_warm_cache_within_500ms() {
-    if !speed_tests_enabled() {
-        return;
-    }
-    let nodes = fake_hierarchy(5_000);
-    let gantt = GanttView::default();
-    let started = Instant::now();
-    let rows = gantt.flatten(&nodes);
-    let _ = gantt.layout_bars(&nodes, &rows, &[], 720.0);
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed.as_millis() < 500,
-        "warm gantt layout took {elapsed:?}"
-    );
-}
-
-#[test]
-fn visible_window_layout_fits_a_60fps_frame() {
-    if !speed_tests_enabled() {
-        return;
-    }
-    let nodes = fake_hierarchy(5_000);
-    let gantt = GanttView::default();
-    let rows = gantt.flatten(&nodes);
-    let started = Instant::now();
-    for _ in 0..10 {
-        let _ = gantt.visible_window(&rows, 720.0);
-        let _ = gantt.layout_bars(&nodes, &rows, &[], 720.0);
-    }
-    let per_frame = started.elapsed() / 10;
-    assert!(
-        per_frame.as_millis() < 16,
-        "visible-window layout took {per_frame:?} (budget 16ms)"
-    );
-}
-
-#[test]
-fn first_frame_state_within_300ms() {
-    if !speed_tests_enabled() {
-        return;
-    }
-    let started = Instant::now();
-    let nodes = fake_hierarchy(200);
-    let gantt = GanttView::default();
-    let _ = gantt.flatten(&nodes);
-    let elapsed = started.elapsed();
-    assert!(elapsed.as_millis() < 300, "first frame took {elapsed:?}");
-}
-
-#[test]
-fn idle_memory_budget_documented() {
-    // RSS of this test process is not the packaged app. The CI speed job
-    // records /proc/self/status VmRSS after the 5,000-row layout instead.
-    let nodes = fake_hierarchy(5_000);
-    let gantt = GanttView::default();
-    let rows = gantt.flatten(&nodes);
-    let _ = gantt.layout_bars(&nodes, &rows, &[], 720.0);
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status")
-        && let Some(rss_kb) = status.lines().find_map(|line| {
-            line.strip_prefix("VmRSS:")
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|n| n.parse::<u64>().ok())
-        })
-    {
-        // Debug tests pull in gpui-kit; the packaged release binary is the
-        // 150 MB budget. Guard a generous ceiling so a leak still fails CI.
-        assert!(
-            rss_kb < 1_500_000,
-            "test RSS {rss_kb} kB is unexpectedly high"
-        );
-    }
-}
-
-/// Epic → Feature → User Story → Task forest shaped like a loaded Team:
-/// Epics and Features are unscheduled (their bars are Rollups), most Stories
-/// and Tasks are scheduled, every node carries the hierarchy batch fields, and
-/// sibling Stories chain as Dependencies.
-fn ado_shaped_hierarchy(count: usize) -> Vec<WorkItemNode> {
-    const FEATURES_PER_EPIC: usize = 4;
-    const STORIES_PER_FEATURE: usize = 5;
-    const TASKS_PER_STORY: usize = 4;
-    let states = ["New", "Active", "Resolved", "Closed"];
-    let people = ["Ada Lovelace", "Grace Hopper", "Alan Turing"];
-    let mut nodes = Vec::with_capacity(count);
-    let push = |nodes: &mut Vec<WorkItemNode>, parent: Option<i64>, ty: &str, dated: bool| {
-        let id = nodes.len() as i64 + 1;
-        let n = id as usize;
-        let start = Date::new(2026, 1, 5)
-            .unwrap()
-            .saturating_add(jiff::Span::new().days((n % 300) as i64));
-        let target = start.saturating_add(jiff::Span::new().days(3 + (n % 20) as i64));
-        let (start, target) = if dated {
-            (
-                Some(format!("{start}T00:00:00Z")),
-                Some(format!("{target}T00:00:00Z")),
-            )
-        } else {
-            (None, None)
-        };
-        let person = people[n % people.len()];
-        let assigned = (!n.is_multiple_of(5)).then(|| IdentityValue {
-            display_name: person.into(),
-            unique_name: format!("{}@contoso.com", person.to_lowercase().replace(' ', ".")),
-            id: None,
-        });
-        let title = format!("{ty} {id} for the checkout and catalog rework");
-        let state = states[n % states.len()];
-        let mut fields = serde_json::Map::new();
-        fields.insert("System.Id".into(), json!(id));
-        fields.insert("System.Rev".into(), json!(3));
-        fields.insert("System.Title".into(), json!(title));
-        fields.insert("System.WorkItemType".into(), json!(ty));
-        fields.insert("System.State".into(), json!(state));
-        if let Some(assigned) = &assigned {
-            fields.insert(
-                "System.AssignedTo".into(),
-                json!({ "displayName": assigned.display_name, "uniqueName": assigned.unique_name }),
-            );
-        }
-        if let Some(parent) = parent {
-            fields.insert("System.Parent".into(), json!(parent));
-        }
-        fields.insert("System.AreaPath".into(), json!("Shop\\Platform"));
-        fields.insert("System.IterationPath".into(), json!("Shop\\Sprint 12"));
-        if let (Some(start), Some(target)) = (&start, &target) {
-            fields.insert("Microsoft.VSTS.Scheduling.StartDate".into(), json!(start));
-            fields.insert("Microsoft.VSTS.Scheduling.TargetDate".into(), json!(target));
-        }
-        nodes.push(WorkItemNode {
-            id,
-            rev: 3,
-            title,
-            work_item_type: ty.into(),
-            state: state.into(),
-            assigned_to: assigned,
-            parent_id: parent,
-            area_path: "Shop\\Platform".into(),
-            iteration_path: "Shop\\Sprint 12".into(),
-            start_date: start,
-            target_date: target,
-            has_date_fields: true,
-            predecessors: Vec::new(),
-            fields,
-        });
-        id
-    };
-    'epics: loop {
-        let epic = push(&mut nodes, None, "Epic", false);
-        for _ in 0..FEATURES_PER_EPIC {
-            let feature = push(&mut nodes, Some(epic), "Feature", false);
-            let mut previous_story = None;
-            for s in 0..STORIES_PER_FEATURE {
-                if nodes.len() >= count {
-                    break 'epics;
-                }
-                let story = push(&mut nodes, Some(feature), "User Story", s % 4 != 3);
-                if let Some(previous) = previous_story {
-                    nodes[story as usize - 1].predecessors.push(previous);
-                }
-                previous_story = Some(story);
-                for t in 0..TASKS_PER_STORY {
-                    if nodes.len() >= count {
-                        break 'epics;
-                    }
-                    push(&mut nodes, Some(story), "Task", t % 3 != 2);
-                }
-            }
-        }
-        if nodes.len() >= count {
-            break;
-        }
-    }
-    nodes.truncate(count);
-    nodes
 }
 
 fn planner_state(dir: &tempfile::TempDir, nodes: Vec<WorkItemNode>) -> PlannerState {
@@ -247,27 +87,62 @@ struct FrameTimes {
     first_paint: Duration,
     scroll: Duration,
     hover: Duration,
+    drag: Duration,
     collapse: Duration,
     filter: Duration,
 }
 
 impl FrameTimes {
-    const MARKDOWN_HEADER: &str = "| Rows | First paint | Scroll | Hover | Collapse | Filter |\n\
-                                   | ---: | ---: | ---: | ---: | ---: | ---: |";
+    const MARKDOWN_HEADER: &str = "| Rows | First paint | Scroll | Hover | Drag | Collapse | Filter |\n\
+                                   | ---: | ---: | ---: | ---: | ---: | ---: | ---: |";
 
     fn markdown_row(&self) -> String {
         format!(
-            "| {} | {:.1?} | {:.1?} | {:.1?} | {:.1?} | {:.1?} |",
-            self.rows, self.first_paint, self.scroll, self.hover, self.collapse, self.filter,
+            "| {} | {:.1?} | {:.1?} | {:.1?} | {:.1?} | {:.1?} | {:.1?} |",
+            self.rows,
+            self.first_paint,
+            self.scroll,
+            self.hover,
+            self.drag,
+            self.collapse,
+            self.filter,
         )
     }
 }
 
+/// Window centre of a plain scheduled bar wide enough to grab mid-body and
+/// far enough from the right edge to drag.
+fn draggable_bar(view: &gpui_kit::Entity<PlannerView>, vcx: &mut VisualTestContext) -> (f32, f32) {
+    view.update(vcx, |view, _| {
+        let gantt = &view.state.gantt;
+        view.state
+            .layout_visible_bars(gantt.viewport_h)
+            .into_iter()
+            .find(|bar| {
+                bar.kind == GanttBarKind::Scheduled
+                    && !bar.summary
+                    && !bar.milestone
+                    && !bar.marker
+                    && !bar.open_ended
+                    && bar.width >= 48.0
+                    && bar.x >= 0.0
+                    && bar.x + bar.width + 200.0 < gantt.timeline_width
+            })
+            .map(|bar| {
+                (
+                    gantt.timeline_origin_x + bar.x + bar.width / 2.0,
+                    gantt.timeline_origin_y + TIMELINE_HEADER_H + bar.y + ROW_HEIGHT / 2.0,
+                )
+            })
+            .expect("a draggable bar in the first rows")
+    })
+}
+
 /// Paints a real `PlannerView` over `count` ADO-shaped rows at 1280×800,
-/// then times `samples` wheel-scroll and row-hover frames and `samples / 4`
-/// Epic collapse/expand and State-filter frames. The GPUI test platform does
-/// layout but no GPU work, so these are CPU frame-build times, not on-screen
-/// latency.
+/// then times `samples` wheel-scroll, row-hover and bar-drag frames and
+/// `samples / 4` Epic collapse/expand and State-filter frames. The GPUI test
+/// platform does layout but no GPU work, so these are CPU frame-build
+/// times, not on-screen latency.
 fn measure_frame_times(
     cx: &mut gpui_kit::TestAppContext,
     count: usize,
@@ -283,9 +158,48 @@ fn measure_frame_times(
     let started = Instant::now();
     draw(vcx);
     let first_paint = started.elapsed();
+    // A second paint lays rows out for the measured body.
+    draw(vcx);
+
+    // Drag before scrolling, while the first Stories' bars are on screen.
+    let (bar_x, bar_y) = draggable_bar(&view, vcx);
+    vcx.simulate_mouse_move(point(px(bar_x), px(bar_y)), None, Modifiers::default());
+    draw(vcx);
+    vcx.simulate_mouse_down(
+        point(px(bar_x), px(bar_y)),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(vcx);
+    let mut drag = Vec::with_capacity(samples);
+    for i in 1..=samples {
+        let x = px(bar_x + 3.0 * i as f32);
+        let started = Instant::now();
+        vcx.simulate_mouse_move(
+            point(x, px(bar_y)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        draw(vcx);
+        drag.push(started.elapsed());
+    }
+    view.update(vcx, |view, cx| {
+        assert!(
+            view.state.gantt.gesture.is_some(),
+            "the pointer must be dragging a bar"
+        );
+        view.state.cancel_gesture();
+        cx.notify();
+    });
+    vcx.simulate_mouse_up(
+        point(px(bar_x), px(bar_y)),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    draw(vcx);
+
     // Release builds drop debug selectors; this point is inside the tree body.
     let tree = point(px(150.), px(420.));
-
     let mut scroll = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
@@ -341,6 +255,7 @@ fn measure_frame_times(
         first_paint,
         scroll: median(scroll),
         hover: median(hover),
+        drag: median(drag),
         collapse: median(collapse),
         filter: median(filter),
     }
@@ -349,14 +264,14 @@ fn measure_frame_times(
 /// Keeps the frame-time harness building and running on every CI platform.
 /// Times nothing: debug builds on shared runners are too noisy for a budget.
 #[gpui_kit::test]
-fn frame_time_harness_paints_scrolls_and_filters(cx: &mut gpui_kit::TestAppContext) {
+fn frame_time_harness_paints_scrolls_drags_and_filters(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
     let times = measure_frame_times(cx, 200, 2);
     assert_eq!(times.rows, 200);
 }
 
-/// Prints the table in `docs/performance.md` for the same synthetic datasets,
-/// so before/after runs compare like for like. Run with
+/// Prints the frame-time table in `docs/performance.md` for the same
+/// synthetic datasets, so before/after runs compare like for like. Run with
 /// `ADO_PLANNER_SPEED_TESTS=1 cargo test --release -p ado-planner --test speed
 /// -- --nocapture planner_frame_times`.
 #[gpui_kit::test]
@@ -370,4 +285,31 @@ fn planner_frame_times(cx: &mut gpui_kit::TestAppContext) {
         let times = measure_frame_times(cx, count, FRAME_SAMPLES);
         eprintln!("{}", times.markdown_row());
     }
+}
+
+#[gpui_kit::test]
+fn scroll_and_drag_at_5000_rows_meet_the_frame_budgets(cx: &mut gpui_kit::TestAppContext) {
+    if !speed_tests_enabled() {
+        return;
+    }
+    cx.update(gpui_kit::init);
+    eprintln!("{}", FrameTimes::MARKDOWN_HEADER);
+    let runs: Vec<FrameTimes> = (0..BUDGET_RUNS)
+        .map(|_| {
+            let times = measure_frame_times(cx, BUDGET_ROWS, FRAME_SAMPLES);
+            eprintln!("{}", times.markdown_row());
+            times
+        })
+        .collect();
+    let scroll = median(runs.iter().map(|run| run.scroll).collect());
+    let drag = median(runs.iter().map(|run| run.drag).collect());
+    eprintln!("medians: scroll {scroll:.1?}, drag {drag:.1?}");
+    assert!(
+        scroll <= SCROLL_BUDGET,
+        "scroll frame {scroll:?} at {BUDGET_ROWS} rows is over the {SCROLL_BUDGET:?} budget"
+    );
+    assert!(
+        drag <= DRAG_BUDGET,
+        "drag frame {drag:?} at {BUDGET_ROWS} rows is over the {DRAG_BUDGET:?} budget"
+    );
 }

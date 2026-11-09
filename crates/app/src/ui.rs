@@ -183,6 +183,7 @@ pub struct PlannerView {
     /// when switching teams so a new empty backlog shows the hint again,
     /// unless a known pointer would leave it stranded.
     empty_timeline_hint_dismissed: bool,
+    startup_probe: crate::startup_probe::StartupProbe,
     form_loading: Option<(i64, String)>,
     io_busy: bool,
     saving_shown_at: Option<Instant>,
@@ -568,6 +569,7 @@ impl PlannerView {
             dates_anchor: None,
             banner_dismissed: false,
             empty_timeline_hint_dismissed: false,
+            startup_probe: crate::startup_probe::StartupProbe::from_env(),
             form_loading: None,
             io_busy: false,
             saving_shown_at: None,
@@ -12790,6 +12792,12 @@ impl Render for PlannerView {
         self.ensure_form_inputs(window, cx);
         self.flush_pending_form_dates(window, cx);
         window.set_window_title(&self.window_title());
+        let gantt_rows = if self.startup_probe.wants_gantt() && !self.state.hierarchy_loading {
+            self.state.visible_rows().len()
+        } else {
+            0
+        };
+        self.startup_probe.note_render(gantt_rows, window);
         if let Some(form_id) = self.state.form.as_ref().map(|form| form.model.id) {
             if self.form_title_focused_for != Some(form_id) {
                 // Focus the dialog, not Title — auto-focus made accidental edits too easy.

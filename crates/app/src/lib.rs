@@ -9,6 +9,7 @@ pub mod form;
 pub mod gantt;
 pub mod paths;
 pub mod prefs;
+pub mod startup_probe;
 pub mod state;
 pub mod toasts;
 pub mod ui;

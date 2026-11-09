@@ -406,6 +406,15 @@ fn pat_check_error(err: ClientError) -> Error {
 }
 
 pub fn create_session(data_dir: &std::path::Path) -> PlannerSession {
+    create_session_with(data_dir, entra_client_id())
+}
+
+/// [`create_session`] with the Entra client id passed in instead of read from
+/// the environment. `None` is PAT sign-in.
+pub fn create_session_with(
+    data_dir: &std::path::Path,
+    entra_client_id: Option<String>,
+) -> PlannerSession {
     let key = crate::persist::load_or_create_keyring_key();
     let persist = crate::persist::should_persist_session(key.is_some());
     let file = FileStore::new(crate::persist::session_dir(data_dir).join("session.bin"));
@@ -414,10 +423,13 @@ pub fn create_session(data_dir: &std::path::Path) -> PlannerSession {
     } else {
         EncryptedStore::new(Box::new(MemoryStore::new(false)), None)
     };
-    if let Some(client_id) = entra_client_id() {
-        PlannerSession::oauth(store, client_id)
-    } else {
-        PlannerSession::pat(store)
+    session_for(store, entra_client_id)
+}
+
+fn session_for(store: EncryptedStore, entra_client_id: Option<String>) -> PlannerSession {
+    match entra_client_id {
+        Some(client_id) => PlannerSession::oauth(store, client_id),
+        None => PlannerSession::pat(store),
     }
 }
 
@@ -437,6 +449,18 @@ mod tests {
             EncryptedStore::new(Box::new(MemoryStore::new(persist)), key)
         };
         PlannerSession::pat(inner)
+    }
+
+    #[tokio::test]
+    async fn no_entra_client_id_is_a_pat_session_and_one_is_entra() {
+        let store = || EncryptedStore::new(Box::new(MemoryStore::new(false)), None);
+        let mut pat = session_for(store(), None);
+        assert_eq!(pat.session_info().await.unwrap().auth_mode, AuthMode::Pat);
+        let mut entra = session_for(store(), Some("client-id".into()));
+        assert_eq!(
+            entra.session_info().await.unwrap().auth_mode,
+            AuthMode::Entra
+        );
     }
 
     #[tokio::test]
