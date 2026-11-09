@@ -138,7 +138,6 @@ jobs:
           add-paths: |
             Cargo.toml
             Cargo.lock
-            package.json
             CHANGELOG.md
           body: |
             Merging this PR releases **${{ steps.next.outputs.tag }}**: the Release PR workflow tags the merge commit and builds Linux and Windows artifacts into a GitHub Release.

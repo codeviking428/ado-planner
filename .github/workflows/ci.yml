@@ -14,46 +14,9 @@ permissions:
   contents: read
 
 env:
-  # E2E launches Electron via Playwright `_electron`, not Chromium/Firefox/WebKit.
-  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.30.3
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Install
-        run: pnpm install --frozen-lockfile
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Unit tests
-        run: pnpm test
-
-      - name: Build
-        run: pnpm exec electron-vite build
-
-      - name: Install Xvfb
-        run: sudo apt-get update && sudo apt-get install -y xvfb
-
-      - name: E2E
-        run: xvfb-run -a pnpm exec playwright test -c e2e/playwright.config.ts
-
   rust:
     strategy:
       fail-fast: false
@@ -146,6 +109,7 @@ jobs:
       - name: Release script tests
         run: |
           python3 .github/scripts/test_write_rust_latest_json.py
+          python3 .github/scripts/test_write_electron_feed.py
           python3 .github/scripts/test_check_pe_subsystem.py
 
       - name: NSIS template matches cargo-packager

@@ -2,8 +2,8 @@
 # Read, check, and bump the release version. See docs/RELEASING.md.
 #
 #   release-version.sh current            print the workspace version
-#   release-version.sh check              every crate and package.json share it
-#   release-version.sh bump X.Y.Z         set it in Cargo.toml, Cargo.lock, package.json
+#   release-version.sh check              every crate shares it
+#   release-version.sh bump X.Y.Z         set it in Cargo.toml and Cargo.lock
 #   release-version.sh changelog vX.Y.Z   prepend the git-cliff section to CHANGELOG.md
 #   release-version.sh notes vX.Y.Z       print that version's CHANGELOG.md section
 set -euo pipefail
@@ -28,15 +28,13 @@ current() {
 }
 
 check() {
-  local want versions npm
+  local want versions
   want="$(current)"
   [[ -n "$want" ]] || die "ado-planner is not a workspace member"
   versions="$(package_versions)"
   if awk -v want="$want" '$2 != want { bad = 1; print "  " $0 } END { exit !bad }' <<<"$versions" >&2; then
     die "crates above do not use version.workspace = true (want $want)"
   fi
-  npm="$(jq -r .version package.json)"
-  [[ "$npm" == "$want" ]] || die "package.json is $npm but Cargo.toml is $want"
   echo "$want"
 }
 
@@ -46,8 +44,6 @@ bump() {
   [[ "$next" =~ $semver_re ]] || die "not a plain SemVer: $next"
   sed -i.bak -E '/^\[workspace\.package\]/,/^\[/ s/^version = "[^"]*"/version = "'"$next"'"/' Cargo.toml
   rm -f Cargo.toml.bak
-  jq --arg v "$next" '.version = $v' package.json >package.json.tmp
-  mv package.json.tmp package.json
   cargo update --workspace --quiet
   [[ "$(check)" == "$next" ]] || die "bump to $next did not apply"
 }

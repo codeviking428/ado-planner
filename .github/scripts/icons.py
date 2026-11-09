@@ -8,8 +8,8 @@
     python3 .github/scripts/icons.py check-appdir squashfs-root [--require-svg]
 
 generate renders every size straight from the SVG (no downscaling), packs the
-Windows .ico and macOS .icns, copies the Electron runtime icon, and records the
-SHA-256 of the SVG and of every output in assets/icons/manifest.json. check
+Windows .ico and macOS .icns, and records the SHA-256 of the SVG and of every
+output in assets/icons/manifest.json. check
 fails if the SVG embeds rasters or external references, if an output is
 missing, malformed, or the wrong size, or if any hash in the manifest no longer
 matches, which means someone edited the SVG without regenerating or edited an
@@ -40,11 +40,9 @@ MANIFEST = ICONS / "manifest.json"
 ICO = ICONS / "ado-planner.ico"
 ICNS = ICONS / "ado-planner.icns"
 PNG_DIR = ICONS / "png"
-ELECTRON_RUNTIME_PNG = Path("resources/icon.png")
 
 # freedesktop hicolor sizes. cargo-packager installs each PNG under
-# usr/share/icons/hicolor/<w>x<h>/apps/ado-planner.png by its pixel size, and
-# electron-builder needs the size in the file name.
+# usr/share/icons/hicolor/<w>x<h>/apps/ado-planner.png by its pixel size.
 PNG_SIZES = (16, 24, 32, 48, 64, 128, 256, 512)
 # 16/32/48/256 are the classic shell sizes; 20/24/40/64 cover 125% to 200%
 # scaling of the 16 and 32 px title bar and taskbar slots.
@@ -63,7 +61,6 @@ ICNS_TYPES = (
     (b"ic13", 256),
     (b"ic14", 512),
 )
-ELECTRON_RUNTIME_SIZE = 512
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 SVG_NS = "{http://www.w3.org/2000/svg}"
@@ -79,7 +76,7 @@ def png_path(size: int) -> Path:
 
 
 def outputs() -> list[Path]:
-    return [*(png_path(s) for s in PNG_SIZES), ICO, ICNS, ELECTRON_RUNTIME_PNG]
+    return [*(png_path(s) for s in PNG_SIZES), ICO, ICNS]
 
 
 def sha256(path: Path) -> str:
@@ -443,7 +440,7 @@ def generate(root: Path) -> None:
         raise IconError("rsvg-convert not found; install librsvg2-bin (apt) or librsvg (brew)")
     svg = root / SVG
     check_svg(svg)
-    sizes = sorted({*PNG_SIZES, *ICO_SIZES, *(s for _, s in ICNS_TYPES), ELECTRON_RUNTIME_SIZE})
+    sizes = sorted({*PNG_SIZES, *ICO_SIZES, *(s for _, s in ICNS_TYPES)})
     with tempfile.TemporaryDirectory() as tmp:
         pngs = {s: render(svg, s, Path(tmp) / f"{s}.png") for s in sizes}
     (root / PNG_DIR).mkdir(parents=True, exist_ok=True)
@@ -451,7 +448,6 @@ def generate(root: Path) -> None:
         (root / png_path(size)).write_bytes(pngs[size])
     (root / ICO).write_bytes(pack_ico(pngs))
     (root / ICNS).write_bytes(pack_icns(pngs))
-    (root / ELECTRON_RUNTIME_PNG).write_bytes(pngs[ELECTRON_RUNTIME_SIZE])
     manifest = {
         "source": {"path": SVG.as_posix(), "sha256": sha256(svg)},
         "outputs": {p.as_posix(): sha256(root / p) for p in outputs()},
@@ -510,13 +506,6 @@ def check(root: Path) -> list[str]:
                 raise IconError(f"{kind.decode()} is {png_size(found[kind])}, want {size}x{size}")
 
     guard(ICNS.as_posix(), icns)
-
-    def runtime() -> None:
-        got = png_size((root / ELECTRON_RUNTIME_PNG).read_bytes())
-        if got != (ELECTRON_RUNTIME_SIZE, ELECTRON_RUNTIME_SIZE):
-            raise IconError(f"is {got[0]}x{got[1]}")
-
-    guard(ELECTRON_RUNTIME_PNG.as_posix(), runtime)
 
     def manifest() -> None:
         data = json.loads((root / MANIFEST).read_text())
