@@ -22,7 +22,15 @@ dirs = "6"
 html5ever = "0.35"
 htmd = "0.3"
 jiff = { version = "0.2", features = ["serde"] }
-keyring = "3"
+# Without a backend feature keyring silently uses its in-memory mock store.
+# Linux uses the pure-Rust zbus Secret Service client, so no libdbus at build or run time.
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "async-secret-service",
+    "async-io",
+    "crypto-rust",
+] }
 markup5ever_rcdom = "0.35"
 oauth2 = "5"
 open = "5"

@@ -101,11 +101,26 @@ pub fn should_persist_session(keyring_available: bool) -> bool {
 pub struct EncryptedStore {
     inner: Box<dyn SessionStore>,
     key: Option<[u8; 32]>,
+    keyring_backed: bool,
 }
 
 impl EncryptedStore {
     pub fn new(inner: Box<dyn SessionStore>, key: Option<[u8; 32]>) -> Self {
-        Self { inner, key }
+        Self {
+            inner,
+            key,
+            keyring_backed: false,
+        }
+    }
+
+    /// `key` came from the OS keyring, so [`Self::forget`] deletes it there too.
+    /// Stores built with [`Self::new`] never touch the keyring.
+    pub fn keyring_backed(inner: Box<dyn SessionStore>, key: Option<[u8; 32]>) -> Self {
+        Self {
+            inner,
+            key,
+            keyring_backed: true,
+        }
     }
 
     pub fn persist_to_disk(&self) -> bool {
@@ -113,12 +128,18 @@ impl EncryptedStore {
     }
 
     pub fn read_plain(&self) -> Option<String> {
+        if !self.inner.persist_to_disk() {
+            return None;
+        }
         let key = self.key?;
         let bytes = self.inner.read()?;
         decrypt(&key, &bytes).ok()
     }
 
     pub fn write_plain(&self, plain: &str) -> Result<(), Error> {
+        if !self.inner.persist_to_disk() {
+            return Ok(());
+        }
         let Some(key) = self.key else {
             return Ok(());
         };
@@ -129,10 +150,25 @@ impl EncryptedStore {
     pub fn unlink(&self) {
         self.inner.unlink();
     }
+
+    /// Logout: delete the session file and the keyring key. A keyring-backed
+    /// store mints a new key so a later sign-in in this run still persists.
+    pub fn forget(&mut self) {
+        self.inner.unlink();
+        if self.keyring_backed {
+            delete_keyring_key();
+            self.key = load_or_create_keyring_key();
+        }
+    }
 }
 
 pub fn load_or_create_keyring_key() -> Option<[u8; 32]> {
     let entry = keyring::Entry::new("ado-planner", "session-key").ok()?;
+    load_or_create_key(&entry)
+}
+
+/// `None` when the keyring cannot be read or written, so the Session stays in memory.
+fn load_or_create_key(entry: &keyring::Entry) -> Option<[u8; 32]> {
     match entry.get_secret() {
         Ok(secret) if secret.len() >= 32 => {
             let mut key = [0u8; 32];
@@ -247,16 +283,202 @@ impl StoredOauth {
             None => true,
         }
     }
+
+    /// Legacy rows without `expires_at` count as live; the API rejects them if not.
+    pub fn is_expired(&self, now_unix: i64) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| expires_at <= now_unix)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use keyring::mock::MockCredential;
+
     use super::*;
 
+    fn mock_entry() -> keyring::Entry {
+        let credential = keyring::mock::default_credential_builder()
+            .build(None, "ado-planner", "session-key")
+            .unwrap();
+        keyring::Entry::new_with_credential(credential)
+    }
+
+    fn fail_next(entry: &keyring::Entry, err: keyring::Error) {
+        entry
+            .get_credential()
+            .downcast_ref::<MockCredential>()
+            .unwrap()
+            .set_error(err);
+    }
+
+    fn persists_with(entry: &keyring::Entry) -> bool {
+        should_persist_session(load_or_create_key(entry).is_some())
+    }
+
+    /// Counts reads and records writes so a test can assert on disk traffic.
+    #[derive(Clone, Default)]
+    struct SpyStore {
+        persist: bool,
+        reads: Arc<AtomicUsize>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl SpyStore {
+        fn persisting() -> Self {
+            Self {
+                persist: true,
+                ..Self::default()
+            }
+        }
+
+        fn write_count(&self) -> usize {
+            self.writes.lock().unwrap().len()
+        }
+    }
+
+    impl SessionStore for SpyStore {
+        fn persist_to_disk(&self) -> bool {
+            self.persist
+        }
+
+        fn read(&self) -> Option<Vec<u8>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.writes.lock().unwrap().last().cloned()
+        }
+
+        fn write(&self, bytes: &[u8]) -> Result<(), Error> {
+            self.writes.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn unlink(&self) {
+            self.writes.lock().unwrap().clear();
+        }
+    }
+
+    // `msal-cache.test.ts`: Windows and macOS persist when encryption is available.
     #[test]
-    fn windows_and_macos_persist_when_keyring_available() {
-        assert!(should_persist_session(true));
-        assert!(!should_persist_session(false));
+    fn a_working_keyring_persists_and_reuses_its_key() {
+        let entry = mock_entry();
+        let first = load_or_create_key(&entry).expect("new key");
+        assert_eq!(load_or_create_key(&entry), Some(first));
+        assert!(persists_with(&entry));
+    }
+
+    // `msal-cache.test.ts`: Windows is memory-only when encryption is unavailable.
+    #[test]
+    fn an_unreadable_keyring_is_memory_only() {
+        let entry = mock_entry();
+        fail_next(&entry, keyring::Error::NoStorageAccess("locked".into()));
+        assert!(!persists_with(&entry));
+    }
+
+    // `msal-cache.test.ts`: Linux gnome_libsecret persists. The Secret Service
+    // is the Linux keyring, so a store that can save the key persists.
+    #[test]
+    fn a_keyring_that_saves_the_key_persists() {
+        let entry = mock_entry();
+        fail_next(&entry, keyring::Error::NoEntry);
+        assert!(persists_with(&entry));
+    }
+
+    /// Empty keyring that refuses every save.
+    struct ReadOnlyKeyring;
+
+    impl keyring::credential::CredentialApi for ReadOnlyKeyring {
+        fn set_secret(&self, _: &[u8]) -> keyring::Result<()> {
+            Err(keyring::Error::PlatformFailure("no secret service".into()))
+        }
+
+        fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+            Err(keyring::Error::NoEntry)
+        }
+
+        fn delete_credential(&self) -> keyring::Result<()> {
+            Err(keyring::Error::NoEntry)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    // `msal-cache.test.ts`: Linux basic_text is memory-only. Without a Secret
+    // Service the key cannot be saved, and a plaintext key would defeat the cipher.
+    #[test]
+    fn a_keyring_that_cannot_save_the_key_is_memory_only() {
+        let entry = keyring::Entry::new_with_credential(Box::new(ReadOnlyKeyring));
+        assert!(!persists_with(&entry));
+    }
+
+    // `msal-cache.test.ts`: Linux unknown backend is memory-only.
+    #[test]
+    fn an_unknown_keyring_failure_is_memory_only() {
+        let entry = mock_entry();
+        fail_next(
+            &entry,
+            keyring::Error::PlatformFailure("org.freedesktop.DBus.Error.ServiceUnknown".into()),
+        );
+        assert!(!persists_with(&entry));
+    }
+
+    // `msal-cache.test.ts`: plugin writes only when persistToDisk and cache changed.
+    #[test]
+    fn a_persisting_store_reads_back_what_it_wrote_and_encrypts_it() {
+        let spy = SpyStore::persisting();
+        let store = EncryptedStore::new(Box::new(spy.clone()), Some([5u8; 32]));
+        assert!(store.read_plain().is_none());
+        store.write_plain(r#"{"pat":"pat-secret-value"}"#).unwrap();
+        assert_eq!(spy.write_count(), 1);
+        let on_disk = spy.writes.lock().unwrap()[0].clone();
+        assert!(
+            !String::from_utf8_lossy(&on_disk).contains("pat-secret-value"),
+            "the session file must not hold the PAT in plain text"
+        );
+        assert_eq!(
+            store.read_plain().as_deref(),
+            Some(r#"{"pat":"pat-secret-value"}"#)
+        );
+        let other_key = EncryptedStore::new(Box::new(spy.clone()), Some([6u8; 32]));
+        assert!(other_key.read_plain().is_none());
+    }
+
+    // `msal-cache.test.ts`: memory-only plugin never writes.
+    #[test]
+    fn a_memory_only_store_never_reads_or_writes() {
+        for key in [None, Some([5u8; 32])] {
+            let spy = SpyStore::default();
+            let store = EncryptedStore::new(Box::new(spy.clone()), key);
+            assert!(!store.persist_to_disk());
+            store.write_plain("secret").unwrap();
+            assert!(store.read_plain().is_none());
+            assert_eq!(spy.write_count(), 0);
+            assert_eq!(spy.reads.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn a_persisting_store_without_a_key_never_writes() {
+        let spy = SpyStore::persisting();
+        let store = EncryptedStore::new(Box::new(spy.clone()), None);
+        store.write_plain("pat").unwrap();
+        assert!(!store.persist_to_disk());
+        assert_eq!(spy.write_count(), 0);
+    }
+
+    #[test]
+    fn forget_on_a_test_store_leaves_the_keyring_alone() {
+        let spy = SpyStore::persisting();
+        let mut store = EncryptedStore::new(Box::new(spy.clone()), Some([5u8; 32]));
+        store.write_plain("pat").unwrap();
+        store.forget();
+        assert_eq!(spy.write_count(), 0);
+        assert!(!store.keyring_backed);
+        assert!(store.persist_to_disk(), "the in-memory key is kept");
     }
 
     #[test]
@@ -266,14 +488,6 @@ mod tests {
         assert_eq!(store.read().as_deref(), Some(b"secret".as_slice()));
         store.unlink();
         assert!(store.read().is_none());
-    }
-
-    #[test]
-    fn encrypted_store_without_key_never_writes() {
-        let inner = MemoryStore::new(true);
-        let store = EncryptedStore::new(Box::new(inner), None);
-        store.write_plain("pat").unwrap();
-        assert!(!store.persist_to_disk());
     }
 
     #[test]
