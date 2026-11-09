@@ -6,9 +6,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ado_core::{
-    AuthMode, FLAVORS, FormControlKind, color_for_type, compact_date, dates_column_text_indexed,
-    format_date_range, identity_from_field, is_unscheduled, iso_date_only, parse_iso_date,
-    parse_user_date,
+    AuthMode, DependencyLink, FLAVORS, FormControlKind, color_for_type, compact_date,
+    dates_column_text_indexed, format_date_range, identity_from_field, is_unscheduled,
+    iso_date_only, parse_iso_date, parse_user_date,
 };
 use ado_session::PlannerSession;
 use chrono::Datelike;
@@ -46,18 +46,18 @@ use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
-    ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, CriticalPath, DATES_COL_WIDTH,
-    DETAILS_PILL_WIDTH, DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind,
-    HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT,
-    LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS,
-    NudgeAxis, OUTER_LINK_HIT, OUTSIDE_LABEL_H, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
+    ASSIGNEE_COL_WIDTH, ArrowState, ArrowTone, BarHitZone, CAMERA_EASE_MS, CLASH_BADGE, ClashMarks,
+    CriticalPath, DATES_COL_WIDTH, DETAILS_PILL_WIDTH, DependencyArrow, EXPANDER_SLOT, GanttScale,
+    GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP,
+    LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W,
+    NUDGE_IDLE_MS, NudgeAxis, OUTER_LINK_HIT, OUTSIDE_LABEL_H, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
     PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, RESIZE_HALO_END_OUTSIDE, RESIZE_HALO_OUTSIDE, ROW_HEIGHT,
     SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SavedGanttView,
-    TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
-    bar_label_right, bar_outside_label_frame, bar_title_is_inside, bar_title_paint_px,
-    header_label_px, offscreen_edge_chip, outside_title_right_gap, parent_date_overflow,
-    parent_overflow_tip, related_dependency_ids, timeline_is_empty_of_scheduled,
-    today_line_chip_skips, today_line_segments, today_pill_left,
+    ScheduleBadge, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT,
+    bar_hover_tooltip, bar_label_right, bar_outside_label_frame, bar_title_is_inside,
+    bar_title_paint_px, dependency_arrow_paint, header_label_px, offscreen_edge_chip,
+    outside_title_right_gap, parent_date_overflow, parent_overflow_tip, related_dependency_ids,
+    timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -3407,6 +3407,7 @@ impl PlannerView {
             .visible_window(&visible.rows, content_h)
             .to_vec();
         let bars = visible.layout_bars(&self.state, content_h);
+        let clash_marks = visible.clash_marks(&self.state, &bars);
         let body_box = self.gantt_body_box.clone();
         let entity_id = cx.entity_id();
         let gantt = v_flex()
@@ -3488,7 +3489,14 @@ impl PlannerView {
                                 }),
                             ),
                     )
-                    .child(self.render_timeline(&visible.nodes, &window, &bars, content_h, cx))
+                    .child(self.render_timeline(
+                        &visible.nodes,
+                        &window,
+                        &bars,
+                        &clash_marks,
+                        content_h,
+                        cx,
+                    ))
                     .when(empty_canvas && !self.state.hierarchy_loading, |el| {
                         el.child(
                             div()
@@ -3892,6 +3900,7 @@ impl PlannerView {
                 && parse_iso_date(node.target_date.as_deref()).is_some()
         });
         let selected = self.state.gantt.show_critical_path;
+        let show_arrows = self.state.show_arrows();
         let trigger = div()
             .id("gantt-toolbar-more")
             .debug_selector(|| "gantt-toolbar-more".into())
@@ -3938,6 +3947,41 @@ impl PlannerView {
                                         this.toolbar_more_open = false;
                                         this.state.gantt.clear_hover();
                                         this.open_create(this.state.gantt.selected_id, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("gantt-show-arrows")
+                            .debug_selector(|| "gantt-show-arrows".into())
+                            .w_full()
+                            .child(
+                                Button::new("show-arrows")
+                                    .accessibility_label("Show arrows")
+                                    .when(show_arrows, |btn| {
+                                        btn.child(
+                                            div()
+                                                .debug_selector(|| {
+                                                    "gantt-show-arrows-check".into()
+                                                })
+                                                .child("✓"),
+                                        )
+                                    })
+                                    .child("Show arrows")
+                                    .compact()
+                                    .toggled(show_arrows)
+                                    .selected(show_arrows)
+                                    .when(show_arrows, |btn| btn.primary())
+                                    .when(!show_arrows, |btn| btn.ghost())
+                                    .tooltip(
+                                        "Show Dependency arrows. Clash and Critical path arrows always show.",
+                                    )
+                                    .tooltip_placement(Placement::Bottom)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toolbar_more_open = false;
+                                        let show = !this.state.show_arrows();
+                                        this.state.set_show_arrows(show);
+                                        cx.notify();
                                     })),
                             ),
                     )
@@ -4971,6 +5015,7 @@ impl PlannerView {
         nodes: &[ado_core::WorkItemNode],
         window: &[crate::gantt::VisibleRow],
         bars: &[crate::gantt::BarLayout],
+        clash_marks: &ClashMarks,
         content_h: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -5281,10 +5326,27 @@ impl PlannerView {
                         self.render_open_ended_cue(bar, cx)
                     }))
                     .children({
+                        let show_arrows = self.state.show_arrows();
                         let arrows = self.state.gantt.layout_dependency_arrows(bars);
-                        arrows.into_iter().map(|arrow| {
-                            self.render_dependency_arrow(&arrow, bars, &path, &related_ids, cx)
-                        })
+                        arrows
+                            .into_iter()
+                            .filter(|arrow| {
+                                let link = (arrow.from_id, arrow.to_id);
+                                show_arrows
+                                    || clash_marks.links.contains(&link)
+                                    || path.links.contains(&link)
+                            })
+                            .map(|arrow| {
+                                self.render_dependency_arrow(
+                                    &arrow,
+                                    bars,
+                                    &path,
+                                    &clash_marks.links,
+                                    &related_ids,
+                                    cx,
+                                )
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .children({
                         // After arrows/cues so the line stays continuous
@@ -5348,6 +5410,14 @@ impl PlannerView {
                         // After connectors so a short bar's end ring is not
                         // hidden under the outgoing stub.
                         self.render_gantt_link_handles(bar, dragging, cx)
+                    }))
+                    .children(bars.iter().filter_map(|bar| {
+                        let badge = clash_marks.badges.get(&bar.id)?;
+                        // Off-screen bars already carry an edge chip.
+                        if crate::gantt::bar_offscreen_edge(bar, width).is_some() {
+                            return None;
+                        }
+                        Some(self.render_schedule_badge(bar, badge, cx))
                     }))
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
@@ -7256,6 +7326,55 @@ impl PlannerView {
         )
     }
 
+    /// Warning `!` on the successor's start edge, painted above the grips so
+    /// its tooltip gets hover. It does not occlude, so a press on it still
+    /// reaches the resize grip and link handle underneath.
+    fn render_schedule_badge(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        badge: &ScheduleBadge,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let id = bar.id;
+        let lines = badge.lines();
+        let timeline_w = self.state.gantt.timeline_width.max(1.0);
+        let left = (bar.x - CLASH_BADGE / 2.0).clamp(0.0, (timeline_w - CLASH_BADGE).max(0.0));
+        let top = bar.y + (bar.paint_top() - CLASH_BADGE / 2.0).max(1.0);
+        div()
+            .id(("gantt-clash-badge", id as u64))
+            .debug_selector(move || format!("gantt-clash-badge-{id}"))
+            .role(Role::Image)
+            .aria_label(badge.accessibility_label())
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .size(px(CLASH_BADGE))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(cx.theme().warning)
+            .text_color(cx.theme().background)
+            .text_size(px(11.))
+            .line_height(px(CLASH_BADGE))
+            .font_weight(gpui_kit::FontWeight::BOLD)
+            .child("!")
+            .tooltip(move |window, cx| {
+                let lines = lines.clone();
+                Tooltip::element(move |_, _| {
+                    v_flex().children(lines.iter().map(|line| {
+                        let selector = format!("gantt-clash-tip: {line}");
+                        div()
+                            .debug_selector(move || selector)
+                            .whitespace_nowrap()
+                            .child(line.clone())
+                    }))
+                })
+                .build(window, cx)
+            })
+            .into_any_element()
+    }
+
     /// Dates chip after the title overlay so short-bar / milestone titles
     /// cannot cover the committed range.
     fn render_pinned_bar_tooltip(
@@ -7685,6 +7804,7 @@ impl PlannerView {
         arrow: &DependencyArrow,
         bars: &[crate::gantt::BarLayout],
         path: &CriticalPath,
+        clashes: &HashSet<DependencyLink>,
         related_ids: &HashSet<i64>,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -7692,20 +7812,27 @@ impl PlannerView {
         let hovered = self.state.gantt.hovered_link == Some((arrow.from_id, arrow.to_id));
         let related = related_ids.contains(&arrow.from_id) && related_ids.contains(&arrow.to_id);
         let on_critical = path.links.contains(&(arrow.from_id, arrow.to_id));
-        let color = if on_critical {
-            cx.theme().danger
-        } else if selected || hovered || related {
-            cx.theme().primary
-        } else if self.state.gantt.show_critical_path {
-            cx.theme().primary.opacity(0.28)
-        } else {
-            cx.theme().primary.opacity(0.7)
+        let paint = dependency_arrow_paint(ArrowState {
+            clash: clashes.contains(&(arrow.from_id, arrow.to_id)),
+            on_critical,
+            focused: selected || hovered,
+            related,
+            critical_path_on: self.state.gantt.show_critical_path,
+        });
+        let color = match paint.tone {
+            ArrowTone::Clash => cx.theme().warning,
+            ArrowTone::Critical => cx.theme().danger,
+            ArrowTone::Emphasis => cx.theme().primary,
+            ArrowTone::Dimmed => cx.theme().primary.opacity(0.28),
+            ArrowTone::Plain => cx.theme().primary.opacity(0.7),
         };
-        let stroke = if selected || hovered || on_critical {
-            3.0
-        } else {
-            2.0
-        };
+        let stroke = paint.stroke;
+        let tone_selector = format!(
+            "gantt-arrow-{}-{}-{}",
+            arrow.from_id,
+            arrow.to_id,
+            paint.tone.as_str()
+        );
         let stub_start = arrow.stub_start();
         let gutter_y = arrow.gutter_y();
         let wrap = arrow.wraps_around_successor();
@@ -7727,6 +7854,7 @@ impl PlannerView {
         let (gutter_left, gutter_h) = inset_span(arrow.x2, stub_start, gutter_r, gutter_r);
         let (drop_top, drop) = inset_span(gutter_y, arrow.y2, drop_r, drop_r);
         div()
+            .debug_selector(move || tone_selector)
             .absolute()
             .left(px(min_x))
             .top(px(min_y))

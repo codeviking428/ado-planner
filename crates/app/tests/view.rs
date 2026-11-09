@@ -5,11 +5,11 @@ use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind,
     HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_INSET, MILESTONE_SIZE,
-    MIN_TIMELINE_WIDTH, OUTER_LINK_HIT, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN,
-    RESIZE_HIT_WIDTH, ROW_HEIGHT, SHORT_BAR_OUTER_LINK_HIT, TODAY_ALIGN, TODAY_PILL_GAP,
-    TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, YEAR_MIN_BAR_H, YEAR_MIN_BAR_WIDTH, bar_hover_tooltip,
-    bar_title_is_inside, bar_title_paint_px, insert_index_for_child, outside_label_is_beside_bar,
-    related_dependency_ids,
+    MIN_TIMELINE_WIDTH, NudgeAxis, OUTER_LINK_HIT, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN,
+    PARALLEL_VERT_MIN, RESIZE_HIT_WIDTH, ROW_HEIGHT, SHORT_BAR_OUTER_LINK_HIT, TODAY_ALIGN,
+    TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, YEAR_MIN_BAR_H, YEAR_MIN_BAR_WIDTH,
+    bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px, insert_index_for_child,
+    outside_label_is_beside_bar, related_dependency_ids,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
@@ -3515,6 +3515,264 @@ fn critical_path_menu_item_shows_a_check_while_on(cx: &mut gpui_kit::TestAppCont
     assert!(
         cx.debug_bounds("gantt-critical-path-check").is_none(),
         "the check must clear once the highlight is off"
+    );
+}
+
+/// Unscheduled Epic #1 over #2 (Jul 6–10), #3 (Jul 9–20, after #2: a Clash)
+/// and #4 (Jul 21–30, after #3: no Clash).
+fn clash_state(dir: &tempfile::TempDir) -> PlannerState {
+    let mut state = idle_state(dir);
+    let mut nodes = fake_hierarchy(4);
+    let dates = [
+        (None, None, vec![]),
+        (Some("2026-07-06"), Some("2026-07-10"), vec![]),
+        (Some("2026-07-09"), Some("2026-07-20"), vec![2]),
+        (Some("2026-07-21"), Some("2026-07-30"), vec![3]),
+    ];
+    for (node, (start, target, preds)) in nodes.iter_mut().zip(dates) {
+        node.start_date = start.map(|date| format!("{date}T00:00:00Z"));
+        node.target_date = target.map(|date| format!("{date}T00:00:00Z"));
+        node.predecessors = preds;
+    }
+    state.nodes = nodes;
+    state
+}
+
+fn clash_window(
+    cx: &mut gpui_kit::TestAppContext,
+    state: PlannerState,
+) -> (Entity<PlannerView>, &mut VisualTestContext) {
+    cx.update(gpui_kit::init);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    (view, cx)
+}
+
+fn has(cx: &mut VisualTestContext, selector: &'static str) -> bool {
+    cx.debug_bounds(selector).is_some()
+}
+
+#[gpui_kit::test]
+fn clash_arrows_take_the_warning_colour_even_on_the_critical_path(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = clash_window(cx, clash_state(&dir));
+    assert!(
+        has(cx, "gantt-arrow-2-3-clash"),
+        "#3 starts Jul 9, before #2's Jul 10 Target Date"
+    );
+    assert!(
+        has(cx, "gantt-arrow-3-4-plain"),
+        "#4 starts after #3 finishes"
+    );
+    view.update(cx, |view, cx| {
+        view.state.gantt.show_critical_path = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-2-3-clash"),
+        "a clashing Critical path arrow takes the warning colour"
+    );
+    assert!(has(cx, "gantt-arrow-3-4-critical"));
+}
+
+#[gpui_kit::test]
+fn clash_badge_sits_on_the_successor_start_with_one_tooltip_line_per_predecessor(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = clash_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 4) {
+        node.start_date = Some("2026-07-09T00:00:00Z".into());
+        node.predecessors = vec![2, 3];
+    }
+    let (_view, cx) = clash_window(cx, state);
+    assert!(has(cx, "gantt-clash-badge-3"));
+    assert!(!has(cx, "gantt-clash-badge-2"), "#2 has no predecessor");
+    let badge = cx.debug_bounds("gantt-clash-badge-4").expect("#4 badge");
+    let bar = cx.debug_bounds("gantt-bar-4").expect("#4 bar");
+    let badge_mid = f32::from(badge.origin.x) + f32::from(badge.size.width) / 2.0;
+    assert!(
+        (badge_mid - f32::from(bar.origin.x)).abs() <= 2.0,
+        "the ! centres on the successor's start edge, badge_mid={badge_mid} bar_left={}",
+        f32::from(bar.origin.x)
+    );
+    cx.simulate_mouse_move(badge.center(), None, Modifiers::default());
+    cx.background_executor
+        .advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(has(
+        cx,
+        "gantt-clash-tip: Starts Jul 9 · #2 finishes Jul 10"
+    ));
+    assert!(has(
+        cx,
+        "gantt-clash-tip: Starts Jul 9 · #3 finishes Jul 20"
+    ));
+}
+
+#[gpui_kit::test]
+fn clash_badge_does_not_block_the_start_resize(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = clash_state(&dir);
+    state.gantt.selected_id = Some(3);
+    state.gantt.hovered_id = Some(3);
+    state.gantt.bar_hovered_id = Some(3);
+    let (view, cx) = clash_window(cx, state);
+    let badge = cx.debug_bounds("gantt-clash-badge-3").expect("#3 badge");
+    let bar = cx.debug_bounds("gantt-bar-3").expect("#3 bar");
+    let press = point(
+        bar.origin.x + px(2.),
+        badge.origin.y + badge.size.height - px(2.),
+    );
+    cx.simulate_mouse_down(press, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("press under the !");
+        assert_eq!(gesture.id, 3);
+        assert_eq!(gesture.kind, GestureKind::ResizeStart);
+    });
+}
+
+#[gpui_kit::test]
+fn dragging_repaints_clashes_live_and_cancel_restores_them(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = clash_window(cx, clash_state(&dir));
+    assert!(!has(cx, "gantt-clash-badge-4"));
+    let bar = cx.debug_bounds("gantt-bar-4").expect("#4 bar");
+    let start = bar.center();
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Move)
+        );
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(start.x - px(ppd * 3.0), start.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-3-4-clash"),
+        "dragging #4 to Jul 18 starts it before #3's Jul 20 Target Date"
+    );
+    assert!(has(cx, "gantt-clash-badge-4"));
+    view.update(cx, |view, cx| {
+        let escape = KeyDownEvent {
+            keystroke: Keystroke::parse("escape").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        view.handle_key(&escape, cx);
+        assert!(view.state.gantt.gesture.is_none());
+    });
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-3-4-plain"),
+        "cancel restores the arrow"
+    );
+    assert!(!has(cx, "gantt-clash-badge-4"), "cancel clears the badge");
+    assert!(has(cx, "gantt-arrow-2-3-clash"), "the loaded Clash stays");
+}
+
+#[gpui_kit::test]
+fn nudging_repaints_clashes_and_discard_restores_them(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = clash_state(&dir);
+    state.gantt.selected_id = Some(3);
+    let (view, cx) = clash_window(cx, state);
+    view.update(cx, |view, cx| {
+        view.state.nudge(NudgeAxis::Both, 1).expect("nudge");
+        view.state.nudge(NudgeAxis::Both, 1).expect("nudge");
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-2-3-plain"),
+        "#3 nudged to Jul 11 no longer starts before #2's Jul 10 Target Date"
+    );
+    assert!(
+        has(cx, "gantt-arrow-3-4-clash"),
+        "#3 now finishes Jul 22, after #4 starts on Jul 21"
+    );
+    view.update(cx, |view, cx| {
+        view.state.discard_nudge();
+        cx.notify();
+    });
+    draw(cx);
+    assert!(has(cx, "gantt-arrow-2-3-clash"));
+    assert!(has(cx, "gantt-arrow-3-4-plain"));
+}
+
+#[gpui_kit::test]
+fn show_arrows_hides_ordinary_arrows_and_survives_a_restart(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = clash_state(&dir);
+    state.gantt.selected_id = Some(4);
+    state.gantt.hovered_id = Some(4);
+    state.gantt.bar_hovered_id = Some(4);
+    let (view, cx) = clash_window(cx, state);
+    open_gantt_overflow(cx);
+    let arrows = cx
+        .debug_bounds("gantt-show-arrows")
+        .expect("Show arrows item");
+    let critical = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path item");
+    assert!(
+        arrows.origin.y < critical.origin.y,
+        "Show arrows sits above Critical path"
+    );
+    assert!(has(cx, "gantt-show-arrows-check"), "on by default");
+    cx.simulate_click(arrows.center(), Modifiers::default());
+    draw(cx);
+    assert!(!has(cx, "gantt-arrow-3-4-plain"), "ordinary arrows hide");
+    assert!(has(cx, "gantt-arrow-2-3-clash"), "Clash arrows still show");
+    assert!(
+        has(cx, "gantt-link-handle-4-link-end"),
+        "link handles still show"
+    );
+    view.update(cx, |view, cx| {
+        view.state.gantt.show_critical_path = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-3-4-critical"),
+        "Critical path arrows still show"
+    );
+    open_gantt_overflow(cx);
+    assert!(!has(cx, "gantt-show-arrows-check"));
+
+    let restarted = PlannerState::new(
+        AppPaths::new(dir.path().to_path_buf()),
+        PlannerSession::pat(EncryptedStore::new(Box::new(MemoryStore::new(false)), None)),
+        None,
+        None,
+    );
+    assert!(
+        !restarted.show_arrows(),
+        "Show arrows off must survive a restart"
     );
 }
 
