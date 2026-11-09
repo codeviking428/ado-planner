@@ -43,6 +43,14 @@ _Avoid_: Date cascade, summary bar (when meaning the persisted dates)
 The Dependency chain in the current forest whose last Target Date is latest. A derived highlight, not a stored field. Only Work Items with Start Date and Target Date are vertices.
 _Avoid_: critical-path field, Hierarchy as a path
 
+**Clash**:
+A Dependency whose successor starts before its predecessor's Target Date, judged on Start Date and Target Date only. Derived, not stored.
+_Avoid_: conflict (Delivery Plans' rule, which also reads Iteration Path), overlap
+
+**Milestone**:
+A Work Item with a Target Date and no Start Date, drawn as a diamond. Equal Start Date and Target Date is a one-day bar, not a Milestone.
+_Avoid_: zero-duration bar
+
 **Nudge**:
 Moving the selected Gantt bar's Start Date, Target Date, or both by one day from the keyboard. Rapid nudges save as one change.
 _Avoid_: shift, bump
