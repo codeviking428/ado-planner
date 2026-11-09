@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ado_session::{
-    EncryptedStore, LoginCreds, MemoryStore, OauthEndpoints, PlannerSession,
+    EncryptedStore, LoginCreds, MemoryStore, OauthEndpoints, PlannerSession, SessionStore,
     entra_client_id_from_env,
 };
 use axum::extract::State;
@@ -102,7 +102,11 @@ impl TokenSourceExt for PlannerSession {
 
 struct TokenState {
     hits: AtomicU32,
+    /// Answer `invalid_grant`, as Entra does for a revoked or expired refresh token.
     fail: AtomicBool,
+    /// Answer 503 with an HTML body, as a proxy or outage does.
+    down: AtomicBool,
+    no_refresh: AtomicBool,
     expires_in: AtomicU32,
 }
 
@@ -126,6 +130,8 @@ async fn start_token_server() -> (String, Arc<TokenState>) {
     let state = Arc::new(TokenState {
         hits: AtomicU32::new(0),
         fail: AtomicBool::new(false),
+        down: AtomicBool::new(false),
+        no_refresh: AtomicBool::new(false),
         expires_in: AtomicU32::new(3600),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -139,8 +145,21 @@ async fn start_token_server() -> (String, Arc<TokenState>) {
     (format!("http://{addr}"), state)
 }
 
+fn oauth_session_on(token_origin: &str, disk: SharedStore) -> PlannerSession {
+    let store = EncryptedStore::new(Box::new(disk), Some([9u8; 32]));
+    oauth_session_with(token_origin, store, Some(token_origin))
+}
+
 fn oauth_session(token_origin: &str, ado: Option<&str>) -> PlannerSession {
     let store = EncryptedStore::new(Box::new(MemoryStore::new(true)), Some([9u8; 32]));
+    oauth_session_with(token_origin, store, ado)
+}
+
+fn oauth_session_with(
+    token_origin: &str,
+    store: EncryptedStore,
+    ado: Option<&str>,
+) -> PlannerSession {
     let mut session = PlannerSession::oauth(store, "11111111-2222-3333-4444-555555555555".into())
         .with_oauth_endpoints(OauthEndpoints {
             auth_url: format!("{token_origin}/authorize"),
@@ -186,23 +205,122 @@ async fn oauth_refreshes_when_the_access_token_is_expired() {
 }
 
 #[tokio::test]
-async fn oauth_refresh_failure_keeps_the_access_token() {
+async fn oauth_rejected_refresh_requires_sign_in_again() {
     let (origin, state) = start_token_server().await;
     state.expires_in.store(0, Ordering::SeqCst);
-    let mut session = oauth_session(&origin, Some(&origin));
+    let disk = SharedStore::default();
+    let mut session = oauth_session_on(&origin, disk.clone());
     let info = complete_oauth(&mut session, "test-code", "http://127.0.0.1:9/").await;
     assert!(info.signed_in);
+    assert!(disk.has_session());
+
     state.fail.store(true, Ordering::SeqCst);
-    let token = session
-        .ensure_access_token()
-        .await
-        .expect("keep access token");
-    assert_eq!(token, "fake-access");
+    let err = session.ensure_access_token().await.unwrap_err();
+    assert_eq!(err, ado_core::Error::SignInRequired);
+    let text = err.to_string();
+    assert!(text.contains("Sign in again"), "{text}");
+    assert!(!text.contains("fake-access") && !text.contains("fake-refresh"));
+    assert!(!session.session_info().await.unwrap().signed_in);
+    assert!(
+        !disk.has_session(),
+        "a rejected refresh token must not survive to the next launch"
+    );
+    let hits = state.hits.load(Ordering::SeqCst);
+    assert_eq!(
+        session.ensure_access_token().await.unwrap_err(),
+        ado_core::Error::SignInRequired
+    );
+    assert_eq!(
+        state.hits.load(Ordering::SeqCst),
+        hits,
+        "a dead refresh token is not retried"
+    );
+
+    let mut next_launch = oauth_session_on(&origin, disk.clone());
+    assert!(!next_launch.session_info().await.unwrap().signed_in);
+
+    state.fail.store(false, Ordering::SeqCst);
+    state.expires_in.store(3600, Ordering::SeqCst);
+    let info = complete_oauth(&mut session, "second-code", "http://127.0.0.1:9/").await;
+    assert!(info.signed_in, "signing in again restores the Session");
+    assert_eq!(session.ensure_access_token().await.unwrap(), "fake-access");
+}
+
+#[tokio::test]
+async fn oauth_unreachable_token_endpoint_keeps_the_session_for_a_retry() {
+    let (origin, state) = start_token_server().await;
+    state.expires_in.store(0, Ordering::SeqCst);
+    let disk = SharedStore::default();
+    let mut session = oauth_session_on(&origin, disk.clone());
+    complete_oauth(&mut session, "test-code", "http://127.0.0.1:9/").await;
+
+    state.down.store(true, Ordering::SeqCst);
+    let err = session.ensure_access_token().await.unwrap_err();
+    assert_ne!(err, ado_core::Error::SignInRequired);
+    assert!(!err.to_string().contains("fake-refresh"), "{err}");
     assert!(session.session_info().await.unwrap().signed_in);
+    assert!(disk.has_session());
+
+    state.down.store(false, Ordering::SeqCst);
+    state.expires_in.store(3600, Ordering::SeqCst);
+    let hits = state.hits.load(Ordering::SeqCst);
+    assert_eq!(session.ensure_access_token().await.unwrap(), "fake-access");
+    assert_eq!(
+        state.hits.load(Ordering::SeqCst),
+        hits + 1,
+        "retried refresh"
+    );
+}
+
+#[tokio::test]
+async fn oauth_expired_token_without_a_refresh_token_requires_sign_in() {
+    let (origin, state) = start_token_server().await;
+    state.expires_in.store(0, Ordering::SeqCst);
+    state.no_refresh.store(true, Ordering::SeqCst);
+    let mut session = oauth_session(&origin, Some(&origin));
+    complete_oauth(&mut session, "test-code", "http://127.0.0.1:9/").await;
+    assert_eq!(
+        session.ensure_access_token().await.unwrap_err(),
+        ado_core::Error::SignInRequired
+    );
+    assert!(!session.session_info().await.unwrap().signed_in);
+}
+
+// `msal-cache.test.ts`: plugin writes only when persistToDisk and cache changed.
+#[tokio::test]
+async fn oauth_session_writes_to_disk_only_when_the_tokens_change() {
+    let (origin, state) = start_token_server().await;
+    let disk = SharedStore::default();
+    let mut session = oauth_session_on(&origin, disk.clone());
+    complete_oauth(&mut session, "test-code", "http://127.0.0.1:9/").await;
+    assert_eq!(disk.writes(), 1, "sign-in writes the Session once");
+
+    session.ensure_access_token().await.unwrap();
+    session.ensure_access_token().await.unwrap();
+    assert_eq!(disk.writes(), 1, "a fresh access token is not rewritten");
+
+    let mut restored = oauth_session_on(&origin, disk.clone());
+    assert!(restored.session_info().await.unwrap().signed_in);
+    assert_eq!(restored.ensure_access_token().await.unwrap(), "fake-access");
+    assert_eq!(disk.writes(), 1, "restoring a Session does not rewrite it");
+
+    state.expires_in.store(0, Ordering::SeqCst);
+    let disk = SharedStore::default();
+    let mut expiring = oauth_session_on(&origin, disk.clone());
+    complete_oauth(&mut expiring, "test-code", "http://127.0.0.1:9/").await;
+    expiring.ensure_access_token().await.unwrap();
+    assert_eq!(disk.writes(), 2, "sign-in and one refresh");
 }
 
 async fn token(State(state): State<Arc<TokenState>>) -> axum::response::Response {
     state.hits.fetch_add(1, Ordering::SeqCst);
+    if state.down.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "<html>upstream unavailable</html>",
+        )
+            .into_response();
+    }
     if state.fail.load(Ordering::SeqCst) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -210,13 +328,53 @@ async fn token(State(state): State<Arc<TokenState>>) -> axum::response::Response
         )
             .into_response();
     }
-    Json(json!({
+    let mut body = json!({
         "token_type": "Bearer",
         "access_token": "fake-access",
-        "refresh_token": "fake-refresh",
         "expires_in": state.expires_in.load(Ordering::SeqCst)
-    }))
-    .into_response()
+    });
+    if !state.no_refresh.load(Ordering::SeqCst) {
+        body["refresh_token"] = json!("fake-refresh");
+    }
+    Json(body).into_response()
+}
+
+/// One encrypted session file shared by several `PlannerSession`s, standing in
+/// for the file on disk across app launches.
+#[derive(Clone, Default)]
+struct SharedStore {
+    bytes: Arc<Mutex<Option<Vec<u8>>>>,
+    writes: Arc<AtomicU32>,
+}
+
+impl SharedStore {
+    fn has_session(&self) -> bool {
+        self.bytes.lock().unwrap().is_some()
+    }
+
+    fn writes(&self) -> u32 {
+        self.writes.load(Ordering::SeqCst)
+    }
+}
+
+impl SessionStore for SharedStore {
+    fn persist_to_disk(&self) -> bool {
+        true
+    }
+
+    fn read(&self) -> Option<Vec<u8>> {
+        self.bytes.lock().unwrap().clone()
+    }
+
+    fn write(&self, bytes: &[u8]) -> Result<(), ado_core::Error> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        *self.bytes.lock().unwrap() = Some(bytes.to_vec());
+        Ok(())
+    }
+
+    fn unlink(&self) {
+        *self.bytes.lock().unwrap() = None;
+    }
 }
 
 #[test]
