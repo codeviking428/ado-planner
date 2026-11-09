@@ -2618,6 +2618,18 @@ impl GanttView {
         let today = jiff::Zoned::now().date();
         let today_px = self.x_for_date(today);
         let today_x = (today_px >= 0.0 && today_px <= timeline_w).then_some(today_px);
+        // A dragged Unscheduled bar is laid out at the dates its drop would
+        // write, so its links draw like a scheduled bar's.
+        let live_dated = self
+            .gesture
+            .as_ref()
+            .filter(|gesture| {
+                gesture.kind != GestureKind::Link
+                    && (gesture.live_start != gesture.start
+                        || gesture.live_target != gesture.target)
+            })
+            .map(|gesture| gesture.id);
+        let is_gutter = |bar: &BarLayout| bar_is_gutter(bar) && Some(bar.id) != live_dated;
         let mut out = Vec::new();
         for bar in bars {
             for pred_id in &bar.predecessors {
@@ -2626,7 +2638,7 @@ impl GanttView {
                 };
                 // Gutter pills have no dates. A connector from/to "No dates"
                 // looks scheduled and stacks on the left-edge hint.
-                if bar_is_gutter(pred) || bar_is_gutter(bar) {
+                if is_gutter(pred) || is_gutter(bar) {
                     continue;
                 }
                 // Both ends past the clip would clamp to one edge and paint a
@@ -2645,7 +2657,7 @@ impl GanttView {
                 };
                 // Gutter pills live at the left edge. Attach to their right
                 // so the inbound is not a cramped stub on top of "No dates".
-                let succ_gutter = bar_is_gutter(bar);
+                let succ_gutter = is_gutter(bar);
                 let succ_right = if bar.milestone || bar.marker {
                     bar.x + MILESTONE_SIZE
                 } else {
@@ -14758,5 +14770,44 @@ mod tests {
             HashSet::from([(2, 3)]),
             "Target Jul 22 runs past #3's Jul 21 start"
         );
+    }
+
+    #[test]
+    fn dragging_an_unscheduled_pill_draws_its_clash_arrow_live() {
+        let today = jiff::Zoned::now().date();
+        let mut pred = node(1, None);
+        pred.start_date = Some(ado_core::iso_date_only(today.saturating_sub(5.days())));
+        pred.target_date = Some(ado_core::iso_date_only(today.saturating_add(10.days())));
+        let mut pill = node(2, None);
+        pill.start_date = None;
+        pill.target_date = None;
+        pill.iteration_path.clear();
+        pill.predecessors = vec![1];
+        let nodes = vec![pred, pill];
+        let mut gantt = GanttView {
+            origin: today.saturating_sub(20.days()),
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert!(gantt.layout_dependency_arrows(&bars).is_empty());
+        let bar = bars.iter().find(|bar| bar.id == 2).unwrap().clone();
+        assert!(bar.marker);
+        gantt
+            .begin_gesture(&bar, GestureKind::Move, bar.x, &nodes, &[])
+            .expect("move");
+        gantt.update_gesture(gantt.x_for_date(today.saturating_add(2.days())));
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let arrows = gantt.layout_dependency_arrows(&bars);
+        assert!(
+            arrows
+                .iter()
+                .any(|arrow| (arrow.from_id, arrow.to_id) == (1, 2)),
+            "the dragged pill is on the timeline, so its arrow draws"
+        );
+        assert!(marks_for(&gantt, &nodes).links.contains(&(1, 2)));
+        gantt.cancel_gesture();
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        assert!(gantt.layout_dependency_arrows(&bars).is_empty());
     }
 }
