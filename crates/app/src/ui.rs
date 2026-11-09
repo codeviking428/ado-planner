@@ -10698,12 +10698,28 @@ impl PlannerView {
                             }
                         }
                         Err(err) => {
-                            if nudging && !still_after {
-                                this.state.gantt.pending_nudge = None;
+                            if nudging {
+                                this.state.discard_nudge();
                                 this.nudge_gen += 1;
                             }
-                            if still_after || nudging {
+                            // Edits made on top of the failed dates were never
+                            // saved either; drop their queued saves with it.
+                            let chained = this.take_chained_date_saves(&revert);
+                            let (tip_start, tip_target) = chained
+                                .last()
+                                .map_or((&after_start, &after_target), |save| {
+                                    (&save.after_start, &save.after_target)
+                                });
+                            let live_at_tip = this.state.nodes.iter().any(|node| {
+                                node.id == id
+                                    && &node.start_date == tip_start
+                                    && &node.target_date == tip_target
+                            });
+                            if live_at_tip {
                                 this.state.restore_node(previous);
+                                for save in chained.iter().rev() {
+                                    this.state.revert_date_save_history(save);
+                                }
                                 this.state.revert_date_save_history(&revert);
                                 this.state.restore_date_save_failed(&revert);
                                 for reason in
@@ -10714,6 +10730,9 @@ impl PlannerView {
                                 if role == DateSaveRole::Commit {
                                     this.state.toasts.dismiss_undo();
                                 }
+                            }
+                            for save in &chained {
+                                this.restore_matching_cascade(&save.cascade);
                             }
                             if role == DateSaveRole::Commit {
                                 this.restore_matching_cascade(&kids);
@@ -10731,6 +10750,31 @@ impl PlannerView {
             });
         })
         .detach();
+    }
+
+    /// Remove queued Commit saves for `failed.id` that start from the dates
+    /// `failed` would have written, following the chain in queue order.
+    fn take_chained_date_saves(&mut self, failed: &PendingDateSave) -> Vec<PendingDateSave> {
+        let mut start = failed.after_start.clone();
+        let mut target = failed.after_target.clone();
+        let mut chained = Vec::new();
+        let mut index = 0;
+        while index < self.date_save_queue.len() {
+            let save = &self.date_save_queue[index];
+            if save.id == failed.id
+                && save.role == DateSaveRole::Commit
+                && save.previous.start_date == start
+                && save.previous.target_date == target
+            {
+                let save = self.date_save_queue.remove(index).expect("queued save");
+                start = save.after_start.clone();
+                target = save.after_target.clone();
+                chained.push(save);
+            } else {
+                index += 1;
+            }
+        }
+        chained
     }
 
     fn enqueue_matching_cascade(&mut self, cx: &mut Context<Self>, kids: Vec<PendingDateSave>) {

@@ -2888,6 +2888,54 @@ fn ui_escape_during_an_in_flight_save_drops_only_the_later_presses(
 }
 
 #[gpui_kit::test]
+fn ui_failed_save_drops_a_later_nudge_already_queued_behind_it(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
+    let before = app.mock.patch_count();
+    nudge_during_a_slow_patch(&view, cx, &app, true, "right right");
+    idle(cx, NUDGE_IDLE_MS);
+    view.read_with(cx, |view, _| {
+        assert!(
+            view.state.gantt.pending_nudge.is_none() && view.io_pending(),
+            "the second batch must be committed and queued behind the in-flight PATCH"
+        );
+    });
+    settle(&view, cx, "the failed first PATCH", |view| {
+        view.state.toasts.last_error_message().is_some()
+    });
+    idle(cx, NUDGE_IDLE_MS * 2);
+    settle(&view, cx, "no PATCH for the queued batch", |_| true);
+    assert_eq!(
+        app.mock.patch_count(),
+        before,
+        "a save built on dates that never saved must not be sent"
+    );
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            node_dates(view, PERSIST_CART),
+            original,
+            "the bar returns to what Azure DevOps has"
+        );
+        assert!(
+            view.state.history.undo.is_empty(),
+            "neither batch may stay on the Undo stack"
+        );
+        assert!(
+            view.state
+                .toasts
+                .items
+                .iter()
+                .all(|toast| toast.undo.is_none())
+        );
+    });
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-06")
+    );
+}
+
+#[gpui_kit::test]
 fn ui_failed_save_drops_presses_made_while_it_was_in_flight(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
