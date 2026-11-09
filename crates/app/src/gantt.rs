@@ -150,6 +150,20 @@ pub fn dependency_link_tooltip(from_title: &str, to_title: &str) -> String {
     format!("{from_title} → {to_title}, finish-to-start")
 }
 
+/// `Would loop: #12 → #34 → #56 → #12`, cut to five ids and `…`.
+pub fn dependency_loop_message(ids: &[i64]) -> String {
+    const MAX_IDS: usize = 5;
+    let mut parts: Vec<String> = ids
+        .iter()
+        .take(MAX_IDS)
+        .map(|id| format!("#{id}"))
+        .collect();
+    if ids.len() > MAX_IDS {
+        parts.push("…".into());
+    }
+    format!("Would loop: {}", parts.join(" → "))
+}
+
 const MAJOR_LABEL_ESTIMATE: f32 = 84.0;
 const TICK_MIN_GAP: f32 = 18.0;
 /// Keep edge tick/year labels off the clip.
@@ -10295,6 +10309,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dependency_loop_message_cuts_to_five_ids() {
+        assert_eq!(
+            dependency_loop_message(&[12, 34, 56, 12]),
+            "Would loop: #12 → #34 → #56 → #12"
+        );
+        assert_eq!(
+            dependency_loop_message(&[1, 2, 3, 4, 5]),
+            "Would loop: #1 → #2 → #3 → #4 → #5"
+        );
+        assert_eq!(
+            dependency_loop_message(&[1, 2, 3, 4, 5, 6, 1]),
+            "Would loop: #1 → #2 → #3 → #4 → #5 → …"
+        );
     }
 
     #[test]

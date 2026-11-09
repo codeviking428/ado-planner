@@ -1535,7 +1535,7 @@ impl PlannerView {
             .as_ref()
             .is_some_and(|gesture| gesture.kind == GestureKind::Link)
         {
-            return Some(CursorStyle::DragLink);
+            return Some(self.link_drag_cursor());
         }
         match self.hover_bar_zone.map(|(_, zone)| zone) {
             Some(BarHitZone::ResizeStart | BarHitZone::ResizeEnd) => {
@@ -1543,6 +1543,14 @@ impl PlannerView {
             }
             Some(BarHitZone::Link) => Some(CursorStyle::DragLink),
             _ => None,
+        }
+    }
+
+    fn link_drag_cursor(&self) -> CursorStyle {
+        if self.state.link_drag_refusal().is_some() {
+            CursorStyle::OperationNotAllowed
+        } else {
+            CursorStyle::DragLink
         }
     }
 
@@ -2372,6 +2380,11 @@ impl PlannerView {
         }
         self.state.gantt.context_menu = None;
         self.clear_hover_after_history(cx);
+        if self.state.refuse_looping_undo_action(&action) {
+            self.note_toasts_changed(cx);
+            self.request_repaint(None, cx);
+            return;
+        }
         self.dequeue_undone_link_save(&action);
         let original = self.state.history_action_message_for_undo(&action);
         let undid = undone_toast_message(&original);
@@ -2508,6 +2521,11 @@ impl PlannerView {
             self.request_repaint(None, cx);
             return;
         }
+        if self.state.refuse_looping_history_link(true) {
+            self.note_toasts_changed(cx);
+            self.request_repaint(None, cx);
+            return;
+        }
         self.dequeue_history_link_undo();
         self.skip_saving_hold = true;
         self.spawn_state(cx, |mut state| async move {
@@ -2528,6 +2546,11 @@ impl PlannerView {
             for save in pending {
                 self.enqueue_date_save(cx, save);
             }
+            self.note_toasts_changed(cx);
+            self.request_repaint(None, cx);
+            return;
+        }
+        if self.state.refuse_looping_history_link(false) {
             self.note_toasts_changed(cx);
             self.request_repaint(None, cx);
             return;
@@ -5677,6 +5700,7 @@ impl PlannerView {
                     )
                 })
             })
+            .children(self.render_link_refused_tip(bars, width, cx))
             .when(
                 self.state
                     .gantt
@@ -5691,7 +5715,7 @@ impl PlannerView {
                             .absolute()
                             .inset_0()
                             .occlude()
-                            .cursor(CursorStyle::DragLink)
+                            .cursor(self.link_drag_cursor())
                             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                                 this.apply_scroll(event, cx);
                             }))
@@ -5720,6 +5744,45 @@ impl PlannerView {
                     this.release_bar_gesture(x, y, window, cx);
                 }),
             )
+    }
+
+    /// Same-row chip naming why the hovered link target is refused.
+    fn render_link_refused_tip(
+        &self,
+        bars: &[crate::gantt::BarLayout],
+        width: f32,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let (target, text) = self.state.link_drag_refusal()?;
+        let bar = bars.iter().find(|bar| bar.id == target)?;
+        let painted_w = if bar.milestone || bar.marker {
+            MILESTONE_SIZE
+        } else {
+            bar.width.max(8.0)
+        };
+        let tip_w = (text.chars().count() as f32 * 7.0 + 24.0).max(48.0);
+        let extra = drag_preview_row_extra(bar, parent_date_overflow(&self.state.nodes, bar.id));
+        let left = row_side_tooltip_left(bar.x, painted_w, extra, tip_w, width);
+        let top = TIMELINE_HEADER_H + bar.y + ((ROW_HEIGHT - 22.0) / 2.0).max(2.0);
+        Some(
+            div()
+                .debug_selector(|| "gantt-link-refused-tip".into())
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .px_2()
+                .py(px(3.))
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().danger)
+                .bg(cx.theme().popover)
+                .text_color(cx.theme().popover_foreground)
+                .text_xs()
+                .whitespace_nowrap()
+                .shadow_md()
+                .child(text)
+                .into_any_element(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5755,6 +5818,9 @@ impl PlannerView {
                 .gesture
                 .as_ref()
                 .is_some_and(|gesture| gesture.id == id && gesture.kind != GestureKind::Link);
+        let link_refused = self.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+            gesture.kind == GestureKind::Link && gesture.link_to == Some(id)
+        }) && self.state.link_drag_refusal().is_some();
         let can_resize = bar.can_resize();
         let bar_h = bar.paint_h();
         let bar_top = bar.paint_top();
@@ -6035,6 +6101,18 @@ impl PlannerView {
                         )
                     },
                 )
+                .when(link_refused, |el| {
+                    el.child(
+                        div()
+                            .debug_selector(move || format!("gantt-link-refused-{id}"))
+                            .absolute()
+                            .inset_0()
+                            .when(milestone || marker || summary, |el| el.rounded_md())
+                            .when(!milestone && !marker && !summary, |el| el.rounded_full())
+                            .border_2()
+                            .border_color(cx.theme().danger),
+                    )
+                })
                 .children(self.bar_inner_resize_grips(bar, dragging, cx))
                 .children(self.bar_summary_edge_affordances(bar, dragging, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -10468,6 +10546,7 @@ impl PlannerView {
         match self.hover_cursor_style() {
             Some(CursorStyle::ResizeLeftRight) => Some("ew-resize"),
             Some(CursorStyle::DragLink) => Some("drag-link"),
+            Some(CursorStyle::OperationNotAllowed) => Some("not-allowed"),
             Some(_) => Some("other"),
             None => None,
         }
@@ -12013,7 +12092,7 @@ impl Render for PlannerView {
                     .as_ref()
                     .is_some_and(|gesture| gesture.kind == GestureKind::Link)
                     || matches!(self.hover_bar_zone, Some((_, BarHitZone::Link))),
-                |el| el.cursor(CursorStyle::DragLink),
+                |el| el.cursor(self.link_drag_cursor()),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
                 let x: f32 = event.position.x.into();
