@@ -2887,21 +2887,44 @@ impl PlannerView {
                                 .gap_3()
                                 .child(Label::new("Organization"))
                                 .child(
-                                    Input::new(&self.org_input)
-                                        .id("organization-input")
-                                        .disabled(busy),
+                                    div()
+                                        .id("sign-in-org")
+                                        .debug_selector(|| "sign-in-org".into())
+                                        .child(
+                                            Input::new(&self.org_input)
+                                                .id("organization-input")
+                                                .disabled(busy),
+                                        ),
                                 )
                                 .child(Label::new("Personal access token"))
-                                .child(Input::new(&self.pat_input).id("pat-input").disabled(busy))
+                                .child(
+                                    div()
+                                        .id("sign-in-pat")
+                                        .debug_selector(|| "sign-in-pat".into())
+                                        .child(
+                                            Input::new(&self.pat_input)
+                                                .id("pat-input")
+                                                .disabled(busy),
+                                        ),
+                                )
                                 .when_some(error.take(), |el, error| el.child(error))
                                 .child(
-                                    Button::new("sign-in")
-                                        .primary()
-                                        .label(if busy { "Signing in…" } else { "Continue" })
-                                        .loading(busy)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.submit_pat(cx);
-                                        })),
+                                    div()
+                                        .id("sign-in-continue")
+                                        .debug_selector(|| "sign-in-continue".into())
+                                        .child(
+                                            Button::new("sign-in")
+                                                .primary()
+                                                .label(if busy {
+                                                    "Signing in…"
+                                                } else {
+                                                    "Continue"
+                                                })
+                                                .loading(busy)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.submit_pat(cx);
+                                                })),
+                                        ),
                                 ),
                         )
                     })
@@ -3303,32 +3326,44 @@ impl PlannerView {
             "state-filter" => self.state.prefs.planner.hidden_states.clone(),
             _ => self.state.hidden_roots(),
         };
-        let trigger = div().w(px(120.)).flex_shrink_0().overflow_hidden().child(
-            Button::new(id)
-                .label(caption)
-                .tooltip(tooltip)
-                .selected(open || hidden > 0)
-                .when(open || hidden > 0, |btn| btn.primary())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_scope = None;
-                    this.open_flavor = false;
-                    this.toolbar_more_open = false;
-                    this.state.gantt.context_menu = None;
-                    this.dismiss_empty_timeline_hint();
-                    this.open_filter = if this.open_filter == Some(id) {
-                        None
-                    } else {
-                        Some(id)
-                    };
-                    this.filter_query.update(cx, |input, cx| {
-                        input.set_value("", window, cx);
-                    });
-                    if this.open_filter == Some(id) {
-                        Self::focus_input(&this.filter_query, window, cx);
-                    }
-                    cx.notify();
-                })),
-        );
+        let caption_selector = format!("filter-caption-{caption}");
+        let trigger = div()
+            .id(SharedString::from(format!("{id}-trigger")))
+            .debug_selector(move || format!("{id}-trigger"))
+            .w(px(120.))
+            .flex_shrink_0()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id(SharedString::from(caption_selector.clone()))
+                    .debug_selector(move || caption_selector.clone())
+                    .child(
+                        Button::new(id)
+                            .label(caption)
+                            .tooltip(tooltip)
+                            .selected(open || hidden > 0)
+                            .when(open || hidden > 0, |btn| btn.primary())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_scope = None;
+                                this.open_flavor = false;
+                                this.toolbar_more_open = false;
+                                this.state.gantt.context_menu = None;
+                                this.dismiss_empty_timeline_hint();
+                                this.open_filter = if this.open_filter == Some(id) {
+                                    None
+                                } else {
+                                    Some(id)
+                                };
+                                this.filter_query.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                                if this.open_filter == Some(id) {
+                                    Self::focus_input(&this.filter_query, window, cx);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
         let mut popup = Popup::new(format!("{id}-popup"), trigger).offset(px(12.));
         if open {
             popup = popup.content(self.filter_menu(id, items, hidden_set, cx));
@@ -3353,28 +3388,38 @@ impl PlannerView {
                     .w_full(),
             )
             .child(
-                Button::new(SharedString::from(format!("show-all-{id}")))
-                    .label("Show all")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        match id {
-                            "type-filter" => this.state.show_all_types(),
-                            "state-filter" => this.state.show_all_states(),
-                            _ => this.state.show_all_roots(),
-                        }
-                        this.drop_tooltips_for_reload(cx);
-                    })),
+                div()
+                    .id(SharedString::from(format!("{id}-show-all")))
+                    .debug_selector(move || format!("{id}-show-all"))
+                    .child(
+                        Button::new(SharedString::from(format!("show-all-{id}")))
+                            .label("Show all")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match id {
+                                    "type-filter" => this.state.show_all_types(),
+                                    "state-filter" => this.state.show_all_states(),
+                                    _ => this.state.show_all_roots(),
+                                }
+                                this.drop_tooltips_for_reload(cx);
+                            })),
+                    ),
             )
             .child(
-                Button::new(SharedString::from(format!("hide-all-{id}")))
-                    .label("Hide all")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        match id {
-                            "type-filter" => this.state.hide_all_types(),
-                            "state-filter" => this.state.hide_all_states(),
-                            _ => this.state.hide_all_roots(),
-                        }
-                        cx.notify();
-                    })),
+                div()
+                    .id(SharedString::from(format!("{id}-hide-all")))
+                    .debug_selector(move || format!("{id}-hide-all"))
+                    .child(
+                        Button::new(SharedString::from(format!("hide-all-{id}")))
+                            .label("Hide all")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match id {
+                                    "type-filter" => this.state.hide_all_types(),
+                                    "state-filter" => this.state.hide_all_states(),
+                                    _ => this.state.hide_all_roots(),
+                                }
+                                cx.notify();
+                            })),
+                    ),
             )
             .when(filtered.is_empty(), |el| {
                 el.child(
@@ -3386,8 +3431,10 @@ impl PlannerView {
             .children(filtered.into_iter().map(|item| {
                 let checked = !hidden.contains(&item);
                 let item_click = item.clone();
+                let item_selector = format!("{id}-item-{item}");
                 h_flex()
                     .id(SharedString::from(format!("filter-item-{item}")))
+                    .debug_selector(move || item_selector.clone())
                     .w_full()
                     .min_w(px(220.))
                     .gap_2()
@@ -3482,6 +3529,7 @@ impl PlannerView {
         if self.state.scope().is_none() {
             return v_flex()
                 .id("choose-team")
+                .debug_selector(|| "choose-team".into())
                 .size_full()
                 .items_center()
                 .justify_center()

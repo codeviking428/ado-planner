@@ -1,10 +1,15 @@
 //! Ports sign-in, scope, filter and persistence cases from `e2e/app.spec.ts`.
 
+mod support;
+
+use ado_core::Flavor;
 use ado_planner::paths::AppPaths;
+use ado_planner::prefs::AppPrefs;
 use ado_planner::state::PlannerState;
 use ado_planner::ui::PlannerView;
 use ado_session::{EncryptedStore, MemoryStore, OauthEndpoints, PlannerSession};
-use gpui_kit::px;
+use gpui_kit::{Entity, VisualTestContext, px};
+use support::{MockApp, ORG_URL, PAT, click, settle};
 
 async fn signed_in_state() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
     let mock = ado_mock::start().await;
@@ -550,4 +555,299 @@ fn entra_refresh_through_the_mock_token_endpoint_loads_the_planner() {
     assert!(state.session_info.signed_in);
     assert!(state.sign_in_error.is_none());
     assert!(state.visible_nodes().iter().any(|n| n.id == 1001));
+}
+
+fn sign_in_through_the_card(view: &Entity<PlannerView>, cx: &mut VisualTestContext) {
+    assert!(cx.debug_bounds("sign-in-shell").is_some());
+    click(cx, "sign-in-org");
+    cx.simulate_input(ORG_URL);
+    click(cx, "sign-in-pat");
+    cx.simulate_input(PAT);
+    click(cx, "sign-in-continue");
+    settle(view, cx, "sign-in and the first hierarchy", |view| {
+        view.state.session_info.signed_in && !view.state.nodes.is_empty()
+    });
+}
+
+fn pick(cx: &mut VisualTestContext, trigger: &'static str, option: &'static str) {
+    click(cx, trigger);
+    click(cx, option);
+}
+
+fn scope(view: &Entity<PlannerView>, cx: &mut VisualTestContext) -> [String; 3] {
+    view.read_with(cx, |view, _| {
+        let planner = &view.state.prefs.planner;
+        [
+            planner.org.clone(),
+            planner.project.clone(),
+            planner.team.clone(),
+        ]
+    })
+}
+
+fn saved_prefs(app: &MockApp) -> AppPrefs {
+    AppPrefs::load(&AppPaths::new(app.dir.path().to_path_buf()).prefs_file())
+}
+
+fn data_dir_mentions_the_pat(app: &MockApp) -> bool {
+    std::fs::read_dir(app.dir.path())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .any(|bytes| {
+            bytes
+                .windows(PAT.len())
+                .any(|window| window == PAT.as_bytes())
+        })
+}
+
+#[gpui_kit::test]
+fn ui_sign_in_shows_the_signed_in_header_and_log_out_returns_to_the_card(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let app = MockApp::start();
+    let (view, cx) = support::open(cx, app.signed_out());
+    sign_in_through_the_card(&view, cx);
+    assert!(cx.debug_bounds("sign-in-shell").is_none());
+    assert!(cx.debug_bounds("signed-in-chrome").is_some());
+    assert!(cx.debug_bounds("header-log-out").is_some());
+    assert!(cx.debug_bounds("gantt-tree-row-1003").is_some());
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.state.session_info.display_name.as_deref(),
+            Some("Ada Lovelace")
+        );
+        assert_eq!(view.state.initials(), "AL");
+    });
+    assert_eq!(
+        scope(&view, cx),
+        ["contoso".to_string(), "Shop".into(), "Platform".into()]
+    );
+    assert!(
+        !data_dir_mentions_the_pat(&app),
+        "the PAT must not reach prefs.json or the query cache"
+    );
+
+    click(cx, "header-log-out");
+    settle(&view, cx, "log out", |view| {
+        !view.state.session_info.signed_in
+    });
+    assert!(cx.debug_bounds("sign-in-shell").is_some());
+    assert!(cx.debug_bounds("signed-in-chrome").is_none());
+    view.read_with(cx, |view, _| assert!(view.state.nodes.is_empty()));
+}
+
+#[gpui_kit::test]
+fn ui_team_iteration_and_assignee_pickers_rescope_the_rows(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = support::open(cx, app.signed_in());
+
+    pick(cx, "assignee-trigger", "assignee-option-grace@contoso.com");
+    assert!(
+        cx.debug_bounds("gantt-tree-row-1003").is_none(),
+        "Persist cart is not assigned to Grace"
+    );
+    pick(cx, "assignee-trigger", "assignee-option-anyone");
+    assert!(cx.debug_bounds("gantt-tree-row-1003").is_some());
+
+    pick(
+        cx,
+        "iteration-trigger",
+        "iteration-option-Shop\\FY26\\Sprint 10",
+    );
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.state.prefs.planner.iteration_path,
+            "Shop\\FY26\\Sprint 10"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-tree-row-1003").is_some(),
+        "Sprint 10"
+    );
+    assert!(
+        cx.debug_bounds("gantt-tree-row-1012").is_none(),
+        "Sprint 12"
+    );
+    pick(cx, "iteration-trigger", "iteration-option-");
+    assert!(cx.debug_bounds("gantt-tree-row-1012").is_some());
+
+    pick(cx, "team-trigger", "team-option-Growth");
+    settle(&view, cx, "the Growth hierarchy", |view| {
+        view.state.nodes.iter().any(|node| node.id == 1020)
+    });
+    assert!(cx.debug_bounds("gantt-tree-row-1020").is_some());
+    assert!(cx.debug_bounds("gantt-tree-row-1003").is_none());
+    assert_eq!(saved_prefs(&app).planner.team, "Growth");
+}
+
+#[gpui_kit::test]
+fn ui_stale_saved_scope_heals_on_sign_in(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let mut stale = AppPrefs::default();
+    stale.planner.org = "contoso".into();
+    stale.planner.project = "Retired".into();
+    stale.planner.team = "Gone".into();
+    stale.planner.iteration_path = "Retired\\Sprint 1".into();
+    stale.save(&AppPaths::new(app.dir.path().to_path_buf()).prefs_file());
+
+    let (view, cx) = support::open(cx, app.signed_out());
+    sign_in_through_the_card(&view, cx);
+    assert_eq!(
+        scope(&view, cx),
+        ["contoso".to_string(), "Shop".into(), "Platform".into()]
+    );
+    view.read_with(cx, |view, _| {
+        assert!(view.state.prefs.planner.iteration_path.is_empty());
+    });
+    assert!(cx.debug_bounds("gantt-tree-row-1003").is_some());
+    let saved = saved_prefs(&app);
+    assert_eq!(saved.planner.project, "Shop");
+    assert_eq!(saved.planner.team, "Platform");
+    assert!(saved.planner.iteration_path.is_empty());
+}
+
+#[gpui_kit::test]
+fn ui_failed_team_load_shows_choose_a_team_until_a_retry(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = support::open(cx, app.signed_out());
+    app.mock
+        .fail_next("/contoso/_apis/projects/Shop/teams", 503, "Teams down");
+    click(cx, "sign-in-org");
+    cx.simulate_input(ORG_URL);
+    click(cx, "sign-in-pat");
+    cx.simulate_input(PAT);
+    click(cx, "sign-in-continue");
+    settle(&view, cx, "sign-in with a failed Team load", |view| {
+        view.state.session_info.signed_in && view.state.toasts.last_error_message().is_some()
+    });
+    assert!(
+        cx.debug_bounds("choose-team").is_some(),
+        "no Team means the Choose a Team empty state"
+    );
+    view.read_with(cx, |view, _| {
+        assert!(view.state.prefs.planner.team.is_empty());
+        let error = view.state.toasts.last_error_message().unwrap_or_default();
+        assert!(
+            error.contains("Teams down") || error.contains("503"),
+            "{error}"
+        );
+    });
+
+    click(cx, "project-trigger");
+    click(cx, "scope-current");
+    settle(&view, cx, "the Team reload", |view| {
+        view.state.prefs.planner.team == "Platform"
+    });
+    assert!(cx.debug_bounds("choose-team").is_none());
+    assert!(cx.debug_bounds("gantt-tree-row-1003").is_some());
+}
+
+#[gpui_kit::test]
+fn ui_filters_hide_show_search_and_count(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = support::open(cx, app.signed_in());
+    assert!(cx.debug_bounds("filter-caption-Types: All").is_some());
+
+    click(cx, "type-filter-trigger");
+    click(cx, "type-filter-item-Task");
+    assert!(cx.debug_bounds("filter-caption-Types: 1 hidden").is_some());
+    assert!(cx.debug_bounds("gantt-tree-row-1005").is_none());
+    assert!(cx.debug_bounds("gantt-tree-row-1003").is_some());
+    cx.simulate_input("Ep");
+    support::draw(cx);
+    assert!(cx.debug_bounds("type-filter-item-Epic").is_some());
+    assert!(
+        cx.debug_bounds("type-filter-item-Task").is_none(),
+        "search narrows the list"
+    );
+    click(cx, "type-filter-hide-all");
+    assert!(cx.debug_bounds("gantt-tree-row-1001").is_none());
+    assert!(
+        cx.debug_bounds("empty-show-all").is_some(),
+        "hiding every type offers Show all"
+    );
+    click(cx, "type-filter-show-all");
+    assert!(cx.debug_bounds("filter-caption-Types: All").is_some());
+    assert!(cx.debug_bounds("gantt-tree-row-1005").is_some());
+    cx.simulate_keystrokes("escape");
+    support::draw(cx);
+
+    let roots = view.read_with(cx, |view, _| view.state.types().len());
+    click(cx, "root-filter-trigger");
+    click(cx, "root-filter-item-Task");
+    assert!(
+        cx.debug_bounds("gantt-tree-row-1012").is_none(),
+        "the unparented Task root hides"
+    );
+    assert!(
+        cx.debug_bounds("gantt-tree-row-1005").is_some(),
+        "Tasks under an Epic stay"
+    );
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.state.selected_root_count(), roots - 1);
+    });
+    cx.simulate_keystrokes("escape");
+    support::draw(cx);
+
+    click(cx, "state-filter-trigger");
+    click(cx, "state-filter-item-New");
+    assert!(cx.debug_bounds("filter-caption-States: 1 hidden").is_some());
+    assert!(
+        cx.debug_bounds("gantt-tree-row-1005").is_none(),
+        "Cart UI is New"
+    );
+
+    let saved = saved_prefs(&app);
+    assert!(saved.planner.hidden_types.is_empty());
+    assert_eq!(saved.planner.hidden_states, vec!["New".to_string()]);
+}
+
+#[gpui_kit::test]
+fn ui_scope_filters_and_flavor_survive_a_restart(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = support::open(cx, app.signed_in());
+    click(cx, "state-filter-trigger");
+    click(cx, "state-filter-item-New");
+    cx.simulate_keystrokes("escape");
+    support::draw(cx);
+    pick(cx, "header-theme-trigger", "flavor-option-latte");
+    pick(cx, "team-trigger", "team-option-Growth");
+    settle(&view, cx, "the Growth hierarchy", |view| {
+        view.state.nodes.iter().any(|node| node.id == 1020)
+    });
+
+    let (restarted, cx) =
+        cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, app.signed_out()));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    support::draw(cx);
+    restarted.read_with(cx, |view, _| {
+        assert_eq!(
+            view.state.flavor(),
+            Flavor::Latte,
+            "Flavor is read from prefs.json"
+        );
+        assert!(
+            !view.state.session_info.signed_in,
+            "the Session is not persisted"
+        );
+    });
+    sign_in_through_the_card(&restarted, cx);
+    assert_eq!(
+        scope(&restarted, cx),
+        ["contoso".to_string(), "Shop".into(), "Growth".into()]
+    );
+    restarted.read_with(cx, |view, _| {
+        assert_eq!(
+            view.state.prefs.planner.hidden_states,
+            vec!["New".to_string()]
+        );
+    });
+    assert!(cx.debug_bounds("filter-caption-States: 1 hidden").is_some());
+    assert!(cx.debug_bounds("gantt-tree-row-1020").is_some());
+    assert!(!data_dir_mentions_the_pat(&app));
 }
