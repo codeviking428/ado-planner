@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -32,17 +32,71 @@ pub enum ClientError {
         status: StatusCode,
         url: String,
         body: String,
+        /// `Retry-After` in seconds. The HTTP-date form is ignored.
+        retry_after: Option<Duration>,
     },
 }
 
+/// Attempts, the first included, for writes that retry 429 and 5xx.
+const RETRY_ATTEMPTS: u32 = 4;
+const RETRY_BASE: Duration = Duration::from_millis(200);
+/// A longer `Retry-After` turns the failure permanent rather than hold the
+/// write queue.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
+
 impl ClientError {
+    /// How long to wait before retry `attempt` (from 0), or `None` when the
+    /// error is not a 429 or 5xx. Backoff doubles from 200 ms with jitter,
+    /// and never undercuts `Retry-After`.
+    pub fn retry_delay(&self, attempt: u32) -> Option<Duration> {
+        let Self::Status {
+            status,
+            retry_after,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if *status != StatusCode::TOO_MANY_REQUESTS && !status.is_server_error() {
+            return None;
+        }
+        if retry_after.is_some_and(|after| after > RETRY_AFTER_CAP) {
+            return None;
+        }
+        let backoff = RETRY_BASE.saturating_mul(1 << attempt.min(8));
+        let jittered = backoff.mul_f64(0.5 + jitter() / 2.0);
+        Some(retry_after.map_or(jittered, |after| after.max(jittered)))
+    }
+
+    /// One line for a person: Azure DevOps's `message`, else the status.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Status { status, body, .. } => serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|value| value.get("message")?.as_str().map(ToOwned::to_owned))
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or_else(|| {
+                    format!(
+                        "Azure DevOps returned {} {}",
+                        status.as_u16(),
+                        status.canonical_reason().unwrap_or("")
+                    )
+                    .trim_end()
+                    .to_string()
+                }),
+            other => other.to_string(),
+        }
+    }
+
     pub fn is_precondition_failed(&self) -> bool {
         matches!(self, Self::Status { status, .. } if *status == StatusCode::PRECONDITION_FAILED)
     }
 
     pub fn is_backlogs_failure(&self) -> bool {
         match self {
-            Self::Status { url, body, status } => {
+            Self::Status {
+                url, body, status, ..
+            } => {
                 url.contains("/backlogs")
                     && (body.contains("TF400497")
                         || body.to_ascii_lowercase().contains("iteration path")
@@ -53,6 +107,14 @@ impl ClientError {
             _ => false,
         }
     }
+}
+
+/// A fraction in `[0, 1)`. `RandomState` is seeded per instance, which is
+/// enough to spread retries without a random number crate.
+fn jitter() -> f64 {
+    use std::hash::BuildHasher;
+    let bits = std::collections::hash_map::RandomState::new().hash_one(0u8);
+    (bits % 1_000) as f64 / 1_000.0
 }
 
 pub struct AdoClient {
@@ -138,6 +200,12 @@ impl AdoClient {
         if status == StatusCode::NO_CONTENT {
             return Ok(Value::Null);
         }
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
         let text = response.text().await.unwrap_or_default();
         // Azure DevOps answers rejected credentials with 203 and an HTML sign-in page.
         if !status.is_success() || status == StatusCode::NON_AUTHORITATIVE_INFORMATION {
@@ -145,6 +213,7 @@ impl AdoClient {
                 status,
                 url: url.to_string(),
                 body: text.chars().take(400).collect(),
+                retry_after,
             });
         }
         if text.is_empty() {
@@ -625,6 +694,34 @@ impl AdoClient {
         }
     }
 
+    /// [`Self::patch_work_item_with_rev_retry`], also retrying 429 and 5xx
+    /// with jittered backoff that honours `Retry-After`.
+    pub async fn patch_work_item_with_backoff(
+        &self,
+        org: &str,
+        project: &str,
+        id: i64,
+        rev: i64,
+        build: impl Fn(i64) -> Vec<JsonPatchOp>,
+    ) -> Result<i64, ClientError> {
+        let mut attempt = 0;
+        loop {
+            let result = self
+                .patch_work_item_with_rev_retry(org, project, id, rev, &build)
+                .await;
+            let delay = match &result {
+                Err(err) if attempt + 1 < RETRY_ATTEMPTS => err.retry_delay(attempt),
+                _ => None,
+            };
+            let Some(delay) = delay else {
+                return result;
+            };
+            tracing::debug!(id, attempt, ?delay, "retrying work item PATCH");
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
     pub async fn add_dependency(
         &self,
         org: &str,
@@ -876,4 +973,58 @@ fn map_named(value: Option<&Value>) -> Vec<Project> {
                 .to_string(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(code: u16, retry_after: Option<u64>) -> ClientError {
+        ClientError::Status {
+            status: StatusCode::from_u16(code).unwrap(),
+            url: "https://dev.azure.com/contoso".into(),
+            body: String::new(),
+            retry_after: retry_after.map(Duration::from_secs),
+        }
+    }
+
+    #[test]
+    fn retry_delay_covers_429_and_5xx_only() {
+        assert!(status(429, None).retry_delay(0).is_some());
+        assert!(status(503, None).retry_delay(0).is_some());
+        assert!(status(400, None).retry_delay(0).is_none());
+        assert!(status(412, None).retry_delay(0).is_none());
+        assert!(ClientError::Message("x".into()).retry_delay(0).is_none());
+    }
+
+    #[test]
+    fn retry_delay_doubles_with_jitter_and_honours_retry_after() {
+        for attempt in 0..3 {
+            let delay = status(503, None).retry_delay(attempt).unwrap();
+            let full = RETRY_BASE * (1 << attempt);
+            assert!(delay >= full / 2 && delay <= full, "{attempt}: {delay:?}");
+        }
+        assert_eq!(
+            status(429, Some(5)).retry_delay(0),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            status(429, Some(31)).retry_delay(0),
+            None,
+            "a wait past the cap is a permanent failure"
+        );
+    }
+
+    #[test]
+    fn reason_prefers_the_azure_devops_message() {
+        let mut err = status(400, None);
+        if let ClientError::Status { body, .. } = &mut err {
+            *body = r#"{"message":"TF401320: Rule error"}"#.into();
+        }
+        assert_eq!(err.reason(), "TF401320: Rule error");
+        assert_eq!(
+            status(503, None).reason(),
+            "Azure DevOps returned 503 Service Unavailable"
+        );
+    }
 }

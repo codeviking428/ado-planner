@@ -3649,7 +3649,10 @@ fn clash_badge_does_not_block_the_start_resize(cx: &mut gpui_kit::TestAppContext
 #[gpui_kit::test]
 fn dragging_repaints_clashes_live_and_cancel_restores_them(cx: &mut gpui_kit::TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let (view, cx) = clash_window(cx, clash_state(&dir));
+    let mut state = clash_state(&dir);
+    // Flexible would snap this drop clear of #3; No-action leaves the Clash.
+    state.set_cascade_mode(ado_core::CascadeMode::NoAction);
+    let (view, cx) = clash_window(cx, state);
     assert!(!has(cx, "gantt-clash-badge-4"));
     let bar = cx.debug_bounds("gantt-bar-4").expect("#4 bar");
     let start = bar.center();
@@ -3693,6 +3696,122 @@ fn dragging_repaints_clashes_live_and_cancel_restores_them(cx: &mut gpui_kit::Te
     );
     assert!(!has(cx, "gantt-clash-badge-4"), "cancel clears the badge");
     assert!(has(cx, "gantt-arrow-2-3-clash"), "the loaded Clash stays");
+}
+
+/// Drag the bar at `selector` by `days` and leave the pointer down.
+fn drag_bar_by(
+    view: &Entity<PlannerView>,
+    cx: &mut VisualTestContext,
+    selector: &'static str,
+    days: f32,
+) {
+    let bar = cx.debug_bounds(selector).expect(selector);
+    let start = bar.center();
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(start.x + px(ppd * days), start.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+}
+
+fn drag_chip(view: &Entity<PlannerView>, cx: &mut VisualTestContext) -> String {
+    view.update(cx, |view, _| {
+        GanttView::drag_preview_text(view.state.gantt.gesture.as_ref().expect("dragging"))
+    })
+}
+
+#[gpui_kit::test]
+fn drag_preview_paints_what_the_cascade_leaves_and_counts_moves(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = clash_window(cx, clash_state(&dir));
+    drag_bar_by(&view, cx, "gantt-bar-3", 3.0);
+    assert!(
+        drag_chip(&view, cx).ends_with(" · moves 1"),
+        "{}",
+        drag_chip(&view, cx)
+    );
+    assert!(
+        has(cx, "gantt-bar-4") && !has(cx, "gantt-arrow-3-4-clash"),
+        "Flexible pushes #4 past #3's new Jul 23 Target Date on drop"
+    );
+    assert!(!has(cx, "gantt-clash-badge-4"));
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.id == 4)
+                .and_then(|node| node.start_date.clone())
+                .as_deref(),
+            Some("2026-07-21T00:00:00Z"),
+            "successors move on drop, not during the drag"
+        );
+        view.state.cancel_gesture();
+        view.state.set_cascade_mode(ado_core::CascadeMode::NoAction);
+    });
+    draw(cx);
+    drag_bar_by(&view, cx, "gantt-bar-3", 3.0);
+    assert!(!drag_chip(&view, cx).contains("moves"));
+    assert!(has(cx, "gantt-arrow-3-4-clash"));
+    view.update(cx, |view, _| {
+        view.state.cancel_gesture();
+        view.state.set_cascade_mode(ado_core::CascadeMode::Flexible);
+    });
+    draw(cx);
+    drag_bar_by(&view, cx, "gantt-bar-4", -3.0);
+    assert!(
+        !has(cx, "gantt-arrow-3-4-clash") && !has(cx, "gantt-clash-badge-4"),
+        "a Flexible drop into overlap snaps later, so the preview shows no Clash"
+    );
+}
+
+#[gpui_kit::test]
+fn date_cascade_menu_picks_one_mode_and_survives_a_restart(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = clash_window(cx, clash_state(&dir));
+    open_gantt_overflow(cx);
+    let critical = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path item");
+    let label = cx
+        .debug_bounds("gantt-cascade-label")
+        .expect("Date cascade group");
+    assert!(label.origin.y > critical.origin.y, "below Critical path");
+    let items = [
+        "gantt-cascade-flexible",
+        "gantt-cascade-strict",
+        "gantt-cascade-no-action",
+    ]
+    .map(|selector| cx.debug_bounds(selector).expect(selector));
+    assert!(items[0].origin.y < items[1].origin.y && items[1].origin.y < items[2].origin.y);
+    assert!(
+        has(cx, "gantt-cascade-flexible-check"),
+        "Flexible by default"
+    );
+    assert!(!has(cx, "gantt-cascade-strict-check"));
+    assert!(!has(cx, "gantt-cascade-no-action-check"));
+    cx.simulate_click(items[1].center(), Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(view.state.cascade_mode(), ado_core::CascadeMode::Strict);
+    });
+    open_gantt_overflow(cx);
+    assert!(has(cx, "gantt-cascade-strict-check"));
+    assert!(!has(cx, "gantt-cascade-flexible-check"));
+
+    let restarted = PlannerState::new(
+        AppPaths::new(dir.path().to_path_buf()),
+        PlannerSession::pat(EncryptedStore::new(Box::new(MemoryStore::new(false)), None)),
+        None,
+        None,
+    );
+    assert_eq!(restarted.cascade_mode(), ado_core::CascadeMode::Strict);
 }
 
 #[gpui_kit::test]
@@ -6873,6 +6992,146 @@ fn month_persist_xdotool_style_drag_persists_link_in_the_mock(cx: &mut gpui_kit:
     );
 }
 
+fn mock_dates(
+    runtime: &tokio::runtime::Runtime,
+    mock: &ado_mock::AdoMock,
+    id: i64,
+) -> (Option<String>, Option<String>) {
+    runtime.block_on(async {
+        let item = mock.work_item(id).await.expect("mock item");
+        let field = |name: &str| {
+            item["fields"]
+                .get(name)
+                .and_then(|value| value.as_str())
+                .map(|text| text[..10].to_string())
+        };
+        (
+            field(ado_core::START_DATE_FIELD),
+            field(ado_core::TARGET_DATE_FIELD),
+        )
+    })
+}
+
+fn wait_for(cx: &mut VisualTestContext, mut done: impl FnMut(&mut VisualTestContext) -> bool) {
+    allow_ado_client_wake(cx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        if done(cx) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Drop Persist cart (#1003, Jul 6 → Jul 20) five days later, through the
+/// view's date save queue. Its successor #1012 (Jul 21 → Aug 4) follows.
+fn drop_persist_cart_later(
+    fail_successor: bool,
+    cx: &mut gpui_kit::TestAppContext,
+) -> (
+    tokio::runtime::Runtime,
+    ado_mock::AdoMock,
+    Entity<PlannerView>,
+    &mut VisualTestContext,
+) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, mut state, _dir) = signed_in_with_mock();
+    if fail_successor {
+        mock.fail_next("/workitems/1012", 400, "TF401320: Rule error");
+    }
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    drag_bar_by(&view, cx, "gantt-bar-1003", 5.0);
+    assert!(drag_chip(&view, cx).ends_with(" · moves 1"));
+    let bar = cx.debug_bounds("gantt-bar-1003").expect("bar");
+    cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
+    draw(cx);
+    (runtime, mock, view, cx)
+}
+
+#[gpui_kit::test]
+fn a_drop_cascades_through_the_save_queue_and_undoes_in_one_step(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let (runtime, mock, view, cx) = drop_persist_cart_later(false, cx);
+    let pushed = (
+        Some("2026-07-25".to_string()),
+        Some("2026-08-08".to_string()),
+    );
+    wait_for(cx, |_| mock_dates(&runtime, &mock, 1012) == pushed);
+    assert_eq!(mock_dates(&runtime, &mock, 1012), pushed);
+    view.update(cx, |view, _| {
+        let message = view.state.toasts.last_message().unwrap_or_default();
+        assert!(message.ends_with(" · 1 successor moved"), "{message}");
+        assert_eq!(view.state.history.undo.len(), 1, "one undo entry");
+    });
+    view.update(cx, |view, cx| {
+        let undo = KeyDownEvent {
+            keystroke: Keystroke::parse("ctrl-z").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        view.handle_key(&undo, cx);
+    });
+    let loaded = (
+        Some("2026-07-21".to_string()),
+        Some("2026-08-04".to_string()),
+    );
+    wait_for(cx, |_| {
+        mock_dates(&runtime, &mock, 1012) == loaded
+            && mock_dates(&runtime, &mock, 1003).1.as_deref() == Some("2026-07-20")
+    });
+    assert_eq!(mock_dates(&runtime, &mock, 1012), loaded);
+    assert_eq!(
+        mock_dates(&runtime, &mock, 1003).1.as_deref(),
+        Some("2026-07-20")
+    );
+    view.update(cx, |view, _| {
+        let message = view.state.toasts.last_message().unwrap_or_default();
+        assert!(
+            message.starts_with("Undone") && message.ends_with(" · 1 successor moved"),
+            "Ctrl+Z names the cascade it undid: {message}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_failed_cascade_row_reverts_and_paints_the_badge(cx: &mut gpui_kit::TestAppContext) {
+    let (runtime, mock, view, cx) = drop_persist_cart_later(true, cx);
+    wait_for(cx, |cx| has(cx, "gantt-clash-badge-1012"));
+    assert_eq!(
+        mock_dates(&runtime, &mock, 1003).1.as_deref(),
+        Some("2026-07-25"),
+        "the user's change stands"
+    );
+    assert_eq!(
+        mock_dates(&runtime, &mock, 1012),
+        (Some("2026-07-21".into()), Some("2026-08-04".into()))
+    );
+    view.update(cx, |view, _| {
+        let live = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1012)
+            .unwrap();
+        assert_eq!(live.start_date.as_deref(), Some("2026-07-21T00:00:00Z"));
+        assert_eq!(
+            view.state.gantt.move_failures.get(&1012),
+            Some(&vec!["TF401320: Rule error".to_string()])
+        );
+    });
+    assert!(has(cx, "gantt-arrow-1003-1012-clash"));
+}
+
 /// Xvfb/xdotool mousedown → mousemoves → mouseup over Cart UI must commit
 /// even when capture is gone and an occluding child (arrow, title, badge)
 /// is under the pointer. The canvas drop layer + window-root mouse-up must
@@ -7085,6 +7344,7 @@ fn busy_io_still_persists_an_optimistic_link(cx: &mut gpui_kit::TestAppContext) 
                     successor_id: 1005,
                     predecessor_id: 1003,
                     linked: true,
+                    ..
                 }
             )),
             "queued link must keep an undo entry after adopt_spawned"
@@ -13053,6 +13313,7 @@ fn toast_stack_undo_while_busy_is_queued(cx: &mut gpui_kit::TestAppContext) {
         successor_id: 2,
         predecessor_id: 1,
         linked: true,
+        dates: Vec::new(),
     });
     state
         .toasts
@@ -17628,6 +17889,7 @@ fn looping_redo_toasts_and_sends_no_patch(cx: &mut gpui_kit::TestAppContext) {
         successor_id: 1005,
         predecessor_id: 1003,
         linked: true,
+        dates: Vec::new(),
     });
     let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
     draw(cx);

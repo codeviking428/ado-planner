@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::cascade::CascadeMode;
 use crate::types::AssigneeFilter;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +30,8 @@ pub struct PlannerPrefs {
     /// Off hides ordinary Dependency arrows; Clash and Critical path arrows stay.
     #[serde(default = "default_true")]
     pub show_arrows: bool,
+    #[serde(default)]
+    pub cascade_mode: CascadeMode,
 }
 
 fn deserialize_root_types<'de, D>(deserializer: D) -> Result<Option<Option<Vec<String>>>, D::Error>
@@ -87,6 +90,10 @@ pub fn parse_planner_prefs(raw: Option<&str>) -> Option<PlannerPrefs> {
             .get("showArrows")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true),
+        cascade_mode: value
+            .get("cascadeMode")
+            .and_then(|mode| CascadeMode::deserialize(mode).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -142,6 +149,7 @@ mod tests {
             hidden_states: vec!["Done".into()],
             root_types: Some(Some(vec!["Epic".into(), "Feature".into()])),
             show_arrows: false,
+            cascade_mode: CascadeMode::Strict,
         };
         assert_eq!(
             parse_planner_prefs(Some(&serialize_planner_prefs(&prefs))),
@@ -157,6 +165,18 @@ mod tests {
         assert!(!off.show_arrows);
         let serde_missing: PlannerPrefs = serde_json::from_str("{}").unwrap();
         assert!(serde_missing.show_arrows);
+    }
+
+    #[test]
+    fn cascade_mode_defaults_to_flexible_and_keeps_a_choice() {
+        let missing = parse_planner_prefs(Some(r#"{"org":"amergis"}"#)).unwrap();
+        assert_eq!(missing.cascade_mode, CascadeMode::Flexible);
+        let strict = parse_planner_prefs(Some(r#"{"cascadeMode":"no_action"}"#)).unwrap();
+        assert_eq!(strict.cascade_mode, CascadeMode::NoAction);
+        let junk = parse_planner_prefs(Some(r#"{"cascadeMode":"sideways"}"#)).unwrap();
+        assert_eq!(junk.cascade_mode, CascadeMode::Flexible);
+        let saved = serialize_planner_prefs(&strict);
+        assert!(saved.contains(r#""cascadeMode":"no_action""#), "{saved}");
     }
 
     #[test]

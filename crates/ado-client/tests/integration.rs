@@ -168,6 +168,73 @@ async fn remove_dependency_uses_the_server_rev() {
         .expect("stale caller rev must not 412");
 }
 
+#[tokio::test]
+async fn backoff_retries_server_errors_and_429_then_succeeds() {
+    let mock = ado_mock::start().await;
+    let ado = pat_client(&mock);
+    let start = "2026-07-08".parse().unwrap();
+    mock.fail_next("/workitems/1003", 503, "busy");
+    mock.fail_next("/workitems/1003", 429, "slow down");
+    let rev = ado
+        .patch_work_item_with_backoff("contoso", "Shop", 1003, 5, |rev| {
+            ado_core::build_dates_patch(rev, Some(start), None)
+        })
+        .await
+        .expect("third attempt lands");
+    assert_eq!(rev, 6);
+    assert_eq!(
+        mock.patch_count(),
+        1,
+        "the failed attempts never reached the store"
+    );
+}
+
+#[tokio::test]
+async fn backoff_waits_for_retry_after() {
+    let mock = ado_mock::start().await;
+    let ado = pat_client(&mock);
+    let start = "2026-07-08".parse().unwrap();
+    mock.fail_next_retry_after("/workitems/1003", 429, "slow down", 1);
+    let began = std::time::Instant::now();
+    ado.patch_work_item_with_backoff("contoso", "Shop", 1003, 5, |rev| {
+        ado_core::build_dates_patch(rev, Some(start), None)
+    })
+    .await
+    .expect("retry after the wait");
+    assert!(
+        began.elapsed() >= std::time::Duration::from_secs(1),
+        "Retry-After: 1 must hold the retry for a second, waited {:?}",
+        began.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn backoff_gives_up_on_client_errors_and_after_four_attempts() {
+    let mock = ado_mock::start().await;
+    let ado = pat_client(&mock);
+    let start = "2026-07-08".parse().unwrap();
+    mock.fail_next("/workitems/1003", 400, "TF401320: Rule error");
+    let err = ado
+        .patch_work_item_with_backoff("contoso", "Shop", 1003, 5, |rev| {
+            ado_core::build_dates_patch(rev, Some(start), None)
+        })
+        .await
+        .expect_err("400 is permanent");
+    assert_eq!(err.reason(), "TF401320: Rule error");
+    assert_eq!(mock.request_count("/workitems/1003"), 1, "no retry on 400");
+    for _ in 0..4 {
+        mock.fail_next("/workitems/1003", 500, "down");
+    }
+    let err = ado
+        .patch_work_item_with_backoff("contoso", "Shop", 1003, 5, |rev| {
+            ado_core::build_dates_patch(rev, Some(start), None)
+        })
+        .await
+        .expect_err("still down after four attempts");
+    assert_eq!(err.reason(), "down");
+    assert_eq!(mock.request_count("/workitems/1003"), 5);
+}
+
 fn pat_client(mock: &ado_mock::AdoMock) -> AdoClient {
     AdoClient::with_base_urls(
         tokens(AuthScheme::Pat, Some("contoso")),

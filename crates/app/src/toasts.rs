@@ -82,6 +82,8 @@ pub enum HistoryEntry {
         successor_id: i64,
         predecessor_id: i64,
         linked: bool,
+        /// Date cascade moves an added link made, undone with it.
+        dates: Vec<DatesChange>,
     },
     Created {
         id: i64,

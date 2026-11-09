@@ -122,6 +122,60 @@ pub fn plan_cascade(
     planner.writes
 }
 
+/// Flexible's answer to a drop into overlap: the dates that start the
+/// changed Work Item on its latest predecessor Target Date instead. A move
+/// keeps its duration. With `keep_target` (a start-edge resize) only Start
+/// Date moves, and Target Date only as far as it must to stay on or after
+/// it. `None` outside Flexible, when the change did not move the start, or
+/// when it leaves no Clash with a predecessor.
+pub fn snap_later(
+    nodes: &[WorkItemNode],
+    change: DateChange,
+    mode: CascadeMode,
+    keep_target: bool,
+) -> Option<WorkItemDates> {
+    if mode != CascadeMode::Flexible {
+        return None;
+    }
+    let node = nodes.iter().find(|node| node.id == change.id)?;
+    if !node.has_date_fields {
+        return None;
+    }
+    let starts = |dates: WorkItemDates| dates.start.or(dates.target);
+    let moved_to = starts(change.after)?;
+    if starts(change.before) == Some(moved_to) {
+        return None;
+    }
+    let latest = node
+        .predecessors
+        .iter()
+        .filter(|&&pred| pred != change.id)
+        .filter_map(|&pred| nodes.iter().find(|node| node.id == pred))
+        .filter_map(crate::clash::clash_ends)
+        .filter_map(|dates| dates.target)
+        .max()?;
+    if moved_to >= latest {
+        return None;
+    }
+    let days = days_between(moved_to, latest);
+    Some(match change.after.start {
+        Some(_) => WorkItemDates {
+            start: Some(latest),
+            target: change.after.target.map(|target| {
+                if keep_target {
+                    target.max(latest)
+                } else {
+                    target.saturating_add(days.days())
+                }
+            }),
+        },
+        None => WorkItemDates {
+            start: None,
+            target: Some(latest),
+        },
+    })
+}
+
 struct Planner<'a> {
     by_id: HashMap<i64, &'a WorkItemNode>,
     predecessors: HashMap<i64, BTreeSet<i64>>,
@@ -934,6 +988,68 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn flexible_snaps_a_drop_into_overlap_later() {
+        let nodes = vec![
+            a(),
+            item(3, "07-01", "07-12", &[]),
+            item(2, "07-12", "07-15", &[1, 3]),
+            item(4, "", "07-20", &[1]),
+            no_fields(5, &[1]),
+            item(6, "07-11", "07-13", &[1, 99]),
+        ];
+        let snap = |id, before: (&str, &str), after: (&str, &str), mode, keep_target| {
+            snap_later(&nodes, change(id, before, after), mode, keep_target)
+        };
+        assert_eq!(
+            snap(2, ("07-12", "07-15"), ("07-08", "07-11"), Flexible, false),
+            Some(span("07-12", "07-15")),
+            "a move starts on the latest predecessor Target Date and keeps its duration"
+        );
+        assert_eq!(
+            snap(2, ("07-12", "07-15"), ("07-08", "07-15"), Flexible, true),
+            Some(span("07-12", "07-15")),
+            "a start-edge resize moves only Start Date"
+        );
+        assert_eq!(
+            snap(2, ("07-12", "07-13"), ("07-05", "07-11"), Flexible, true),
+            Some(span("07-12", "07-12")),
+            "Target Date moves only as far as it must"
+        );
+        assert_eq!(
+            snap(4, ("", "07-20"), ("", "07-08"), Flexible, false),
+            Some(span("", "07-10")),
+            "a Milestone moves its Target Date"
+        );
+        assert_eq!(
+            snap(2, ("07-12", "07-15"), ("07-12", "07-12"), Flexible, false),
+            None,
+            "the start did not move"
+        );
+        assert_eq!(
+            snap(2, ("07-14", "07-15"), ("07-12", "07-13"), Flexible, false),
+            None,
+            "starting on the predecessor Target Date is no Clash"
+        );
+        for mode in [Strict, NoAction] {
+            assert_eq!(
+                snap(2, ("07-12", "07-15"), ("07-08", "07-11"), mode, false),
+                None,
+                "{mode:?} leaves the overlap"
+            );
+        }
+        assert_eq!(
+            snap(5, ("07-12", "07-15"), ("07-08", "07-11"), Flexible, false),
+            None,
+            "type without date fields"
+        );
+        assert_eq!(
+            snap(6, ("07-11", "07-13"), ("07-09", "07-11"), Flexible, false),
+            Some(span("07-10", "07-12")),
+            "an off-forest predecessor does not count"
+        );
     }
 
     #[test]

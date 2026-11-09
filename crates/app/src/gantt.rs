@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ado_core::{
-    DEFAULT_BAR_DAYS, DependencyLink, GanttBarKind, HierarchyIndex, IterationHint, IterationNode,
-    WorkItemDates, WorkItemNode, clash_ends, compact_date, dates_column_text,
+    DEFAULT_BAR_DAYS, DateWrite, DependencyLink, GanttBarKind, HierarchyIndex, IterationHint,
+    IterationNode, WorkItemDates, WorkItemNode, clash_ends, compact_date, dates_column_text,
     dates_column_text_indexed, format_date_range, from_gantt_exclusive_end, gantt_bar_display,
     gantt_bar_display_indexed, iteration_hint_for_path, parse_iso_date, retest_clashes,
 };
@@ -435,6 +435,36 @@ pub struct Gesture {
     pub link_from_start: bool,
     /// Dependencies into and out of this bar, found once at press so each
     /// frame re-judges only these Clashes.
+    pub links: Vec<DependencyLink>,
+    /// The Date cascade a drop at the live dates would run.
+    pub preview: Option<CascadePreview>,
+}
+
+impl Gesture {
+    /// The dates the bar paints at: the live dates, or where a Flexible
+    /// snap puts the drop.
+    pub fn shown_dates(&self) -> (Date, Date) {
+        let Some(snapped) = self.preview.as_ref().and_then(|preview| preview.snapped) else {
+            return (self.live_start, self.live_target);
+        };
+        let start = snapped.start.or(snapped.target).unwrap_or(self.live_start);
+        let shift = (start - self.live_start).get_days();
+        let target = snapped
+            .target
+            .unwrap_or_else(|| self.live_target.saturating_add(shift.days()));
+        (start, target.max(start))
+    }
+}
+
+/// A drop's Date cascade, planned once per live day rather than per frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CascadePreview {
+    /// The gesture's `(live_start, live_target)` this was planned for.
+    pub for_dates: (Date, Date),
+    /// Where a Flexible snap puts the dragged bar, when it snaps.
+    pub snapped: Option<WorkItemDates>,
+    pub writes: Vec<DateWrite>,
+    /// The gesture's links plus every moved successor's.
     pub links: Vec<DependencyLink>,
 }
 
@@ -948,6 +978,9 @@ pub struct GanttView {
     /// After [`GanttView::go_today`], toolbar scale/zoom keeps Today still
     /// instead of re-anchoring to a Year park at x=0.
     pub keep_today: bool,
+    /// `Couldn't move` reasons from Date cascade writes that failed for
+    /// good, until the next good write to that Work Item or a reload.
+    pub move_failures: HashMap<i64, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -989,6 +1022,7 @@ impl Default for GanttView {
             hover_locked: false,
             year_gutter_snap: 0.0,
             keep_today: false,
+            move_failures: HashMap::new(),
         }
     }
 }
@@ -1800,7 +1834,7 @@ impl GanttView {
                     .filter(|gesture| gesture.id == node.id && gesture.kind != GestureKind::Link);
                 let mut marker = false;
                 let (start, target) = if let Some(gesture) = live {
-                    (gesture.live_start, gesture.live_target)
+                    gesture.shown_dates()
                 } else if display.kind == GanttBarKind::NoFields {
                     // Keep "No dates" readable on Year/Quarter. A 16px box
                     // collapses the label to "…".
@@ -1854,7 +1888,8 @@ impl GanttView {
                     && live.as_ref().is_none_or(|gesture| !gesture.had_target);
                 let open_ended = start_only;
                 let label = if let Some(gesture) = live {
-                    format_date_range(Some(gesture.live_start), Some(gesture.live_target))
+                    let (start, target) = gesture.shown_dates();
+                    format_date_range(Some(start), Some(target))
                 } else {
                     dates_column_text_indexed(node, nodes, index, hint.as_ref())
                 };
@@ -1940,6 +1975,7 @@ impl GanttView {
                 had_target,
                 link_from_start: bar.link_from_start_handle(origin_x),
                 links: Vec::new(),
+                preview: None,
             });
             return Ok(());
         }
@@ -1978,6 +2014,7 @@ impl GanttView {
             had_target,
             link_from_start: false,
             links: ado_core::links_touching(nodes, bar.id),
+            preview: None,
         });
         Ok(())
     }
@@ -2114,20 +2151,28 @@ impl GanttView {
                 None => "Drop on a bar to link".into(),
             };
         }
-        if gesture.live_start == gesture.live_target {
-            compact_date(gesture.live_start)
+        let dates = Self::drag_dates_text(gesture);
+        match gesture.preview.as_ref().map(|preview| preview.writes.len()) {
+            Some(moves) if moves > 0 => format!("{dates} · moves {moves}"),
+            _ => dates,
+        }
+    }
+
+    fn drag_dates_text(gesture: &Gesture) -> String {
+        let (start, target) = gesture.shown_dates();
+        if start == target {
+            compact_date(start)
         } else {
-            let days = gesture
-                .live_target
-                .since((Unit::Day, gesture.live_start))
+            let days = target
+                .since((Unit::Day, start))
                 .map(|span| span.get_days())
                 .unwrap_or(0)
                 .max(0)
                 + 1;
             format!(
                 "{} → {} · {days}d",
-                compact_date(gesture.live_start),
-                compact_date(gesture.live_target)
+                compact_date(start),
+                compact_date(target)
             )
         }
     }
@@ -2148,8 +2193,21 @@ impl GanttView {
     }
 
     /// Dates the Clash rule reads for `node`: its own fields, or what a drop
-    /// of the live drag or resize would write.
+    /// of the live drag or resize would write, Date cascade included.
     pub fn clash_ends_for(&self, node: &WorkItemNode) -> Option<WorkItemDates> {
+        if let Some(preview) = self.gesture.as_ref().and_then(|g| g.preview.as_ref()) {
+            if let Some(write) = preview.writes.iter().find(|write| write.id == node.id) {
+                return Some(WorkItemDates {
+                    start: write.start,
+                    target: write.target,
+                });
+            }
+            if let Some(snapped) = preview.snapped
+                && self.gesture.as_ref().is_some_and(|g| g.id == node.id)
+            {
+                return Some(snapped);
+            }
+        }
         let moved = self.gesture.as_ref().filter(|gesture| {
             gesture.id == node.id
                 && gesture.kind != GestureKind::Link
@@ -2184,18 +2242,21 @@ impl GanttView {
         };
         let mut links = loaded.clone();
         if let Some(gesture) = &self.gesture {
-            retest_clashes(&mut links, &gesture.links, ends);
+            let touched = gesture
+                .preview
+                .as_ref()
+                .map_or(&gesture.links, |preview| &preview.links);
+            retest_clashes(&mut links, touched, ends);
         }
         let mut badges = HashMap::new();
         for bar in bars {
-            let Some(successor) = ends(bar.id) else {
-                continue;
-            };
+            let successor = ends(bar.id);
             let clashes: Vec<ClashLine> = bar
                 .predecessors
                 .iter()
-                .filter(|from| links.contains(&(**from, bar.id)))
+                .filter(|from| successor.is_some() && links.contains(&(**from, bar.id)))
                 .filter_map(|&from| {
+                    let successor = successor?;
                     Some(ClashLine {
                         predecessor_id: from,
                         starts: successor.start.or(successor.target)?,
@@ -2203,14 +2264,9 @@ impl GanttView {
                     })
                 })
                 .collect();
-            if !clashes.is_empty() {
-                badges.insert(
-                    bar.id,
-                    ScheduleBadge {
-                        clashes,
-                        failures: Vec::new(),
-                    },
-                );
+            let failures = self.move_failures.get(&bar.id).cloned().unwrap_or_default();
+            if !clashes.is_empty() || !failures.is_empty() {
+                badges.insert(bar.id, ScheduleBadge { clashes, failures });
             }
         }
         ClashMarks { links, badges }

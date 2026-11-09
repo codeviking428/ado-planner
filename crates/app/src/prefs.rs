@@ -31,6 +31,7 @@ impl Default for AppPrefs {
                 hidden_states: Vec::new(),
                 root_types: None,
                 show_arrows: true,
+                cascade_mode: ado_core::CascadeMode::default(),
             },
             flavor: default_flavor(),
             tree_width: default_tree_width(),
