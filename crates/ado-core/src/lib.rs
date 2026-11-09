@@ -17,7 +17,7 @@ pub mod team_members;
 pub mod types;
 
 pub use cascade::{
-    CascadeMode, CascadeTrigger, DateChange, DateWrite, WorkItemDates, plan_cascade,
+    CascadeMode, CascadeTrigger, DateChange, DateWrite, WorkItemDates, plan_cascade, snap_later,
 };
 pub use clash::{
     DependencyLink, clash_ends, clashes, ends_clash, link_clashes, links_touching, retest_clashes,
