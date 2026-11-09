@@ -1,9 +1,15 @@
+mod support;
+
+use ado_core::{START_DATE_FIELD, TARGET_DATE_FIELD};
 use ado_planner::gantt::ContextTarget;
 use ado_planner::paths::AppPaths;
 use ado_planner::state::DateSaveRole;
 use ado_planner::state::PlannerState;
 use ado_planner::toasts::{HistoryEntry, UndoAction};
+use ado_planner::ui::PlannerView;
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
+use gpui_kit::{Entity, VisualTestContext};
+use support::{MockApp, click, date_only, node_dates, right_click, settle};
 
 async fn signed_in() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
     let mock = ado_mock::start().await;
@@ -301,23 +307,274 @@ async fn expand_collapse_below_this_row() {
     assert!(state.gantt.context_menu.is_some());
 }
 
+const PERSIST_CART: i64 = 1003;
+
+fn planner<'a>(
+    cx: &'a mut gpui_kit::TestAppContext,
+    app: &MockApp,
+) -> (Entity<PlannerView>, &'a mut VisualTestContext) {
+    support::open(cx, app.signed_in())
+}
+
+fn menu_is_closed(view: &Entity<PlannerView>, cx: &mut VisualTestContext) {
+    view.read_with(cx, |view, _| {
+        assert!(
+            view.state.gantt.context_menu.is_none(),
+            "choosing an action must close the menu"
+        );
+    });
+    assert!(cx.debug_bounds("gantt-context-menu").is_none());
+}
+
 #[gpui_kit::test]
-fn gpui_context_menu_action_labels(cx: &mut gpui_kit::TestAppContext) {
-    cx.update(gpui_kit::init);
-    let labels = [
-        "Open",
-        "Add child",
-        "Open in Azure DevOps",
-        "Copy ID",
-        "Copy link",
-        "Clear dates",
-        "Schedule to iteration",
-        "Expand all",
-        "Collapse all",
-        "Hide this type",
-        "Hide this state",
-    ];
-    for label in labels {
-        assert!(!label.is_empty());
+fn bar_menu_open_shows_the_work_item_form(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = planner(cx, &app);
+    right_click(cx, "gantt-bar-1003");
+    click(cx, "gantt-menu-Open");
+    settle(&view, cx, "the form to load", |view| {
+        view.state.form.is_some() && !view.form_is_loading()
+    });
+    menu_is_closed(&view, cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.state.form.as_ref().map(|form| form.model.id),
+            Some(PERSIST_CART)
+        );
+    });
+    assert!(cx.debug_bounds("work-item-form-dialog").is_some());
+}
+
+#[gpui_kit::test]
+fn bar_menu_open_in_azure_devops_opens_the_edit_url(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = planner(cx, &app);
+    right_click(cx, "gantt-bar-1003");
+    click(cx, "gantt-menu-Open in Azure DevOps");
+    menu_is_closed(&view, cx);
+    let url = cx
+        .opened_url()
+        .expect("Open in Azure DevOps must open a URL");
+    assert!(
+        url.contains("/contoso/Shop/_workitems/edit/1003"),
+        "unexpected URL {url}"
+    );
+}
+
+#[gpui_kit::test]
+fn bar_menu_copy_id_and_copy_link_write_the_clipboard(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = planner(cx, &app);
+    right_click(cx, "gantt-bar-1003");
+    click(cx, "gantt-menu-Copy ID");
+    menu_is_closed(&view, cx);
+    let copied = cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(copied.as_deref(), Some("1003"));
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.state.toasts.last_message(), Some("Copied #1003"));
+    });
+
+    right_click(cx, "gantt-bar-1003");
+    click(cx, "gantt-menu-Copy link");
+    menu_is_closed(&view, cx);
+    let link = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .unwrap_or_default();
+    assert!(
+        link.contains("/contoso/Shop/_workitems/edit/1003"),
+        "{link}"
+    );
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.state.toasts.last_message(), Some("Copied link"));
+    });
+}
+
+#[gpui_kit::test]
+fn bar_menu_clear_dates_then_toast_undo_restores_them(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = planner(cx, &app);
+    let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
+    right_click(cx, "gantt-bar-1003");
+    click(cx, "gantt-menu-Clear dates");
+    settle(&view, cx, "Clear dates", |view| {
+        node_dates(view, PERSIST_CART) == (None, None)
+    });
+    menu_is_closed(&view, cx);
+    assert_eq!(app.mock_field(PERSIST_CART, START_DATE_FIELD), None);
+    assert_eq!(app.mock_field(PERSIST_CART, TARGET_DATE_FIELD), None);
+
+    click(cx, "toast-undo");
+    settle(&view, cx, "the Clear dates undo", |view| {
+        node_dates(view, PERSIST_CART) == original
+    });
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-06"),
+        "Undo must write Start back to Azure DevOps"
+    );
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, TARGET_DATE_FIELD).as_deref()),
+        Some("2026-07-20")
+    );
+    assert!(cx.debug_bounds("gantt-bar-1003").is_some());
+}
+
+#[gpui_kit::test]
+fn bar_menu_schedule_to_iteration_uses_the_sprint_dates(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = planner(cx, &app);
+    right_click(cx, "gantt-bar-1003");
+    click(cx, "gantt-menu-Schedule to iteration");
+    settle(&view, cx, "Schedule to iteration", |view| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        date_only(start.as_deref()) == Some("2026-07-13")
+    });
+    menu_is_closed(&view, cx);
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-13"),
+        "Sprint 10 starts Jul 13"
+    );
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, TARGET_DATE_FIELD).as_deref()),
+        Some("2026-07-24"),
+        "Sprint 10 finishes Jul 24"
+    );
+}
+
+#[gpui_kit::test]
+fn row_menu_collapse_all_then_expand_all_below_this_row(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (_view, cx) = planner(cx, &app);
+    for id in [
+        "gantt-tree-row-1002",
+        "gantt-tree-row-1003",
+        "gantt-tree-row-1005",
+    ] {
+        assert!(cx.debug_bounds(id).is_some(), "{id} starts expanded");
     }
+    right_click(cx, "gantt-tree-row-1001");
+    click(cx, "gantt-menu-Collapse all");
+    assert!(cx.debug_bounds("gantt-tree-row-1001").is_some());
+    for id in [
+        "gantt-tree-row-1002",
+        "gantt-tree-row-1003",
+        "gantt-tree-row-1005",
+    ] {
+        assert!(
+            cx.debug_bounds(id).is_none(),
+            "{id} must collapse under the Epic"
+        );
+    }
+    assert!(
+        cx.debug_bounds("gantt-tree-row-1012").is_some(),
+        "rows outside the subtree stay put"
+    );
+    right_click(cx, "gantt-tree-row-1001");
+    click(cx, "gantt-menu-Expand all");
+    for id in [
+        "gantt-tree-row-1002",
+        "gantt-tree-row-1003",
+        "gantt-tree-row-1005",
+    ] {
+        assert!(cx.debug_bounds(id).is_some(), "{id} must expand again");
+    }
+}
+
+#[gpui_kit::test]
+fn row_menu_hide_this_type_writes_the_types_filter(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = planner(cx, &app);
+    right_click(cx, "gantt-tree-row-1005");
+    click(cx, "gantt-menu-Hide this type");
+    menu_is_closed(&view, cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.state.prefs.planner.hidden_types,
+            vec!["Task".to_string()]
+        );
+    });
+    assert!(cx.debug_bounds("gantt-tree-row-1005").is_none());
+    assert!(cx.debug_bounds("gantt-tree-row-1012").is_none());
+    assert!(cx.debug_bounds("gantt-tree-row-1003").is_some());
+    assert!(
+        cx.debug_bounds("filter-caption-Types: 1 hidden").is_some(),
+        "the Types button must count the hidden type"
+    );
+}
+
+#[gpui_kit::test]
+fn row_menu_hide_this_state_writes_the_states_filter(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = planner(cx, &app);
+    right_click(cx, "gantt-tree-row-1005");
+    click(cx, "gantt-menu-Hide this state");
+    menu_is_closed(&view, cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.state.prefs.planner.hidden_states,
+            vec!["New".to_string()]
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-tree-row-1005").is_none(),
+        "Cart UI is New"
+    );
+    assert!(
+        cx.debug_bounds("gantt-tree-row-1003").is_some(),
+        "Persist cart is Active"
+    );
+    assert!(cx.debug_bounds("filter-caption-States: 1 hidden").is_some());
+}
+
+#[gpui_kit::test]
+fn row_menu_fits_inside_the_window_near_the_bottom(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (_view, cx) = planner(cx, &app);
+    right_click(cx, "gantt-tree-row-1014");
+    let menu = support::bounds(cx, "gantt-context-menu");
+    let last = support::bounds(cx, "gantt-menu-Hide this state");
+    let bottom = f32::from(menu.origin.y + menu.size.height);
+    assert!(
+        bottom <= 800.0,
+        "a menu opened low in an 800px window must move up to fit, bottom={bottom}"
+    );
+    assert!(f32::from(last.origin.y + last.size.height) <= 800.0);
+}
+
+#[gpui_kit::test]
+fn bar_menu_has_no_hide_filters(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (_view, cx) = planner(cx, &app);
+    right_click(cx, "gantt-bar-1003");
+    assert!(cx.debug_bounds("gantt-menu-Open").is_some());
+    assert!(cx.debug_bounds("gantt-menu-Hide this type").is_none());
+    assert!(cx.debug_bounds("gantt-menu-Hide this state").is_none());
+}
+
+#[gpui_kit::test]
+fn date_actions_on_an_item_without_date_fields_toast_and_skip_the_patch(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let app = MockApp::start();
+    let mut state = app.signed_in();
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == PERSIST_CART) {
+        node.has_date_fields = false;
+    }
+    let (view, cx) = support::open(cx, state);
+    let before = app.mock.patch_count();
+    for action in ["gantt-menu-Clear dates", "gantt-menu-Schedule to iteration"] {
+        right_click(cx, "gantt-tree-row-1003");
+        click(cx, action);
+        settle(&view, cx, action, |_| true);
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.state.toasts.last_error_message(),
+                Some("This Work Item has no Start Date and Target Date fields."),
+                "{action} must use the drag error toast"
+            );
+        });
+    }
+    assert_eq!(app.mock.patch_count(), before);
 }

@@ -8782,7 +8782,7 @@ impl PlannerView {
             .into_any_element()
     }
 
-    fn render_context_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_context_menu(&mut self, window_h: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(target) = self.state.gantt.context_menu else {
             return div().into_any_element();
         };
@@ -8790,12 +8790,12 @@ impl PlannerView {
         let from_row = !target.from_bar;
         let link = target.link;
         let menu_w = 240.0;
+        let items = 11 + usize::from(link.is_some()) + if from_row { 2 } else { 0 };
+        let menu_h = context_menu_height(items);
         let x = target
             .x
             .clamp(8.0, (self.state.gantt.viewport_w - menu_w).max(8.0));
-        let y = target
-            .y
-            .clamp(72.0, (self.state.gantt.viewport_h + 64.0).max(72.0));
+        let y = target.y.clamp(72.0, (window_h - menu_h - 8.0).max(72.0));
         v_flex()
             .id("gantt-context-menu")
             .debug_selector(|| "gantt-context-menu".into())
@@ -11538,6 +11538,13 @@ impl PlannerView {
     }
 }
 
+/// Painted height of the right-click menu: 32px items, 4px gaps, 4px padding
+/// and a 1px border on each side.
+fn context_menu_height(items: usize) -> f32 {
+    let items = items as f32;
+    items * 32.0 + (items - 1.0).max(0.0) * 4.0 + 10.0
+}
+
 fn this_type(state: &PlannerState, id: i64) -> Option<String> {
     state
         .nodes
@@ -12876,7 +12883,7 @@ impl Render for PlannerView {
                                         }),
                                 )
                             })
-                            .child(self.render_context_menu(cx))
+                            .child(self.render_context_menu(viewport_h, cx))
                             .child(self.render_dates_popover(cx))
                             .child(self.render_form(cx))
                             .child(self.render_delete_confirm(cx))
