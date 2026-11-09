@@ -72,6 +72,15 @@ impl AdoMock {
         });
     }
 
+    /// Hold the next matching request for `delay_ms`, then fail it.
+    pub fn fail_next_after(&self, path: &str, delay_ms: u64, status: u16, message: &str) {
+        self.state.pending.lock().expect("pending").push(Pending {
+            path: path.to_string(),
+            delay_ms,
+            failure: Some((status, message.to_string())),
+        });
+    }
+
     /// Requests whose path and query contain `fragment`, reads included.
     pub fn request_count(&self, fragment: &str) -> usize {
         self.state

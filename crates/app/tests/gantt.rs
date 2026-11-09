@@ -2805,27 +2805,107 @@ fn ui_escape_discards_unsaved_nudges(cx: &mut gpui_kit::TestAppContext) {
     });
 }
 
+/// Press once, let the 500 ms commit start a PATCH the mock holds (and
+/// optionally fails), then press `during` while that PATCH is in flight.
+fn nudge_during_a_slow_patch(
+    view: &gpui_kit::Entity<ado_planner::ui::PlannerView>,
+    cx: &mut gpui_kit::VisualTestContext,
+    app: &MockApp,
+    fails: bool,
+    during: &str,
+) {
+    let path = format!("/workitems/{PERSIST_CART}");
+    if fails {
+        app.mock.fail_next_after(&path, 400, 503, "save failed");
+    } else {
+        app.mock.delay_next(&path, 400);
+    }
+    cx.simulate_keystrokes("right");
+    idle(cx, NUDGE_IDLE_MS);
+    assert!(
+        view.read_with(cx, |view, _| view.io_pending()),
+        "the first Nudge PATCH must still be in flight"
+    );
+    cx.simulate_keystrokes(during);
+    support::draw(cx);
+}
+
 #[gpui_kit::test]
-fn ui_nudges_during_an_in_flight_save_are_saved_too(cx: &mut gpui_kit::TestAppContext) {
+fn ui_nudges_during_an_in_flight_save_wait_for_their_own_idle(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);
     let before = app.mock.patch_count();
-    app.mock
-        .delay_next(&format!("/workitems/{PERSIST_CART}"), 300);
-    cx.simulate_keystrokes("right");
-    idle(cx, NUDGE_IDLE_MS);
-    cx.simulate_keystrokes("right right");
-    idle(cx, NUDGE_IDLE_MS);
-    settle(&view, cx, "both Nudge PATCHes", |_| {
-        app.mock.patch_count() >= before + 2
+    nudge_during_a_slow_patch(&view, cx, &app, false, "right right");
+    settle(&view, cx, "the first Nudge PATCH", |_| true);
+    assert_eq!(
+        app.mock.patch_count(),
+        before + 1,
+        "later presses must not save the moment the first PATCH returns"
+    );
+    view.read_with(cx, |view, _| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        assert_eq!(date_only(start.as_deref()), Some("2026-07-09"));
+        assert!(view.state.gantt.pending_nudge.is_some());
     });
+    idle(cx, NUDGE_IDLE_MS);
+    settle(&view, cx, "the second Nudge PATCH", |_| true);
+    assert_eq!(
+        app.mock.patch_count(),
+        before + 2,
+        "one PATCH per idle batch"
+    );
     assert_eq!(
         date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
         Some("2026-07-09"),
         "presses made while the first PATCH was in flight must still save"
     );
+    idle(cx, NUDGE_IDLE_MS * 2);
+    settle(&view, cx, "no stray PATCH", |_| true);
+    assert_eq!(app.mock.patch_count(), before + 2);
+}
+
+#[gpui_kit::test]
+fn ui_escape_during_an_in_flight_save_drops_only_the_later_presses(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let before = app.mock.patch_count();
+    nudge_during_a_slow_patch(&view, cx, &app, false, "right right escape");
+    settle(&view, cx, "the first Nudge PATCH", |_| true);
+    idle(cx, NUDGE_IDLE_MS * 2);
+    settle(&view, cx, "no PATCH for the discarded presses", |_| true);
+    assert_eq!(app.mock.patch_count(), before + 1);
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-07")
+    );
     view.read_with(cx, |view, _| {
         let (start, _) = node_dates(view, PERSIST_CART);
-        assert_eq!(date_only(start.as_deref()), Some("2026-07-09"));
+        assert_eq!(date_only(start.as_deref()), Some("2026-07-07"));
+        assert!(view.state.gantt.pending_nudge.is_none());
     });
+}
+
+#[gpui_kit::test]
+fn ui_failed_save_drops_presses_made_while_it_was_in_flight(cx: &mut gpui_kit::TestAppContext) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let original = view.read_with(cx, |view, _| node_dates(view, PERSIST_CART));
+    let before = app.mock.patch_count();
+    nudge_during_a_slow_patch(&view, cx, &app, true, "right right");
+    settle(&view, cx, "the failed Nudge PATCH", |view| {
+        view.state.toasts.last_error_message().is_some()
+    });
+    idle(cx, NUDGE_IDLE_MS * 2);
+    settle(&view, cx, "no PATCH after the failure", |_| true);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            node_dates(view, PERSIST_CART),
+            original,
+            "a failed save rolls back to Azure DevOps, later presses included"
+        );
+        assert!(view.state.gantt.pending_nudge.is_none());
+    });
+    assert_eq!(app.mock.patch_count(), before);
 }

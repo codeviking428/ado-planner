@@ -10629,10 +10629,29 @@ impl PlannerView {
                             && node.start_date == after_start
                             && node.target_date == after_target
                     });
+                    // Presses since this PATCH started are still coalescing;
+                    // the Nudge timer saves them, and Escape can still drop them.
+                    let nudging = this
+                        .state
+                        .gantt
+                        .pending_nudge
+                        .as_ref()
+                        .is_some_and(|nudge| nudge.id == id);
                     match result {
                         Ok(()) => {
                             this.state.gantt.move_failures.remove(&id);
-                            if still_after {
+                            if !still_after && nudging {
+                                if let Some(rev) = working
+                                    .nodes
+                                    .iter()
+                                    .find(|node| node.id == id)
+                                    .map(|n| n.rev)
+                                    && let Some(live) =
+                                        this.state.nodes.iter_mut().find(|node| node.id == id)
+                                {
+                                    live.rev = rev;
+                                }
+                            } else if still_after {
                                 if let Some(rev) = working
                                     .nodes
                                     .iter()
@@ -10679,7 +10698,11 @@ impl PlannerView {
                             }
                         }
                         Err(err) => {
-                            if still_after {
+                            if nudging && !still_after {
+                                this.state.gantt.pending_nudge = None;
+                                this.nudge_gen += 1;
+                            }
+                            if still_after || nudging {
                                 this.state.restore_node(previous);
                                 this.state.revert_date_save_history(&revert);
                                 this.state.restore_date_save_failed(&revert);
