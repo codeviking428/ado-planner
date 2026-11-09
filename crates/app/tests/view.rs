@@ -16435,3 +16435,362 @@ fn persist_cart_and_cart_resize_chips_clear_their_neighbours(cx: &mut gpui_kit::
         draw(cx);
     }
 }
+
+fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} must paint"));
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    draw(cx);
+}
+
+fn type_in_form(view: &Entity<PlannerView>, cx: &mut VisualTestContext, field: &str, text: &str) {
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.type_form_field(field, text, window, cx));
+    });
+    draw(cx);
+}
+
+/// Mock-backed details dialog whose I/O blocks on the test thread instead of
+/// waking the GPUI scheduler from the ado-client runtime.
+fn mock_form_view(
+    cx: &mut gpui_kit::TestAppContext,
+    state: PlannerState,
+    id: i64,
+) -> (Entity<PlannerView>, &mut VisualTestContext) {
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    view.update(cx, |view, cx| {
+        view.run_io_inline_for_test();
+        view.open_form(id, cx);
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("work-item-form-dialog").is_some(),
+        "details for #{id} must open from the mock"
+    );
+    (view, cx)
+}
+
+fn mock_rev(state: &PlannerState, id: i64) -> i64 {
+    state
+        .nodes
+        .iter()
+        .find(|node| node.id == id)
+        .map(|node| node.rev)
+        .expect("item in the mock Hierarchy")
+}
+
+fn html_form_model(html: &str) -> ado_core::WorkItemFormModel {
+    let mut values = serde_json::Map::new();
+    values.insert("System.Title".into(), serde_json::json!("Persist cart"));
+    values.insert("System.Description".into(), serde_json::json!(html));
+    let control = |reference: &str, label: &str, kind| ado_core::FormControl {
+        id: reference.into(),
+        reference_name: reference.into(),
+        label: label.into(),
+        kind,
+        required: false,
+        read_only: false,
+        visible: true,
+        options: None,
+    };
+    ado_core::WorkItemFormModel {
+        id: 1003,
+        rev: 1,
+        work_item_type: "User Story".into(),
+        system_controls: vec![control(
+            "System.Title",
+            "Title",
+            ado_core::FormControlKind::String,
+        )],
+        pages: vec![ado_core::FormPage {
+            id: "details".into(),
+            label: "Details".into(),
+            groups: vec![ado_core::FormGroup {
+                id: "description".into(),
+                label: "Description".into(),
+                controls: vec![control(
+                    "System.Description",
+                    "Description",
+                    ado_core::FormControlKind::Html,
+                )],
+            }],
+        }],
+        values,
+    }
+}
+
+/// Port of the e2e "open and save Work Item form with a success toast" case.
+#[gpui_kit::test]
+fn form_save_from_the_dialog_toasts_and_updates_the_hierarchy(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, state, _dir) = signed_in_with_mock();
+    let rev = mock_rev(&state, 1003);
+    let (view, cx) = mock_form_view(cx, state, 1003);
+    type_in_form(&view, cx, "System.Title", "Persist cart (saved)");
+    click_selector(cx, "save-work-item");
+    view.update(cx, |view, _| {
+        assert!(
+            view.state.form.is_none(),
+            "a successful save closes the dialog"
+        );
+        let toast = view.state.toasts.items.last().expect("save toast");
+        assert_eq!(toast.kind, ToastKind::Success);
+        assert!(
+            toast.message.starts_with("Renamed ") && toast.message.contains("Persist cart (saved)"),
+            "save must toast the rename, got {:?}",
+            toast.message
+        );
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1003)
+            .expect("Persist cart");
+        assert_eq!(node.title, "Persist cart (saved)");
+        assert_eq!(node.rev, rev + 1, "the Hierarchy must take the saved rev");
+    });
+    assert!(
+        cx.debug_bounds("toast-title").is_some(),
+        "the toast must paint"
+    );
+    let saved = runtime.block_on(mock.work_item(1003)).expect("mock item");
+    assert_eq!(saved["fields"]["System.Title"], "Persist cart (saved)");
+}
+
+#[gpui_kit::test]
+fn rev_conflict_on_save_toasts_and_reloads_keeping_only_my_edits(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, state, _dir) = signed_in_with_mock();
+    let rev = mock_rev(&state, 1003);
+    let mut elsewhere = state.clone();
+    let (view, cx) = mock_form_view(cx, state, 1003);
+    runtime.block_on(async {
+        elsewhere.open_form(1003).await.expect("open elsewhere");
+        elsewhere
+            .form
+            .as_mut()
+            .expect("form elsewhere")
+            .set_string("System.Title", "Changed elsewhere".into());
+        elsewhere.save_form().await.expect("save elsewhere");
+    });
+    type_in_form(&view, cx, "Microsoft.VSTS.Scheduling.StoryPoints", "21");
+    let patches = mock.patch_count();
+    click_selector(cx, "save-work-item");
+    assert_eq!(
+        mock.patch_count(),
+        patches + 1,
+        "the stale save must send one PATCH with test /rev"
+    );
+    view.update(cx, |view, cx| {
+        let toast = view.state.toasts.items.last().expect("conflict toast");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert!(
+            toast.message.contains("changed in Azure DevOps"),
+            "a rev conflict must explain the reload, got {:?}",
+            toast.message
+        );
+        let form = view.state.form.as_ref().expect("the dialog stays open");
+        assert!(!form.saving);
+        assert_eq!(
+            form.model.rev,
+            rev + 1,
+            "the reload must pick up the new rev"
+        );
+        assert_eq!(
+            form.values["System.Title"], "Changed elsewhere",
+            "fields I did not touch must take the server's new value"
+        );
+        assert_eq!(
+            form.values["Microsoft.VSTS.Scheduling.StoryPoints"].as_f64(),
+            Some(21.0),
+            "my edit must survive the reload"
+        );
+        assert_eq!(
+            view.form_input_value("System.Title", cx).as_deref(),
+            Some("Changed elsewhere"),
+            "the Title field must show the reloaded value, or the next save reverts it"
+        );
+        assert_eq!(
+            view.form_input_value("Microsoft.VSTS.Scheduling.StoryPoints", cx)
+                .as_deref(),
+            Some("21")
+        );
+        assert!(view.form_save_is_enabled(cx), "my edit can be saved again");
+    });
+    assert!(
+        cx.debug_bounds("toast-title").is_some(),
+        "the toast must paint"
+    );
+    assert!(cx.debug_bounds("work-item-form-dialog").is_some());
+    click_selector(cx, "save-work-item");
+    view.update(cx, |view, _| {
+        assert!(view.state.form.is_none(), "the retry must save");
+        let node = view
+            .state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1003)
+            .expect("Persist cart");
+        assert_eq!(node.title, "Changed elsewhere");
+        assert_eq!(node.rev, rev + 2);
+    });
+    let saved = runtime.block_on(mock.work_item(1003)).expect("mock item");
+    assert_eq!(saved["fields"]["System.Title"], "Changed elsewhere");
+    assert_eq!(
+        saved["fields"]["Microsoft.VSTS.Scheduling.StoryPoints"].as_f64(),
+        Some(21.0)
+    );
+}
+
+#[gpui_kit::test]
+fn non_plain_html_field_renders_read_only_with_an_edit_in_ado_link(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let html =
+        r#"<p>Hello <span style="color:red">Ada</span></p><table><tr><td>1</td></tr></table>"#;
+    assert!(!ado_core::is_plain_html_field(html));
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.form = Some(FormDraft::from_model(html_form_model(html)));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let rendered = cx
+        .debug_bounds("form-html-view")
+        .expect("non-plain HTML must render as rich text");
+    assert!(
+        f32::from(rendered.size.height) > 0.0,
+        "the rich text view must have height, got {:?}",
+        rendered.size
+    );
+    assert!(cx.debug_bounds("form-html-readonly").is_some());
+    assert!(
+        cx.debug_bounds("form-edit-in-ado").is_some(),
+        "non-plain HTML must offer Edit in Azure DevOps"
+    );
+    assert!(
+        cx.debug_bounds("form-html-editor").is_none(),
+        "non-plain HTML must not get an editor"
+    );
+    assert!(cx.debug_bounds("form-html-preview").is_none());
+    view.update(cx, |view, cx| {
+        assert_eq!(view.form_input_value("System.Description", cx), None);
+        view.sync_form_inputs_for_test(cx);
+        assert!(!view.form_save_is_enabled(cx));
+        let ops = view.state.form.as_ref().expect("form").patch_ops();
+        assert!(
+            ops.iter().all(|op| op.path != "/fields/System.Description"),
+            "a read-only HTML field must never be patched: {ops:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn plain_html_field_edits_markdown_in_a_multi_line_editor(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let html = "<p>Keep the cart</p>";
+    assert!(ado_core::is_plain_html_field(html));
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.form = Some(FormDraft::from_model(html_form_model(html)));
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("form-html-editor").is_some());
+    assert!(cx.debug_bounds("form-html-preview").is_some());
+    assert!(cx.debug_bounds("form-html-readonly").is_none());
+    assert!(cx.debug_bounds("form-edit-in-ado").is_none());
+    type_in_form(
+        &view,
+        cx,
+        "System.Description",
+        "Keep the cart\n\nand **restore** it",
+    );
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.form_input_value("System.Description", cx).as_deref(),
+            Some("Keep the cart\n\nand **restore** it"),
+            "the Markdown editor must keep line breaks"
+        );
+        let form = view.state.form.as_ref().expect("form");
+        let saved = form.values["System.Description"]
+            .as_str()
+            .expect("html")
+            .to_string();
+        assert!(
+            saved.contains("<p>Keep the cart</p>") && saved.contains("<strong>restore</strong>"),
+            "the draft must save Markdown as HTML, got {saved}"
+        );
+        assert!(view.form_save_is_enabled(cx));
+    });
+}
+
+#[gpui_kit::test]
+fn identity_search_runs_250ms_after_typing_stops(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (_runtime, mock, state, _dir) = signed_in_with_mock();
+    let (view, cx) = mock_form_view(cx, state, 1003);
+    assert!(cx.debug_bounds("form-identity-search").is_some());
+    let searches = || mock.request_count("/_apis/identities");
+    let before = searches();
+    type_in_form(&view, cx, "System.AssignedTo", "Gr");
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+    assert_eq!(searches(), before, "a pause under 250 ms must not search");
+    type_in_form(&view, cx, "System.AssignedTo", "Grace");
+    cx.executor()
+        .advance_clock(ado_planner::ui::IDENTITY_SEARCH_DEBOUNCE - Duration::from_millis(1));
+    cx.run_until_parked();
+    assert_eq!(
+        searches(),
+        before,
+        "each keystroke must restart the 250 ms wait"
+    );
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        searches() > before,
+        "the search must run once typing has paused for 250 ms"
+    );
+    let after = searches();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(searches(), after, "only the last query is searched");
+    view.update(cx, |view, _| {
+        let form = view.state.form.as_ref().expect("form");
+        assert_eq!(form.identity_query, "Grace");
+        assert!(
+            form.identity_results
+                .iter()
+                .any(|identity| identity.display_name == "Grace Hopper"),
+            "results must come from the mock: {:?}",
+            form.identity_results
+        );
+    });
+    click_selector(cx, "form-identity-result-grace@contoso.com");
+    view.update(cx, |view, cx| {
+        let form = view.state.form.as_ref().expect("form");
+        let picked = ado_core::identity_from_field(&form.values["System.AssignedTo"])
+            .expect("picked identity");
+        assert_eq!(
+            picked.unique_name, "grace@contoso.com",
+            "clicking a result must assign it"
+        );
+        assert!(view.form_save_is_enabled(cx));
+    });
+}
