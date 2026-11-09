@@ -16645,3 +16645,170 @@ fn persist_cart_and_cart_resize_chips_clear_their_neighbours(cx: &mut gpui_kit::
         draw(cx);
     }
 }
+
+fn loop_state_with_mock() -> (
+    tokio::runtime::Runtime,
+    ado_mock::AdoMock,
+    PlannerState,
+    tempfile::TempDir,
+) {
+    let (runtime, mock, mut state, dir) = signed_in_with_mock();
+    // In memory only: Persist cart already waits on Cart UI, so
+    // Persist cart → Cart UI would close a loop.
+    state
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == 1003)
+        .expect("Persist cart")
+        .predecessors
+        .push(1005);
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1005)
+            .is_some_and(|node| !node.predecessors.contains(&1003)),
+        "precondition: Cart UI must not already depend on Persist cart"
+    );
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = None;
+    state.gantt.viewport_h = 720.0;
+    (runtime, mock, state, dir)
+}
+
+fn wait_for_mock_io(cx: &mut VisualTestContext) {
+    allow_ado_client_wake(cx);
+    let deadline = std::time::Instant::now() + Duration::from_millis(400);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[gpui_kit::test]
+fn looping_link_drop_shows_refused_state_and_sends_no_patch(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, state, _dir) = loop_state_with_mock();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let patches = mock.patch_count();
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let at_edge = grab_outer_link_handle(bar);
+    cx.simulate_mouse_move(at_edge, None, Modifiers::default());
+    cx.simulate_mouse_down(at_edge, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
+    let end = cart.center();
+    for step in 1..=6 {
+        let t = step as f32 / 6.0;
+        let mid = point(
+            at_edge.x + (end.x - at_edge.x) * t,
+            at_edge.y + (end.y - at_edge.y) * t,
+        );
+        cx.simulate_mouse_move(mid, Some(MouseButton::Left), Modifiers::default());
+        draw(cx);
+    }
+    let expected = "Would loop: #1003 → #1005 → #1003";
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.link_drag_refusal(),
+            Some((1005, expected.to_string())),
+            "hovering Cart UI must name the loop"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("not-allowed"),
+            "a looping target must show the not-allowed cursor"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-refused-1005").is_some(),
+        "the looping target must paint the destructive outline"
+    );
+    assert!(
+        cx.debug_bounds("gantt-link-refused-tip").is_some(),
+        "the looping target must paint the Would loop tooltip"
+    );
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let toast = view.state.toasts.items.last().expect("loop toast");
+        assert_eq!(toast.kind, ToastKind::Warning);
+        assert_eq!(toast.message, expected);
+        assert!(
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.id == 1005)
+                .is_some_and(|node| !node.predecessors.contains(&1003)),
+            "a refused drop must not add the predecessor"
+        );
+        assert!(view.state.gantt.gesture.is_none());
+        assert_eq!(view.link_save_queue_len_for_test(), 0);
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-refused-tip").is_none(),
+        "the refused tooltip must clear after the drop"
+    );
+    wait_for_mock_io(cx);
+    assert_eq!(
+        mock.patch_count(),
+        patches,
+        "a looping drop must not PATCH Azure DevOps"
+    );
+    assert!(!mock_has_predecessor(&runtime, &mock, 1005, 1003));
+}
+
+#[gpui_kit::test]
+fn looping_redo_toasts_and_sends_no_patch(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, mut state, _dir) = loop_state_with_mock();
+    state.history.redo.push(HistoryEntry::Link {
+        successor_id: 1005,
+        predecessor_id: 1003,
+        linked: true,
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let patches = mock.patch_count();
+    let redo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-shift-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| view.handle_key(&redo, cx));
+    draw(cx);
+    wait_for_mock_io(cx);
+    view.update(cx, |view, _| {
+        let toast = view.state.toasts.items.last().expect("loop toast");
+        assert_eq!(toast.kind, ToastKind::Warning);
+        assert_eq!(toast.message, "Would loop: #1003 → #1005 → #1003");
+        assert_eq!(
+            view.state.history.redo.len(),
+            1,
+            "a refused redo must stay on the redo stack"
+        );
+        assert!(view.state.history.undo.is_empty());
+    });
+    assert_eq!(
+        mock.patch_count(),
+        patches,
+        "a looping redo must not PATCH Azure DevOps"
+    );
+    assert!(!mock_has_predecessor(&runtime, &mock, 1005, 1003));
+}

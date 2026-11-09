@@ -2280,16 +2280,11 @@ impl PlannerState {
         if successor_id == predecessor_id {
             return false;
         }
-        let Some(node) = self
-            .nodes
-            .iter()
-            .find(|node| node.id == successor_id)
-            .cloned()
-        else {
+        if !self.nodes.iter().any(|node| node.id == successor_id) {
             return false;
-        };
-        if node.predecessors.contains(&predecessor_id) {
-            self.toasts.push(ToastKind::Warning, "Link already exists");
+        }
+        if let Some(text) = self.link_refusal(successor_id, predecessor_id) {
+            self.toasts.push(ToastKind::Warning, text);
             return false;
         }
         if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
@@ -2310,6 +2305,79 @@ impl PlannerState {
             );
         }
         true
+    }
+
+    /// Why a link from `predecessor_id` to `successor_id` would be refused:
+    /// it already exists, or it closes a loop through loaded Work Items.
+    pub fn link_refusal(&self, successor_id: i64, predecessor_id: i64) -> Option<String> {
+        let successor = self.nodes.iter().find(|node| node.id == successor_id)?;
+        if successor.predecessors.contains(&predecessor_id) {
+            return Some("Link already exists".into());
+        }
+        self.dependency_loop_text(successor_id, predecessor_id)
+    }
+
+    /// The refusal for the bar the connector hovers, as `(target, text)`.
+    pub fn link_drag_refusal(&self) -> Option<(i64, String)> {
+        let gesture = self.gantt.gesture.as_ref()?;
+        if gesture.kind != GestureKind::Link {
+            return None;
+        }
+        let target = gesture.link_to.filter(|id| *id != gesture.id)?;
+        let (successor, predecessor) = if gesture.link_from_start {
+            (gesture.id, target)
+        } else {
+            (target, gesture.id)
+        };
+        self.link_refusal(successor, predecessor)
+            .map(|text| (target, text))
+    }
+
+    fn dependency_loop_text(&self, successor_id: i64, predecessor_id: i64) -> Option<String> {
+        ado_core::dependency_loop(&self.nodes, predecessor_id, successor_id)
+            .map(|ids| crate::gantt::dependency_loop_message(&ids))
+    }
+
+    /// Warn instead of sending a link Azure DevOps would reject as a loop.
+    /// A repeat replaces the toast.
+    fn refuse_looping_link(&mut self, successor_id: i64, predecessor_id: i64) -> bool {
+        let Some(text) = self.dependency_loop_text(successor_id, predecessor_id) else {
+            return false;
+        };
+        self.toasts.push(ToastKind::Warning, text);
+        true
+    }
+
+    /// Refuse the next undo or redo when it would re-add a looping link.
+    /// The entry stays on its stack, since nothing changed.
+    pub fn refuse_looping_history_link(&mut self, is_undo: bool) -> bool {
+        let stack = if is_undo {
+            &self.history.undo
+        } else {
+            &self.history.redo
+        };
+        let Some(HistoryEntry::Link {
+            successor_id,
+            predecessor_id,
+            linked,
+        }) = stack.last()
+        else {
+            return false;
+        };
+        let re_adds = if is_undo { !*linked } else { *linked };
+        let (successor_id, predecessor_id) = (*successor_id, *predecessor_id);
+        re_adds && self.refuse_looping_link(successor_id, predecessor_id)
+    }
+
+    /// Refuse a toast Undo that would restore a looping link.
+    pub fn refuse_looping_undo_action(&mut self, action: &UndoAction) -> bool {
+        match action {
+            UndoAction::RestoreLink {
+                successor_id,
+                predecessor_id,
+            } => self.refuse_looping_link(*successor_id, *predecessor_id),
+            _ => false,
+        }
     }
 
     pub async fn persist_added_dependency(
@@ -2873,6 +2941,9 @@ impl PlannerState {
     }
 
     pub async fn undo(&mut self) -> Result<(), AppError> {
+        if self.refuse_looping_history_link(true) {
+            return Ok(());
+        }
         let Some(entry) = self.history.pop_undo() else {
             return Ok(());
         };
@@ -2892,6 +2963,9 @@ impl PlannerState {
     }
 
     pub async fn redo(&mut self) -> Result<(), AppError> {
+        if self.refuse_looping_history_link(false) {
+            return Ok(());
+        }
         let Some(entry) = self.history.pop_redo() else {
             return Ok(());
         };
