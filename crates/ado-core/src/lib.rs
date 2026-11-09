@@ -1,6 +1,7 @@
 //! Pure domain logic for ADO Planner. No I/O.
 
 pub mod cascade;
+pub mod clash;
 pub mod dates;
 pub mod dependencies;
 pub mod error;
@@ -17,6 +18,9 @@ pub mod types;
 
 pub use cascade::{
     CascadeMode, CascadeTrigger, DateChange, DateWrite, WorkItemDates, plan_cascade,
+};
+pub use clash::{
+    DependencyLink, clash_ends, clashes, ends_clash, link_clashes, links_touching, retest_clashes,
 };
 pub use dates::{
     DEFAULT_BAR_DAYS, GanttBarDisplay, GanttBarKind, HierarchyIndex, IterationHint,

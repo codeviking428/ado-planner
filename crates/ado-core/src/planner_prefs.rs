@@ -26,6 +26,9 @@ pub struct PlannerPrefs {
         skip_serializing_if = "Option::is_none"
     )]
     pub root_types: Option<Option<Vec<String>>>,
+    /// Off hides ordinary Dependency arrows; Clash and Critical path arrows stay.
+    #[serde(default = "default_true")]
+    pub show_arrows: bool,
 }
 
 fn deserialize_root_types<'de, D>(deserializer: D) -> Result<Option<Option<Vec<String>>>, D::Error>
@@ -33,6 +36,10 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Some(Option::<Vec<String>>::deserialize(deserializer)?))
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn anyone() -> String {
@@ -76,6 +83,10 @@ pub fn parse_planner_prefs(raw: Option<&str>) -> Option<PlannerPrefs> {
         hidden_types: string_array(&value, "hiddenTypes"),
         hidden_states: string_array(&value, "hiddenStates"),
         root_types,
+        show_arrows: value
+            .get("showArrows")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
     })
 }
 
@@ -130,11 +141,22 @@ mod tests {
             hidden_types: vec!["Task".into()],
             hidden_states: vec!["Done".into()],
             root_types: Some(Some(vec!["Epic".into(), "Feature".into()])),
+            show_arrows: false,
         };
         assert_eq!(
             parse_planner_prefs(Some(&serialize_planner_prefs(&prefs))),
             Some(prefs)
         );
+    }
+
+    #[test]
+    fn show_arrows_defaults_on_and_keeps_off() {
+        let missing = parse_planner_prefs(Some(r#"{"org":"amergis"}"#)).unwrap();
+        assert!(missing.show_arrows);
+        let off = parse_planner_prefs(Some(r#"{"showArrows":false}"#)).unwrap();
+        assert!(!off.show_arrows);
+        let serde_missing: PlannerPrefs = serde_json::from_str("{}").unwrap();
+        assert!(serde_missing.show_arrows);
     }
 
     #[test]
