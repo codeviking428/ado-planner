@@ -2651,10 +2651,30 @@ impl PlannerView {
         .detach();
     }
 
+    /// An unsaved Nudge is the newest edit but is not on the history stack yet.
+    /// Ctrl+Z and redo drop it first, as Escape does, so they never rewrite a
+    /// bar that a pending Nudge still owns.
+    fn discard_pending_nudge(&mut self) -> bool {
+        if self.state.gantt.pending_nudge.is_none() {
+            return false;
+        }
+        self.state.discard_nudge();
+        self.nudge_gen += 1;
+        true
+    }
+
     fn undo_last(&mut self, cx: &mut Context<Self>) {
         self.clear_hover_after_history(cx);
         self.state.gantt.context_menu = None;
-        if self.history_hotkey_is_duplicate(true) || self.state.history.undo.is_empty() {
+        if self.history_hotkey_is_duplicate(true) {
+            cx.notify();
+            return;
+        }
+        if self.discard_pending_nudge() {
+            self.request_repaint(None, cx);
+            return;
+        }
+        if self.state.history.undo.is_empty() {
             cx.notify();
             return;
         }
@@ -2687,6 +2707,7 @@ impl PlannerView {
             cx.notify();
             return;
         }
+        self.discard_pending_nudge();
         let pending = self.state.redo_date_stack_now();
         if !pending.is_empty() {
             self.queue_form_dates_from_draft();

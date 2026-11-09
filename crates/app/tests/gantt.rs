@@ -3136,6 +3136,48 @@ fn ui_queued_batch_still_saves_under_a_newer_unsaved_nudge(cx: &mut gpui_kit::Te
 }
 
 #[gpui_kit::test]
+fn ui_ctrl_z_during_an_in_flight_save_drops_the_unsaved_nudge_first(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let app = MockApp::start();
+    let (view, cx) = nudge_ready(cx, &app);
+    let before = app.patches_to(PERSIST_CART);
+    let gate = nudge_during_a_held_patch(&view, cx, &app, false, "right right");
+    cx.simulate_keystrokes("ctrl-z");
+    support::draw(cx);
+    view.read_with(cx, |view, _| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        assert_eq!(
+            date_only(start.as_deref()),
+            Some("2026-07-07"),
+            "the first Ctrl+Z drops only the unsaved presses"
+        );
+        assert!(view.state.gantt.pending_nudge.is_none());
+    });
+    gate.release();
+    idle(cx, NUDGE_IDLE_MS * 2);
+    settle(&view, cx, "the first Nudge PATCH", |_| true);
+    assert_eq!(app.patches_to(PERSIST_CART), before + 1);
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-07")
+    );
+
+    cx.simulate_keystrokes("ctrl-z");
+    settle(&view, cx, "the undo PATCH", |_| true);
+    assert_eq!(app.patches_to(PERSIST_CART), before + 2);
+    assert_eq!(
+        date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
+        Some("2026-07-06"),
+        "the second Ctrl+Z undoes the saved batch in Azure DevOps"
+    );
+    view.read_with(cx, |view, _| {
+        let (start, _) = node_dates(view, PERSIST_CART);
+        assert_eq!(date_only(start.as_deref()), Some("2026-07-06"));
+    });
+}
+
+#[gpui_kit::test]
 fn ui_failed_save_drops_presses_made_while_it_was_in_flight(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
     let (view, cx) = nudge_ready(cx, &app);

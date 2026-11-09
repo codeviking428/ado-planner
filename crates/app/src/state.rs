@@ -1501,15 +1501,30 @@ impl PlannerState {
     /// `node`'s dates without a Nudge that is still coalescing on it, i.e.
     /// what the bar shows again if that Nudge is discarded.
     pub fn dates_before_nudge(&self, node: &WorkItemNode) -> (Option<String>, Option<String>) {
-        match &self.gantt.pending_nudge {
-            Some(nudge) if nudge.id == node.id => (
-                nudge.had_start.then(|| iso_date_only(nudge.original_start)),
-                nudge
-                    .had_target
-                    .then(|| iso_date_only(nudge.original_target)),
-            ),
-            _ => (node.start_date.clone(), node.target_date.clone()),
+        let live = (node.start_date.clone(), node.target_date.clone());
+        let Some(nudge) = self
+            .gantt
+            .pending_nudge
+            .as_ref()
+            .filter(|nudge| nudge.id == node.id)
+        else {
+            return live;
+        };
+        let shown = (
+            nudge.had_start.then(|| iso_date_only(nudge.start)),
+            nudge.had_target.then(|| iso_date_only(nudge.target)),
+        );
+        // Only while the bar still shows the Nudge; anything that rewrote the
+        // node since (an undo, a picker) is the real live state.
+        if live != shown {
+            return live;
         }
+        (
+            nudge.had_start.then(|| iso_date_only(nudge.original_start)),
+            nudge
+                .had_target
+                .then(|| iso_date_only(nudge.original_target)),
+        )
     }
 
     fn restore_nudge(&mut self, pending: &PendingNudge) {
@@ -6056,6 +6071,46 @@ mod toast_copy_tests {
             second.absorbed[0].cascade.len(),
             1,
             "its children stay too, so a rollback can restore them"
+        );
+    }
+
+    #[test]
+    fn dates_before_nudge_looks_past_the_nudge_only_while_the_bar_shows_it() {
+        use jiff::civil::date;
+        let mut state = super::PlannerState::new(
+            crate::paths::AppPaths::new(std::env::temp_dir().join("dates-before-nudge")),
+            ado_session::PlannerSession::pat(ado_session::EncryptedStore::new(
+                Box::new(ado_session::MemoryStore::new(false)),
+                None,
+            )),
+            None,
+            None,
+        );
+        let mut node = super::fake_hierarchy(1).remove(0);
+        node.start_date = Some("2026-07-09T00:00:00Z".into());
+        node.target_date = Some("2026-07-23T00:00:00Z".into());
+        state.gantt.pending_nudge = Some(crate::gantt::PendingNudge {
+            id: node.id,
+            start: date(2026, 7, 9),
+            target: date(2026, 7, 23),
+            original_start: date(2026, 7, 6),
+            original_target: date(2026, 7, 20),
+            original_rev: node.rev,
+            had_start: true,
+            had_target: true,
+        });
+        assert_eq!(
+            state.dates_before_nudge(&node),
+            (
+                Some("2026-07-06T00:00:00Z".into()),
+                Some("2026-07-20T00:00:00Z".into())
+            )
+        );
+        node.start_date = Some("2026-07-01T00:00:00Z".into());
+        assert_eq!(
+            state.dates_before_nudge(&node).0.as_deref(),
+            Some("2026-07-01T00:00:00Z"),
+            "a node rewritten under the Nudge reports its live dates"
         );
     }
 
