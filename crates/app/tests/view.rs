@@ -13647,9 +13647,11 @@ fn enter_after_create_does_not_open_details(cx: &mut gpui_kit::TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.set_create_title("Refunds", window, cx));
     });
+    // Enter spawns the mock create on ado-client; its reply can land during
+    // the draw below, so parking must be allowed before the keystroke.
+    allow_ado_client_wake(cx);
     cx.simulate_keystrokes("enter");
     draw(cx);
-    allow_ado_client_wake(cx);
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     let mut created = false;
     while std::time::Instant::now() < deadline {
