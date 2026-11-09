@@ -4,12 +4,13 @@ use std::time::{Duration, Instant};
 
 use ado_client::{AdoClient, AdoRuntime, TokenSource};
 use ado_core::{
-    AssigneeFilter, DependencyLink, Flavor, HierarchyIndex, HierarchyResult, IdentityValue,
-    IterationNode, Organization, OverlayFilter, Project, ScopeSelection, SessionInfo, Team,
-    WorkItemNode, apply_overlays, build_clear_dates_patch, build_dates_patch, build_field_patch,
-    build_replace_dates_patch, choose_available, compact_date, identity_from_field,
-    is_assignee_special, iso_date_only, parent_relation_op, parse_iso_date, resolve_root_types,
-    schedule_from_iteration,
+    AssigneeFilter, CascadeMode, CascadeTrigger, DateChange, DependencyLink, Flavor,
+    HierarchyIndex, HierarchyResult, IdentityValue, IterationNode, Organization, OverlayFilter,
+    Project, ScopeSelection, SessionInfo, Team, WorkItemDates, WorkItemNode, apply_overlays,
+    build_clear_dates_patch, build_dates_patch, build_field_patch, build_replace_dates_patch,
+    choose_available, compact_date, identity_from_field, is_assignee_special, iso_date_only,
+    links_touching, parent_relation_op, parse_iso_date, plan_cascade, resolve_root_types,
+    schedule_from_iteration, snap_later,
 };
 use ado_session::{LoginCreds, PlannerSession, SharedSession};
 use jiff::ToSpan;
@@ -21,8 +22,8 @@ use crate::cache::{CacheFreshness, QueryCache};
 use crate::error::AppError;
 use crate::form::FormDraft;
 use crate::gantt::{
-    BarLayout, ClashMarks, GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView,
-    VisibleRow, insert_index_for_child,
+    BarLayout, CascadePreview, ClashMarks, GanttView, Gesture, GestureKind, NudgeAxis,
+    PendingNudge, SavedGanttView, VisibleRow, insert_index_for_child,
 };
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
@@ -73,6 +74,12 @@ pub struct PlannerState {
     /// extra once PATCH succeeds. A local undo toast is already on screen
     /// at commit; this stash only lives until the persist clone is made.
     shifted_children: HashMap<i64, Vec<PendingDateSave>>,
+    /// Date cascade moves from a committed date save, keyed by its Work Item,
+    /// for the Moved toast rebuilt once that PATCH succeeds.
+    cascaded: HashMap<i64, Vec<PendingDateSave>>,
+    /// Date cascade moves from a new Dependency, keyed by `(successor,
+    /// predecessor)`. They persist once the link does, and revert if it fails.
+    link_cascades: HashMap<(i64, i64), Vec<PendingDateSave>>,
     /// True after a real PAT/Entra login or a restored stored session, so a
     /// visual-test idle state (signed_in faked, no token) can toast a link
     /// without PATCHing.
@@ -308,6 +315,8 @@ impl PlannerState {
             history_recording: true,
             team_views: HashMap::new(),
             shifted_children: HashMap::new(),
+            cascaded: HashMap::new(),
+            link_cascades: HashMap::new(),
             session_token_ready: false,
             visible: VisibleCache::default(),
             prefs,
@@ -338,6 +347,15 @@ impl PlannerState {
 
     pub fn set_show_arrows(&mut self, show: bool) {
         self.prefs.planner.show_arrows = show;
+        self.persist_prefs();
+    }
+
+    pub fn cascade_mode(&self) -> CascadeMode {
+        self.prefs.planner.cascade_mode
+    }
+
+    pub fn set_cascade_mode(&mut self, mode: CascadeMode) {
+        self.prefs.planner.cascade_mode = mode;
         self.persist_prefs();
     }
 
@@ -1148,6 +1166,7 @@ impl PlannerState {
         }
         self.team_settings_error = result.warning.clone();
         self.nodes = result.nodes.clone();
+        self.gantt.move_failures.clear();
         self.hierarchy = Some(result);
         if let Some(saved) = self.team_views.get(&self.prefs.planner.team).cloned() {
             self.gantt.restore(saved);
@@ -1371,6 +1390,11 @@ impl PlannerState {
                 } else {
                     self.toasts.push(ToastKind::Success, message);
                 }
+                self.gantt.move_failures.remove(&id);
+                if dates_changed && let Some(before) = before {
+                    let saves = self.cascade_after(id, &before);
+                    self.persist_cascade(saves).await;
+                }
                 Ok(())
             }
             Err(err) if err.is_precondition_failed() => {
@@ -1518,6 +1542,7 @@ impl PlannerState {
                     successor_id: succ,
                     predecessor_id: pred,
                     linked: true,
+                    ..
                 } if *succ == successor_id && *pred == predecessor_id
             )
         });
@@ -1528,6 +1553,7 @@ impl PlannerState {
             successor_id,
             predecessor_id,
             linked: true,
+            dates: Vec::new(),
         });
         self.toasts.push_undo(
             self.link_changed_message("Added", predecessor_id, successor_id),
@@ -1544,6 +1570,7 @@ impl PlannerState {
                 successor_id: entry_succ,
                 predecessor_id: entry_pred,
                 linked: true,
+                ..
             }) if *entry_succ == successor_id && *entry_pred == predecessor_id => {
                 self.history.undo.pop();
             }
@@ -1620,6 +1647,7 @@ impl PlannerState {
             }
             DateSaveRole::Restore => {}
             DateSaveRole::Cascade => {
+                self.discard_cascade_row(pending);
                 self.discard_dates_after(pending.id, &pending.after_start, &pending.after_target);
                 // Grouped undo puts DatesGroup on redo; a failed child persist
                 // must move that group back so Ctrl+Z can finish the restore.
@@ -1758,6 +1786,7 @@ impl PlannerState {
             .iter()
             .find(|node| node.id == gesture.id)
             .cloned()?;
+        let (start, target) = self.snap_gesture_drop(&gesture, &previous, start, target);
         let after_start = start
             .map(iso_date_only)
             .or_else(|| previous.start_date.clone());
@@ -2022,21 +2051,41 @@ impl PlannerState {
         }
         let start = parse_iso_date(pending.after_start.as_deref());
         let target = parse_iso_date(pending.after_target.as_deref());
-        match self
-            .client
-            .patch_work_item_with_rev_retry(
-                &scope.org,
-                &scope.project,
-                pending.id,
-                pending.rev,
-                |rev| build_replace_dates_patch(rev, start, target),
-            )
-            .await
-        {
+        let result = if pending.role == DateSaveRole::Cascade {
+            let clears = (start.is_none() && pending.previous.start_date.is_some())
+                || (target.is_none() && pending.previous.target_date.is_some());
+            self.client
+                .patch_work_item_with_backoff(
+                    &scope.org,
+                    &scope.project,
+                    pending.id,
+                    pending.rev,
+                    |rev| {
+                        if clears {
+                            build_replace_dates_patch(rev, start, target)
+                        } else {
+                            build_dates_patch(rev, start, target)
+                        }
+                    },
+                )
+                .await
+        } else {
+            self.client
+                .patch_work_item_with_rev_retry(
+                    &scope.org,
+                    &scope.project,
+                    pending.id,
+                    pending.rev,
+                    |rev| build_replace_dates_patch(rev, start, target),
+                )
+                .await
+        };
+        match result {
             Ok(rev) => {
                 if let Some(live) = self.nodes.iter_mut().find(|node| node.id == pending.id) {
                     live.rev = rev;
                 }
+                self.gantt.move_failures.remove(&pending.id);
                 self.sync_open_form_from_node(pending.id);
                 self.persist_hierarchy_cache();
                 if pending.role == DateSaveRole::Commit {
@@ -2056,6 +2105,9 @@ impl PlannerState {
                     self.restore_node(pending.previous.clone());
                     self.revert_date_save_history(&pending);
                     self.restore_date_save_failed(&pending);
+                    if pending.role == DateSaveRole::Cascade {
+                        self.note_move_failure(pending.id, err.reason());
+                    }
                 }
                 self.toasts
                     .push(ToastKind::Error, error_text(&err, "Could not save dates"));
@@ -2101,8 +2153,11 @@ impl PlannerState {
                     node.rev = rev;
                 }
                 self.persist_hierarchy_cache();
+                self.gantt.move_failures.remove(&id);
                 if self.history_recording {
                     self.push_dates_moved_toast(id, Some(start), Some(target), &previous);
+                    let saves = self.cascade_after(id, &previous);
+                    self.persist_cascade(saves).await;
                 }
                 Ok(())
             }
@@ -2193,6 +2248,7 @@ impl PlannerState {
                             node.rev = rev;
                         }
                         self.persist_hierarchy_cache();
+                        self.gantt.move_failures.remove(&id);
                         if self.history_recording {
                             self.push_dates_moved_toast(
                                 id,
@@ -2200,6 +2256,8 @@ impl PlannerState {
                                 parse_iso_date(after_target.as_deref()),
                                 &previous,
                             );
+                            let saves = self.cascade_after(id, &previous);
+                            self.persist_cascade(saves).await;
                         }
                         Ok(())
                     }
@@ -2263,6 +2321,7 @@ impl PlannerState {
                 }
                 self.sync_open_form_from_node(id);
                 self.persist_hierarchy_cache();
+                self.gantt.move_failures.remove(&id);
                 if self.history_recording {
                     self.push_dates_moved_toast(id, start, target, &previous);
                 }
@@ -2319,6 +2378,7 @@ impl PlannerState {
                 successor_id,
                 predecessor_id,
                 linked: true,
+                dates: Vec::new(),
             });
             self.toasts.push_undo(
                 self.link_changed_message("Added", predecessor_id, successor_id),
@@ -2327,6 +2387,18 @@ impl PlannerState {
                     predecessor_id,
                 },
             );
+            let saves = self.cascade_now(
+                successor_id,
+                &[],
+                CascadeTrigger::NewDependency {
+                    predecessor: predecessor_id,
+                    successor: successor_id,
+                },
+            );
+            if !saves.is_empty() {
+                self.link_cascades
+                    .insert((successor_id, predecessor_id), saves);
+            }
         }
         true
     }
@@ -2384,6 +2456,7 @@ impl PlannerState {
             successor_id,
             predecessor_id,
             linked,
+            ..
         }) = stack.last()
         else {
             return false;
@@ -2439,10 +2512,22 @@ impl PlannerState {
                 }
                 self.sync_open_form_from_node(successor_id);
                 self.persist_hierarchy_cache();
+                let saves = self
+                    .link_cascades
+                    .remove(&(successor_id, predecessor_id))
+                    .unwrap_or_default();
+                self.persist_cascade(saves).await;
                 Ok(())
             }
             Err(err) => {
                 self.restore_node(previous);
+                if let Some(saves) = self.link_cascades.remove(&(successor_id, predecessor_id)) {
+                    let matching: Vec<_> = saves
+                        .into_iter()
+                        .filter(|save| save.live_dates_match(&self.nodes))
+                        .collect();
+                    self.restore_cascade_saves(&matching);
+                }
                 self.discard_last_link(successor_id, predecessor_id);
                 self.dismiss_added_link_undo(successor_id, predecessor_id);
                 self.toasts.push(
@@ -2504,6 +2589,7 @@ impl PlannerState {
                         successor_id,
                         predecessor_id,
                         linked: false,
+                        dates: Vec::new(),
                     });
                     self.toasts.push_undo(
                         self.link_changed_message("Removed", predecessor_id, successor_id),
@@ -2827,6 +2913,102 @@ impl PlannerState {
 
     pub fn update_bar_gesture(&mut self, x: f32) {
         self.gantt.update_gesture(x);
+        self.refresh_cascade_preview();
+    }
+
+    /// Plan the Date cascade a drop at the live dates would run. Only when
+    /// the live day changes, not every frame.
+    pub fn refresh_cascade_preview(&mut self) {
+        let Some(gesture) = self.gantt.gesture.as_ref() else {
+            return;
+        };
+        if gesture.kind == GestureKind::Link {
+            return;
+        }
+        let key = (gesture.live_start, gesture.live_target);
+        if gesture
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.for_dates == key)
+        {
+            return;
+        }
+        let preview = self.plan_cascade_preview(gesture);
+        if let Some(gesture) = self.gantt.gesture.as_mut() {
+            gesture.preview = preview;
+        }
+    }
+
+    fn plan_cascade_preview(&self, gesture: &Gesture) -> Option<CascadePreview> {
+        if gesture.live_start == gesture.start && gesture.live_target == gesture.target {
+            return None;
+        }
+        let previous = self.nodes.iter().find(|node| node.id == gesture.id)?;
+        let before = WorkItemDates::of(previous);
+        let landing = |(start, target): (Option<Date>, Option<Date>)| WorkItemDates {
+            start: start.or(before.start),
+            target: target.or(before.target),
+        };
+        let (start, target) = GanttView::gesture_patch_dates(gesture);
+        let dropped = landing((start, target));
+        let landed = landing(self.snap_gesture_drop(gesture, previous, start, target));
+        let change = DateChange {
+            id: gesture.id,
+            before,
+            after: landed,
+        };
+        let writes = plan_cascade(
+            &self.nodes,
+            &[change],
+            self.cascade_mode(),
+            CascadeTrigger::DateChange,
+        );
+        let mut links = gesture.links.clone();
+        for write in &writes {
+            for link in links_touching(&self.nodes, write.id) {
+                if !links.contains(&link) {
+                    links.push(link);
+                }
+            }
+        }
+        Some(CascadePreview {
+            for_dates: (gesture.live_start, gesture.live_target),
+            snapped: (landed != dropped).then_some(landed),
+            writes,
+            links,
+        })
+    }
+
+    /// Flexible snaps a drag or start-edge resize that drops the bar into
+    /// overlap with a predecessor. Returns the `(start, target)` to write.
+    fn snap_gesture_drop(
+        &self,
+        gesture: &Gesture,
+        previous: &WorkItemNode,
+        start: Option<Date>,
+        target: Option<Date>,
+    ) -> (Option<Date>, Option<Date>) {
+        if !matches!(gesture.kind, GestureKind::Move | GestureKind::ResizeStart) {
+            return (start, target);
+        }
+        let before = WorkItemDates::of(previous);
+        let change = DateChange {
+            id: previous.id,
+            before,
+            after: WorkItemDates {
+                start: start.or(before.start),
+                target: target.or(before.target),
+            },
+        };
+        match snap_later(
+            &self.nodes,
+            change,
+            self.cascade_mode(),
+            gesture.kind == GestureKind::ResizeStart,
+        ) {
+            Some(snapped) => (snapped.start.or(start), snapped.target.or(target)),
+            None => (start, target),
+        }
     }
 
     pub fn cancel_gesture(&mut self) {
@@ -2862,8 +3044,12 @@ impl PlannerState {
             }
             return Ok(());
         }
-        if let Some(pending) = self.commit_date_gesture_now() {
-            return self.persist_pending_dates(pending).await;
+        if let Some(mut pending) = self.commit_date_gesture_now() {
+            self.cascade_committed(&mut pending);
+            let moves = pending.cascade.clone();
+            self.persist_pending_dates(pending).await?;
+            self.persist_cascade(moves).await;
+            return Ok(());
         }
         self.gantt.clear_hover();
         Ok(())
@@ -3056,13 +3242,17 @@ impl PlannerState {
                 successor_id,
                 predecessor_id,
                 linked,
+                dates,
             } => {
                 let should_link = if is_undo { !*linked } else { *linked };
-                let result = if should_link {
+                let mut result = if should_link {
                     self.add_dependency(*successor_id, *predecessor_id).await
                 } else {
                     self.remove_dependency(*successor_id, *predecessor_id).await
                 };
+                if result.is_ok() {
+                    result = self.replay_dates(dates, is_undo).await;
+                }
                 if is_undo && result.is_ok() {
                     self.clear_selection_after_link_undo();
                 }
@@ -3089,6 +3279,24 @@ impl PlannerState {
                 self.restore_fields(*id, &fields).await
             }
         }
+    }
+
+    /// Write each recorded move's dates back: `before` for an undo.
+    async fn replay_dates(&mut self, dates: &[DatesChange], is_undo: bool) -> Result<(), AppError> {
+        for change in dates {
+            let (start, target) = if is_undo {
+                (&change.before_start, &change.before_target)
+            } else {
+                (&change.after_start, &change.after_target)
+            };
+            self.save_exact_dates(
+                change.id,
+                parse_iso_date(start.as_deref()),
+                parse_iso_date(target.as_deref()),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn apply_undo(&mut self, action: UndoAction) -> Result<(), AppError> {
@@ -3128,7 +3336,11 @@ impl PlannerState {
                 successor_id,
                 predecessor_id,
             } => {
-                let result = self.remove_dependency(*successor_id, *predecessor_id).await;
+                let dates = self.link_cascade_dates(*successor_id, *predecessor_id);
+                let mut result = self.remove_dependency(*successor_id, *predecessor_id).await;
+                if result.is_ok() {
+                    result = self.replay_dates(&dates, true).await;
+                }
                 if result.is_ok() {
                     self.clear_selection_after_link_undo();
                 }
@@ -3230,6 +3442,27 @@ impl PlannerState {
             } => vec![*successor_id, *predecessor_id],
             UndoAction::StackUndo | UndoAction::StackRedo => Vec::new(),
         };
+        let cascaded: Vec<i64> = match action {
+            UndoAction::RemoveLink {
+                successor_id,
+                predecessor_id,
+            } => self
+                .link_cascade_dates(*successor_id, *predecessor_id)
+                .iter()
+                .map(|change| change.id)
+                .collect(),
+            _ => Vec::new(),
+        };
+        for id in &cascaded {
+            if let (Some(src), Some(dst)) = (
+                working.nodes.iter().find(|node| node.id == *id),
+                self.nodes.iter_mut().find(|node| node.id == *id),
+            ) {
+                dst.start_date = src.start_date.clone();
+                dst.target_date = src.target_date.clone();
+                dst.rev = src.rev;
+            }
+        }
         if let UndoAction::DeleteCreated { id, .. } = action {
             self.nodes.retain(|node| node.id != *id);
             if self.gantt.selected_id == Some(*id) {
@@ -3556,7 +3789,253 @@ impl PlannerState {
     /// them off the live state after that clone is made so a later move
     /// cannot reuse leftovers.
     pub fn take_shifted_children(&mut self, parent_id: i64) -> Vec<PendingDateSave> {
+        self.cascaded.remove(&parent_id);
         self.shifted_children.remove(&parent_id).unwrap_or_default()
+    }
+
+    /// Run the Date cascade for a committed date save and its Shift-drag
+    /// children, planned once over all of them, and hang the moves on it.
+    pub fn cascade_committed(&mut self, pending: &mut PendingDateSave) {
+        let changes: Vec<DateChange> = std::iter::once(&*pending)
+            .chain(&pending.cascade)
+            .map(|save| DateChange {
+                id: save.id,
+                before: WorkItemDates::of(&save.previous),
+                after: WorkItemDates {
+                    start: parse_iso_date(save.after_start.as_deref()),
+                    target: parse_iso_date(save.after_target.as_deref()),
+                },
+            })
+            .collect();
+        let moves = self.cascade_now(pending.id, &changes, CascadeTrigger::DateChange);
+        if moves.is_empty() {
+            return;
+        }
+        self.cascaded.insert(pending.id, moves.clone());
+        pending.cascade.extend(moves);
+    }
+
+    /// The Date cascade after `id`'s dates changed from `previous` to live.
+    fn cascade_after(&mut self, id: i64, previous: &WorkItemNode) -> Vec<PendingDateSave> {
+        let Some(live) = self.nodes.iter().find(|node| node.id == id) else {
+            return Vec::new();
+        };
+        let change = DateChange {
+            id,
+            before: WorkItemDates::of(previous),
+            after: WorkItemDates::of(live),
+        };
+        self.cascade_now(id, &[change], CascadeTrigger::DateChange)
+    }
+
+    /// Plan the Date cascade for `changes`, already applied to `nodes`, and
+    /// apply its moves. They join the undo entry and toast for `root`, so one
+    /// Undo reverts the change and its cascade. Undo and redo replay
+    /// recorded dates, so they never cascade.
+    pub fn cascade_now(
+        &mut self,
+        root: i64,
+        changes: &[DateChange],
+        trigger: CascadeTrigger,
+    ) -> Vec<PendingDateSave> {
+        if !self.history_recording {
+            return Vec::new();
+        }
+        let writes = plan_cascade(&self.nodes, changes, self.cascade_mode(), trigger);
+        let mut moves = Vec::with_capacity(writes.len());
+        let mut changed = Vec::with_capacity(writes.len());
+        for write in writes {
+            let Some(node) = self.nodes.iter_mut().find(|node| node.id == write.id) else {
+                continue;
+            };
+            let previous = node.clone();
+            node.start_date = write.start.map(iso_date_only);
+            node.target_date = write.target.map(iso_date_only);
+            let after_start = node.start_date.clone();
+            let after_target = node.target_date.clone();
+            self.sync_open_form_from_node(write.id);
+            changed.push(DatesChange {
+                id: write.id,
+                before_start: previous.start_date.clone(),
+                before_target: previous.target_date.clone(),
+                after_start: after_start.clone(),
+                after_target: after_target.clone(),
+            });
+            moves.push(PendingDateSave {
+                id: write.id,
+                start: write.start,
+                target: write.target,
+                after_start,
+                after_target,
+                rev: previous.rev,
+                previous,
+                role: DateSaveRole::Cascade,
+                cascade: Vec::new(),
+            });
+        }
+        if moves.is_empty() {
+            return moves;
+        }
+        match trigger {
+            CascadeTrigger::NewDependency {
+                predecessor,
+                successor,
+            } => self.fold_link_cascade(successor, predecessor, changed),
+            CascadeTrigger::DateChange => self.fold_descendant_dates(root, changed),
+        }
+        self.attach_successors_to_toast(root, trigger, &moves);
+        moves
+    }
+
+    /// Persist Date cascade moves in order. A row that fails for good
+    /// reverts and gets a badge; the others stand.
+    async fn persist_cascade(&mut self, moves: Vec<PendingDateSave>) {
+        for mut save in moves {
+            let Some(live) = self.nodes.iter().find(|node| node.id == save.id) else {
+                continue;
+            };
+            if save.live_dates_match(&self.nodes) {
+                save.rev = live.rev;
+                let _ = self.persist_pending_dates(save).await;
+            }
+        }
+    }
+
+    pub fn note_move_failure(&mut self, id: i64, reason: String) {
+        let reasons = self.gantt.move_failures.entry(id).or_default();
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+
+    fn fold_link_cascade(
+        &mut self,
+        successor_id: i64,
+        predecessor_id: i64,
+        moved: Vec<DatesChange>,
+    ) {
+        let entry = self.history.undo.iter_mut().rev().find(|entry| {
+            matches!(
+                entry,
+                HistoryEntry::Link {
+                    successor_id: succ,
+                    predecessor_id: pred,
+                    linked: true,
+                    ..
+                } if *succ == successor_id && *pred == predecessor_id
+            )
+        });
+        if let Some(HistoryEntry::Link { dates, .. }) = entry {
+            dates.extend(moved);
+        }
+    }
+
+    /// The Date cascade recorded with an added link, for its Undo.
+    fn link_cascade_dates(&self, successor_id: i64, predecessor_id: i64) -> Vec<DatesChange> {
+        self.history
+            .undo
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                HistoryEntry::Link {
+                    successor_id: succ,
+                    predecessor_id: pred,
+                    linked: true,
+                    dates,
+                } if *succ == successor_id && *pred == predecessor_id => Some(dates.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// A Date cascade row that failed for good is back on Azure DevOps's
+    /// dates, so Undo must not write it again. Shift-drag children stay.
+    fn discard_cascade_row(&mut self, pending: &PendingDateSave) {
+        let is_row = |item: &DatesChange| {
+            item.id == pending.id
+                && item.after_start == pending.after_start
+                && item.after_target == pending.after_target
+        };
+        let nodes = &self.nodes;
+        let is_child = |first: i64| descendant_ids(nodes, first).contains(&pending.id);
+        for entry in self.history.undo.iter_mut().rev() {
+            match entry {
+                HistoryEntry::DatesGroup { items }
+                    if items.iter().skip(1).any(is_row)
+                        && !items.first().is_some_and(|first| is_child(first.id)) =>
+                {
+                    let first = items.remove(0);
+                    items.retain(|item| !is_row(item));
+                    items.insert(0, first);
+                    return;
+                }
+                HistoryEntry::Link { dates, .. } if dates.iter().any(is_row) => {
+                    dates.retain(|item| !is_row(item));
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Name the cascade on the change's toast, and fold its moves into
+    /// that toast's Undo.
+    fn attach_successors_to_toast(
+        &mut self,
+        root: i64,
+        trigger: CascadeTrigger,
+        moves: &[PendingDateSave],
+    ) {
+        if moves.is_empty() {
+            return;
+        }
+        let suffix = successors_moved_suffix(moves.len());
+        let restores = moves.iter().map(|save| DateRestore {
+            id: save.id,
+            start_date: save.previous.start_date.clone(),
+            target_date: save.previous.target_date.clone(),
+            rev: save.previous.rev,
+        });
+        for toast in self.toasts.items.iter_mut().rev() {
+            match (&mut toast.undo, trigger) {
+                (
+                    Some(UndoAction::RemoveLink {
+                        successor_id,
+                        predecessor_id,
+                    }),
+                    CascadeTrigger::NewDependency {
+                        predecessor,
+                        successor,
+                    },
+                ) if *successor_id == successor && *predecessor_id == predecessor => {}
+                (
+                    Some(UndoAction::RestoreDates {
+                        id,
+                        start_date,
+                        target_date,
+                        rev,
+                    }),
+                    CascadeTrigger::DateChange,
+                ) if *id == root => {
+                    let mut items = vec![DateRestore {
+                        id: *id,
+                        start_date: start_date.clone(),
+                        target_date: target_date.clone(),
+                        rev: *rev,
+                    }];
+                    items.extend(restores);
+                    toast.undo = Some(UndoAction::RestoreDatesBatch { items });
+                }
+                (Some(UndoAction::RestoreDatesBatch { items }), CascadeTrigger::DateChange)
+                    if items.first().is_some_and(|item| item.id == root) =>
+                {
+                    items.extend(restores);
+                }
+                _ => continue,
+            }
+            toast.message.push_str(&suffix);
+            return;
+        }
     }
 
     pub fn restore_cascade_saves(&mut self, children: &[PendingDateSave]) {
@@ -3615,6 +4094,9 @@ impl PlannerState {
         );
         if let Some(children) = shifted {
             self.attach_children_to_move_toast(previous.id, &children);
+        }
+        if let Some(moves) = self.cascaded.remove(&previous.id) {
+            self.attach_successors_to_toast(previous.id, CascadeTrigger::DateChange, &moves);
         }
     }
 
@@ -3787,6 +4269,23 @@ impl PlannerState {
         false
     }
 
+    /// A grouped date move's message: Shift-drag descendants of `first` as
+    /// children, the rest as Date cascade successors.
+    fn group_message(
+        &self,
+        message: String,
+        first: i64,
+        others: impl Iterator<Item = i64>,
+    ) -> String {
+        let descendants: HashSet<i64> = descendant_ids(&self.nodes, first).into_iter().collect();
+        let (children, successors): (Vec<i64>, Vec<i64>) =
+            others.partition(|id| descendants.contains(id));
+        let mut message =
+            named_dates_with_children(message, &self.item_title(first), children.len());
+        message.push_str(&successors_moved_suffix(successors.len()));
+        message
+    }
+
     pub(crate) fn item_title(&self, id: i64) -> String {
         self.nodes
             .iter()
@@ -3865,11 +4364,7 @@ impl PlannerState {
                     live.and_then(|node| parse_iso_date(node.start_date.as_deref())),
                     live.and_then(|node| parse_iso_date(node.target_date.as_deref())),
                 );
-                named_dates_with_children(
-                    message,
-                    &self.item_title(first.id),
-                    items.len().saturating_sub(1),
-                )
+                self.group_message(message, first.id, items.iter().skip(1).map(|item| item.id))
             }
             UndoAction::RestoreFields { id, fields } => {
                 let title = self.item_title(*id);
@@ -3933,16 +4428,13 @@ impl PlannerState {
                     parse_iso_date(first.after_start.as_deref()),
                     parse_iso_date(first.after_target.as_deref()),
                 );
-                named_dates_with_children(
-                    message,
-                    &self.item_title(first.id),
-                    items.len().saturating_sub(1),
-                )
+                self.group_message(message, first.id, items.iter().skip(1).map(|item| item.id))
             }
             HistoryEntry::Link {
                 successor_id,
                 predecessor_id,
                 linked,
+                ..
             } => {
                 let verb = if *linked { "Added" } else { "Removed" };
                 self.link_changed_message(verb, *predecessor_id, *successor_id)
@@ -4008,11 +4500,7 @@ impl PlannerState {
                     parse_iso_date(first.after_start.as_deref()),
                     parse_iso_date(first.after_target.as_deref()),
                 );
-                named_dates_with_children(
-                    message,
-                    &self.item_title(first.id),
-                    items.len().saturating_sub(1),
-                )
+                self.group_message(message, first.id, items.iter().skip(1).map(|item| item.id))
             }
             other => self.history_action_message(other),
         }
@@ -4046,6 +4534,15 @@ pub(crate) fn dates_moved_message(
     target: Option<Date>,
 ) -> String {
     dates_range_message("Moved", title, start, target)
+}
+
+/// ` · 3 successors moved` for a change's Date cascade toast.
+fn successors_moved_suffix(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => " · 1 successor moved".into(),
+        _ => format!(" · {count} successors moved"),
+    }
 }
 
 fn named_dates_with_children(message: String, title: &str, extra_count: usize) -> String {
@@ -4917,6 +5414,7 @@ mod toast_copy_tests {
             successor_id: 2,
             predecessor_id: 1,
             linked: true,
+            dates: Vec::new(),
         });
         let working = state.clone();
         state.merge_undo_action(
@@ -4941,7 +5439,8 @@ mod toast_copy_tests {
                 Some(HistoryEntry::Link {
                     successor_id: 2,
                     predecessor_id: 1,
-                    linked: true
+                    linked: true,
+                    ..
                 })
             ),
             "undoing a link must leave Redo, got {:?}",
