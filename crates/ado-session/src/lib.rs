@@ -16,5 +16,5 @@ pub use identity::{
 pub use oauth::OauthEndpoints;
 pub use organization::normalize_organization;
 pub use persist::{EncryptedStore, MemoryStore, SessionStore, should_persist_session};
-pub use provider::{LoginCreds, PlannerSession, create_session};
+pub use provider::{LoginCreds, PlannerSession, create_session, create_session_with};
 pub use shared::SharedSession;

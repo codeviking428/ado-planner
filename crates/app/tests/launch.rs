@@ -43,7 +43,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `RUST_LOG` filter for the app; when set, its log is echoed to stderr with
 /// the time since spawn, to see where a slow launch spends its time.
 const LOG_ENV: &str = "ADO_PLANNER_LAUNCH_LOG";
-/// Either one switches `create_session` to Entra sign-in; the budgets use a PAT.
+/// Either one switches the app to Entra sign-in; the budgets use a PAT.
 const ENTRA_VARS: [&str; 2] = ["ENTRA_CLIENT_ID", "MAIN_VITE_ENTRA_CLIENT_ID"];
 
 fn speed_tests_enabled() -> bool {
@@ -76,15 +76,10 @@ fn mock_work_items(count: usize) -> Vec<Value> {
 /// Team, as a first launch would. That leaves the encrypted Session, prefs
 /// and query cache on disk for the measured relaunches.
 fn sign_in_once(runtime: &tokio::runtime::Runtime, mock_url: &str, data_dir: &Path) -> usize {
-    for var in ENTRA_VARS {
-        assert!(
-            std::env::var_os(var).is_none(),
-            "unset {var}: the launch budgets sign in with a PAT"
-        );
-    }
     runtime.block_on(async {
         let paths = AppPaths::new(data_dir.to_path_buf());
-        let session = ado_session::create_session(&paths.data_dir).with_bases(mock_url, mock_url);
+        let session =
+            ado_session::create_session_with(&paths.data_dir, None).with_bases(mock_url, mock_url);
         let mut state = PlannerState::new(
             paths,
             session,
