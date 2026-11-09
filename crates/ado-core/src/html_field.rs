@@ -47,7 +47,7 @@ pub fn markdown_to_html(markdown: &str) -> String {
 fn normalize_html(html: &str) -> String {
     let dom = parse_document(RcDom::default(), ParseOpts::default())
         .from_utf8()
-        .one(html.as_bytes());
+        .one(html.trim().as_bytes());
     let mut out = Vec::new();
     let document: SerializableHandle = dom.document.clone().into();
     let opts = SerializeOpts {
@@ -90,6 +90,14 @@ mod tests {
     fn plain_paragraphs_are_editable() {
         let html = include_str!("../tests/fixtures/plain-paragraphs.html");
         assert!(is_plain_html_field(html), "paragraphs should round-trip");
+    }
+
+    #[test]
+    fn a_paragraph_without_a_trailing_newline_is_editable() {
+        assert!(
+            is_plain_html_field("<p>Keep the cart</p>"),
+            "Markdown output ends in a newline; that alone must not make a field read-only"
+        );
     }
 
     #[test]

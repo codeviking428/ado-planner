@@ -23,7 +23,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::calendar::{CalendarEvent, CalendarState, Date as PickerDate};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::h_flex;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
@@ -75,6 +75,7 @@ const DATES_RANGE_HINT: &str = "Start → Target, or start only";
 const DATE_HINT: &str = "Date";
 const DATES_ERROR_SLOT_H: f32 = 48.0;
 const SAVING_HOLD_MS: u64 = 400;
+pub const IDENTITY_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const PROGRESS_ROLLUP_TIP: &str =
     "Progress is rolled up from child work-item states. Active counts as half done.";
 const DATES_ROLLUP_TIP: &str = "Dates roll up from children";
@@ -135,9 +136,19 @@ pub struct PlannerView {
     scope_query: Entity<InputState>,
     inline_input: Entity<InputState>,
     form_inputs: HashMap<String, Entity<InputState>>,
+    /// Multi-line Markdown editors for Plain HTML fields (ADR-0002).
+    form_html_editors: HashMap<String, Entity<TextareaState>>,
     form_dates: HashMap<String, Entity<CalendarState>>,
     form_dates_preview: Option<String>,
     form_inputs_for: Option<i64>,
+    /// `FormDraft::reloads` the inputs were built from; a rev-conflict reload rebuilds them.
+    form_inputs_reloads: u32,
+    /// Date seed for widgets rebuilt after a rev-conflict reload.
+    form_reload_dates: Option<(Option<chrono::NaiveDate>, Option<chrono::NaiveDate>)>,
+    identity_search_gen: u64,
+    /// Tests block on Azure DevOps I/O instead of awaiting it in a GPUI task,
+    /// so a reply from the ado-client thread never wakes the test scheduler.
+    inline_io: bool,
     form_title_focused_for: Option<i64>,
     form_calendar_open: bool,
     form_dates_typed_seed: String,
@@ -523,9 +534,14 @@ impl PlannerView {
             scope_query,
             inline_input,
             form_inputs: HashMap::new(),
+            form_html_editors: HashMap::new(),
             form_dates: HashMap::new(),
             form_dates_preview: None,
             form_inputs_for: None,
+            form_inputs_reloads: 0,
+            form_reload_dates: None,
+            identity_search_gen: 0,
+            inline_io: false,
             form_title_focused_for: None,
             form_calendar_open: false,
             form_dates_typed_seed: String::new(),
@@ -854,6 +870,13 @@ impl PlannerView {
     }
 
     pub fn form_input_value(&self, field: &str, cx: &App) -> Option<String> {
+        self.form_field_text(field, cx)
+    }
+
+    fn form_field_text(&self, field: &str, cx: &App) -> Option<String> {
+        if let Some(editor) = self.form_html_editors.get(field) {
+            return Some(editor.read(cx).value().to_string());
+        }
         self.form_inputs
             .get(field)
             .map(|input| input.read(cx).value().to_string())
@@ -867,14 +890,29 @@ impl PlannerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(input) = self.form_inputs.get(field).cloned() else {
+        if let Some(editor) = self.form_html_editors.get(field).cloned() {
+            editor.update(cx, |editor, cx| {
+                editor.replace_all(text, window, cx);
+            });
+        } else if let Some(input) = self.form_inputs.get(field).cloned() {
+            input.update(cx, |input, cx| {
+                input.replace_all(text, window, cx);
+            });
+        } else {
             return;
-        };
-        input.update(cx, |input, cx| {
-            input.replace_all(text, window, cx);
-        });
+        }
         self.sync_form_inputs(cx);
         cx.notify();
+    }
+
+    pub fn form_date_picker_count_for_test(&self) -> usize {
+        self.form_dates.len()
+    }
+
+    /// Run Azure DevOps I/O to completion on the calling thread. GPUI tests use
+    /// this so no ado-client reply lands on the test scheduler from another thread.
+    pub fn run_io_inline_for_test(&mut self) {
+        self.inline_io = true;
     }
 
     /// Tests type a range into the details Dates field and sync the draft.
@@ -975,6 +1013,10 @@ impl PlannerView {
         self.form_inputs
             .values()
             .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
+            || self
+                .form_html_editors
+                .values()
+                .any(|editor| editor.read(cx).focus_handle(cx).is_focused(window))
             || self
                 .form_dates
                 .values()
@@ -1112,88 +1154,101 @@ impl PlannerView {
         let runtime = self.state.runtime.clone();
         let mut working = self.state.clone();
         working.gantt.context_menu = None;
+        if self.inline_io {
+            let outcome = runtime.handle().block_on(work(working));
+            self.finish_io(Some(outcome), saving, cx);
+            cx.notify();
+            return true;
+        }
         let rx = runtime.spawn_result(async move { work(working).await });
         cx.spawn(async move |this, cx| {
-            let outcome = rx.await;
-            let _ = this.update(cx, |this, cx| {
-                this.io_busy = false;
-                if saving {
-                    this.finish_or_hold_saving_status(cx);
-                }
-                match outcome {
-                    Ok((working, result)) => {
-                        let shown_at = this.loading_shown_at;
-                        let discard_form = this.form_loading.is_none() && this.state.form.is_none();
-                        let prev_selected = this.state.gantt.selected_id;
-                        this.state.adopt_spawned(working);
-                        this.state.gantt.context_menu = None;
-                        if discard_form {
-                            this.state.form = None;
-                        }
-                        if this.sync_form_dates_after_io {
-                            this.sync_form_dates_after_io = false;
-                            this.queue_form_dates_from_draft();
-                        }
-                        if let Some(at) = shown_at
-                            && !this.state.hierarchy_loading
-                        {
-                            let remain = Duration::from_millis(280).saturating_sub(at.elapsed());
-                            if remain > Duration::ZERO {
-                                this.state.hierarchy_loading = true;
-                                this.loading_hold_gen += 1;
-                                let hold_gen = this.loading_hold_gen;
-                                cx.spawn(async move |this, cx| {
-                                    cx.background_executor().timer(remain).await;
-                                    if let Some(this) = this.upgrade() {
-                                        this.update(cx, |this, cx| {
-                                            if this.loading_hold_gen != hold_gen {
-                                                return;
-                                            }
-                                            this.state.hierarchy_loading = false;
-                                            this.loading_shown_at = None;
-                                            if let Some(from) = this.pending_camera_from.take() {
-                                                this.start_camera_anim(from, cx);
-                                            }
-                                            cx.notify();
-                                        });
-                                    }
-                                })
-                                .detach();
-                            } else {
-                                this.loading_shown_at = None;
-                                if let Some(from) = this.pending_camera_from.take() {
-                                    this.start_camera_anim(from, cx);
-                                }
-                            }
-                        } else if let Some(from) = this.pending_camera_from.take() {
-                            this.start_camera_anim(from, cx);
-                        }
-                        if let Err(err) = result {
-                            tracing::warn!("planner action failed: {err}");
-                            this.end_session_if_signed_out(&err);
-                        }
-                        this.after_io_selection_change(prev_selected);
-                    }
-                    Err(_) => tracing::warn!("planner action cancelled"),
-                }
-                this.form_loading = None;
-                this.restore_queued_links();
-                this.replay_pending_toast_undo(cx);
-                this.drain_link_saves(cx);
-                if let Some(team) = this.pending_team.take() {
-                    this.queue_team_switch(team, cx);
-                }
-                if !this.update_checked && this.state.session_info.signed_in {
-                    this.update_checked = true;
-                    this.spawn_update_check(cx);
-                }
-                this.note_toasts_changed(cx);
-                cx.notify();
-            });
+            let outcome = rx.await.ok();
+            let _ = this.update(cx, |this, cx| this.finish_io(outcome, saving, cx));
         })
         .detach();
         cx.notify();
         true
+    }
+
+    fn finish_io(
+        &mut self,
+        outcome: Option<(PlannerState, Result<(), AppError>)>,
+        saving: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.io_busy = false;
+        if saving {
+            self.finish_or_hold_saving_status(cx);
+        }
+        match outcome {
+            Some((working, result)) => {
+                let shown_at = self.loading_shown_at;
+                let discard_form = self.form_loading.is_none() && self.state.form.is_none();
+                let prev_selected = self.state.gantt.selected_id;
+                self.state.adopt_spawned(working);
+                self.state.gantt.context_menu = None;
+                if discard_form {
+                    self.state.form = None;
+                }
+                if self.sync_form_dates_after_io {
+                    self.sync_form_dates_after_io = false;
+                    self.queue_form_dates_from_draft();
+                }
+                if let Some(at) = shown_at
+                    && !self.state.hierarchy_loading
+                {
+                    let remain = Duration::from_millis(280).saturating_sub(at.elapsed());
+                    if remain > Duration::ZERO {
+                        self.state.hierarchy_loading = true;
+                        self.loading_hold_gen += 1;
+                        let hold_gen = self.loading_hold_gen;
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(remain).await;
+                            if let Some(this) = this.upgrade() {
+                                this.update(cx, |this, cx| {
+                                    if this.loading_hold_gen != hold_gen {
+                                        return;
+                                    }
+                                    this.state.hierarchy_loading = false;
+                                    this.loading_shown_at = None;
+                                    if let Some(from) = this.pending_camera_from.take() {
+                                        this.start_camera_anim(from, cx);
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .detach();
+                    } else {
+                        self.loading_shown_at = None;
+                        if let Some(from) = self.pending_camera_from.take() {
+                            self.start_camera_anim(from, cx);
+                        }
+                    }
+                } else if let Some(from) = self.pending_camera_from.take() {
+                    self.start_camera_anim(from, cx);
+                }
+                if let Err(err) = result {
+                    tracing::warn!("planner action failed: {err}");
+                    self.end_session_if_signed_out(&err);
+                }
+                self.after_io_selection_change(prev_selected);
+            }
+            None => tracing::warn!("planner action cancelled"),
+        }
+        self.form_loading = None;
+        self.restore_queued_links();
+        self.replay_pending_toast_undo(cx);
+        self.drain_link_saves(cx);
+        if let Some(team) = self.pending_team.take() {
+            self.queue_team_switch(team, cx);
+        }
+        if !self.update_checked && self.state.session_info.signed_in {
+            self.update_checked = true;
+            self.spawn_update_check(cx);
+        }
+        self.note_toasts_changed(cx);
+        cx.notify();
     }
 
     fn after_io_selection_change(&mut self, prev_selected: Option<i64>) {
@@ -1250,31 +1305,88 @@ impl PlannerView {
         self.state.require_sign_in(err);
     }
 
-    fn spawn_unbounded<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
-    where
-        F: FnOnce(PlannerState) -> Fut + Send + 'static,
-        Fut: Future<Output = (PlannerState, Result<(), AppError>)> + Send + 'static,
-    {
-        let runtime = self.state.runtime.clone();
-        let working = self.state.clone();
-        let rx = runtime.spawn_result(async move { work(working).await });
+    /// Search identities once typing pauses for `IDENTITY_SEARCH_DEBOUNCE`.
+    /// Each keystroke restarts the wait, and a reply for an older query is dropped.
+    fn queue_identity_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.identity_search_gen += 1;
+        let search_gen = self.identity_search_gen;
+        if let Some(form) = self.state.form.as_mut() {
+            form.identity_query = query.clone();
+        }
         cx.spawn(async move |this, cx| {
-            let outcome = rx.await;
+            cx.background_executor()
+                .timer(IDENTITY_SEARCH_DEBOUNCE)
+                .await;
             let _ = this.update(cx, |this, cx| {
-                match outcome {
-                    Ok((working, result)) => {
-                        this.state.adopt_spawned(working);
-                        if let Err(err) = result {
-                            tracing::warn!("planner action failed: {err}");
-                            this.end_session_if_signed_out(&err);
-                        }
-                    }
-                    Err(_) => tracing::warn!("planner action cancelled"),
+                if this.identity_search_gen == search_gen {
+                    this.run_identity_search(query, search_gen, cx);
                 }
-                cx.notify();
             });
         })
         .detach();
+    }
+
+    fn run_identity_search(&mut self, query: String, search_gen: u64, cx: &mut Context<Self>) {
+        let Some(form_id) = self.state.form.as_ref().map(|form| form.model.id) else {
+            return;
+        };
+        if query.trim().is_empty() {
+            if let Some(form) = self.state.form.as_mut() {
+                form.identity_results.clear();
+            }
+            cx.notify();
+            return;
+        }
+        let Some(scope) = self.state.scope() else {
+            return;
+        };
+        let client = self.state.client.clone();
+        let search = async move { client.search_identities(&scope.org, &query).await };
+        if self.inline_io {
+            let result = self.state.runtime.handle().block_on(search);
+            self.apply_identity_results(form_id, search_gen, result, cx);
+            return;
+        }
+        let rx = self.state.runtime.spawn_result(search);
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.apply_identity_results(form_id, search_gen, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn apply_identity_results(
+        &mut self,
+        form_id: i64,
+        search_gen: u64,
+        result: Result<Vec<ado_core::IdentityValue>, ado_client::ClientError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.identity_search_gen != search_gen {
+            return;
+        }
+        match result {
+            Ok(results) => {
+                if let Some(form) = self
+                    .state
+                    .form
+                    .as_mut()
+                    .filter(|form| form.model.id == form_id)
+                {
+                    form.identity_results = results;
+                }
+            }
+            Err(err) => {
+                let err = AppError::from(err);
+                tracing::warn!("identity search failed: {err}");
+                self.end_session_if_signed_out(&err);
+            }
+        }
+        cx.notify();
     }
 
     fn visible_camera(&mut self) -> SavedGanttView {
@@ -1360,7 +1472,10 @@ impl PlannerView {
     }
 
     fn spawn_update_check(&mut self, cx: &mut Context<Self>) {
-        if self.state.updater.prompt.is_some() || !self.state.session_info.signed_in {
+        if self.inline_io
+            || self.state.updater.prompt.is_some()
+            || !self.state.session_info.signed_in
+        {
             return;
         }
         let runtime = self.state.runtime.clone();
@@ -8963,13 +9078,18 @@ impl PlannerView {
                             .border_t_1()
                             .border_color(cx.theme().border)
                             .child(
-                                Button::new("save-work-item")
-                                    .primary()
-                                    .label("Save")
-                                    .disabled(!dirty || saving || dates_error.is_some())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.save_form(window, cx)
-                                    })),
+                                div()
+                                    .id("save-work-item-slot")
+                                    .debug_selector(|| "save-work-item".into())
+                                    .child(
+                                        Button::new("save-work-item")
+                                            .primary()
+                                            .label("Save")
+                                            .disabled(!dirty || saving || dates_error.is_some())
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.save_form(window, cx)
+                                            })),
+                                    ),
                             )
                             .child(
                                 div()
@@ -9039,32 +9159,54 @@ impl PlannerView {
                         })
                         .unwrap_or_default();
                     v_flex()
+                        .id(SharedString::from(format!("form-html-readonly-{id}")))
+                        .debug_selector(|| "form-html-readonly".into())
                         .gap_1()
-                        .child(TextView::html(
-                            SharedString::from(format!("html-{id}")),
-                            value.as_str().unwrap_or(""),
-                        ))
                         .child(
-                            Button::new(SharedString::from(format!("edit-ado-{id}")))
-                                .label("Edit in Azure DevOps")
-                                .on_click(move |_, _, _| {
-                                    let _ = open::that(&url);
-                                }),
+                            div()
+                                .id(SharedString::from(format!("form-html-view-{id}")))
+                                .debug_selector(|| "form-html-view".into())
+                                .child(TextView::html(
+                                    SharedString::from(format!("html-{id}")),
+                                    value.as_str().unwrap_or(""),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("form-edit-in-ado-{id}")))
+                                .debug_selector(|| "form-edit-in-ado".into())
+                                .child(
+                                    Button::new(SharedString::from(format!("edit-ado-{id}")))
+                                        .label("Edit in Azure DevOps")
+                                        .on_click(move |_, _, _| {
+                                            let _ = open::that(&url);
+                                        }),
+                                ),
                         )
                         .into_any_element()
                 }
                 FormControlKind::Html => {
                     let markdown = form.html_markdown.get(&id).cloned().unwrap_or_default();
-                    let editor = self.form_inputs.get(&id).cloned();
+                    let editor = self.form_html_editors.get(&id).cloned();
                     v_flex()
                         .gap_1()
-                        .when_some(editor, |el, input| {
-                            el.child(Input::new(&input).id(SharedString::from(format!("md-{id}"))))
+                        .when_some(editor, |el, editor| {
+                            el.child(
+                                div()
+                                    .id(SharedString::from(format!("form-html-editor-{id}")))
+                                    .debug_selector(|| "form-html-editor".into())
+                                    .child(Textarea::new(&editor).w_full()),
+                            )
                         })
-                        .child(TextView::markdown(
-                            SharedString::from(format!("md-preview-{id}")),
-                            markdown,
-                        ))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("form-html-preview-{id}")))
+                                .debug_selector(|| "form-html-preview".into())
+                                .child(TextView::markdown(
+                                    SharedString::from(format!("md-preview-{id}")),
+                                    markdown,
+                                )),
+                        )
                         .into_any_element()
                 }
                 FormControlKind::Boolean => {
@@ -9258,30 +9400,19 @@ impl PlannerView {
                                 )
                                 .child(div().text_sm().child(chip_name)),
                         )
-                        .child(h_flex().gap_2().when_some(editor, |el, input| {
+                        .when_some(editor, |el, input| {
                             el.child(
-                                Input::new(&input)
-                                    .id(SharedString::from(format!("ident-q-{field}")))
-                                    .flex_1(),
+                                div()
+                                    .id(SharedString::from(format!("form-ident-search-{field}")))
+                                    .debug_selector(|| "form-identity-search".into())
+                                    .w_full()
+                                    .child(
+                                        Input::new(&input)
+                                            .id(SharedString::from(format!("ident-q-{field}")))
+                                            .w_full(),
+                                    ),
                             )
-                            .child(
-                                Button::new(SharedString::from(format!("search-{field}")))
-                                    .ghost()
-                                    .compact()
-                                    .label("Search")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let query = this
-                                            .form_inputs
-                                            .get(&field)
-                                            .map(|input| input.read(cx).value().to_string())
-                                            .unwrap_or_default();
-                                        this.spawn_unbounded(cx, move |mut state| async move {
-                                            let result = state.search_identities(query).await;
-                                            (state, result)
-                                        });
-                                    })),
-                            )
-                        }))
+                        })
                         .children(results.into_iter().map(|identity| {
                             let label = identity.display_name.clone();
                             let unique = identity.unique_name.clone();
@@ -9289,7 +9420,10 @@ impl PlannerView {
                             let chip = label.clone();
                             h_flex()
                                 .id(SharedString::from(format!("ident-{field}-{unique}")))
-                                .debug_selector(|| "form-identity-result".into())
+                                .debug_selector({
+                                    let unique = unique.clone();
+                                    move || format!("form-identity-result-{unique}")
+                                })
                                 .gap_2()
                                 .items_center()
                                 .w_full()
@@ -9377,6 +9511,7 @@ impl PlannerView {
         self.dismiss_overlays();
         self.state.close_form();
         self.form_inputs.clear();
+        self.form_html_editors.clear();
         self.form_dates.clear();
         self.form_dates_preview = None;
         self.form_inputs_for = None;
@@ -9434,10 +9569,9 @@ impl PlannerView {
             ) {
                 continue;
             }
-            let Some(input) = self.form_inputs.get(&control.reference_name) else {
+            let Some(live) = self.form_field_text(&control.reference_name, cx) else {
                 continue;
             };
-            let live = input.read(cx).value().to_string();
             let stored = if control.kind == FormControlKind::Html {
                 form.html_markdown
                     .get(&control.reference_name)
@@ -9477,6 +9611,11 @@ impl PlannerView {
         let Some(form) = self.state.form.as_mut() else {
             return;
         };
+        for (reference, editor) in &self.form_html_editors {
+            if form.is_plain_html(reference) {
+                form.set_markdown(reference, editor.read(cx).value().to_string());
+            }
+        }
         let controls = crate::form::all_controls(&form.model);
         for control in controls {
             let Some(input) = self.form_inputs.get(&control.reference_name) else {
@@ -9505,9 +9644,6 @@ impl PlannerView {
                     } else {
                         form.set_string(&control.reference_name, text);
                     }
-                }
-                FormControlKind::Html if form.is_plain_html(&control.reference_name) => {
-                    form.set_markdown(&control.reference_name, text);
                 }
                 FormControlKind::Identity => {
                     form.identity_query = text;
@@ -10469,32 +10605,52 @@ impl PlannerView {
     fn ensure_form_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = self.state.form.as_ref() else {
             self.form_inputs.clear();
+            self.form_html_editors.clear();
             self.form_dates.clear();
             self.form_dates_preview = None;
             self.pending_form_dates_text = None;
             self.form_inputs_for = None;
             return;
         };
-        if self.form_inputs_for != Some(form.model.id) {
+        if self.form_inputs_for != Some(form.model.id) || self.form_inputs_reloads != form.reloads {
             self.form_inputs.clear();
+            self.form_html_editors.clear();
             self.form_dates.clear();
             self.form_dates_preview = None;
             self.pending_form_dates_text = None;
             self.form_dates_typed_seed.clear();
             self.form_calendar_open = false;
             self.form_inputs_for = Some(form.model.id);
-        }
-        let node_dates = self
-            .state
-            .nodes
-            .iter()
-            .find(|node| node.id == form.model.id)
-            .map(|node| {
+            self.form_inputs_reloads = form.reloads;
+            // After a rev-conflict reload the draft carries the user's dates, and
+            // the Hierarchy row still holds the dates from before the save. Keep
+            // them fixed for the dialog so later edits cannot move the widgets.
+            self.form_reload_dates = (form.reloads > 0).then(|| {
+                let day = |field: &str| {
+                    form.values
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|text| parse_iso_date(Some(text)))
+                        .and_then(jiff_to_naive)
+                };
                 (
-                    parse_iso_date(node.start_date.as_deref()).and_then(jiff_to_naive),
-                    parse_iso_date(node.target_date.as_deref()).and_then(jiff_to_naive),
+                    day(ado_core::START_DATE_FIELD),
+                    day(ado_core::TARGET_DATE_FIELD),
                 )
             });
+        }
+        let node_dates = self.form_reload_dates.or_else(|| {
+            self.state
+                .nodes
+                .iter()
+                .find(|node| node.id == form.model.id)
+                .map(|node| {
+                    (
+                        parse_iso_date(node.start_date.as_deref()).and_then(jiff_to_naive),
+                        parse_iso_date(node.target_date.as_deref()).and_then(jiff_to_naive),
+                    )
+                })
+        });
         for control in crate::form::all_controls(&form.model) {
             if control.read_only
                 || matches!(
@@ -10669,22 +10825,63 @@ impl PlannerView {
                 self.form_dates.insert(store_key, picker);
                 continue;
             }
+            if control.kind == FormControlKind::Html {
+                if self.form_html_editors.contains_key(&control.reference_name) {
+                    continue;
+                }
+                let markdown = form
+                    .html_markdown
+                    .get(&control.reference_name)
+                    .cloned()
+                    .unwrap_or_default();
+                let editor = cx.new(|cx| {
+                    let mut state = TextareaState::new(window, cx).auto_grow(4, 12);
+                    state.set_value(markdown, window, cx);
+                    state
+                });
+                self._subscriptions.push(cx.subscribe(
+                    &editor,
+                    |this, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            this.sync_form_inputs(cx);
+                            cx.notify();
+                        }
+                    },
+                ));
+                self.form_html_editors
+                    .insert(control.reference_name.clone(), editor);
+                continue;
+            }
             if self.form_inputs.contains_key(&control.reference_name) {
                 continue;
             }
-            let initial = if control.kind == FormControlKind::Html {
-                form.html_markdown
-                    .get(&control.reference_name)
-                    .cloned()
-                    .unwrap_or_default()
-            } else if control.kind == FormControlKind::Identity {
-                form.identity_query.clone()
-            } else {
-                form.values
-                    .get(&control.reference_name)
-                    .map(|value| crate::form::format_form_value(control.kind, value))
-                    .unwrap_or_default()
-            };
+            if control.kind == FormControlKind::Identity {
+                let query = form.identity_query.clone();
+                let input = cx.new(|cx| {
+                    let mut state = InputState::new(window, cx);
+                    state.set_placeholder("Search people", window, cx);
+                    state.set_value(query, window, cx);
+                    state
+                });
+                self._subscriptions.push(cx.subscribe(
+                    &input,
+                    |this, input, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            let query = input.read(cx).value().to_string();
+                            this.queue_identity_search(query, cx);
+                            cx.notify();
+                        }
+                    },
+                ));
+                self.form_inputs
+                    .insert(control.reference_name.clone(), input);
+                continue;
+            }
+            let initial = form
+                .values
+                .get(&control.reference_name)
+                .map(|value| crate::form::format_form_value(control.kind, value))
+                .unwrap_or_default();
             let input = cx.new(|cx| {
                 let mut state = InputState::new(window, cx);
                 state.set_value(initial, window, cx);
