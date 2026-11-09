@@ -10291,10 +10291,13 @@ impl PlannerView {
             self.form_inputs_for = Some(form.model.id);
             self.form_inputs_reloads = form.reloads;
         }
+        // After a rev-conflict reload the draft carries the user's dates, and
+        // the Hierarchy row still holds the dates from before the save.
         let node_dates = self
             .state
             .nodes
             .iter()
+            .filter(|_| form.reloads == 0)
             .find(|node| node.id == form.model.id)
             .map(|node| {
                 (

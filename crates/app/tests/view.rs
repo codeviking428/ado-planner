@@ -16581,6 +16581,12 @@ fn rev_conflict_on_save_toasts_and_reloads_keeping_only_my_edits(
         elsewhere.save_form().await.expect("save elsewhere");
     });
     type_in_form(&view, cx, "Microsoft.VSTS.Scheduling.StoryPoints", "21");
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.type_form_dates("Jul 22 -> Jul 28", window, cx);
+        });
+    });
+    draw(cx);
     let patches = mock.patch_count();
     click_selector(cx, "save-work-item");
     assert_eq!(
@@ -16622,6 +16628,14 @@ fn rev_conflict_on_save_toasts_and_reloads_keeping_only_my_edits(
                 .as_deref(),
             Some("21")
         );
+        assert_eq!(
+            view.form_picker_date(cx),
+            Some(PickerDate::Range(
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 22),
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 28),
+            )),
+            "rebuilt date pickers must show my dates, not the pre-save Gantt dates"
+        );
         assert!(view.form_save_is_enabled(cx), "my edit can be saved again");
     });
     assert!(
@@ -16647,6 +16661,18 @@ fn rev_conflict_on_save_toasts_and_reloads_keeping_only_my_edits(
         saved["fields"]["Microsoft.VSTS.Scheduling.StoryPoints"].as_f64(),
         Some(21.0)
     );
+    for (field, day) in [
+        (ado_core::START_DATE_FIELD, "2026-07-22"),
+        (ado_core::TARGET_DATE_FIELD, "2026-07-28"),
+    ] {
+        assert!(
+            saved["fields"][field]
+                .as_str()
+                .is_some_and(|text| text.starts_with(day)),
+            "{field} must save my date, got {:?}",
+            saved["fields"][field]
+        );
+    }
 }
 
 #[gpui_kit::test]
