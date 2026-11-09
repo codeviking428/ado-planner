@@ -1,6 +1,7 @@
 //! Pure domain logic for ADO Planner. No I/O.
 
 pub mod dates;
+pub mod dependencies;
 pub mod error;
 pub mod flavor;
 pub mod form_layout;
@@ -22,6 +23,7 @@ pub use dates::{
     iso_date_only, iteration_hint_for_path, parent_relation_op, parse_iso_date, parse_user_date,
     schedule_from_iteration, to_gantt_inclusive_target, type_has_start_and_target,
 };
+pub use dependencies::dependency_loop;
 pub use error::Error;
 pub use flavor::{
     FLAVORS, Flavor, KNOWN_TYPE_COLORS, color_for_type, default_flavor, is_dark_flavor,
