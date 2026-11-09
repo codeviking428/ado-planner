@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -29,7 +30,11 @@ struct AppState {
     last_patch_content_type: StdMutex<Option<String>>,
     writes: StdMutex<Vec<(String, String)>>,
     requests: StdMutex<Vec<String>>,
+    reject_tokens: AtomicBool,
 }
+
+/// Path of the fake Entra token endpoint, relative to [`AdoMock::url`].
+pub const TOKEN_PATH: &str = "/oauth2/v2.0/token";
 
 pub struct AdoMock {
     pub url: String,
@@ -63,6 +68,12 @@ impl AdoMock {
             .iter()
             .filter(|uri| uri.contains(fragment))
             .count()
+    }
+
+    /// Answer every later token request with `invalid_grant`, as Entra does
+    /// for a revoked or expired refresh token.
+    pub fn reject_token_requests(&self) {
+        self.state.reject_tokens.store(true, Ordering::SeqCst);
     }
 
     pub fn patch_count(&self) -> usize {
@@ -127,6 +138,7 @@ pub async fn start() -> AdoMock {
         last_patch_content_type: StdMutex::new(None),
         writes: StdMutex::new(Vec::new()),
         requests: StdMutex::new(Vec::new()),
+        reject_tokens: AtomicBool::new(false),
     });
     let app = Router::new()
         .fallback(any(handle))
@@ -198,6 +210,23 @@ async fn route(
             .lock()
             .expect("writes")
             .push((method.to_string(), path.to_string()));
+    }
+    if *method == Method::POST && path == TOKEN_PATH {
+        if state.reject_tokens.load(Ordering::SeqCst) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "invalid_grant", "error_description": "AADSTS70043: The refresh token has expired." }),
+            ));
+        }
+        return Ok(json_response(
+            StatusCode::OK,
+            json!({
+                "token_type": "Bearer",
+                "access_token": "mock-access",
+                "refresh_token": "mock-refresh",
+                "expires_in": 3600
+            }),
+        ));
     }
     let fixtures = &state.fixtures;
     if path.ends_with("/_apis/connectionData") {

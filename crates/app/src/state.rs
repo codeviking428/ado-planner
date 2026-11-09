@@ -629,7 +629,15 @@ impl PlannerState {
     }
 
     pub async fn login_entra(&mut self) -> Result<(), AppError> {
-        let info = self.session.inner().lock().await.login(None).await?;
+        self.sign_in_error = None;
+        let login = self.session.inner().lock().await.login(None).await;
+        let info = match login {
+            Ok(info) => info,
+            Err(err) => {
+                self.sign_in_error = Some(err.to_string());
+                return Err(err.into());
+            }
+        };
         self.session_info = info;
         if !self.session_info.signed_in {
             self.toasts
@@ -654,6 +662,29 @@ impl PlannerState {
         self.session.inner().lock().await.logout().await?;
         self.session_info = self.session.inner().lock().await.session_info().await?;
         self.session_token_ready = false;
+        self.clear_signed_in_data();
+        self.cache.clear();
+        Ok(())
+    }
+
+    /// The Session ended underneath a request (Entra refresh rejected): show
+    /// the sign-in card with the reason. Toasts from the failed loads belong
+    /// to the signed-in shell, so they go too.
+    pub fn require_sign_in(&mut self, error: &AppError) {
+        self.session_info = SessionInfo {
+            signed_in: false,
+            display_name: None,
+            username: None,
+            auth_mode: self.session_info.auth_mode,
+        };
+        self.session_token_ready = false;
+        self.session_loading = false;
+        self.sign_in_error = Some(error.to_string());
+        self.toasts.clear();
+        self.clear_signed_in_data();
+    }
+
+    fn clear_signed_in_data(&mut self) {
         self.orgs.clear();
         self.projects.clear();
         self.teams.clear();
@@ -661,8 +692,6 @@ impl PlannerState {
         self.members.clear();
         self.hierarchy = None;
         self.nodes.clear();
-        self.cache.clear();
-        Ok(())
     }
 
     async fn reload_after_sign_in(&mut self) -> Result<(), AppError> {

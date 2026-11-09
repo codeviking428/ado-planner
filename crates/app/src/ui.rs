@@ -1165,6 +1165,7 @@ impl PlannerView {
                         }
                         if let Err(err) = result {
                             tracing::warn!("planner action failed: {err}");
+                            this.end_session_if_signed_out(&err);
                         }
                         this.after_io_selection_change(prev_selected);
                     }
@@ -1232,6 +1233,18 @@ impl PlannerView {
         self.focus_planner(window, cx);
     }
 
+    /// A request found the Session gone (Entra refresh rejected): drop the
+    /// planner overlays and show the sign-in card with the reason.
+    fn end_session_if_signed_out(&mut self, err: &AppError) {
+        if !err.is_sign_in_required() {
+            return;
+        }
+        self.dismiss_overlays();
+        self.form_loading = None;
+        self.state.form = None;
+        self.state.require_sign_in(err);
+    }
+
     fn spawn_unbounded<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
     where
         F: FnOnce(PlannerState) -> Fut + Send + 'static,
@@ -1248,6 +1261,7 @@ impl PlannerView {
                         this.state.adopt_spawned(working);
                         if let Err(err) = result {
                             tracing::warn!("planner action failed: {err}");
+                            this.end_session_if_signed_out(&err);
                         }
                     }
                     Err(_) => tracing::warn!("planner action cancelled"),
@@ -2056,6 +2070,14 @@ impl PlannerView {
         self.submit_pat(cx)
     }
 
+    /// Runs the startup bootstrap that [`Self::new`] spawns.
+    pub fn bootstrap_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.spawn_state(cx, |mut state| async move {
+            let result = state.bootstrap().await;
+            (state, result)
+        })
+    }
+
     fn render_error_banner(&self, cx: &Context<Self>) -> impl IntoElement {
         if self.banner_dismissed || self.details_overlay() {
             return div().into_any_element();
@@ -2477,6 +2499,7 @@ impl PlannerView {
                         if let Some(msg) = working.toasts.last_error_message() {
                             this.state.toasts.push(ToastKind::Error, msg.to_string());
                         }
+                        this.end_session_if_signed_out(&err);
                     }
                     Err(_) => tracing::warn!("toast undo cancelled"),
                 }
@@ -2621,6 +2644,19 @@ impl PlannerView {
             .text_color(cx.theme().muted_foreground)
             .child(Spinner::new().small())
             .child("Signing in and loading your projects…");
+        let mut error = self
+            .state
+            .sign_in_error
+            .clone()
+            .filter(|_| !busy)
+            .map(|message| {
+                div()
+                    .id("sign-in-error")
+                    .debug_selector(|| "sign-in-error".into())
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .child(message)
+            });
         v_flex()
             .id("sign-in-shell")
             .debug_selector(|| "sign-in-shell".into())
@@ -2668,19 +2704,7 @@ impl PlannerView {
                                 )
                                 .child(Label::new("Personal access token"))
                                 .child(Input::new(&self.pat_input).id("pat-input").disabled(busy))
-                                .when_some(
-                                    self.state.sign_in_error.clone().filter(|_| !busy),
-                                    |el, message| {
-                                        el.child(
-                                            div()
-                                                .id("sign-in-error")
-                                                .debug_selector(|| "sign-in-error".into())
-                                                .text_sm()
-                                                .text_color(cx.theme().danger)
-                                                .child(message),
-                                        )
-                                    },
-                                )
+                                .when_some(error.take(), |el, error| el.child(error))
                                 .child(
                                     Button::new("sign-in")
                                         .primary()
@@ -2693,18 +2717,19 @@ impl PlannerView {
                         )
                     })
                     .when(!pat_mode, |el| {
-                        el.child(
-                            Button::new("sign-in")
-                                .primary()
-                                .label(if busy { "Signing in…" } else { "Sign in" })
-                                .loading(busy)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.spawn_state(cx, |mut state| async move {
-                                        let result = state.login_entra().await;
-                                        (state, result)
-                                    });
-                                })),
-                        )
+                        el.when_some(error.take(), |el, error| el.child(error))
+                            .child(
+                                Button::new("sign-in")
+                                    .primary()
+                                    .label(if busy { "Signing in…" } else { "Sign in" })
+                                    .loading(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.spawn_state(cx, |mut state| async move {
+                                            let result = state.login_entra().await;
+                                            (state, result)
+                                        });
+                                    })),
+                            )
                     })
                     .when(busy, |el| el.child(status)),
             )
@@ -10118,6 +10143,7 @@ impl PlannerView {
                                 this.state.toasts.push(ToastKind::Error, msg.to_string());
                             }
                             tracing::warn!("planner action failed: {err}");
+                            this.end_session_if_signed_out(&err);
                         }
                     }
                 }
