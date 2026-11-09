@@ -20,6 +20,7 @@ struct Pending {
     path: String,
     delay_ms: u64,
     failure: Option<(u16, String)>,
+    retry_after: Option<u64>,
 }
 
 struct AppState {
@@ -48,6 +49,7 @@ impl AdoMock {
             path: path.to_string(),
             delay_ms,
             failure: None,
+            retry_after: None,
         });
     }
 
@@ -56,6 +58,17 @@ impl AdoMock {
             path: path.to_string(),
             delay_ms: 0,
             failure: Some((status, message.to_string())),
+            retry_after: None,
+        });
+    }
+
+    /// [`Self::fail_next`] with a `Retry-After: <seconds>` header.
+    pub fn fail_next_retry_after(&self, path: &str, status: u16, message: &str, seconds: u64) {
+        self.state.pending.lock().expect("pending").push(Pending {
+            path: path.to_string(),
+            delay_ms: 0,
+            failure: Some((status, message.to_string())),
+            retry_after: Some(seconds),
         });
     }
 
@@ -176,10 +189,17 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> Respo
             tokio::time::sleep(Duration::from_millis(pending.delay_ms)).await;
         }
         if let Some((status, message)) = pending.failure {
-            return json_response(
+            let mut response = json_response(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 json!({ "message": message }),
             );
+            if let Some(seconds) = pending.retry_after {
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from(seconds),
+                );
+            }
+            return response;
         }
     }
 
