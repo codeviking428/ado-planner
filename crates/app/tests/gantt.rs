@@ -2654,6 +2654,8 @@ async fn link_whose_walk_leaves_loaded_work_items_still_patches() {
 const PERSIST_CART: i64 = 1003;
 /// Depends on Persist cart in the fixture, so Persist cart's moves cascade to it.
 const UNPARENTED_SPIKE: i64 = 1012;
+/// Persist cart's Epic; Cart (#1002) sits between them.
+const CHECKOUT_REWRITE: i64 = 1001;
 
 fn nudge_ready<'a>(
     cx: &'a mut gpui_kit::TestAppContext,
@@ -2729,6 +2731,48 @@ fn ui_five_right_presses_send_one_patch_after_500ms_idle(cx: &mut gpui_kit::Test
         (Some("2026-07-25"), Some("2026-08-08")),
         "#1012 follows #1003's new Target, as in tests/cascade.rs"
     );
+    let server = |id: i64| {
+        (
+            app.mock_field(id, START_DATE_FIELD),
+            app.mock_field(id, TARGET_DATE_FIELD),
+        )
+    };
+    let short = |dates: (Option<String>, Option<String>)| {
+        (
+            date_only(dates.0.as_deref()).map(str::to_string),
+            date_only(dates.1.as_deref()).map(str::to_string),
+        )
+    };
+    for (id, start, target, what) in [
+        (
+            CART,
+            "2026-07-11",
+            "2026-07-25",
+            "Cart rolls up over Persist cart and Cart UI",
+        ),
+        (
+            CHECKOUT_REWRITE,
+            "2026-07-11",
+            "2026-08-15",
+            "Checkout rewrite rolls up over Cart and Go-live",
+        ),
+    ] {
+        assert_eq!(
+            short(server(id)),
+            (Some(start.to_string()), Some(target.to_string())),
+            "{what}: a Nudge writes the Hierarchy Rollup like a drag"
+        );
+        assert_eq!(app.patches_to(id), 1, "{what}: one Rollup write");
+    }
+    view.read_with(cx, |view, _| {
+        for id in [PERSIST_CART, UNPARENTED_SPIKE, CART, CHECKOUT_REWRITE] {
+            assert_eq!(
+                short(node_dates(view, id)),
+                short(server(id)),
+                "#{id} on screen matches Azure DevOps"
+            );
+        }
+    });
     assert_eq!(
         date_only(app.mock_field(PERSIST_CART, START_DATE_FIELD).as_deref()),
         Some("2026-07-11")
