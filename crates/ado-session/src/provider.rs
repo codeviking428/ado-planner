@@ -3,8 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use ado_client::{AdoClient, AuthScheme, StaticTokens, TokenSource};
+use ado_client::{AdoClient, AuthScheme, ClientError, StaticTokens, TokenSource};
 use ado_core::{AuthMode, Error, SessionInfo};
+use reqwest::StatusCode;
 
 use crate::auth_mode::entra_client_id;
 use crate::identity::{PatIdentity, fetch_pat_identity, fetch_session_identity};
@@ -172,11 +173,7 @@ impl PlannerSession {
             (Some(ado), Some(vssps)) => AdoClient::with_base_urls(tokens, ado, vssps),
             _ => AdoClient::new(tokens),
         };
-        client
-            .ping_org(org)
-            .await
-            .map_err(|err| Error::message(err.to_string()))?;
-        Ok(())
+        client.ping_org(org).await.map_err(pat_check_error)
     }
 
     async fn login_oauth(&mut self) -> Result<SessionInfo, Error> {
@@ -373,6 +370,24 @@ impl TokenSource for PlannerSession {
 
     async fn organization(&self) -> Result<Option<String>, Error> {
         Ok(self.memory_pat.as_ref().map(|row| row.organization.clone()))
+    }
+}
+
+/// Response bodies can be HTML sign-in pages, so they never reach the message.
+fn pat_check_error(err: ClientError) -> Error {
+    match err {
+        ClientError::Status {
+            status:
+                StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::NON_AUTHORITATIVE_INFORMATION,
+            ..
+        } => Error::PatRejected,
+        ClientError::Status { status, .. } => Error::message(format!(
+            "Azure DevOps returned {status} while checking the organization. Check the organization URL and try again."
+        )),
+        ClientError::Core(err) => err,
+        other => Error::message(format!("Could not reach Azure DevOps: {other}")),
     }
 }
 

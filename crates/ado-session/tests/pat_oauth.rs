@@ -34,6 +34,59 @@ async fn pat_login_validates_by_listing_projects() {
     );
 }
 
+#[tokio::test]
+async fn rejected_pat_returns_a_readable_error_and_retry_signs_in() {
+    let mock = ado_mock::start().await;
+    let store = EncryptedStore::new(Box::new(MemoryStore::new(true)), Some([3u8; 32]));
+    let mut session = PlannerSession::pat(store).with_bases(&mock.url, &mock.url);
+    let creds = |pat: &str| LoginCreds {
+        pat: Some(pat.into()),
+        organization: Some("contoso".into()),
+    };
+    for status in [401, 403, 203] {
+        mock.fail_next(
+            "/contoso/_apis/projects",
+            status,
+            "<html>TF400813: Personal access token has expired</html>",
+        );
+        let err = session
+            .login(Some(creds("expired-pat-value")))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ado_core::Error::PatRejected, "status {status}");
+        let text = err.to_string();
+        assert!(text.contains("invalid, expired"), "{text}");
+        assert!(!text.contains("<html>") && !text.contains("expired-pat-value"));
+        assert!(!session.session_info().await.unwrap().signed_in);
+    }
+    let info = session
+        .login(Some(creds("pat-secret-value")))
+        .await
+        .expect("retry");
+    assert!(info.signed_in);
+}
+
+#[tokio::test]
+async fn other_validation_failures_omit_the_response_body() {
+    let mock = ado_mock::start().await;
+    let store = EncryptedStore::new(Box::new(MemoryStore::new(false)), None);
+    let mut session = PlannerSession::pat(store).with_bases(&mock.url, &mock.url);
+    mock.fail_next("/contoso/_apis/projects", 404, "<html>not found</html>");
+    let text = session
+        .login(Some(LoginCreds {
+            pat: Some("pat-secret-value".into()),
+            organization: Some("contoso".into()),
+        }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        text.contains("404") && text.contains("organization URL"),
+        "{text}"
+    );
+    assert!(!text.contains("<html>") && !text.contains("pat-secret-value"));
+}
+
 trait TokenSourceExt {
     async fn org(&self) -> Option<String>;
 }

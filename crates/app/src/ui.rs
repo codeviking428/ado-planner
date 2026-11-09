@@ -2652,6 +2652,19 @@ impl PlannerView {
                                 )
                                 .child(Label::new("Personal access token"))
                                 .child(Input::new(&self.pat_input).id("pat-input").disabled(busy))
+                                .when_some(
+                                    self.state.sign_in_error.clone().filter(|_| !busy),
+                                    |el, message| {
+                                        el.child(
+                                            div()
+                                                .id("sign-in-error")
+                                                .debug_selector(|| "sign-in-error".into())
+                                                .text_sm()
+                                                .text_color(cx.theme().danger)
+                                                .child(message),
+                                        )
+                                    },
+                                )
                                 .child(
                                     Button::new("sign-in")
                                         .primary()
