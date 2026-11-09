@@ -110,14 +110,17 @@ Pick **Org → Project → Team** in the header. The Gantt loads that Team's Wor
 | Hide clutter                   | Check **Hide types** / **Hide states**                          |
 | Move work in time              | Drag a bar; Start + Target save together                        |
 | Change just the finish         | Drag the bar's right edge (left edge changes Start)             |
-| Nudge a day at a time          | Focus a bar, then **←** / **→** (one day at every scale)        |
+| Nudge a day at a time          | Click a bar, then **←** / **→** (one day at every scale)        |
 | Nudge Target only              | **Shift+←** / **Shift+→**                                       |
 | Nudge Start only               | **Alt+←** / **Alt+→**                                           |
 | Cancel a drag or unsaved Nudge | **Escape**                                                      |
+| Move the selection             | **↑** / **↓**; **Enter** opens the Work Item                    |
 | Edit title, state, assignee…   | Double-click a bar or a Work Item row                           |
 | Jump around the timeline       | **Today**, **‹ ›**, scale (Day → Year), and **+ −** zoom        |
 | Switch light/dark              | **Flavor** — Catppuccin `latte`, `frappe`, `macchiato`, `mocha` |
 | Sign out                       | **Log out** — clears the stored Session / PAT                   |
+
+Nudges add up while you keep pressing. ADO Planner saves them as one change, one PATCH and one Undo, 500 ms after the last arrow press. Until then **Escape** or moving the selection with **↑** / **↓** puts the bar back without saving.
 
 Items without Start/Target date fields can't be dragged (you'll get a toast). They show an `Unscheduled` hint from their iteration dates instead.
 
