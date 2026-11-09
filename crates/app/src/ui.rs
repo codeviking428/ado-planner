@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ado_core::{
-    AuthMode, DependencyLink, FLAVORS, FormControlKind, color_for_type, compact_date,
+    AuthMode, CascadeMode, DependencyLink, FLAVORS, FormControlKind, color_for_type, compact_date,
     dates_column_text_indexed, format_date_range, identity_from_field, is_unscheduled,
     iso_date_only, parse_iso_date, parse_user_date,
 };
@@ -2018,7 +2018,8 @@ impl PlannerView {
         target: Option<jiff::civil::Date>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(pending) = self.state.commit_range_dates_now(id, start, target) {
+        if let Some(mut pending) = self.state.commit_range_dates_now(id, start, target) {
+            self.state.cascade_committed(&mut pending);
             self.enqueue_date_save(cx, pending);
         }
     }
@@ -4143,6 +4144,72 @@ impl PlannerView {
                                         cx.notify();
                                     })),
                             ),
+                    )
+                    .child(
+                        div()
+                            .id("gantt-cascade-label")
+                            .debug_selector(|| "gantt-cascade-label".into())
+                            .px_2()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Date cascade"),
+                    )
+                    .children(
+                        [
+                            (
+                                CascadeMode::Flexible,
+                                "flexible",
+                                "Flexible",
+                                "Push successors later only when they would overlap",
+                            ),
+                            (
+                                CascadeMode::Strict,
+                                "strict",
+                                "Strict",
+                                "Move successors by the same number of days",
+                            ),
+                            (
+                                CascadeMode::NoAction,
+                                "no-action",
+                                "No-action",
+                                "Never move successors; show Clashes",
+                            ),
+                        ]
+                        .into_iter()
+                        .map(|(mode, key, label, tip)| {
+                            let current = self.state.cascade_mode() == mode;
+                            div()
+                                .id(SharedString::from(format!("gantt-cascade-{key}")))
+                                .debug_selector(move || format!("gantt-cascade-{key}"))
+                                .w_full()
+                                .child(
+                                    Button::new(SharedString::from(format!("cascade-{key}")))
+                                        .accessibility_label(label)
+                                        .when(current, |btn| {
+                                            btn.child(
+                                                div()
+                                                    .debug_selector(move || {
+                                                        format!("gantt-cascade-{key}-check")
+                                                    })
+                                                    .child("✓"),
+                                            )
+                                        })
+                                        .child(label)
+                                        .compact()
+                                        .toggled(current)
+                                        .selected(current)
+                                        .when(current, |btn| btn.primary())
+                                        .when(!current, |btn| btn.ghost())
+                                        .tooltip(tip)
+                                        .tooltip_placement(Placement::Bottom)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toolbar_more_open = false;
+                                            this.state.set_cascade_mode(mode);
+                                            cx.notify();
+                                        })),
+                                )
+                        }),
                     )
                     .child(
                         div()
@@ -10305,6 +10372,7 @@ impl PlannerView {
             if shift_children {
                 pending.cascade = self.state.shift_children_with_committed_move(&pending);
             }
+            self.state.cascade_committed(&mut pending);
             self.enqueue_date_save(cx, pending);
             self.note_toasts_changed(cx);
         }
@@ -10395,6 +10463,7 @@ impl PlannerView {
             successor_id,
             predecessor_id,
             linked: true,
+            ..
         }) = self.state.history.undo.last()
         {
             self.dequeue_link_save(*successor_id, *predecessor_id);
@@ -10512,6 +10581,7 @@ impl PlannerView {
                     });
                     match result {
                         Ok(()) => {
+                            this.state.gantt.move_failures.remove(&id);
                             if still_after {
                                 if let Some(rev) = working
                                     .nodes
@@ -10563,6 +10633,11 @@ impl PlannerView {
                                 this.state.restore_node(previous);
                                 this.state.revert_date_save_history(&revert);
                                 this.state.restore_date_save_failed(&revert);
+                                for reason in
+                                    working.gantt.move_failures.get(&id).into_iter().flatten()
+                                {
+                                    this.state.note_move_failure(id, reason.clone());
+                                }
                                 if role == DateSaveRole::Commit {
                                     this.state.toasts.dismiss_undo();
                                 }
