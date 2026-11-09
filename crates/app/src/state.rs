@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use ado_client::{AdoClient, AdoRuntime, TokenSource};
 use ado_core::{
-    AssigneeFilter, Flavor, HierarchyIndex, HierarchyResult, IdentityValue, IterationNode,
-    Organization, OverlayFilter, Project, ScopeSelection, SessionInfo, Team, WorkItemNode,
-    apply_overlays, build_clear_dates_patch, build_dates_patch, build_field_patch,
+    AssigneeFilter, DependencyLink, Flavor, HierarchyIndex, HierarchyResult, IdentityValue,
+    IterationNode, Organization, OverlayFilter, Project, ScopeSelection, SessionInfo, Team,
+    WorkItemNode, apply_overlays, build_clear_dates_patch, build_dates_patch, build_field_patch,
     build_replace_dates_patch, choose_available, compact_date, identity_from_field,
     is_assignee_special, iso_date_only, parent_relation_op, parse_iso_date, resolve_root_types,
     schedule_from_iteration,
@@ -21,8 +21,8 @@ use crate::cache::{CacheFreshness, QueryCache};
 use crate::error::AppError;
 use crate::form::FormDraft;
 use crate::gantt::{
-    BarLayout, GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView, VisibleRow,
-    insert_index_for_child,
+    BarLayout, ClashMarks, GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView,
+    VisibleRow, insert_index_for_child,
 };
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
@@ -100,6 +100,7 @@ struct VisibleEntry {
     username: Option<String>,
     nodes: Arc<Vec<WorkItemNode>>,
     index: Arc<HierarchyIndex>,
+    clashes: Arc<HashSet<DependencyLink>>,
     rows: Option<(HashSet<i64>, Arc<Vec<VisibleRow>>)>,
 }
 
@@ -117,6 +118,8 @@ fn sorted_distinct<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
 pub struct Visible {
     pub nodes: Arc<Vec<WorkItemNode>>,
     pub index: Arc<HierarchyIndex>,
+    /// Clashes on the loaded dates, before any live gesture.
+    pub clashes: Arc<HashSet<DependencyLink>>,
     pub rows: Arc<Vec<VisibleRow>>,
 }
 
@@ -129,6 +132,14 @@ impl Visible {
             &state.iterations,
             viewport_h,
         )
+    }
+
+    /// Clashes as a drop now would leave them, with a badge per clashing
+    /// successor among `bars`.
+    pub fn clash_marks(&self, state: &PlannerState, bars: &[BarLayout]) -> ClashMarks {
+        state
+            .gantt
+            .clash_marks(&self.clashes, &self.nodes, &self.index, bars)
     }
 }
 
@@ -321,6 +332,15 @@ impl PlannerState {
         self.persist_prefs();
     }
 
+    pub fn show_arrows(&self) -> bool {
+        self.prefs.planner.show_arrows
+    }
+
+    pub fn set_show_arrows(&mut self, show: bool) {
+        self.prefs.planner.show_arrows = show;
+        self.persist_prefs();
+    }
+
     pub fn initials(&self) -> String {
         let name = self
             .session_info
@@ -422,6 +442,7 @@ impl PlannerState {
             Visible {
                 nodes: entry.nodes.clone(),
                 index: entry.index.clone(),
+                clashes: entry.clashes.clone(),
                 rows,
             }
         })
@@ -453,6 +474,7 @@ impl PlannerState {
                 planner: self.prefs.planner.clone(),
                 username: self.session_info.username.clone(),
                 index: Arc::new(HierarchyIndex::new(&nodes)),
+                clashes: Arc::new(ado_core::clashes(&nodes)),
                 nodes: Arc::new(nodes),
                 rows: None,
             });
@@ -629,7 +651,15 @@ impl PlannerState {
     }
 
     pub async fn login_entra(&mut self) -> Result<(), AppError> {
-        let info = self.session.inner().lock().await.login(None).await?;
+        self.sign_in_error = None;
+        let login = self.session.inner().lock().await.login(None).await;
+        let info = match login {
+            Ok(info) => info,
+            Err(err) => {
+                self.sign_in_error = Some(err.to_string());
+                return Err(err.into());
+            }
+        };
         self.session_info = info;
         if !self.session_info.signed_in {
             self.toasts
@@ -654,6 +684,29 @@ impl PlannerState {
         self.session.inner().lock().await.logout().await?;
         self.session_info = self.session.inner().lock().await.session_info().await?;
         self.session_token_ready = false;
+        self.clear_signed_in_data();
+        self.cache.clear();
+        Ok(())
+    }
+
+    /// The Session ended underneath a request (Entra refresh rejected): show
+    /// the sign-in card with the reason. Toasts from the failed loads belong
+    /// to the signed-in shell, so they go too.
+    pub fn require_sign_in(&mut self, error: &AppError) {
+        self.session_info = SessionInfo {
+            signed_in: false,
+            display_name: None,
+            username: None,
+            auth_mode: self.session_info.auth_mode,
+        };
+        self.session_token_ready = false;
+        self.session_loading = false;
+        self.sign_in_error = Some(error.to_string());
+        self.toasts.clear();
+        self.clear_signed_in_data();
+    }
+
+    fn clear_signed_in_data(&mut self) {
         self.orgs.clear();
         self.projects.clear();
         self.teams.clear();
@@ -661,8 +714,6 @@ impl PlannerState {
         self.members.clear();
         self.hierarchy = None;
         self.nodes.clear();
-        self.cache.clear();
-        Ok(())
     }
 
     async fn reload_after_sign_in(&mut self) -> Result<(), AppError> {
@@ -2253,16 +2304,11 @@ impl PlannerState {
         if successor_id == predecessor_id {
             return false;
         }
-        let Some(node) = self
-            .nodes
-            .iter()
-            .find(|node| node.id == successor_id)
-            .cloned()
-        else {
+        if !self.nodes.iter().any(|node| node.id == successor_id) {
             return false;
-        };
-        if node.predecessors.contains(&predecessor_id) {
-            self.toasts.push(ToastKind::Warning, "Link already exists");
+        }
+        if let Some(text) = self.link_refusal(successor_id, predecessor_id) {
+            self.toasts.push(ToastKind::Warning, text);
             return false;
         }
         if let Some(live) = self.nodes.iter_mut().find(|n| n.id == successor_id) {
@@ -2283,6 +2329,79 @@ impl PlannerState {
             );
         }
         true
+    }
+
+    /// Why a link from `predecessor_id` to `successor_id` would be refused:
+    /// it already exists, or it closes a loop through loaded Work Items.
+    pub fn link_refusal(&self, successor_id: i64, predecessor_id: i64) -> Option<String> {
+        let successor = self.nodes.iter().find(|node| node.id == successor_id)?;
+        if successor.predecessors.contains(&predecessor_id) {
+            return Some("Link already exists".into());
+        }
+        self.dependency_loop_text(successor_id, predecessor_id)
+    }
+
+    /// The refusal for the bar the connector hovers, as `(target, text)`.
+    pub fn link_drag_refusal(&self) -> Option<(i64, String)> {
+        let gesture = self.gantt.gesture.as_ref()?;
+        if gesture.kind != GestureKind::Link {
+            return None;
+        }
+        let target = gesture.link_to.filter(|id| *id != gesture.id)?;
+        let (successor, predecessor) = if gesture.link_from_start {
+            (gesture.id, target)
+        } else {
+            (target, gesture.id)
+        };
+        self.link_refusal(successor, predecessor)
+            .map(|text| (target, text))
+    }
+
+    fn dependency_loop_text(&self, successor_id: i64, predecessor_id: i64) -> Option<String> {
+        ado_core::dependency_loop(&self.nodes, predecessor_id, successor_id)
+            .map(|ids| crate::gantt::dependency_loop_message(&ids))
+    }
+
+    /// Warn instead of sending a link Azure DevOps would reject as a loop.
+    /// A repeat replaces the toast.
+    fn refuse_looping_link(&mut self, successor_id: i64, predecessor_id: i64) -> bool {
+        let Some(text) = self.dependency_loop_text(successor_id, predecessor_id) else {
+            return false;
+        };
+        self.toasts.push(ToastKind::Warning, text);
+        true
+    }
+
+    /// Refuse the next undo or redo when it would re-add a looping link.
+    /// The entry stays on its stack, since nothing changed.
+    pub fn refuse_looping_history_link(&mut self, is_undo: bool) -> bool {
+        let stack = if is_undo {
+            &self.history.undo
+        } else {
+            &self.history.redo
+        };
+        let Some(HistoryEntry::Link {
+            successor_id,
+            predecessor_id,
+            linked,
+        }) = stack.last()
+        else {
+            return false;
+        };
+        let re_adds = if is_undo { !*linked } else { *linked };
+        let (successor_id, predecessor_id) = (*successor_id, *predecessor_id);
+        re_adds && self.refuse_looping_link(successor_id, predecessor_id)
+    }
+
+    /// Refuse a toast Undo that would restore a looping link.
+    pub fn refuse_looping_undo_action(&mut self, action: &UndoAction) -> bool {
+        match action {
+            UndoAction::RestoreLink {
+                successor_id,
+                predecessor_id,
+            } => self.refuse_looping_link(*successor_id, *predecessor_id),
+            _ => false,
+        }
     }
 
     pub async fn persist_added_dependency(
@@ -2846,6 +2965,9 @@ impl PlannerState {
     }
 
     pub async fn undo(&mut self) -> Result<(), AppError> {
+        if self.refuse_looping_history_link(true) {
+            return Ok(());
+        }
         let Some(entry) = self.history.pop_undo() else {
             return Ok(());
         };
@@ -2865,6 +2987,9 @@ impl PlannerState {
     }
 
     pub async fn redo(&mut self) -> Result<(), AppError> {
+        if self.refuse_looping_history_link(false) {
+            return Ok(());
+        }
         let Some(entry) = self.history.pop_redo() else {
             return Ok(());
         };

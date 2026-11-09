@@ -2,7 +2,7 @@ use ado_core::{START_DATE_FIELD, TARGET_DATE_FIELD, parse_iso_date};
 use ado_planner::gantt::{GanttScale, GanttView, GestureKind, NudgeAxis};
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{DateSaveRole, PlannerState, fake_hierarchy};
-use ado_planner::toasts::{HistoryEntry, UndoAction};
+use ado_planner::toasts::{HistoryEntry, ToastKind, UndoAction};
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use jiff::ToSpan;
 use jiff::civil::Date;
@@ -2515,4 +2515,130 @@ fn gpui_gantt_scale_and_zoom(cx: &mut gpui_kit::TestAppContext) {
     gantt.zoom_at(2.0, 10.0, 0.0);
     assert_eq!(gantt.scale, GanttScale::Day);
     assert!((gantt.zoom - 2.0).abs() < f32::EPSILON);
+}
+
+fn make_persist_cart_wait_on_cart_ui(state: &mut PlannerState) {
+    state
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == 1003)
+        .expect("Persist cart")
+        .predecessors
+        .push(1005);
+}
+
+fn loop_toasts(state: &PlannerState) -> Vec<&str> {
+    state
+        .toasts
+        .items
+        .iter()
+        .filter(|toast| toast.kind == ToastKind::Warning && toast.message.starts_with("Would loop"))
+        .map(|toast| toast.message.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn looping_link_is_refused_before_any_patch() {
+    let (mock, mut state, _dir) = signed_in().await;
+    make_persist_cart_wait_on_cart_ui(&mut state);
+    let patches = mock.patch_count();
+    assert!(!state.apply_link_now(1005, 1003));
+    state
+        .add_dependency(1005, 1003)
+        .await
+        .expect("a refused link is not an error");
+    assert_eq!(mock.patch_count(), patches, "a loop must not PATCH");
+    assert_eq!(
+        loop_toasts(&state),
+        vec!["Would loop: #1003 → #1005 → #1003"],
+        "a repeat must replace the loop toast"
+    );
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1005)
+            .is_some_and(|node| !node.predecessors.contains(&1003))
+    );
+    assert!(state.history.undo.is_empty());
+}
+
+#[tokio::test]
+async fn link_refusal_names_duplicates_and_loops() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    make_persist_cart_wait_on_cart_ui(&mut state);
+    assert_eq!(
+        state.link_refusal(1003, 1005).as_deref(),
+        Some("Link already exists")
+    );
+    assert_eq!(
+        state.link_refusal(1005, 1003).as_deref(),
+        Some("Would loop: #1003 → #1005 → #1003")
+    );
+    assert_eq!(state.link_refusal(1004, 1003), None);
+}
+
+#[tokio::test]
+async fn looping_redo_keeps_history_and_sends_no_patch() {
+    let (mock, mut state, _dir) = signed_in().await;
+    state.history.redo.push(HistoryEntry::Link {
+        successor_id: 1005,
+        predecessor_id: 1003,
+        linked: true,
+    });
+    make_persist_cart_wait_on_cart_ui(&mut state);
+    let patches = mock.patch_count();
+    state.redo().await.expect("refused redo");
+    assert_eq!(mock.patch_count(), patches, "a looping redo must not PATCH");
+    assert_eq!(state.history.redo.len(), 1);
+    assert!(state.history.undo.is_empty());
+    assert_eq!(
+        state
+            .toasts
+            .items
+            .last()
+            .map(|toast| toast.message.as_str()),
+        Some("Would loop: #1003 → #1005 → #1003"),
+        "the loop toast must not be replaced by a Redid toast"
+    );
+}
+
+#[tokio::test]
+async fn looping_undo_of_a_removed_link_sends_no_patch() {
+    let (mock, mut state, _dir) = signed_in().await;
+    state.history.undo.push(HistoryEntry::Link {
+        successor_id: 1005,
+        predecessor_id: 1003,
+        linked: false,
+    });
+    make_persist_cart_wait_on_cart_ui(&mut state);
+    let patches = mock.patch_count();
+    state.undo().await.expect("refused undo");
+    assert_eq!(mock.patch_count(), patches, "a looping undo must not PATCH");
+    assert_eq!(state.history.undo.len(), 1);
+    assert!(state.history.redo.is_empty());
+    assert!(state.refuse_looping_undo_action(&UndoAction::RestoreLink {
+        successor_id: 1005,
+        predecessor_id: 1003,
+    }));
+    assert_eq!(loop_toasts(&state).len(), 1);
+}
+
+#[tokio::test]
+async fn link_whose_walk_leaves_loaded_work_items_still_patches() {
+    let (mock, mut state, _dir) = signed_in().await;
+    state
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == 1003)
+        .expect("Persist cart")
+        .predecessors
+        .push(999_999);
+    let patches = mock.patch_count();
+    state
+        .add_dependency(1005, 1003)
+        .await
+        .expect("link persists");
+    assert_eq!(mock.patch_count(), patches + 1);
+    assert!(loop_toasts(&state).is_empty());
 }

@@ -9,11 +9,9 @@ use reqwest::StatusCode;
 
 use crate::auth_mode::entra_client_id;
 use crate::identity::{PatIdentity, fetch_pat_identity, fetch_session_identity};
-use crate::oauth::{self, OauthEndpoints};
+use crate::oauth::{self, OauthEndpoints, RefreshError};
 use crate::organization::normalize_organization;
-use crate::persist::{
-    EncryptedStore, FileStore, MemoryStore, StoredOauth, StoredPat, delete_keyring_key, unix_now,
-};
+use crate::persist::{EncryptedStore, FileStore, MemoryStore, StoredOauth, StoredPat, unix_now};
 
 pub struct LoginCreds {
     pub pat: Option<String>,
@@ -239,9 +237,14 @@ impl PlannerSession {
             AuthScheme::Pat => self.access_token().await,
             AuthScheme::Bearer => {
                 let Some(oauth) = self.memory_oauth.clone() else {
-                    return Err(Error::message("No OAuth Session"));
+                    return Err(Error::SignInRequired);
                 };
-                if !oauth.needs_refresh(unix_now()) {
+                let now = unix_now();
+                if !oauth.needs_refresh(now) {
+                    if oauth.is_expired(now) {
+                        self.end_oauth_session();
+                        return Err(Error::SignInRequired);
+                    }
                     return Ok(oauth.access_token);
                 }
                 let Some(refresh_token) = oauth.refresh_token.clone() else {
@@ -275,10 +278,22 @@ impl PlannerSession {
                         self.persist_oauth(&next)?;
                         Ok(next.access_token)
                     }
-                    Err(_) => Ok(oauth.access_token),
+                    Err(RefreshError::Rejected) => {
+                        self.end_oauth_session();
+                        Err(Error::SignInRequired)
+                    }
+                    Err(RefreshError::Unavailable(err)) => Err(err),
                 }
             }
         }
+    }
+
+    /// The refresh token is dead; drop it so the next launch asks for sign-in
+    /// instead of retrying it. The keyring key stays for the next session.
+    fn end_oauth_session(&mut self) {
+        self.memory_oauth = None;
+        self.loaded = true;
+        self.store.unlink();
     }
 
     pub async fn logout(&mut self) -> Result<(), Error> {
@@ -286,8 +301,7 @@ impl PlannerSession {
         self.memory_oauth = None;
         self.identity = None;
         self.loaded = true;
-        self.store.unlink();
-        delete_keyring_key();
+        self.store.forget();
         Ok(())
     }
 
@@ -396,7 +410,7 @@ pub fn create_session(data_dir: &std::path::Path) -> PlannerSession {
     let persist = crate::persist::should_persist_session(key.is_some());
     let file = FileStore::new(crate::persist::session_dir(data_dir).join("session.bin"));
     let store = if persist {
-        EncryptedStore::new(Box::new(file), key)
+        EncryptedStore::keyring_backed(Box::new(file), key)
     } else {
         EncryptedStore::new(Box::new(MemoryStore::new(false)), None)
     };

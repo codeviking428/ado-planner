@@ -5,26 +5,28 @@ use ado_planner::form::FormDraft;
 use ado_planner::gantt::{
     ASSIGNEE_COL_WIDTH, BarHitZone, ContextTarget, GanttScale, GanttView, GestureKind,
     HANDLE_WIDTH, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_INSET, MILESTONE_SIZE,
-    MIN_TIMELINE_WIDTH, OUTER_LINK_HIT, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN, PARALLEL_VERT_MIN,
-    RESIZE_HIT_WIDTH, ROW_HEIGHT, SHORT_BAR_OUTER_LINK_HIT, TODAY_ALIGN, TODAY_PILL_GAP,
-    TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, YEAR_MIN_BAR_H, YEAR_MIN_BAR_WIDTH, bar_hover_tooltip,
-    bar_title_is_inside, bar_title_paint_px, insert_index_for_child, outside_label_is_beside_bar,
-    related_dependency_ids,
+    MIN_TIMELINE_WIDTH, NudgeAxis, OUTER_LINK_HIT, OUTSIDE_LABEL_GAP, PARALLEL_LANE_MIN,
+    PARALLEL_VERT_MIN, RESIZE_HIT_WIDTH, ROW_HEIGHT, SHORT_BAR_OUTER_LINK_HIT, TODAY_ALIGN,
+    TODAY_PILL_GAP, TREE_INDENT, UNSCHEDULED_GUTTER_RIGHT, YEAR_MIN_BAR_H, YEAR_MIN_BAR_WIDTH,
+    bar_hover_tooltip, bar_title_is_inside, bar_title_paint_px, insert_index_for_child,
+    outside_label_is_beside_bar, related_dependency_ids,
 };
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
 use ado_planner::toasts::{HistoryEntry, ToastExtra, ToastKind, UndoAction};
-use ado_planner::ui::PlannerView;
+use ado_planner::ui::{EMPTY_FILTERED_MESSAGE, PlannerView};
 use ado_planner::ui::{
     date_field_text, dates_from_range_picker, dates_from_range_picker_in_years,
     format_picker_dates, looks_like_pat, pending_range_typed, range_picker_is_complete,
     typed_dates_error, typed_dates_error_in,
 };
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::calendar::Date as PickerDate;
+use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, ScrollDelta, ScrollEvent,
-    VisualTestContext, point, px,
+    AppContext as _, Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, PinchEvent,
+    ScrollDelta, ScrollEvent, TouchPhase, VisualTestContext, point, px,
 };
 use jiff::ToSpan;
 use jiff::civil::Date;
@@ -595,6 +597,193 @@ fn large_hierarchy_paints_only_the_row_window_in_both_panes(cx: &mut gpui_kit::T
         taller > filtered,
         "a taller window must paint more rows ({taller} vs {filtered})"
     );
+}
+
+/// Row tooltips live in the window `Root`'s tooltip overlay, which
+/// `add_window_view` does not mount. Opens the view the way `start_app` does.
+fn open_in_root(
+    cx: &mut gpui_kit::TestAppContext,
+    state: PlannerState,
+) -> (Entity<PlannerView>, VisualTestContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        // Tooltips fade in on wall-clock time; the test clock is simulated.
+        cx.set_reduce_motion(true);
+    });
+    let (window, view) = cx.update(|cx| {
+        gpui_kit::open_window(Default::default(), cx, |window, cx| {
+            cx.new(|cx| PlannerView::for_state(window, cx, state))
+        })
+        .expect("window")
+    });
+    (view, VisualTestContext::from_window(window, cx))
+}
+
+/// Lets a tooltip's show delay run out, then paints.
+fn settle(cx: &mut VisualTestContext) {
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    draw(cx);
+}
+
+/// Painted tooltip chips: popover-filled and shorter than a row. Rows and
+/// headers share the popover fill but are at least a row tall.
+fn painted_tooltips(cx: &mut VisualTestContext) -> Vec<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    cx.update(|window, cx| {
+        let popover: gpui_kit::Background = cx.theme().popover.into();
+        let scale = window.scale_factor();
+        window
+            .painted_quads()
+            .iter()
+            .filter(|quad| quad.background == popover)
+            .map(|quad| {
+                gpui_kit::Bounds::new(
+                    point(
+                        px(quad.bounds.origin.x.0 / scale),
+                        px(quad.bounds.origin.y.0 / scale),
+                    ),
+                    gpui_kit::size(
+                        px(quad.bounds.size.width.0 / scale),
+                        px(quad.bounds.size.height.0 / scale),
+                    ),
+                )
+            })
+            .filter(|bounds| f32::from(bounds.size.height) < ROW_HEIGHT)
+            .collect()
+    })
+}
+
+/// The painted title of the row under `pointer`, with its work item id.
+fn title_under(
+    view: &Entity<PlannerView>,
+    cx: &mut VisualTestContext,
+    pointer: gpui_kit::Point<gpui_kit::Pixels>,
+) -> (i64, gpui_kit::Bounds<gpui_kit::Pixels>) {
+    let window: Vec<i64> = view.update(cx, |view, _| {
+        let rows = view.state.visible_rows();
+        let first = view.state.gantt.first_visible_row_index();
+        rows.iter().skip(first).take(40).map(|row| row.id).collect()
+    });
+    window
+        .into_iter()
+        .find_map(|id| {
+            debug_bounds_of(cx, format!("gantt-title-{id}"))
+                .filter(|title| title.contains(&pointer))
+                .map(|title| (id, title))
+        })
+        .expect("a painted title under the pointer")
+}
+
+/// Every painted tooltip must be the one for the row under the still
+/// pointer, at `gap` above that row's current title.
+fn assert_tooltip_tracks_row(
+    view: &Entity<PlannerView>,
+    cx: &mut VisualTestContext,
+    pointer: gpui_kit::Point<gpui_kit::Pixels>,
+    gap: f32,
+    case: &str,
+) -> usize {
+    let (id, title) = title_under(view, cx, pointer);
+    let tips = painted_tooltips(cx);
+    assert!(tips.len() <= 1, "{case}: {} tooltips painted", tips.len());
+    for tip in &tips {
+        let tip_gap = f32::from(title.origin.y) - painted_bottom(*tip);
+        assert!(
+            (tip_gap - gap).abs() < 1.0,
+            "{case}: tooltip at y={} sits {tip_gap}px above #{id}'s title at y={}, \
+             not {gap}px: it was left where an earlier row was painted",
+            f32::from(tip.origin.y),
+            f32::from(title.origin.y),
+        );
+    }
+    tips.len()
+}
+
+/// #76: a "Coding standard" title showed above row #5687 after scrolling.
+/// The tooltip overlay keeps the bounds a trigger had on hover-enter, and a
+/// row that moves under a still pointer never leaves hover.
+#[gpui_kit::test]
+fn row_tooltip_does_not_stay_behind_when_rows_move(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes = fake_hierarchy(LARGE_HIERARCHY as usize);
+    state.nodes[7].title = "Coding standard".into();
+    let (view, mut vcx) = open_in_root(cx, state);
+    let cx = &mut vcx;
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    draw(cx);
+    let title = cx.debug_bounds("gantt-title-8").expect("title of #8");
+    let pointer = title.center();
+    // A real pointer arrives in several moves; the first only enters the row.
+    cx.simulate_mouse_move(
+        point(pointer.x - px(1.), pointer.y),
+        None,
+        Modifiers::default(),
+    );
+    settle(cx);
+    cx.simulate_mouse_move(pointer, None, Modifiers::default());
+    settle(cx);
+    let tips = painted_tooltips(cx);
+    assert_eq!(tips.len(), 1, "hovering a title shows its tooltip");
+    let gap = f32::from(title.origin.y) - painted_bottom(tips[0]);
+    assert!(
+        gap >= 0.0,
+        "the title tooltip sits above the row, gap {gap}"
+    );
+
+    let scroll = |cx: &mut VisualTestContext, dy: f32| {
+        cx.simulate_event(ScrollEvent {
+            position: pointer,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-dy))),
+            ..Default::default()
+        });
+        draw(cx);
+    };
+    // Less than a row: #8 moves up but stays under the pointer.
+    scroll(cx, 12.0);
+    assert_eq!(title_under(&view, cx, pointer).0, 8);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "12px wheel");
+    settle(cx);
+    assert_eq!(
+        assert_tooltip_tracks_row(&view, cx, pointer, gap, "12px wheel, settled"),
+        1,
+        "the resting pointer gets the tooltip back"
+    );
+    for (dy, case) in [
+        (-8.0, "8px wheel up"),
+        (ROW_HEIGHT + 10.0, "a row and a bit"),
+        (3.0 * ROW_HEIGHT - 6.0, "most of three rows"),
+    ] {
+        scroll(cx, dy);
+        assert_tooltip_tracks_row(&view, cx, pointer, gap, case);
+        settle(cx);
+        assert_tooltip_tracks_row(&view, cx, pointer, gap, case);
+    }
+
+    view.update(cx, |view, cx| {
+        view.state.gantt.toggle_expand(1);
+        cx.notify();
+    });
+    draw(cx);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "collapse above");
+    settle(cx);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "collapse above, settled");
+
+    view.update(cx, |view, cx| {
+        for node in view.state.nodes.iter_mut().filter(|node| node.id % 3 == 0) {
+            node.state = "Closed".into();
+        }
+        view.state.prefs.planner.hidden_states = vec!["Closed".into()];
+        cx.notify();
+    });
+    draw(cx);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "State filter");
+    settle(cx);
+    assert_tooltip_tracks_row(&view, cx, pointer, gap, "State filter, settled");
 }
 
 #[gpui_kit::test]
@@ -3329,6 +3518,264 @@ fn critical_path_menu_item_shows_a_check_while_on(cx: &mut gpui_kit::TestAppCont
     );
 }
 
+/// Unscheduled Epic #1 over #2 (Jul 6–10), #3 (Jul 9–20, after #2: a Clash)
+/// and #4 (Jul 21–30, after #3: no Clash).
+fn clash_state(dir: &tempfile::TempDir) -> PlannerState {
+    let mut state = idle_state(dir);
+    let mut nodes = fake_hierarchy(4);
+    let dates = [
+        (None, None, vec![]),
+        (Some("2026-07-06"), Some("2026-07-10"), vec![]),
+        (Some("2026-07-09"), Some("2026-07-20"), vec![2]),
+        (Some("2026-07-21"), Some("2026-07-30"), vec![3]),
+    ];
+    for (node, (start, target, preds)) in nodes.iter_mut().zip(dates) {
+        node.start_date = start.map(|date| format!("{date}T00:00:00Z"));
+        node.target_date = target.map(|date| format!("{date}T00:00:00Z"));
+        node.predecessors = preds;
+    }
+    state.nodes = nodes;
+    state
+}
+
+fn clash_window(
+    cx: &mut gpui_kit::TestAppContext,
+    state: PlannerState,
+) -> (Entity<PlannerView>, &mut VisualTestContext) {
+    cx.update(gpui_kit::init);
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    (view, cx)
+}
+
+fn has(cx: &mut VisualTestContext, selector: &'static str) -> bool {
+    cx.debug_bounds(selector).is_some()
+}
+
+#[gpui_kit::test]
+fn clash_arrows_take_the_warning_colour_even_on_the_critical_path(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = clash_window(cx, clash_state(&dir));
+    assert!(
+        has(cx, "gantt-arrow-2-3-clash"),
+        "#3 starts Jul 9, before #2's Jul 10 Target Date"
+    );
+    assert!(
+        has(cx, "gantt-arrow-3-4-plain"),
+        "#4 starts after #3 finishes"
+    );
+    view.update(cx, |view, cx| {
+        view.state.gantt.show_critical_path = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-2-3-clash"),
+        "a clashing Critical path arrow takes the warning colour"
+    );
+    assert!(has(cx, "gantt-arrow-3-4-critical"));
+}
+
+#[gpui_kit::test]
+fn clash_badge_sits_on_the_successor_start_with_one_tooltip_line_per_predecessor(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = clash_state(&dir);
+    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == 4) {
+        node.start_date = Some("2026-07-09T00:00:00Z".into());
+        node.predecessors = vec![2, 3];
+    }
+    let (_view, cx) = clash_window(cx, state);
+    assert!(has(cx, "gantt-clash-badge-3"));
+    assert!(!has(cx, "gantt-clash-badge-2"), "#2 has no predecessor");
+    let badge = cx.debug_bounds("gantt-clash-badge-4").expect("#4 badge");
+    let bar = cx.debug_bounds("gantt-bar-4").expect("#4 bar");
+    let badge_mid = f32::from(badge.origin.x) + f32::from(badge.size.width) / 2.0;
+    assert!(
+        (badge_mid - f32::from(bar.origin.x)).abs() <= 2.0,
+        "the ! centres on the successor's start edge, badge_mid={badge_mid} bar_left={}",
+        f32::from(bar.origin.x)
+    );
+    cx.simulate_mouse_move(badge.center(), None, Modifiers::default());
+    cx.background_executor
+        .advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(has(
+        cx,
+        "gantt-clash-tip: Starts Jul 9 · #2 finishes Jul 10"
+    ));
+    assert!(has(
+        cx,
+        "gantt-clash-tip: Starts Jul 9 · #3 finishes Jul 20"
+    ));
+}
+
+#[gpui_kit::test]
+fn clash_badge_does_not_block_the_start_resize(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = clash_state(&dir);
+    state.gantt.selected_id = Some(3);
+    state.gantt.hovered_id = Some(3);
+    state.gantt.bar_hovered_id = Some(3);
+    let (view, cx) = clash_window(cx, state);
+    let badge = cx.debug_bounds("gantt-clash-badge-3").expect("#3 badge");
+    let bar = cx.debug_bounds("gantt-bar-3").expect("#3 bar");
+    let press = point(
+        bar.origin.x + px(2.),
+        badge.origin.y + badge.size.height - px(2.),
+    );
+    cx.simulate_mouse_down(press, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let gesture = view
+            .state
+            .gantt
+            .gesture
+            .as_ref()
+            .expect("press under the !");
+        assert_eq!(gesture.id, 3);
+        assert_eq!(gesture.kind, GestureKind::ResizeStart);
+    });
+}
+
+#[gpui_kit::test]
+fn dragging_repaints_clashes_live_and_cancel_restores_them(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = clash_window(cx, clash_state(&dir));
+    assert!(!has(cx, "gantt-clash-badge-4"));
+    let bar = cx.debug_bounds("gantt-bar-4").expect("#4 bar");
+    let start = bar.center();
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let ppd = view.update(cx, |view, _| {
+        assert_eq!(
+            view.state
+                .gantt
+                .gesture
+                .as_ref()
+                .map(|gesture| gesture.kind),
+            Some(GestureKind::Move)
+        );
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    cx.simulate_mouse_move(
+        point(start.x - px(ppd * 3.0), start.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-3-4-clash"),
+        "dragging #4 to Jul 18 starts it before #3's Jul 20 Target Date"
+    );
+    assert!(has(cx, "gantt-clash-badge-4"));
+    view.update(cx, |view, cx| {
+        let escape = KeyDownEvent {
+            keystroke: Keystroke::parse("escape").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        view.handle_key(&escape, cx);
+        assert!(view.state.gantt.gesture.is_none());
+    });
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-3-4-plain"),
+        "cancel restores the arrow"
+    );
+    assert!(!has(cx, "gantt-clash-badge-4"), "cancel clears the badge");
+    assert!(has(cx, "gantt-arrow-2-3-clash"), "the loaded Clash stays");
+}
+
+#[gpui_kit::test]
+fn nudging_repaints_clashes_and_discard_restores_them(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = clash_state(&dir);
+    state.gantt.selected_id = Some(3);
+    let (view, cx) = clash_window(cx, state);
+    view.update(cx, |view, cx| {
+        view.state.nudge(NudgeAxis::Both, 1).expect("nudge");
+        view.state.nudge(NudgeAxis::Both, 1).expect("nudge");
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-2-3-plain"),
+        "#3 nudged to Jul 11 no longer starts before #2's Jul 10 Target Date"
+    );
+    assert!(
+        has(cx, "gantt-arrow-3-4-clash"),
+        "#3 now finishes Jul 22, after #4 starts on Jul 21"
+    );
+    view.update(cx, |view, cx| {
+        view.state.discard_nudge();
+        cx.notify();
+    });
+    draw(cx);
+    assert!(has(cx, "gantt-arrow-2-3-clash"));
+    assert!(has(cx, "gantt-arrow-3-4-plain"));
+}
+
+#[gpui_kit::test]
+fn show_arrows_hides_ordinary_arrows_and_survives_a_restart(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = clash_state(&dir);
+    state.gantt.selected_id = Some(4);
+    state.gantt.hovered_id = Some(4);
+    state.gantt.bar_hovered_id = Some(4);
+    let (view, cx) = clash_window(cx, state);
+    open_gantt_overflow(cx);
+    let arrows = cx
+        .debug_bounds("gantt-show-arrows")
+        .expect("Show arrows item");
+    let critical = cx
+        .debug_bounds("gantt-critical-path")
+        .expect("Critical path item");
+    assert!(
+        arrows.origin.y < critical.origin.y,
+        "Show arrows sits above Critical path"
+    );
+    assert!(has(cx, "gantt-show-arrows-check"), "on by default");
+    cx.simulate_click(arrows.center(), Modifiers::default());
+    draw(cx);
+    assert!(!has(cx, "gantt-arrow-3-4-plain"), "ordinary arrows hide");
+    assert!(has(cx, "gantt-arrow-2-3-clash"), "Clash arrows still show");
+    assert!(
+        has(cx, "gantt-link-handle-4-link-end"),
+        "link handles still show"
+    );
+    view.update(cx, |view, cx| {
+        view.state.gantt.show_critical_path = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        has(cx, "gantt-arrow-3-4-critical"),
+        "Critical path arrows still show"
+    );
+    open_gantt_overflow(cx);
+    assert!(!has(cx, "gantt-show-arrows-check"));
+
+    let restarted = PlannerState::new(
+        AppPaths::new(dir.path().to_path_buf()),
+        PlannerSession::pat(EncryptedStore::new(Box::new(MemoryStore::new(false)), None)),
+        None,
+        None,
+    );
+    assert!(
+        !restarted.show_arrows(),
+        "Show arrows off must survive a restart"
+    );
+}
+
 #[gpui_kit::test]
 fn auto_fit_toolbar_button_fits_the_span(cx: &mut gpui_kit::TestAppContext) {
     cx.update(gpui_kit::init);
@@ -4462,6 +4909,13 @@ fn filtered_empty_gantt_offers_show_all(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("empty-show-all").is_some(),
         "filtered empty state should offer Show all"
     );
+    let message = cx.update(|window, _| {
+        window
+            .find("empty-gantt-message")
+            .label()
+            .map(str::to_owned)
+    });
+    assert_eq!(message.as_deref(), Some(EMPTY_FILTERED_MESSAGE));
     assert!(
         cx.debug_bounds("gantt-toolbar-more").is_some(),
         "less-used actions sit in the toolbar overflow"
@@ -4470,6 +4924,45 @@ fn filtered_empty_gantt_offers_show_all(cx: &mut gpui_kit::TestAppContext) {
     assert!(
         cx.debug_bounds("gantt-add-item").is_some(),
         "+ Add item must stay reachable from the overflow menu"
+    );
+}
+
+#[gpui_kit::test]
+fn show_all_clears_the_no_match_empty_state(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.hide_all_roots();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let show_all = cx.debug_bounds("empty-show-all").expect("Show all");
+    cx.simulate_click(show_all.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("empty-gantt").is_none(),
+        "Show all must bring the Work Items back"
+    );
+    assert!(cx.debug_bounds("gantt-tree-row-1").is_some());
+}
+
+#[gpui_kit::test]
+fn team_with_no_work_items_does_not_say_filters_hide_them(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes.clear();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let message = cx.update(|window, _| {
+        window
+            .find("empty-gantt-message")
+            .label()
+            .map(str::to_owned)
+    });
+    assert_ne!(message.as_deref(), Some(EMPTY_FILTERED_MESSAGE));
+    assert!(
+        cx.debug_bounds("empty-show-all").is_none(),
+        "an empty Team has nothing for Show all to reveal"
     );
 }
 
@@ -4824,6 +5317,158 @@ fn zoom_buttons_and_ctrl_scroll_update_the_range_title(cx: &mut gpui_kit::TestAp
     assert!(
         cx.debug_bounds("gantt-range-title").is_some(),
         "range title should paint so Ctrl+scroll can update it"
+    );
+}
+
+fn pinch(
+    cx: &mut VisualTestContext,
+    position: gpui_kit::Point<gpui_kit::Pixels>,
+    phase: TouchPhase,
+    delta: f32,
+) {
+    cx.simulate_event(PinchEvent {
+        position,
+        delta,
+        modifiers: Modifiers::default(),
+        phase,
+    });
+    draw(cx);
+}
+
+/// Fractional day under a window-x on the timeline.
+fn day_under(view: &Entity<PlannerView>, cx: &mut VisualTestContext, window_x: f32) -> f32 {
+    view.update(cx, |view, _| {
+        let gantt = &view.state.gantt;
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        (gantt.scroll_x + window_x - gantt.timeline_origin_x) / ppd
+    })
+}
+
+fn month_pinch_view<'a>(
+    cx: &'a mut gpui_kit::TestAppContext,
+    dir: &tempfile::TempDir,
+) -> (Entity<PlannerView>, &'a mut VisualTestContext) {
+    cx.update(gpui_kit::init);
+    let mut state = idle_state(dir);
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    (view, cx)
+}
+
+#[gpui_kit::test]
+fn pinch_zooms_the_timeline_around_the_pointer(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = month_pinch_view(cx, &dir);
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    let anchor = point(
+        timeline.origin.x + timeline.size.width * 0.75,
+        timeline.center().y,
+    );
+    let anchor_x = f32::from(anchor.x);
+    let day_before = day_under(&view, cx, anchor_x);
+
+    pinch(cx, anchor, TouchPhase::Started, 0.0);
+    for _ in 0..3 {
+        pinch(cx, anchor, TouchPhase::Moved, 0.1);
+    }
+    pinch(cx, anchor, TouchPhase::Ended, 0.0);
+    let zoom_in = view.update(cx, |view, _| view.state.gantt.zoom);
+    assert!(
+        (zoom_in - 1.1f32.powi(3)).abs() < 1e-3,
+        "three 10% pinch steps must zoom to ~133%, got {zoom_in}"
+    );
+    let day_in = day_under(&view, cx, anchor_x);
+    assert!(
+        (day_in - day_before).abs() < 0.01,
+        "pinch must keep the date under the pointer still: {day_before} -> {day_in}"
+    );
+
+    pinch(cx, anchor, TouchPhase::Started, 0.0);
+    pinch(cx, anchor, TouchPhase::Moved, -0.2);
+    pinch(cx, anchor, TouchPhase::Ended, 0.0);
+    let zoom_out = view.update(cx, |view, _| view.state.gantt.zoom);
+    assert!(
+        (zoom_out - zoom_in * 0.8).abs() < 1e-3,
+        "a -20% pinch must zoom out, {zoom_in} -> {zoom_out}"
+    );
+    let day_out = day_under(&view, cx, anchor_x);
+    assert!(
+        (day_out - day_before).abs() < 0.01,
+        "pinch-out must keep the date under the pointer still: {day_before} -> {day_out}"
+    );
+}
+
+#[gpui_kit::test]
+fn pinch_zoom_stops_at_the_zoom_limits(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = month_pinch_view(cx, &dir);
+    let anchor = cx
+        .debug_bounds("gantt-timeline")
+        .expect("timeline")
+        .center();
+    pinch(cx, anchor, TouchPhase::Started, 0.0);
+    for _ in 0..20 {
+        pinch(cx, anchor, TouchPhase::Moved, 0.5);
+    }
+    assert_eq!(view.update(cx, |view, _| view.state.gantt.zoom), 4.0);
+    for _ in 0..20 {
+        pinch(cx, anchor, TouchPhase::Moved, -0.5);
+    }
+    pinch(cx, anchor, TouchPhase::Ended, 0.0);
+    assert_eq!(view.update(cx, |view, _| view.state.gantt.zoom), 0.4);
+}
+
+#[gpui_kit::test]
+fn cancelled_pinch_restores_the_camera(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = month_pinch_view(cx, &dir);
+    let anchor = cx
+        .debug_bounds("gantt-timeline")
+        .expect("timeline")
+        .center();
+    let before = view.update(cx, |view, _| {
+        (view.state.gantt.zoom, view.state.gantt.scroll_x)
+    });
+    pinch(cx, anchor, TouchPhase::Started, 0.0);
+    pinch(cx, anchor, TouchPhase::Moved, 0.3);
+    assert_ne!(
+        view.update(cx, |view, _| view.state.gantt.zoom),
+        before.0,
+        "a moving pinch must zoom live"
+    );
+    pinch(cx, anchor, TouchPhase::Cancelled, 0.0);
+    let after = view.update(cx, |view, _| {
+        (view.state.gantt.zoom, view.state.gantt.scroll_x)
+    });
+    assert_eq!(after, before, "a cancelled pinch must not keep its zoom");
+}
+
+#[gpui_kit::test]
+fn pinch_over_the_tree_zooms_around_the_timeline_center(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = month_pinch_view(cx, &dir);
+    let row = cx.debug_bounds("gantt-tree-row-1").expect("tree row");
+    let center_x = view.update(cx, |view, _| {
+        view.state.gantt.timeline_origin_x + view.state.gantt.timeline_width * 0.5
+    });
+    let day_before = day_under(&view, cx, center_x);
+    pinch(cx, row.center(), TouchPhase::Started, 0.0);
+    pinch(cx, row.center(), TouchPhase::Moved, 0.25);
+    pinch(cx, row.center(), TouchPhase::Ended, 0.0);
+    assert!(
+        (view.update(cx, |view, _| view.state.gantt.zoom) - 1.25).abs() < 1e-3,
+        "pinching over the tree must still zoom the timeline"
+    );
+    let day_after = day_under(&view, cx, center_x);
+    assert!(
+        (day_after - day_before).abs() < 0.01,
+        "off-timeline pinch anchors the timeline centre: {day_before} -> {day_after}"
     );
 }
 
@@ -14330,6 +14975,17 @@ fn shift_dragging_a_parent_moves_its_children(cx: &mut gpui_kit::TestAppContext)
         height: px(800.),
     });
     draw(cx);
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        assert!(
+            bars.iter().any(|bar| bar.id == 1 && bar.summary),
+            "the parent must paint as a summary bar; summary bars stay draggable"
+        );
+    });
     let bar = cx.debug_bounds("gantt-bar-1").expect("parent bar");
     let start = bar.center();
     let shift = Modifiers {
@@ -16834,4 +17490,171 @@ fn identity_search_runs_250ms_after_typing_stops(cx: &mut gpui_kit::TestAppConte
         );
         assert!(view.form_save_is_enabled(cx));
     });
+}
+
+fn loop_state_with_mock() -> (
+    tokio::runtime::Runtime,
+    ado_mock::AdoMock,
+    PlannerState,
+    tempfile::TempDir,
+) {
+    let (runtime, mock, mut state, dir) = signed_in_with_mock();
+    // In memory only: Persist cart already waits on Cart UI, so
+    // Persist cart → Cart UI would close a loop.
+    state
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == 1003)
+        .expect("Persist cart")
+        .predecessors
+        .push(1005);
+    assert!(
+        state
+            .nodes
+            .iter()
+            .find(|node| node.id == 1005)
+            .is_some_and(|node| !node.predecessors.contains(&1003)),
+        "precondition: Cart UI must not already depend on Persist cart"
+    );
+    state.gantt.origin = Date::new(2026, 7, 1).unwrap();
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    state.gantt.selected_id = None;
+    state.gantt.viewport_h = 720.0;
+    (runtime, mock, state, dir)
+}
+
+fn wait_for_mock_io(cx: &mut VisualTestContext) {
+    allow_ado_client_wake(cx);
+    let deadline = std::time::Instant::now() + Duration::from_millis(400);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        draw(cx);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[gpui_kit::test]
+fn looping_link_drop_shows_refused_state_and_sends_no_patch(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, state, _dir) = loop_state_with_mock();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    let month = cx.debug_bounds("gantt-scale-Month").expect("Month");
+    cx.simulate_click(month.center(), Modifiers::default());
+    draw(cx);
+    let fit = cx.debug_bounds("gantt-auto-fit").expect("Auto fit");
+    cx.simulate_click(fit.center(), Modifiers::default());
+    draw(cx);
+    let patches = mock.patch_count();
+    let bar = cx
+        .debug_bounds("gantt-bar-1003")
+        .expect("Month Persist cart");
+    let at_edge = grab_outer_link_handle(bar);
+    cx.simulate_mouse_move(at_edge, None, Modifiers::default());
+    cx.simulate_mouse_down(at_edge, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    let cart = cx.debug_bounds("gantt-bar-1005").expect("Cart UI");
+    let end = cart.center();
+    for step in 1..=6 {
+        let t = step as f32 / 6.0;
+        let mid = point(
+            at_edge.x + (end.x - at_edge.x) * t,
+            at_edge.y + (end.y - at_edge.y) * t,
+        );
+        cx.simulate_mouse_move(mid, Some(MouseButton::Left), Modifiers::default());
+        draw(cx);
+    }
+    let expected = "Would loop: #1003 → #1005 → #1003";
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.state.link_drag_refusal(),
+            Some((1005, expected.to_string())),
+            "hovering Cart UI must name the loop"
+        );
+        assert_eq!(
+            view.hover_cursor_for_test(),
+            Some("not-allowed"),
+            "a looping target must show the not-allowed cursor"
+        );
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-refused-1005").is_some(),
+        "the looping target must paint the destructive outline"
+    );
+    assert!(
+        cx.debug_bounds("gantt-link-refused-tip").is_some(),
+        "the looping target must paint the Would loop tooltip"
+    );
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    draw(cx);
+    view.update(cx, |view, _| {
+        let toast = view.state.toasts.items.last().expect("loop toast");
+        assert_eq!(toast.kind, ToastKind::Warning);
+        assert_eq!(toast.message, expected);
+        assert!(
+            view.state
+                .nodes
+                .iter()
+                .find(|node| node.id == 1005)
+                .is_some_and(|node| !node.predecessors.contains(&1003)),
+            "a refused drop must not add the predecessor"
+        );
+        assert!(view.state.gantt.gesture.is_none());
+        assert_eq!(view.link_save_queue_len_for_test(), 0);
+    });
+    assert!(
+        cx.debug_bounds("gantt-link-refused-tip").is_none(),
+        "the refused tooltip must clear after the drop"
+    );
+    wait_for_mock_io(cx);
+    assert_eq!(
+        mock.patch_count(),
+        patches,
+        "a looping drop must not PATCH Azure DevOps"
+    );
+    assert!(!mock_has_predecessor(&runtime, &mock, 1005, 1003));
+}
+
+#[gpui_kit::test]
+fn looping_redo_toasts_and_sends_no_patch(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (runtime, mock, mut state, _dir) = loop_state_with_mock();
+    state.history.redo.push(HistoryEntry::Link {
+        successor_id: 1005,
+        predecessor_id: 1003,
+        linked: true,
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let patches = mock.patch_count();
+    let redo = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-shift-z").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    view.update(cx, |view, cx| view.handle_key(&redo, cx));
+    draw(cx);
+    wait_for_mock_io(cx);
+    view.update(cx, |view, _| {
+        let toast = view.state.toasts.items.last().expect("loop toast");
+        assert_eq!(toast.kind, ToastKind::Warning);
+        assert_eq!(toast.message, "Would loop: #1003 → #1005 → #1003");
+        assert_eq!(
+            view.state.history.redo.len(),
+            1,
+            "a refused redo must stay on the redo stack"
+        );
+        assert!(view.state.history.undo.is_empty());
+    });
+    assert_eq!(
+        mock.patch_count(),
+        patches,
+        "a looping redo must not PATCH Azure DevOps"
+    );
+    assert!(!mock_has_predecessor(&runtime, &mock, 1005, 1003));
 }

@@ -45,7 +45,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 ado-mock.workspace = true
+base64.workspace = true
 gpui-kit = { version = "0.8.1", features = ["component", "assets", "test-support"] }
+minisign = "0.10"
 tempfile.workspace = true
 
 [lints]
@@ -58,7 +60,7 @@ winresource = "0.1"
 product-name = "ADO Planner"
 identifier = "com.codeviking428.ado-planner"
 before-packaging-command = "cargo build --release -p ado-planner"
-formats = ["nsis", "appimage", "dmg"]
+formats = ["nsis", "appimage"]
 out-dir = "../../release/rust"
 binaries = [{ path = "ado-planner", main = true }]
 # Icons come from assets/icons/ado-planner.svg; regenerate with

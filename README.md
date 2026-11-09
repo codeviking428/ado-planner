@@ -16,7 +16,7 @@
   <a href="https://github.com/codeviking428/ado-planner/releases/latest"><img src="https://img.shields.io/github/v/release/codeviking428/ado-planner?label=Download&style=flat-square" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Windows-installer-0f4c81?style=flat-square" alt="Windows">
   <img src="https://img.shields.io/badge/Linux-AppImage-2ea44f?style=flat-square" alt="Linux">
-  <img src="https://img.shields.io/badge/macOS-not%20published-lightgrey?style=flat-square" alt="macOS not published">
+  <img src="https://img.shields.io/badge/macOS-not%20supported-lightgrey?style=flat-square" alt="macOS not supported">
 </p>
 
 <p align="center">
@@ -52,7 +52,7 @@ Each release also carries the native Rust app, which is replacing Electron ([ADR
 
 The installed app checks for updates on launch. Yes downloads, installs, and restarts; No snoozes until next time.
 
-macOS is not published yet. See [Publishing for Mac](#publishing-for-mac).
+There is no macOS build, and none is planned.
 
 ### Install with npm
 
@@ -154,23 +154,6 @@ Linux e2e without a desktop session: `xvfb-run -a pnpm e2e`.
 Every PR (and every push to `master`) runs lint, typecheck, Vitest, `electron-vite` build, and Playwright `_electron` e2e under Xvfb. Those e2e tests drive the packaged Electron app against a loopback ADO mock — they do not need Playwright’s Chromium/Chrome browsers.
 
 Releases go through a release PR: merging it tags `vX.Y.Z` and publishes the Electron and Rust builds to one GitHub Release. Both apps auto-update from that release. See [docs/RELEASING.md](docs/RELEASING.md).
-
-### Publishing for Mac
-
-Off for now. An unsigned `.dmg` is not a product we want to ship — Gatekeeper blocks it, and `electron-updater` on macOS expects a signed build. When we turn it back on:
-
-1. Enroll in the [Apple Developer Program](https://developer.apple.com/programs/) (~$99/year).
-2. Create a **Developer ID Application** certificate (not Apple Development / Mac App Store).
-3. Export the cert + private key as a `.p12` and add repo secrets:
-   - `CSC_LINK` — base64 of the `.p12` (or a URL electron-builder accepts)
-   - `CSC_KEY_PASSWORD` — password for that `.p12`
-   - `APPLE_ID` — Apple ID used for notarization
-   - `APPLE_APP_SPECIFIC_PASSWORD` — [app-specific password](https://support.apple.com/en-us/102654)
-   - `APPLE_TEAM_ID` — 10-character Team ID
-4. Re-add the `macos-latest` / `--mac` matrix entry in `.github/workflows/release.yml` (config for a universal DMG + zip is already in `electron-builder.yml`).
-5. No personal Mac is required to _build_ — GitHub’s `macos-latest` runner is enough. The Apple account is required to _sign and notarize_.
-
-[electron-builder code signing](https://www.electron.build/code-signing) · [notarization](https://www.electron.build/code-signing#notarization)
 
 ## Spec
 

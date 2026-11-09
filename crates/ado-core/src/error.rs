@@ -16,6 +16,8 @@ pub enum Error {
         "Azure DevOps rejected the personal access token. It may be invalid, expired, or missing access to this organization."
     )]
     PatRejected,
+    #[error("Your Microsoft sign-in has expired. Sign in again to keep planning.")]
+    SignInRequired,
     #[error("No Azure DevOps organization is configured")]
     NoOrganization,
 }

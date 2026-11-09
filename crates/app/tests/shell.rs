@@ -3,7 +3,7 @@
 use ado_planner::paths::AppPaths;
 use ado_planner::state::PlannerState;
 use ado_planner::ui::PlannerView;
-use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
+use ado_session::{EncryptedStore, MemoryStore, OauthEndpoints, PlannerSession};
 use gpui_kit::px;
 
 async fn signed_in_state() -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
@@ -453,4 +453,101 @@ fn failed_sign_in_clears_busy_state_and_allows_retry(cx: &mut gpui_kit::TestAppC
         assert!(view.state.session_info.signed_in);
     });
     assert!(cx.debug_bounds("sign-in-shell").is_none());
+}
+
+/// An Entra Session restored from disk whose access token has expired.
+fn expired_entra_state() -> (
+    tokio::runtime::Runtime,
+    ado_mock::AdoMock,
+    PlannerState,
+    tempfile::TempDir,
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("ado-mock-entra")
+        .build()
+        .expect("ado-mock Entra runtime");
+    let (mock, state, dir) = runtime.block_on(async {
+        let mock = ado_mock::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(dir.path().to_path_buf());
+        let store = EncryptedStore::new(Box::new(MemoryStore::new(true)), Some([3u8; 32]));
+        store
+            .write_plain(
+                &serde_json::json!({
+                    "access_token": "stale-access",
+                    "refresh_token": "stale-refresh",
+                    "expires_at": 1,
+                    "redirect": "http://127.0.0.1:9/",
+                    "display_name": "Ada Lovelace",
+                    "username": "ada@contoso.com"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let session = PlannerSession::oauth(store, "11111111-2222-3333-4444-555555555555".into())
+            .with_oauth_endpoints(OauthEndpoints {
+                auth_url: format!("{}/oauth2/v2.0/authorize", mock.url),
+                token_url: format!("{}{}", mock.url, ado_mock::TOKEN_PATH),
+            })
+            .with_bases(&mock.url, &mock.url)
+            .without_browser();
+        let mut state = PlannerState::new(
+            paths,
+            session,
+            Some(mock.url.clone()),
+            Some(mock.url.clone()),
+        );
+        state.session_loading = false;
+        (mock, state, dir)
+    });
+    (runtime, mock, state, dir)
+}
+
+#[gpui_kit::test]
+fn rejected_entra_refresh_returns_to_the_sign_in_card(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (_runtime, mock, state, _dir) = expired_entra_state();
+    mock.reject_token_requests();
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+
+    assert!(view.update(cx, |view, cx| view.bootstrap_for_test(cx)));
+    wait_for_idle(&view, cx);
+
+    assert_eq!(mock.request_count(ado_mock::TOKEN_PATH), 1);
+    assert_eq!(
+        mock.request_count("/_apis/"),
+        0,
+        "no Azure DevOps request goes out with the expired access token"
+    );
+    view.read_with(cx, |view, _| {
+        assert!(!view.state.session_info.signed_in);
+        assert_eq!(view.state.session_info.auth_mode, ado_core::AuthMode::Entra);
+        let message = view.state.sign_in_error.clone().expect("sign-in reason");
+        assert!(message.contains("Sign in again"), "{message}");
+        assert!(!message.contains("stale-refresh") && !message.contains("stale-access"));
+        assert!(
+            view.state.toasts.last_error_message().is_none(),
+            "the failed loads must not leave error toasts behind"
+        );
+        assert!(view.state.orgs.is_empty() && view.state.nodes.is_empty());
+    });
+    assert!(cx.debug_bounds("sign-in-shell").is_some());
+    assert!(
+        cx.debug_bounds("sign-in-error").is_some(),
+        "the Entra sign-in card explains why it is back"
+    );
+    assert!(cx.debug_bounds("signed-in-chrome").is_none());
+}
+
+#[test]
+fn entra_refresh_through_the_mock_token_endpoint_loads_the_planner() {
+    let (runtime, mock, mut state, _dir) = expired_entra_state();
+    runtime
+        .block_on(state.bootstrap())
+        .expect("refreshed bootstrap");
+    assert_eq!(mock.request_count(ado_mock::TOKEN_PATH), 1);
+    assert!(state.session_info.signed_in);
+    assert!(state.sign_in_error.is_none());
+    assert!(state.visible_nodes().iter().any(|n| n.id == 1001));
 }

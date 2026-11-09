@@ -6,14 +6,14 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ado_core::{
-    AuthMode, FLAVORS, FormControlKind, color_for_type, compact_date, dates_column_text_indexed,
-    format_date_range, identity_from_field, is_unscheduled, iso_date_only, parse_iso_date,
-    parse_user_date,
+    AuthMode, DependencyLink, FLAVORS, FormControlKind, color_for_type, compact_date,
+    dates_column_text_indexed, format_date_range, identity_from_field, is_unscheduled,
+    iso_date_only, parse_iso_date, parse_user_date,
 };
 use ado_session::PlannerSession;
 use chrono::Datelike;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{ElementExt as _, Popup, Selectable};
+use gpui_kit::base::{ElementExt as _, Popup, Selectable, TestSupportExt as _};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::Sizable;
@@ -35,9 +35,9 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     Animation, AnimationExt, AnyElement, App, ClipboardItem, Context, CursorStyle, Entity,
     FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, Role,
-    ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions,
-    div, px, rgb,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent, Render,
+    Role, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, TouchPhase,
+    Window, actions, div, px, rgb,
 };
 use jiff::ToSpan;
 
@@ -46,18 +46,18 @@ use crate::error::AppError;
 use crate::flavor_theme::apply_flavor;
 use crate::form::ado_edit_url_on;
 use crate::gantt::{
-    ASSIGNEE_COL_WIDTH, BarHitZone, CAMERA_EASE_MS, CriticalPath, DATES_COL_WIDTH,
-    DETAILS_PILL_WIDTH, DependencyArrow, EXPANDER_SLOT, GanttScale, GanttView, GestureKind,
-    HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP, LINK_HANDLE_HIT,
-    LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W, NUDGE_IDLE_MS,
-    NudgeAxis, OUTER_LINK_HIT, OUTSIDE_LABEL_H, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
+    ASSIGNEE_COL_WIDTH, ArrowState, ArrowTone, BarHitZone, CAMERA_EASE_MS, CLASH_BADGE, ClashMarks,
+    CriticalPath, DATES_COL_WIDTH, DETAILS_PILL_WIDTH, DependencyArrow, EXPANDER_SLOT, GanttScale,
+    GanttView, GestureKind, HANDLE_WIDTH, ID_COL_WIDTH, LEAF_BAR_H, LINK_HANDLE, LINK_HANDLE_GAP,
+    LINK_HANDLE_HIT, LINK_HANDLE_INSET, MILESTONE_SIZE, MIN_TIMELINE_WIDTH, NO_FIELDS_HINT_W,
+    NUDGE_IDLE_MS, NudgeAxis, OUTER_LINK_HIT, OUTSIDE_LABEL_H, OVERFLOW_BADGE, OVERFLOW_BADGE_GAP,
     PARALLEL_LANE_MIN, PLACEHOLDER_BAR_H, RESIZE_HALO_END_OUTSIDE, RESIZE_HALO_OUTSIDE, ROW_HEIGHT,
     SCALE_BUTTON_WIDTH, SELECTED_ACCENT_W, SELECTED_ROW_TINT, SPLITTER_WIDTH, SavedGanttView,
-    TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT, bar_hover_tooltip,
-    bar_label_right, bar_outside_label_frame, bar_title_is_inside, bar_title_paint_px,
-    header_label_px, offscreen_edge_chip, outside_title_right_gap, parent_date_overflow,
-    parent_overflow_tip, related_dependency_ids, timeline_is_empty_of_scheduled,
-    today_line_chip_skips, today_line_segments, today_pill_left,
+    ScheduleBadge, TIMELINE_HEADER_H, TREE_INDENT, TYPE_COL_WIDTH, UNSCHEDULED_GUTTER_RIGHT,
+    bar_hover_tooltip, bar_label_right, bar_outside_label_frame, bar_title_is_inside,
+    bar_title_paint_px, dependency_arrow_paint, header_label_px, offscreen_edge_chip,
+    outside_title_right_gap, parent_date_overflow, parent_overflow_tip, related_dependency_ids,
+    timeline_is_empty_of_scheduled, today_line_chip_skips, today_line_segments, today_pill_left,
 };
 use crate::paths::AppPaths;
 use crate::state::{
@@ -81,6 +81,7 @@ const PROGRESS_ROLLUP_TIP: &str =
 const DATES_ROLLUP_TIP: &str = "Dates roll up from children";
 const DRAG_DATE_PILL_GAP: f32 = 4.0;
 const EMPTY_GANTT_MAX_W: f32 = 480.0;
+pub const EMPTY_FILTERED_MESSAGE: &str = "No Work Items match this Team and the current filters.";
 
 fn drag_date_pill_text_width(text: &str) -> f32 {
     (text.chars().count() as f32 * 7.0 + 16.0).max(36.0)
@@ -206,6 +207,9 @@ pub struct PlannerView {
     camera_anim_gen: u64,
     pending_camera_from: Option<SavedGanttView>,
     skip_camera_anim: bool,
+    /// Camera when the current trackpad pinch started. A cancelled pinch
+    /// restores it.
+    pinch_origin: Option<SavedGanttView>,
     /// True after a drag move with the left button down. A later move with
     /// the button up then commits, covering mouse-up outside the window.
     saw_pressed_drag: bool,
@@ -582,6 +586,7 @@ impl PlannerView {
             camera_anim_gen: 0,
             pending_camera_from: None,
             skip_camera_anim: false,
+            pinch_origin: None,
             saw_pressed_drag: false,
             schedule_origin_x: None,
             pill_press_window_x: None,
@@ -1225,6 +1230,7 @@ impl PlannerView {
                 }
                 if let Err(err) = result {
                     tracing::warn!("planner action failed: {err}");
+                    self.end_session_if_signed_out(&err);
                 }
                 self.after_io_selection_change(prev_selected);
             }
@@ -1285,6 +1291,18 @@ impl PlannerView {
 
     pub fn focus_planner_for_test(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_planner(window, cx);
+    }
+
+    /// A request found the Session gone (Entra refresh rejected): drop the
+    /// planner overlays and show the sign-in card with the reason.
+    fn end_session_if_signed_out(&mut self, err: &AppError) {
+        if !err.is_sign_in_required() {
+            return;
+        }
+        self.dismiss_overlays();
+        self.form_loading = None;
+        self.state.form = None;
+        self.state.require_sign_in(err);
     }
 
     /// Search identities once typing pauses for `IDENTITY_SEARCH_DEBOUNCE`.
@@ -1351,17 +1369,22 @@ impl PlannerView {
         if self.identity_search_gen != search_gen {
             return;
         }
-        let Some(form) = self
-            .state
-            .form
-            .as_mut()
-            .filter(|form| form.model.id == form_id)
-        else {
-            return;
-        };
         match result {
-            Ok(results) => form.identity_results = results,
-            Err(err) => tracing::warn!("identity search failed: {err}"),
+            Ok(results) => {
+                if let Some(form) = self
+                    .state
+                    .form
+                    .as_mut()
+                    .filter(|form| form.model.id == form_id)
+                {
+                    form.identity_results = results;
+                }
+            }
+            Err(err) => {
+                let err = AppError::from(err);
+                tracing::warn!("identity search failed: {err}");
+                self.end_session_if_signed_out(&err);
+            }
         }
         cx.notify();
     }
@@ -1646,7 +1669,7 @@ impl PlannerView {
             .as_ref()
             .is_some_and(|gesture| gesture.kind == GestureKind::Link)
         {
-            return Some(CursorStyle::DragLink);
+            return Some(self.link_drag_cursor());
         }
         match self.hover_bar_zone.map(|(_, zone)| zone) {
             Some(BarHitZone::ResizeStart | BarHitZone::ResizeEnd) => {
@@ -1654,6 +1677,14 @@ impl PlannerView {
             }
             Some(BarHitZone::Link) => Some(CursorStyle::DragLink),
             _ => None,
+        }
+    }
+
+    fn link_drag_cursor(&self) -> CursorStyle {
+        if self.state.link_drag_refusal().is_some() {
+            CursorStyle::OperationNotAllowed
+        } else {
+            CursorStyle::DragLink
         }
     }
 
@@ -2167,6 +2198,14 @@ impl PlannerView {
         self.submit_pat(cx)
     }
 
+    /// Runs the startup bootstrap that [`Self::new`] spawns.
+    pub fn bootstrap_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.spawn_state(cx, |mut state| async move {
+            let result = state.bootstrap().await;
+            (state, result)
+        })
+    }
+
     fn render_error_banner(&self, cx: &Context<Self>) -> impl IntoElement {
         if self.banner_dismissed || self.details_overlay() {
             return div().into_any_element();
@@ -2483,6 +2522,11 @@ impl PlannerView {
         }
         self.state.gantt.context_menu = None;
         self.clear_hover_after_history(cx);
+        if self.state.refuse_looping_undo_action(&action) {
+            self.note_toasts_changed(cx);
+            self.request_repaint(None, cx);
+            return;
+        }
         self.dequeue_undone_link_save(&action);
         let original = self.state.history_action_message_for_undo(&action);
         let undid = undone_toast_message(&original);
@@ -2588,6 +2632,7 @@ impl PlannerView {
                         if let Some(msg) = working.toasts.last_error_message() {
                             this.state.toasts.push(ToastKind::Error, msg.to_string());
                         }
+                        this.end_session_if_signed_out(&err);
                     }
                     Err(_) => tracing::warn!("toast undo cancelled"),
                 }
@@ -2619,6 +2664,11 @@ impl PlannerView {
             self.request_repaint(None, cx);
             return;
         }
+        if self.state.refuse_looping_history_link(true) {
+            self.note_toasts_changed(cx);
+            self.request_repaint(None, cx);
+            return;
+        }
         self.dequeue_history_link_undo();
         self.skip_saving_hold = true;
         self.spawn_state(cx, |mut state| async move {
@@ -2639,6 +2689,11 @@ impl PlannerView {
             for save in pending {
                 self.enqueue_date_save(cx, save);
             }
+            self.note_toasts_changed(cx);
+            self.request_repaint(None, cx);
+            return;
+        }
+        if self.state.refuse_looping_history_link(false) {
             self.note_toasts_changed(cx);
             self.request_repaint(None, cx);
             return;
@@ -2689,6 +2744,48 @@ impl PlannerView {
         cx.notify();
     }
 
+    /// Trackpad pinch zooms continuously around the pointer, without the
+    /// camera ease: a pinch sends dozens of small deltas a second. Backends
+    /// that report a pinch as Ctrl+wheel reach [`Self::apply_scroll`].
+    fn apply_pinch(&mut self, event: &PinchEvent, cx: &mut Context<Self>) {
+        self.empty_timeline_hint_dismissed = true;
+        match event.phase {
+            TouchPhase::Started => {
+                self.cancel_camera_anim();
+                self.pinch_origin = Some(self.state.gantt.snapshot());
+            }
+            TouchPhase::Cancelled => {
+                if let Some(pose) = self.pinch_origin.take() {
+                    self.state.gantt.restore(pose);
+                }
+                cx.notify();
+                return;
+            }
+            TouchPhase::Ended => self.pinch_origin = None,
+            TouchPhase::Moved => {}
+        }
+        if !event.delta.is_finite() || event.delta == 0.0 {
+            return;
+        }
+        self.cancel_camera_anim();
+        self.state.gantt.clear_hover();
+        let factor = (1.0 + event.delta).clamp(0.5, 2.0);
+        let pointer = self.timeline_local_x(f32::from(event.position.x));
+        let rows = self.state.visible_rows().len();
+        let viewport_h = self.state.gantt.viewport_h;
+        let gantt = &mut self.state.gantt;
+        let timeline_width = gantt.timeline_width;
+        gantt.retarget_year_gutter(|gantt| {
+            if pointer >= 0.0 && pointer <= timeline_width {
+                gantt.zoom_at(factor, pointer, 0.0);
+            } else {
+                gantt.zoom_at_center(factor);
+            }
+            gantt.clamp_scroll(rows, viewport_h);
+        });
+        cx.notify();
+    }
+
     fn clear_canvas_hover(&mut self, cx: &mut Context<Self>) {
         if self
             .state
@@ -2732,6 +2829,19 @@ impl PlannerView {
             .text_color(cx.theme().muted_foreground)
             .child(Spinner::new().small())
             .child("Signing in and loading your projects…");
+        let mut error = self
+            .state
+            .sign_in_error
+            .clone()
+            .filter(|_| !busy)
+            .map(|message| {
+                div()
+                    .id("sign-in-error")
+                    .debug_selector(|| "sign-in-error".into())
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .child(message)
+            });
         v_flex()
             .id("sign-in-shell")
             .debug_selector(|| "sign-in-shell".into())
@@ -2779,19 +2889,7 @@ impl PlannerView {
                                 )
                                 .child(Label::new("Personal access token"))
                                 .child(Input::new(&self.pat_input).id("pat-input").disabled(busy))
-                                .when_some(
-                                    self.state.sign_in_error.clone().filter(|_| !busy),
-                                    |el, message| {
-                                        el.child(
-                                            div()
-                                                .id("sign-in-error")
-                                                .debug_selector(|| "sign-in-error".into())
-                                                .text_sm()
-                                                .text_color(cx.theme().danger)
-                                                .child(message),
-                                        )
-                                    },
-                                )
+                                .when_some(error.take(), |el, error| el.child(error))
                                 .child(
                                     Button::new("sign-in")
                                         .primary()
@@ -2804,18 +2902,19 @@ impl PlannerView {
                         )
                     })
                     .when(!pat_mode, |el| {
-                        el.child(
-                            Button::new("sign-in")
-                                .primary()
-                                .label(if busy { "Signing in…" } else { "Sign in" })
-                                .loading(busy)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.spawn_state(cx, |mut state| async move {
-                                        let result = state.login_entra().await;
-                                        (state, result)
-                                    });
-                                })),
-                        )
+                        el.when_some(error.take(), |el, error| el.child(error))
+                            .child(
+                                Button::new("sign-in")
+                                    .primary()
+                                    .label(if busy { "Signing in…" } else { "Sign in" })
+                                    .loading(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.spawn_state(cx, |mut state| async move {
+                                            let result = state.login_entra().await;
+                                            (state, result)
+                                        });
+                                    })),
+                            )
                     })
                     .when(busy, |el| el.child(status)),
             )
@@ -3423,6 +3522,7 @@ impl PlannerView {
             .visible_window(&visible.rows, content_h)
             .to_vec();
         let bars = visible.layout_bars(&self.state, content_h);
+        let clash_marks = visible.clash_marks(&self.state, &bars);
         let body_box = self.gantt_body_box.clone();
         let entity_id = cx.entity_id();
         let gantt = v_flex()
@@ -3504,7 +3604,14 @@ impl PlannerView {
                                 }),
                             ),
                     )
-                    .child(self.render_timeline(&visible.nodes, &window, &bars, content_h, cx))
+                    .child(self.render_timeline(
+                        &visible.nodes,
+                        &window,
+                        &bars,
+                        &clash_marks,
+                        content_h,
+                        cx,
+                    ))
                     .when(empty_canvas && !self.state.hierarchy_loading, |el| {
                         el.child(
                             div()
@@ -3572,8 +3679,7 @@ impl PlannerView {
         let message = if let Some(error) = self.state.team_settings_error.as_ref() {
             error.clone()
         } else if filtered {
-            let noun = if hidden == 1 { "item" } else { "items" };
-            format!("{hidden} {noun} hidden by filters")
+            EMPTY_FILTERED_MESSAGE.to_string()
         } else if team.is_empty() {
             "Choose a team to load work items.".into()
         } else {
@@ -3590,7 +3696,22 @@ impl PlannerView {
             .text_center()
             .px_8()
             .gap_2()
-            .child(Label::new(message))
+            .child(
+                div()
+                    .id("empty-gantt-message")
+                    .role(Role::Status)
+                    .aria_label(message.clone())
+                    .child(Label::new(message))
+                    .test_support(),
+            )
+            .when(filtered && hidden > 0, |el| {
+                let noun = if hidden == 1 { "item" } else { "items" };
+                el.child(
+                    Label::new(format!("{hidden} {noun} hidden by filters"))
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                )
+            })
             .when(filtered, |el| {
                 el.child(
                     div()
@@ -3894,6 +4015,7 @@ impl PlannerView {
                 && parse_iso_date(node.target_date.as_deref()).is_some()
         });
         let selected = self.state.gantt.show_critical_path;
+        let show_arrows = self.state.show_arrows();
         let trigger = div()
             .id("gantt-toolbar-more")
             .debug_selector(|| "gantt-toolbar-more".into())
@@ -3940,6 +4062,41 @@ impl PlannerView {
                                         this.toolbar_more_open = false;
                                         this.state.gantt.clear_hover();
                                         this.open_create(this.state.gantt.selected_id, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("gantt-show-arrows")
+                            .debug_selector(|| "gantt-show-arrows".into())
+                            .w_full()
+                            .child(
+                                Button::new("show-arrows")
+                                    .accessibility_label("Show arrows")
+                                    .when(show_arrows, |btn| {
+                                        btn.child(
+                                            div()
+                                                .debug_selector(|| {
+                                                    "gantt-show-arrows-check".into()
+                                                })
+                                                .child("✓"),
+                                        )
+                                    })
+                                    .child("Show arrows")
+                                    .compact()
+                                    .toggled(show_arrows)
+                                    .selected(show_arrows)
+                                    .when(show_arrows, |btn| btn.primary())
+                                    .when(!show_arrows, |btn| btn.ghost())
+                                    .tooltip(
+                                        "Show Dependency arrows. Clash and Critical path arrows always show.",
+                                    )
+                                    .tooltip_placement(Placement::Bottom)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toolbar_more_open = false;
+                                        let show = !this.state.show_arrows();
+                                        this.state.set_show_arrows(show);
+                                        cx.notify();
                                     })),
                             ),
                     )
@@ -4191,6 +4348,9 @@ impl PlannerView {
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         this.apply_scroll(event, cx);
                     }))
+                    .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                        this.apply_pinch(event, cx);
+                    }))
                     .child(
                         v_flex()
                             .mt(px(-remainder))
@@ -4226,6 +4386,7 @@ impl PlannerView {
                                     || self.pending_delete.is_some()
                                     || self.pending_create.is_some();
                                 let row_selector = format!("gantt-tree-row-{id}");
+                                let anchor = row_tooltip_anchor(self.state.gantt.row_y(offset));
                                 div()
                                     .id(("work-item", id as u64))
                                     .debug_selector(move || row_selector.clone())
@@ -4395,7 +4556,7 @@ impl PlannerView {
                                                         ),
                                                     ),
                                             )
-                                            .child(self.title_cell(id, &title, selected, cx))
+                                            .child(self.title_cell(id, &title, anchor, cx))
                                             .child(
                                                 div()
                                                     .id(("gantt-details-slot", id as u64))
@@ -4406,7 +4567,7 @@ impl PlannerView {
                                                     .flex()
                                                     .items_center()
                                                     .when(!editing_title, |el| {
-                                                        el.child(self.open_details_icon(id, cx))
+                                                        el.child(self.open_details_icon(id, anchor, cx))
                                                     }),
                                             )
                                             .when(show_type, |el| {
@@ -4443,13 +4604,13 @@ impl PlannerView {
             )
     }
 
-    fn open_details_icon(&self, id: i64, cx: &Context<Self>) -> impl IntoElement {
+    fn open_details_icon(&self, id: i64, anchor: u64, cx: &Context<Self>) -> impl IntoElement {
         div()
             .id(("gantt-open-details", id as u64))
             .debug_selector(|| "gantt-open-details".into())
             .flex_shrink_0()
             .child(
-                Button::new(("open-details", id as u64))
+                Button::new(("open-details", anchor))
                     .ghost()
                     .compact()
                     .tab_stop(false)
@@ -4507,7 +4668,7 @@ impl PlannerView {
         &self,
         id: i64,
         title: &str,
-        _selected: bool,
+        anchor: u64,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         if self.inline_edit == Some(InlineEdit::Title(id)) {
@@ -4541,7 +4702,7 @@ impl PlannerView {
                 this.set_hovered(Some(id), cx);
             }))
             .child(
-                Button::new(("title-tip", id as u64))
+                Button::new(("title-tip", anchor))
                     .ghost()
                     .compact()
                     .tab_stop(false)
@@ -4969,6 +5130,7 @@ impl PlannerView {
         nodes: &[ado_core::WorkItemNode],
         window: &[crate::gantt::VisibleRow],
         bars: &[crate::gantt::BarLayout],
+        clash_marks: &ClashMarks,
         content_h: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -5070,6 +5232,9 @@ impl PlannerView {
             .bg(cx.theme().background)
             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                 this.apply_scroll(event, cx);
+            }))
+            .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                this.apply_pinch(event, cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,
@@ -5276,10 +5441,27 @@ impl PlannerView {
                         self.render_open_ended_cue(bar, cx)
                     }))
                     .children({
+                        let show_arrows = self.state.show_arrows();
                         let arrows = self.state.gantt.layout_dependency_arrows(bars);
-                        arrows.into_iter().map(|arrow| {
-                            self.render_dependency_arrow(&arrow, bars, &path, &related_ids, cx)
-                        })
+                        arrows
+                            .into_iter()
+                            .filter(|arrow| {
+                                let link = (arrow.from_id, arrow.to_id);
+                                show_arrows
+                                    || clash_marks.links.contains(&link)
+                                    || path.links.contains(&link)
+                            })
+                            .map(|arrow| {
+                                self.render_dependency_arrow(
+                                    &arrow,
+                                    bars,
+                                    &path,
+                                    &clash_marks.links,
+                                    &related_ids,
+                                    cx,
+                                )
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .children({
                         // After arrows/cues so the line stays continuous
@@ -5343,6 +5525,14 @@ impl PlannerView {
                         // After connectors so a short bar's end ring is not
                         // hidden under the outgoing stub.
                         self.render_gantt_link_handles(bar, dragging, cx)
+                    }))
+                    .children(bars.iter().filter_map(|bar| {
+                        let badge = clash_marks.badges.get(&bar.id)?;
+                        // Off-screen bars already carry an edge chip.
+                        if crate::gantt::bar_offscreen_edge(bar, width).is_some() {
+                            return None;
+                        }
+                        Some(self.render_schedule_badge(bar, badge, cx))
                     }))
                     .children({
                         let rubber = self.state.gantt.gesture.as_ref().and_then(|gesture| {
@@ -5532,6 +5722,9 @@ impl PlannerView {
                                         .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                                             this.dismiss_empty_timeline_hint();
                                             this.apply_scroll(event, cx);
+                                        }))
+                                        .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                                            this.apply_pinch(event, cx);
                                         }))
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -5788,6 +5981,7 @@ impl PlannerView {
                     )
                 })
             })
+            .children(self.render_link_refused_tip(bars, width, cx))
             .when(
                 self.state
                     .gantt
@@ -5802,9 +5996,12 @@ impl PlannerView {
                             .absolute()
                             .inset_0()
                             .occlude()
-                            .cursor(CursorStyle::DragLink)
+                            .cursor(self.link_drag_cursor())
                             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                                 this.apply_scroll(event, cx);
+                            }))
+                            .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                                this.apply_pinch(event, cx);
                             }))
                             .on_mouse_move(cx.listener(
                                 |this, event: &MouseMoveEvent, window, cx| {
@@ -5831,6 +6028,45 @@ impl PlannerView {
                     this.release_bar_gesture(x, y, window, cx);
                 }),
             )
+    }
+
+    /// Same-row chip naming why the hovered link target is refused.
+    fn render_link_refused_tip(
+        &self,
+        bars: &[crate::gantt::BarLayout],
+        width: f32,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let (target, text) = self.state.link_drag_refusal()?;
+        let bar = bars.iter().find(|bar| bar.id == target)?;
+        let painted_w = if bar.milestone || bar.marker {
+            MILESTONE_SIZE
+        } else {
+            bar.width.max(8.0)
+        };
+        let tip_w = (text.chars().count() as f32 * 7.0 + 24.0).max(48.0);
+        let extra = drag_preview_row_extra(bar, parent_date_overflow(&self.state.nodes, bar.id));
+        let left = row_side_tooltip_left(bar.x, painted_w, extra, tip_w, width);
+        let top = TIMELINE_HEADER_H + bar.y + ((ROW_HEIGHT - 22.0) / 2.0).max(2.0);
+        Some(
+            div()
+                .debug_selector(|| "gantt-link-refused-tip".into())
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .px_2()
+                .py(px(3.))
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().danger)
+                .bg(cx.theme().popover)
+                .text_color(cx.theme().popover_foreground)
+                .text_xs()
+                .whitespace_nowrap()
+                .shadow_md()
+                .child(text)
+                .into_any_element(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5866,6 +6102,9 @@ impl PlannerView {
                 .gesture
                 .as_ref()
                 .is_some_and(|gesture| gesture.id == id && gesture.kind != GestureKind::Link);
+        let link_refused = self.state.gantt.gesture.as_ref().is_some_and(|gesture| {
+            gesture.kind == GestureKind::Link && gesture.link_to == Some(id)
+        }) && self.state.link_drag_refusal().is_some();
         let can_resize = bar.can_resize();
         let bar_h = bar.paint_h();
         let bar_top = bar.paint_top();
@@ -6146,6 +6385,18 @@ impl PlannerView {
                         )
                     },
                 )
+                .when(link_refused, |el| {
+                    el.child(
+                        div()
+                            .debug_selector(move || format!("gantt-link-refused-{id}"))
+                            .absolute()
+                            .inset_0()
+                            .when(milestone || marker || summary, |el| el.rounded_md())
+                            .when(!milestone && !marker && !summary, |el| el.rounded_full())
+                            .border_2()
+                            .border_color(cx.theme().danger),
+                    )
+                })
                 .children(self.bar_inner_resize_grips(bar, dragging, cx))
                 .children(self.bar_summary_edge_affordances(bar, dragging, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -6458,6 +6709,9 @@ impl PlannerView {
                 .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                     this.apply_scroll(event, cx);
                 }))
+                .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                    this.apply_pinch(event, cx);
+                }))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_bar_hovered(Some(id), cx);
@@ -6578,6 +6832,9 @@ impl PlannerView {
                     .cursor(CursorStyle::ResizeLeftRight)
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         this.apply_scroll(event, cx);
+                    }))
+                    .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                        this.apply_pinch(event, cx);
                     }))
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
@@ -6850,6 +7107,9 @@ impl PlannerView {
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         this.apply_scroll(event, cx);
                     }))
+                    .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                        this.apply_pinch(event, cx);
+                    }))
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.set_bar_hovered(Some(id), cx);
@@ -6968,6 +7228,9 @@ impl PlannerView {
                 .occlude()
                 .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                     this.apply_scroll(event, cx);
+                }))
+                .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                    this.apply_pinch(event, cx);
                 }))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
@@ -7176,6 +7439,55 @@ impl PlannerView {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// Warning `!` on the successor's start edge, painted above the grips so
+    /// its tooltip gets hover. It does not occlude, so a press on it still
+    /// reaches the resize grip and link handle underneath.
+    fn render_schedule_badge(
+        &self,
+        bar: &crate::gantt::BarLayout,
+        badge: &ScheduleBadge,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let id = bar.id;
+        let lines = badge.lines();
+        let timeline_w = self.state.gantt.timeline_width.max(1.0);
+        let left = (bar.x - CLASH_BADGE / 2.0).clamp(0.0, (timeline_w - CLASH_BADGE).max(0.0));
+        let top = bar.y + (bar.paint_top() - CLASH_BADGE / 2.0).max(1.0);
+        div()
+            .id(("gantt-clash-badge", id as u64))
+            .debug_selector(move || format!("gantt-clash-badge-{id}"))
+            .role(Role::Image)
+            .aria_label(badge.accessibility_label())
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .size(px(CLASH_BADGE))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(cx.theme().warning)
+            .text_color(cx.theme().background)
+            .text_size(px(11.))
+            .line_height(px(CLASH_BADGE))
+            .font_weight(gpui_kit::FontWeight::BOLD)
+            .child("!")
+            .tooltip(move |window, cx| {
+                let lines = lines.clone();
+                Tooltip::element(move |_, _| {
+                    v_flex().children(lines.iter().map(|line| {
+                        let selector = format!("gantt-clash-tip: {line}");
+                        div()
+                            .debug_selector(move || selector)
+                            .whitespace_nowrap()
+                            .child(line.clone())
+                    }))
+                })
+                .build(window, cx)
+            })
+            .into_any_element()
     }
 
     /// Dates chip after the title overlay so short-bar / milestone titles
@@ -7583,6 +7895,9 @@ impl PlannerView {
                 .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                     this.apply_scroll(event, cx);
                 }))
+                .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                    this.apply_pinch(event, cx);
+                }))
                 .on_click(
                     cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
                         this.state.gantt.select_row(id);
@@ -7604,6 +7919,7 @@ impl PlannerView {
         arrow: &DependencyArrow,
         bars: &[crate::gantt::BarLayout],
         path: &CriticalPath,
+        clashes: &HashSet<DependencyLink>,
         related_ids: &HashSet<i64>,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -7611,20 +7927,27 @@ impl PlannerView {
         let hovered = self.state.gantt.hovered_link == Some((arrow.from_id, arrow.to_id));
         let related = related_ids.contains(&arrow.from_id) && related_ids.contains(&arrow.to_id);
         let on_critical = path.links.contains(&(arrow.from_id, arrow.to_id));
-        let color = if on_critical {
-            cx.theme().danger
-        } else if selected || hovered || related {
-            cx.theme().primary
-        } else if self.state.gantt.show_critical_path {
-            cx.theme().primary.opacity(0.28)
-        } else {
-            cx.theme().primary.opacity(0.7)
+        let paint = dependency_arrow_paint(ArrowState {
+            clash: clashes.contains(&(arrow.from_id, arrow.to_id)),
+            on_critical,
+            focused: selected || hovered,
+            related,
+            critical_path_on: self.state.gantt.show_critical_path,
+        });
+        let color = match paint.tone {
+            ArrowTone::Clash => cx.theme().warning,
+            ArrowTone::Critical => cx.theme().danger,
+            ArrowTone::Emphasis => cx.theme().primary,
+            ArrowTone::Dimmed => cx.theme().primary.opacity(0.28),
+            ArrowTone::Plain => cx.theme().primary.opacity(0.7),
         };
-        let stroke = if selected || hovered || on_critical {
-            3.0
-        } else {
-            2.0
-        };
+        let stroke = paint.stroke;
+        let tone_selector = format!(
+            "gantt-arrow-{}-{}-{}",
+            arrow.from_id,
+            arrow.to_id,
+            paint.tone.as_str()
+        );
         let stub_start = arrow.stub_start();
         let gutter_y = arrow.gutter_y();
         let wrap = arrow.wraps_around_successor();
@@ -7646,6 +7969,7 @@ impl PlannerView {
         let (gutter_left, gutter_h) = inset_span(arrow.x2, stub_start, gutter_r, gutter_r);
         let (drop_top, drop) = inset_span(gutter_y, arrow.y2, drop_r, drop_r);
         div()
+            .debug_selector(move || tone_selector)
             .absolute()
             .left(px(min_x))
             .top(px(min_y))
@@ -10250,6 +10574,7 @@ impl PlannerView {
                                 this.state.toasts.push(ToastKind::Error, msg.to_string());
                             }
                             tracing::warn!("planner action failed: {err}");
+                            this.end_session_if_signed_out(&err);
                         }
                     }
                 }
@@ -10661,6 +10986,7 @@ impl PlannerView {
         match self.hover_cursor_style() {
             Some(CursorStyle::ResizeLeftRight) => Some("ew-resize"),
             Some(CursorStyle::DragLink) => Some("drag-link"),
+            Some(CursorStyle::OperationNotAllowed) => Some("not-allowed"),
             Some(_) => Some("other"),
             None => None,
         }
@@ -11947,6 +12273,16 @@ fn link_preview_head(
     }
 }
 
+/// Element key for a tree row's tooltip trigger. The tooltip overlay keeps
+/// the bounds it saw on hover-enter, and a row that scrolls, collapses or
+/// filters under a still pointer never leaves hover, so its tooltip would
+/// stay where the row was, over other rows. Keyed by the painted y, a moved
+/// row is a new trigger: the old tooltip hides and a new one anchors to the
+/// row's current bounds.
+fn row_tooltip_anchor(row_y: f32) -> u64 {
+    u64::from(row_y.to_bits())
+}
+
 fn bar_title_chip(title: String, _ink: gpui_kit::Hsla, truncate: bool) -> gpui_kit::Div {
     // Same boxed chip at every scale: a light fill and dark ink, whether the
     // title sits inside the bar or beside it. Per-scale invert/plain mixes
@@ -12206,7 +12542,7 @@ impl Render for PlannerView {
                     .as_ref()
                     .is_some_and(|gesture| gesture.kind == GestureKind::Link)
                     || matches!(self.hover_bar_zone, Some((_, BarHitZone::Link))),
-                |el| el.cursor(CursorStyle::DragLink),
+                |el| el.cursor(self.link_drag_cursor()),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
                 let x: f32 = event.position.x.into();

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use ado_client::{AdoClient, AuthScheme, StaticTokens};
-use ado_core::{ScopeSelection, build_replace_dates_patch, build_start_target_patch};
+use ado_core::{
+    JsonPatchOp, PatchOp, ScopeSelection, build_replace_dates_patch, build_start_target_patch,
+};
+use serde_json::json;
 
 fn tokens(scheme: AuthScheme, org: Option<&str>) -> Arc<StaticTokens> {
     Arc::new(StaticTokens {
@@ -163,6 +166,158 @@ async fn remove_dependency_uses_the_server_rev() {
     ado.remove_dependency("contoso", "Shop", 1005, 1003, 1)
         .await
         .expect("stale caller rev must not 412");
+}
+
+fn pat_client(mock: &ado_mock::AdoMock) -> AdoClient {
+    AdoClient::with_base_urls(
+        tokens(AuthScheme::Pat, Some("contoso")),
+        &mock.url,
+        &mock.url,
+    )
+}
+
+fn add_field(field: &str, value: serde_json::Value) -> JsonPatchOp {
+    JsonPatchOp {
+        op: PatchOp::Add,
+        path: format!("/fields/{field}"),
+        value: Some(value),
+    }
+}
+
+#[tokio::test]
+async fn ping_org_and_get_work_item_rev() {
+    let mock = ado_mock::start().await;
+    let ado = pat_client(&mock);
+    ado.ping_org("contoso").await.expect("ping");
+    assert_eq!(mock.request_count("/contoso/_apis/projects?$top=1"), 1);
+
+    let rev = ado
+        .get_work_item_rev("contoso", "Shop", 1003)
+        .await
+        .expect("rev");
+    assert_eq!(rev, 5);
+
+    let err = ado
+        .get_work_item_rev("contoso", "Shop", 9999)
+        .await
+        .expect_err("missing item");
+    assert!(err.to_string().contains("404"), "{err}");
+}
+
+#[tokio::test]
+async fn create_work_item_with_parent() {
+    let mock = ado_mock::start().await;
+    let ado = pat_client(&mock);
+    let parent_url = ado.work_item_api_url("contoso", "Shop", 1002);
+    let node = ado
+        .create_work_item(
+            "contoso",
+            "Shop",
+            "User Story",
+            &[
+                add_field("System.Title", json!("Checkout redesign")),
+                add_field("System.AreaPath", json!("Shop\\Platform")),
+                add_field("System.IterationPath", json!("Shop\\Sprint 10")),
+                JsonPatchOp {
+                    op: PatchOp::Add,
+                    path: "/relations/-".into(),
+                    value: Some(json!({
+                        "rel": "System.LinkTypes.Hierarchy-Reverse",
+                        "url": parent_url,
+                    })),
+                },
+            ],
+        )
+        .await
+        .expect("create");
+
+    assert!(node.id > 2003, "id after the fixtures, got {}", node.id);
+    assert_eq!(node.rev, 1);
+    assert_eq!(node.title, "Checkout redesign");
+    assert_eq!(node.work_item_type, "User Story");
+    assert_eq!(node.area_path, "Shop\\Platform");
+    assert_eq!(node.iteration_path, "Shop\\Sprint 10");
+    assert_eq!(node.parent_id, Some(1002));
+    assert_eq!(
+        mock.mutating_writes(),
+        vec![(
+            "POST".to_string(),
+            "/contoso/Shop/_apis/wit/workitems/$User%20Story".to_string()
+        )]
+    );
+
+    let stored = mock.work_item(node.id).await.expect("stored");
+    assert_eq!(stored["fields"]["System.Title"], "Checkout redesign");
+    assert_eq!(stored["fields"]["System.Parent"], 1002);
+}
+
+#[tokio::test]
+async fn create_work_item_injected_failure() {
+    let mock = ado_mock::start().await;
+    mock.fail_next(
+        "/workitems/$Task",
+        400,
+        "TF401320: Rule error for field Title",
+    );
+    let ado = pat_client(&mock);
+    let err = ado
+        .create_work_item(
+            "contoso",
+            "Shop",
+            "Task",
+            &[add_field("System.Title", json!(""))],
+        )
+        .await
+        .expect_err("injected");
+    let text = err.to_string();
+    assert!(text.contains("400"), "{text}");
+    assert!(text.contains("TF401320"), "{text}");
+    assert!(!err.is_precondition_failed());
+}
+
+#[tokio::test]
+async fn delete_work_item_removes_it() {
+    let mock = ado_mock::start().await;
+    let ado = pat_client(&mock);
+    ado.delete_work_item("contoso", "Shop", 1014)
+        .await
+        .expect("delete");
+    assert!(mock.work_item(1014).await.is_none());
+    assert_eq!(
+        mock.mutating_writes(),
+        vec![(
+            "DELETE".to_string(),
+            "/contoso/Shop/_apis/wit/workitems/1014".to_string()
+        )]
+    );
+
+    let err = ado
+        .delete_work_item("contoso", "Shop", 1014)
+        .await
+        .expect_err("already deleted");
+    assert!(err.to_string().contains("404"), "{err}");
+}
+
+#[tokio::test]
+async fn delete_work_item_injected_failure() {
+    let mock = ado_mock::start().await;
+    mock.fail_next(
+        "/workitems/1014",
+        403,
+        "TF401027: You need Delete work items",
+    );
+    let ado = pat_client(&mock);
+    let err = ado
+        .delete_work_item("contoso", "Shop", 1014)
+        .await
+        .expect_err("injected");
+    let text = err.to_string();
+    assert!(text.contains("403"), "{text}");
+    assert!(text.contains("TF401027"), "{text}");
+    assert!(
+        mock.work_item(1014).await.is_some(),
+        "a failed delete must leave the item in place"
+    );
 }
 
 #[tokio::test]

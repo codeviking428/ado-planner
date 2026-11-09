@@ -4,7 +4,8 @@ use std::time::Duration;
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, RequestTokenError, Scope,
+    TokenResponse, TokenUrl,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -158,19 +159,34 @@ pub async fn exchange_code(
     Ok(stored_from_token(&token, redirect))
 }
 
+#[derive(Debug)]
+pub enum RefreshError {
+    /// The token endpoint answered with an OAuth error such as `invalid_grant`.
+    /// Only an interactive sign-in can recover.
+    Rejected,
+    /// The request never got an OAuth answer (offline, timeout, bad body).
+    /// The refresh token may still be good.
+    Unavailable(Error),
+}
+
 pub async fn refresh(
     client_id: &str,
     endpoints: &OauthEndpoints,
     redirect: &str,
     refresh_token: &str,
-) -> Result<StoredOauth, Error> {
-    let oauth = client(client_id, endpoints, redirect)?;
-    let http = http_client()?;
+) -> Result<StoredOauth, RefreshError> {
+    let oauth = client(client_id, endpoints, redirect).map_err(RefreshError::Unavailable)?;
+    let http = http_client().map_err(RefreshError::Unavailable)?;
     let token = oauth
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
         .request_async(&http)
         .await
-        .map_err(|err| Error::message(err.to_string()))?;
+        .map_err(|err| match err {
+            RequestTokenError::ServerResponse(_) => RefreshError::Rejected,
+            other => RefreshError::Unavailable(Error::message(format!(
+                "Could not refresh the Microsoft sign-in: {other}"
+            ))),
+        })?;
     Ok(stored_from_token(&token, redirect))
 }
 
