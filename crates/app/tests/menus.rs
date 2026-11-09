@@ -544,6 +544,50 @@ fn row_menu_fits_inside_the_window_near_the_bottom(cx: &mut gpui_kit::TestAppCon
 }
 
 #[gpui_kit::test]
+fn row_menu_scrolls_inside_a_short_window(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::{ScrollDelta, ScrollEvent, point, px};
+    let app = MockApp::start();
+    let (view, cx) = planner(cx, &app);
+    let window_h = 480.0;
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(window_h),
+    });
+    support::draw(cx);
+    right_click(cx, "gantt-tree-row-1005");
+    let menu = support::bounds(cx, "gantt-context-menu");
+    assert!(
+        f32::from(menu.origin.y + menu.size.height) <= window_h,
+        "the menu must end inside a {window_h}px window, got {menu:?}"
+    );
+    let open = support::bounds(cx, "gantt-menu-Open");
+    assert!(
+        f32::from(open.size.height) >= 32.0,
+        "items keep their height instead of squeezing, got {open:?}"
+    );
+    for _ in 0..10 {
+        cx.simulate_event(ScrollEvent {
+            position: menu.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            ..Default::default()
+        });
+    }
+    support::draw(cx);
+    let last = support::bounds(cx, "gantt-menu-Hide this state");
+    assert!(
+        f32::from(last.origin.y + last.size.height) <= window_h,
+        "scrolling the menu brings Hide this state into the window, got {last:?}"
+    );
+    click(cx, "gantt-menu-Hide this state");
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.state.prefs.planner.hidden_states,
+            vec!["New".to_string()]
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn bar_menu_has_no_hide_filters(cx: &mut gpui_kit::TestAppContext) {
     let app = MockApp::start();
     let (_view, cx) = planner(cx, &app);

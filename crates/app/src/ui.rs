@@ -8796,6 +8796,8 @@ impl PlannerView {
             .x
             .clamp(8.0, (self.state.gantt.viewport_w - menu_w).max(8.0));
         let y = target.y.clamp(72.0, (window_h - menu_h - 8.0).max(72.0));
+        // Below the header there may not be room for every item; scroll then.
+        let max_h = (window_h - y - 8.0).max(context_menu_height(1));
         v_flex()
             .id("gantt-context-menu")
             .debug_selector(|| "gantt-context-menu".into())
@@ -8814,6 +8816,8 @@ impl PlannerView {
             .left(px(x))
             .top(px(y))
             .w(px(menu_w))
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .p_1()
             .gap_1()
             .border_1()
@@ -8910,6 +8914,7 @@ impl PlannerView {
         div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector.clone())
+            .flex_shrink_0()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
