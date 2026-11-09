@@ -1,4 +1,4 @@
-//! Ports sign-in, scope, filter and persistence cases from `e2e/app.spec.ts`.
+//! Sign-in, scope, filter and persistence cases against `ado-mock`.
 
 use ado_planner::paths::AppPaths;
 use ado_planner::state::PlannerState;

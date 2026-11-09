@@ -8446,7 +8446,7 @@ mod tests {
         ]
     }
 
-    /// `e2e/fixtures/work-items.json` topology: Persist cart → spike already
+    /// `crates/ado-mock/fixtures/work-items.json` topology: Persist cart → spike already
     /// exists; Persist cart → Go-live is the runtime handle-drop.
     fn live_fixture_nodes() -> Vec<WorkItemNode> {
         let mut nodes = mock_fixture_nodes();

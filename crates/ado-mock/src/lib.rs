@@ -1,4 +1,4 @@
-//! Loopback Azure DevOps REST mock. Fixture JSON is shared with the TypeScript mock.
+//! Loopback Azure DevOps REST mock serving the JSON in `crates/ado-mock/fixtures`.
 
 mod fixtures;
 mod server;

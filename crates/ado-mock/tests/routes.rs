@@ -2,7 +2,7 @@ use ado_core::{START_DATE_FIELD, TARGET_DATE_FIELD};
 use serde_json::{Value, json};
 
 fn fixtures(name: &str) -> Value {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../e2e/fixtures");
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
     let text = std::fs::read_to_string(dir.join(name)).expect("fixture");
     serde_json::from_str(&text).expect("json")
 }
