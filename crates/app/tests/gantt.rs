@@ -3037,3 +3037,75 @@ fn ui_failed_save_drops_presses_made_while_it_was_in_flight(cx: &mut gpui_kit::T
     });
     assert_eq!(app.mock.patch_count(), before);
 }
+
+const CART: i64 = 1002;
+
+fn shift_drag_bar_by_days(
+    view: &gpui_kit::Entity<ado_planner::ui::PlannerView>,
+    cx: &mut gpui_kit::VisualTestContext,
+    selector: &'static str,
+    days: f32,
+) {
+    use gpui_kit::{Modifiers, MouseButton, point, px};
+    let ppd = view.read_with(cx, |view, _| {
+        view.state.gantt.scale.pixels_per_day(view.state.gantt.zoom)
+    });
+    let start = support::bounds(cx, selector).center();
+    let end = point(start.x + px(ppd * days), start.y);
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    cx.simulate_mouse_move(start, None, shift);
+    cx.simulate_mouse_down(start, MouseButton::Left, shift);
+    support::draw(cx);
+    cx.simulate_mouse_move(end, Some(MouseButton::Left), shift);
+    support::draw(cx);
+    cx.simulate_mouse_up(end, MouseButton::Left, shift);
+    support::draw(cx);
+}
+
+#[gpui_kit::test]
+fn ui_failed_shift_drag_restores_children_of_coalesced_drags_behind_it(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let app = MockApp::start();
+    let mut state = app.signed_in();
+    state.gantt.scale = GanttScale::Month;
+    let (view, cx) = support::open(cx, state);
+    let family = [CART, PERSIST_CART, 1005];
+    let original: Vec<_> = view.read_with(cx, |view, _| {
+        family.iter().map(|id| node_dates(view, *id)).collect()
+    });
+    let before = app.mock.patch_count();
+    let gate = app
+        .mock
+        .hold_next(&format!("/workitems/{CART}"), Some((503, "save failed")));
+    for _ in 0..3 {
+        shift_drag_bar_by_days(&view, cx, "gantt-bar-1002", 3.0);
+    }
+    view.read_with(cx, |view, _| {
+        assert!(view.io_pending(), "the first Cart PATCH is held");
+        let moved: Vec<_> = family.iter().map(|id| node_dates(view, *id)).collect();
+        assert_ne!(
+            moved, original,
+            "the Shift-drags move Cart and its children"
+        );
+    });
+    gate.release();
+    settle(&view, cx, "the failed Cart PATCH", |view| {
+        view.state.toasts.last_error_message().is_some()
+    });
+    view.read_with(cx, |view, _| {
+        let restored: Vec<_> = family.iter().map(|id| node_dates(view, *id)).collect();
+        assert_eq!(
+            restored, original,
+            "Cart and every child return to the dates Azure DevOps has"
+        );
+    });
+    assert_eq!(
+        app.mock.patch_count(),
+        before,
+        "no parent or child PATCH is built on dates that never saved"
+    );
+}

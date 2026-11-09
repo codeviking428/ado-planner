@@ -10754,11 +10754,16 @@ impl PlannerView {
                                     this.state.toasts.dismiss_undo();
                                 }
                             }
-                            for save in &chained {
-                                this.restore_matching_cascade(&save.cascade);
+                            // Newest first, so a child already restored to an
+                            // earlier drag's dates still matches that drag's cascade.
+                            for save in chained.iter().rev() {
+                                this.restore_cascades_with_absorbed(save);
                             }
                             if role == DateSaveRole::Commit {
                                 this.restore_matching_cascade(&kids);
+                                for absorbed in revert.absorbed.iter().rev() {
+                                    this.restore_matching_cascade(&absorbed.cascade);
+                                }
                             }
                             if let Some(msg) = working.toasts.last_error_message() {
                                 this.state.toasts.push(ToastKind::Error, msg.to_string());
@@ -10773,6 +10778,13 @@ impl PlannerView {
             });
         })
         .detach();
+    }
+
+    fn restore_cascades_with_absorbed(&mut self, save: &PendingDateSave) {
+        self.restore_matching_cascade(&save.cascade);
+        for absorbed in save.absorbed.iter().rev() {
+            self.restore_matching_cascade(&absorbed.cascade);
+        }
     }
 
     fn revert_date_save_with_absorbed(&mut self, save: &PendingDateSave) {

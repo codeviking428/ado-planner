@@ -239,8 +239,17 @@ impl PendingDateSave {
             && self.previous.target_date == dropped.after_target
         {
             self.previous = dropped.previous.clone();
+            // Same for Shift-drag children the dropped save had already moved.
+            for child in &mut self.cascade {
+                if let Some(earlier) = dropped.cascade.iter().find(|earlier| {
+                    earlier.id == child.id
+                        && earlier.after_start == child.previous.start_date
+                        && earlier.after_target == child.previous.target_date
+                }) {
+                    child.previous = earlier.previous.clone();
+                }
+            }
             self.absorbed.append(&mut dropped.absorbed);
-            dropped.cascade.clear();
             self.absorbed.push(dropped);
         }
     }
@@ -5992,6 +6001,40 @@ mod toast_copy_tests {
             non_shift.cascade[0].after_start.as_deref(),
             Some("2026-07-12T00:00:00Z"),
             "a later non-Shift parent persist must still persist the Shift-drag children"
+        );
+    }
+
+    #[test]
+    fn a_later_shift_drag_rolls_its_children_back_past_the_dropped_drag() {
+        let first = commit_save(
+            "2026-07-09T00:00:00Z",
+            "2026-07-23T00:00:00Z",
+            Some("2026-07-09T00:00:00Z"),
+        );
+        let mut second = commit_save(
+            "2026-07-12T00:00:00Z",
+            "2026-07-26T00:00:00Z",
+            Some("2026-07-12T00:00:00Z"),
+        );
+        second.previous.start_date = first.after_start.clone();
+        second.previous.target_date = first.after_target.clone();
+        second.cascade[0].previous.start_date = first.cascade[0].after_start.clone();
+        second.cascade[0].previous.target_date = first.cascade[0].after_target.clone();
+        let original_child = first.cascade[0].previous.clone();
+        second.adopt_cascade_from_superseded(first);
+        assert_eq!(
+            second.cascade[0].previous.start_date, original_child.start_date,
+            "the dropped drag's child dates were never sent, so the survivor rolls back past them"
+        );
+        assert_eq!(
+            second.absorbed.len(),
+            1,
+            "the dropped drag stays with the survivor"
+        );
+        assert_eq!(
+            second.absorbed[0].cascade.len(),
+            1,
+            "its children stay too, so a rollback can restore them"
         );
     }
 
