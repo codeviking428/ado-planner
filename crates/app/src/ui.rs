@@ -4227,6 +4227,7 @@ impl PlannerView {
                                     || self.pending_delete.is_some()
                                     || self.pending_create.is_some();
                                 let row_selector = format!("gantt-tree-row-{id}");
+                                let anchor = row_tooltip_anchor(self.state.gantt.row_y(offset));
                                 div()
                                     .id(("work-item", id as u64))
                                     .debug_selector(move || row_selector.clone())
@@ -4396,7 +4397,7 @@ impl PlannerView {
                                                         ),
                                                     ),
                                             )
-                                            .child(self.title_cell(id, &title, selected, cx))
+                                            .child(self.title_cell(id, &title, anchor, cx))
                                             .child(
                                                 div()
                                                     .id(("gantt-details-slot", id as u64))
@@ -4407,7 +4408,7 @@ impl PlannerView {
                                                     .flex()
                                                     .items_center()
                                                     .when(!editing_title, |el| {
-                                                        el.child(self.open_details_icon(id, cx))
+                                                        el.child(self.open_details_icon(id, anchor, cx))
                                                     }),
                                             )
                                             .when(show_type, |el| {
@@ -4444,13 +4445,13 @@ impl PlannerView {
             )
     }
 
-    fn open_details_icon(&self, id: i64, cx: &Context<Self>) -> impl IntoElement {
+    fn open_details_icon(&self, id: i64, anchor: u64, cx: &Context<Self>) -> impl IntoElement {
         div()
             .id(("gantt-open-details", id as u64))
             .debug_selector(|| "gantt-open-details".into())
             .flex_shrink_0()
             .child(
-                Button::new(("open-details", id as u64))
+                Button::new(("open-details", anchor))
                     .ghost()
                     .compact()
                     .tab_stop(false)
@@ -4508,7 +4509,7 @@ impl PlannerView {
         &self,
         id: i64,
         title: &str,
-        _selected: bool,
+        anchor: u64,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         if self.inline_edit == Some(InlineEdit::Title(id)) {
@@ -4542,7 +4543,7 @@ impl PlannerView {
                 this.set_hovered(Some(id), cx);
             }))
             .child(
-                Button::new(("title-tip", id as u64))
+                Button::new(("title-tip", anchor))
                     .ghost()
                     .compact()
                     .tab_stop(false)
@@ -11945,6 +11946,16 @@ fn link_preview_head(
     } else {
         (x2 - 4.0, y2 - 10.0, "◀")
     }
+}
+
+/// Element key for a tree row's tooltip trigger. The tooltip overlay keeps
+/// the bounds it saw on hover-enter, and a row that scrolls, collapses or
+/// filters under a still pointer never leaves hover, so its tooltip would
+/// stay where the row was, over other rows. Keyed by the painted y, a moved
+/// row is a new trigger: the old tooltip hides and a new one anchors to the
+/// row's current bounds.
+fn row_tooltip_anchor(row_y: f32) -> u64 {
+    u64::from(row_y.to_bits())
 }
 
 fn bar_title_chip(title: String, _ink: gpui_kit::Hsla, truncate: bool) -> gpui_kit::Div {

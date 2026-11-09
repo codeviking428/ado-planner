@@ -240,89 +240,134 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 
 const FRAME_SAMPLES: usize = 40;
 
-/// Prints first paint, wheel-scroll and row-hover frame times for the same
-/// synthetic datasets so before/after runs compare like for like. Run with
+/// Median CPU frame-build times for one synthetic dataset.
+#[derive(Debug)]
+struct FrameTimes {
+    rows: usize,
+    first_paint: Duration,
+    scroll: Duration,
+    hover: Duration,
+    collapse: Duration,
+    filter: Duration,
+}
+
+impl FrameTimes {
+    const MARKDOWN_HEADER: &str = "| Rows | First paint | Scroll | Hover | Collapse | Filter |\n\
+                                   | ---: | ---: | ---: | ---: | ---: | ---: |";
+
+    fn markdown_row(&self) -> String {
+        format!(
+            "| {} | {:.1?} | {:.1?} | {:.1?} | {:.1?} | {:.1?} |",
+            self.rows, self.first_paint, self.scroll, self.hover, self.collapse, self.filter,
+        )
+    }
+}
+
+/// Paints a real `PlannerView` over `count` ADO-shaped rows at 1280×800,
+/// then times `samples` wheel-scroll and row-hover frames and `samples / 4`
+/// Epic collapse/expand and State-filter frames. The GPUI test platform does
+/// layout but no GPU work, so these are CPU frame-build times, not on-screen
+/// latency.
+fn measure_frame_times(
+    cx: &mut gpui_kit::TestAppContext,
+    count: usize,
+    samples: usize,
+) -> FrameTimes {
+    let dir = tempfile::tempdir().unwrap();
+    let state = planner_state(&dir, ado_shaped_hierarchy(count));
+    let (view, vcx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    vcx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    let started = Instant::now();
+    draw(vcx);
+    let first_paint = started.elapsed();
+    // Release builds drop debug selectors; this point is inside the tree body.
+    let tree = point(px(150.), px(420.));
+
+    let mut scroll = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let started = Instant::now();
+        vcx.simulate_event(ScrollEvent {
+            position: tree,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-36.))),
+            ..Default::default()
+        });
+        draw(vcx);
+        scroll.push(started.elapsed());
+    }
+
+    let mut hover = Vec::with_capacity(samples);
+    for i in 0..samples {
+        let y = px(300. + 36. * (i % 10) as f32);
+        let started = Instant::now();
+        vcx.simulate_mouse_move(point(tree.x, y), None, Modifiers::default());
+        draw(vcx);
+        hover.push(started.elapsed());
+    }
+
+    let scroll_y = vcx.update(|_, cx| view.read(cx).state.gantt.scroll_y);
+    assert!(scroll_y > 0.0, "wheel events must scroll the rows");
+
+    // Rebuilds rows only (collapse) or every visible node (filter).
+    let toggles = (samples / 4).max(1);
+    let mut collapse = Vec::with_capacity(toggles);
+    let mut filter = Vec::with_capacity(toggles);
+    for _ in 0..toggles {
+        let started = Instant::now();
+        view.update(vcx, |view, cx| {
+            view.state.gantt.toggle_expand(1);
+            cx.notify();
+        });
+        draw(vcx);
+        collapse.push(started.elapsed());
+        let started = Instant::now();
+        view.update(vcx, |view, cx| {
+            let hidden = &mut view.state.prefs.planner.hidden_states;
+            if hidden.is_empty() {
+                hidden.push("Closed".into());
+            } else {
+                hidden.clear();
+            }
+            cx.notify();
+        });
+        draw(vcx);
+        filter.push(started.elapsed());
+    }
+
+    FrameTimes {
+        rows: count,
+        first_paint,
+        scroll: median(scroll),
+        hover: median(hover),
+        collapse: median(collapse),
+        filter: median(filter),
+    }
+}
+
+/// Keeps the frame-time harness building and running on every CI platform.
+/// Times nothing: debug builds on shared runners are too noisy for a budget.
+#[gpui_kit::test]
+fn frame_time_harness_paints_scrolls_and_filters(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let times = measure_frame_times(cx, 200, 2);
+    assert_eq!(times.rows, 200);
+}
+
+/// Prints the table in `docs/performance.md` for the same synthetic datasets,
+/// so before/after runs compare like for like. Run with
 /// `ADO_PLANNER_SPEED_TESTS=1 cargo test --release -p ado-planner --test speed
-/// -- --nocapture planner_frame_times`. The GPUI test platform does layout but
-/// no GPU work, so these are CPU frame-build times, not on-screen latency.
+/// -- --nocapture planner_frame_times`.
 #[gpui_kit::test]
 fn planner_frame_times(cx: &mut gpui_kit::TestAppContext) {
     if !speed_tests_enabled() {
         return;
     }
     cx.update(gpui_kit::init);
+    eprintln!("{}", FrameTimes::MARKDOWN_HEADER);
     for count in [1_000, 5_000, 10_000] {
-        let dir = tempfile::tempdir().unwrap();
-        let state = planner_state(&dir, ado_shaped_hierarchy(count));
-        let (view, vcx) =
-            cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
-        vcx.simulate_resize(gpui_kit::Size {
-            width: px(1280.),
-            height: px(800.),
-        });
-        let started = Instant::now();
-        draw(vcx);
-        let first = started.elapsed();
-        // Release builds drop debug selectors; this point is inside the tree body.
-        let tree = point(px(150.), px(420.));
-
-        let mut scroll = Vec::with_capacity(FRAME_SAMPLES);
-        for _ in 0..FRAME_SAMPLES {
-            let started = Instant::now();
-            vcx.simulate_event(ScrollEvent {
-                position: tree,
-                delta: ScrollDelta::Pixels(point(px(0.), px(-36.))),
-                ..Default::default()
-            });
-            draw(vcx);
-            scroll.push(started.elapsed());
-        }
-
-        let mut hover = Vec::with_capacity(FRAME_SAMPLES);
-        for i in 0..FRAME_SAMPLES {
-            let y = px(300. + 36. * (i % 10) as f32);
-            let started = Instant::now();
-            vcx.simulate_mouse_move(point(tree.x, y), None, Modifiers::default());
-            draw(vcx);
-            hover.push(started.elapsed());
-        }
-
-        let scroll_y = vcx.update(|_, cx| view.read(cx).state.gantt.scroll_y);
-        assert!(scroll_y > 0.0, "wheel events must scroll the rows");
-
-        // Rebuilds rows only (collapse) or every visible node (filter).
-        let mut collapse = Vec::with_capacity(FRAME_SAMPLES / 4);
-        let mut filter = Vec::with_capacity(FRAME_SAMPLES / 4);
-        for _ in 0..FRAME_SAMPLES / 4 {
-            let started = Instant::now();
-            view.update(vcx, |view, cx| {
-                view.state.gantt.toggle_expand(1);
-                cx.notify();
-            });
-            draw(vcx);
-            collapse.push(started.elapsed());
-            let started = Instant::now();
-            view.update(vcx, |view, cx| {
-                let hidden = &mut view.state.prefs.planner.hidden_states;
-                if hidden.is_empty() {
-                    hidden.push("Closed".into());
-                } else {
-                    hidden.clear();
-                }
-                cx.notify();
-            });
-            draw(vcx);
-            filter.push(started.elapsed());
-        }
-
-        eprintln!(
-            "planner_frame_times rows={count:>6} first_paint={first:>10.2?} \
-             scroll={:>10.2?} hover={:>10.2?} collapse={:>10.2?} filter={:>10.2?} \
-             (medians)",
-            median(scroll),
-            median(hover),
-            median(collapse),
-            median(filter),
-        );
+        let times = measure_frame_times(cx, count, FRAME_SAMPLES);
+        eprintln!("{}", times.markdown_row());
     }
 }
