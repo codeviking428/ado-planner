@@ -1,8 +1,10 @@
-//! Date cascade against `ado-mock`: every trigger in every Cascade mode, a
-//! failed write, one-step undo, and the setting across a restart.
+//! Date cascade and Hierarchy Rollup against `ado-mock`: every trigger in
+//! every Cascade mode, a failed write, one-step undo, and the setting across
+//! a restart.
 //!
 //! The fixture's Dependency: #1003 (Jul 6 → Jul 20) precedes #1012
-//! (Jul 21 → Aug 4).
+//! (Jul 21 → Aug 4). Its Hierarchy: Checkout rewrite (#1001) › Cart (#1002)
+//! › #1003 › Cart UI (#1005, Start Date Jul 21 only).
 
 use ado_core::{CascadeMode, START_DATE_FIELD, TARGET_DATE_FIELD};
 use ado_planner::gantt::{GanttView, GestureKind, NudgeAxis};
@@ -14,6 +16,10 @@ use serde_json::{Value, json};
 
 const PRED: i64 = 1003;
 const SUCC: i64 = 1012;
+/// #1003's parent, Jul 6 → Aug 14.
+const CART: i64 = 1002;
+/// #1002's parent, Jul 1 → Sep 30.
+const EPIC: i64 = 1001;
 
 async fn signed_in(mode: CascadeMode) -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
     let mock = ado_mock::start().await;
@@ -116,6 +122,11 @@ async fn each_trigger(mode: CascadeMode, expected: (&str, &str), toast_suffix: O
             _ => form_save(&mut state, PRED, "07-11", "07-25").await,
         }
         assert_eq!(server(&mock, PRED).await.1, "07-25", "{trigger} {mode:?}");
+        assert_eq!(
+            server(&mock, CART).await.1,
+            "07-25",
+            "{trigger} {mode:?}: Cart rolls up to its latest child"
+        );
         let want = dates(expected.0, expected.1);
         assert_eq!(local(&state, SUCC), want, "{trigger} {mode:?} live");
         assert_eq!(server(&mock, SUCC).await, want, "{trigger} {mode:?} server");
@@ -271,16 +282,17 @@ async fn flexible_snaps_a_drop_into_overlap_later() {
 
 #[tokio::test]
 async fn drag_preview_plans_the_cascade_and_counts_moves() {
+    // Cart (#1002) and Checkout rewrite (#1001) roll up in every mode.
     for (mode, moves, clash) in [
-        (CascadeMode::Flexible, true, false),
-        (CascadeMode::Strict, true, false),
-        (CascadeMode::NoAction, false, true),
+        (CascadeMode::Flexible, " · moves 3", false),
+        (CascadeMode::Strict, " · moves 3", false),
+        (CascadeMode::NoAction, " · moves 2", true),
     ] {
         let (mock, mut state, _dir) = signed_in(mode).await;
         begin(&mut state, PRED, GestureKind::Move, 5.0);
         let gesture = state.gantt.gesture.clone().expect("dragging");
         let chip = GanttView::drag_preview_text(&gesture);
-        assert_eq!(chip.ends_with(" · moves 1"), moves, "{mode:?}: {chip}");
+        assert!(chip.ends_with(moves), "{mode:?}: {chip}");
         let visible = state.visible();
         let bars = visible.layout_bars(&state, 10_000.0);
         let marks = visible.clash_marks(&state, &bars);
@@ -364,11 +376,12 @@ async fn a_failed_cascade_write_reverts_that_row_and_badges_it() {
         [HistoryEntry::DatesGroup { items }] => {
             assert_eq!(
                 items.iter().map(|item| item.id).collect::<Vec<_>>(),
-                vec![PRED]
+                vec![PRED, CART, EPIC],
+                "the failed #1012 leaves the entry; the Rollups stay"
             );
         }
         [HistoryEntry::Dates { id, .. }] => assert_eq!(*id, PRED),
-        other => panic!("one undo entry for #1003, got {other:?}"),
+        other => panic!("one undo entry for #1003 and its Rollups, got {other:?}"),
     }
 
     nudge(&mut state, SUCC, 1).await;
@@ -416,7 +429,7 @@ async fn toast_undo_reverts_the_change_and_its_cascade() {
         .and_then(|toast| toast.undo.clone())
         .expect("toast Undo");
     assert!(
-        matches!(&undo, UndoAction::RestoreDatesBatch { items } if items.len() == 2),
+        matches!(&undo, UndoAction::RestoreDatesBatch { items } if items.len() == 4),
         "{undo:?}"
     );
     for save in state.toast_restore_or_undo_dates(undo) {
@@ -424,18 +437,25 @@ async fn toast_undo_reverts_the_change_and_its_cascade() {
     }
     assert_eq!(server(&mock, PRED).await, dates("07-06", "07-20"));
     assert_eq!(server(&mock, SUCC).await, dates("07-21", "08-04"));
+    assert_eq!(server(&mock, CART).await, dates("07-06", "08-14"));
 }
 
 #[tokio::test]
 async fn a_new_dependency_and_its_cascade_undo_in_one_step() {
     let (mock, mut state, _dir) = signed_in(CascadeMode::Flexible).await;
     state.add_dependency(1005, SUCC).await.expect("link");
-    assert!(matches!(
-        state.history.undo.as_slice(),
-        [HistoryEntry::Link { dates, .. }] if dates.len() == 1
-    ));
+    match state.history.undo.as_slice() {
+        [HistoryEntry::Link { dates, .. }] => assert_eq!(
+            dates.iter().map(|change| change.id).collect::<Vec<_>>(),
+            vec![1005, CART, EPIC],
+            "#1005 moves, then Cart and Checkout rewrite roll up"
+        ),
+        other => panic!("one Link entry, got {other:?}"),
+    }
+    assert_eq!(server(&mock, CART).await, dates("07-06", "07-20"));
     state.undo().await.expect("undo");
     assert_eq!(server(&mock, 1005).await, dates("07-21", ""));
+    assert_eq!(server(&mock, CART).await, dates("07-06", "08-14"));
     assert!(!node(&state, 1005).predecessors.contains(&SUCC));
     state.redo().await.expect("redo");
     assert_eq!(server(&mock, 1005).await, dates("08-04", ""));
@@ -476,4 +496,191 @@ async fn cascade_mode_survives_a_restart() {
     assert_eq!(restarted.cascade_mode(), CascadeMode::NoAction);
     let raw = std::fs::read_to_string(state.paths.prefs_file()).unwrap();
     assert!(raw.contains(r#""cascadeMode": "no_action""#), "{raw}");
+}
+
+fn writes_to(mock: &ado_mock::AdoMock, id: i64) -> usize {
+    let path = format!("/workitems/{id}");
+    mock.mutating_writes()
+        .iter()
+        .filter(|(_, written)| written.ends_with(&path) || written.contains(&format!("{path}?")))
+        .count()
+}
+
+/// Go-live milestone (#1013, a Milestone on Aug 15 under Checkout rewrite)
+/// becomes Cart's successor. It already starts after Cart's Aug 14, so the
+/// link moves nothing, and the setup leaves no undo entry or toast.
+async fn with_cart_successor(
+    mode: CascadeMode,
+) -> (ado_mock::AdoMock, PlannerState, tempfile::TempDir) {
+    let (mock, mut state, dir) = signed_in(mode).await;
+    state.add_dependency(GO_LIVE, CART).await.expect("link");
+    assert_eq!(server(&mock, GO_LIVE).await, dates("", "08-15"));
+    state.history.undo.clear();
+    state.history.redo.clear();
+    state.toasts.clear();
+    (mock, state, dir)
+}
+
+const GO_LIVE: i64 = 1013;
+
+/// #1003 moves 30 days to Aug 5 → Aug 19. Cart rolls up to Jul 21 (Cart UI's
+/// Start Date) → Aug 19, so its successor Go-live milestone moves. Under
+/// Strict that move would roll Checkout rewrite up a second time; the walk
+/// ends there instead.
+#[tokio::test]
+async fn a_child_drag_writes_the_parents_rollup_and_moves_its_successor() {
+    for (mode, successor, go_live) in [
+        (CascadeMode::Flexible, ("08-19", "09-02"), "08-19"),
+        (CascadeMode::Strict, ("08-20", "09-03"), "08-20"),
+        (CascadeMode::NoAction, ("07-21", "08-04"), "08-15"),
+    ] {
+        let (mock, mut state, _dir) = with_cart_successor(mode).await;
+        drag(&mut state, PRED, GestureKind::Move, 30.0).await;
+        assert_eq!(server(&mock, PRED).await, dates("08-05", "08-19"));
+        assert_eq!(
+            server(&mock, CART).await,
+            dates("07-21", "08-19"),
+            "{mode:?}: Cart's Rollup"
+        );
+        assert_eq!(
+            server(&mock, EPIC).await,
+            dates("07-21", "08-19"),
+            "{mode:?}: Checkout rewrite's Rollup"
+        );
+        assert_eq!(
+            server(&mock, SUCC).await,
+            dates(successor.0, successor.1),
+            "{mode:?}"
+        );
+        assert_eq!(
+            server(&mock, GO_LIVE).await,
+            dates("", go_live),
+            "{mode:?}: Cart's successor"
+        );
+        for id in [PRED, CART, EPIC, SUCC, GO_LIVE] {
+            assert_eq!(local(&state, id), server(&mock, id).await, "{mode:?} #{id}");
+        }
+        assert_eq!(writes_to(&mock, CART), 1, "{mode:?}: one Rollup write");
+        let toast = last_toast(&state);
+        let suffix = match mode {
+            CascadeMode::NoAction => " · 2 parents rolled up",
+            _ => " · 2 parents rolled up · 2 successors moved",
+        };
+        assert!(toast.ends_with(suffix), "{mode:?}: {toast}");
+    }
+}
+
+#[tokio::test]
+async fn one_undo_restores_the_child_its_rollup_and_the_parents_successor() {
+    let (mock, mut state, _dir) = with_cart_successor(CascadeMode::Flexible).await;
+    drag(&mut state, PRED, GestureKind::Move, 30.0).await;
+    match state.history.undo.as_slice() {
+        [HistoryEntry::DatesGroup { items }] => assert_eq!(
+            items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![PRED, SUCC, CART, EPIC, GO_LIVE]
+        ),
+        other => panic!("one undo entry, got {other:?}"),
+    }
+    state.undo().await.expect("undo");
+    let loaded = [
+        (PRED, dates("07-06", "07-20")),
+        (CART, dates("07-06", "08-14")),
+        (EPIC, dates("07-01", "09-30")),
+        (SUCC, dates("07-21", "08-04")),
+        (GO_LIVE, dates("", "08-15")),
+    ];
+    for (id, want) in &loaded {
+        assert_eq!(&server(&mock, *id).await, want, "#{id} on the server");
+        assert_eq!(&local(&state, *id), want, "#{id} live");
+    }
+    assert!(state.history.undo.is_empty());
+    let toast = last_toast(&state);
+    assert!(
+        toast.starts_with("Undone")
+            && toast.ends_with(" · 2 parents rolled up · 2 successors moved"),
+        "{toast}"
+    );
+
+    state.redo().await.expect("redo");
+    assert_eq!(server(&mock, CART).await, dates("07-21", "08-19"));
+    assert_eq!(server(&mock, GO_LIVE).await, dates("", "08-19"));
+}
+
+#[tokio::test]
+async fn toast_undo_restores_the_rollup_and_the_parents_successor() {
+    let (mock, mut state, _dir) = with_cart_successor(CascadeMode::Flexible).await;
+    drag(&mut state, PRED, GestureKind::Move, 30.0).await;
+    let undo = state
+        .toasts
+        .items
+        .last()
+        .and_then(|toast| toast.undo.clone())
+        .expect("toast Undo");
+    for save in state.toast_restore_or_undo_dates(undo) {
+        state.persist_pending_dates(save).await.expect("restore");
+    }
+    assert_eq!(server(&mock, PRED).await, dates("07-06", "07-20"));
+    assert_eq!(server(&mock, CART).await, dates("07-06", "08-14"));
+    assert_eq!(server(&mock, GO_LIVE).await, dates("", "08-15"));
+}
+
+#[tokio::test]
+async fn moving_the_parent_itself_writes_no_rollup_for_it() {
+    let (mock, mut state, _dir) = signed_in(CascadeMode::Flexible).await;
+    drag(&mut state, CART, GestureKind::Move, 2.0).await;
+    assert_eq!(
+        server(&mock, CART).await,
+        dates("07-08", "08-16"),
+        "the user's dates stand, not its children's span"
+    );
+    assert_eq!(writes_to(&mock, CART), 1, "only the user's write");
+    assert_eq!(server(&mock, PRED).await, dates("07-06", "07-20"));
+    assert_eq!(
+        server(&mock, EPIC).await,
+        dates("07-06", "08-16"),
+        "Cart's own parent still rolls up"
+    );
+}
+
+#[tokio::test]
+async fn loading_writes_no_rollup() {
+    let (mock, state, _dir) = signed_in(CascadeMode::Flexible).await;
+    assert!(mock.mutating_writes().is_empty());
+    assert_eq!(
+        local(&state, CART),
+        dates("07-06", "08-14"),
+        "Cart keeps its loaded dates though its children span less"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_rollup_write_reverts_that_row_and_badges_it() {
+    let (mock, mut state, _dir) = signed_in(CascadeMode::Flexible).await;
+    mock.fail_next(&format!("/workitems/{CART}"), 400, "TF401320: Rule error");
+    drag(&mut state, PRED, GestureKind::Move, 5.0).await;
+    assert_eq!(
+        server(&mock, PRED).await.1,
+        "07-25",
+        "the user's change stands"
+    );
+    assert_eq!(
+        server(&mock, SUCC).await,
+        dates("07-25", "08-08"),
+        "the cascade stands"
+    );
+    assert_eq!(local(&state, CART), dates("07-06", "08-14"), "row reverted");
+    assert_eq!(server(&mock, CART).await, dates("07-06", "08-14"));
+    assert_eq!(
+        state.gantt.move_failures.get(&CART),
+        Some(&vec!["TF401320: Rule error".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn a_rollup_write_retries_server_errors() {
+    let (mock, mut state, _dir) = signed_in(CascadeMode::Flexible).await;
+    mock.fail_next(&format!("/workitems/{CART}"), 503, "busy");
+    drag(&mut state, PRED, GestureKind::Move, 5.0).await;
+    assert_eq!(server(&mock, CART).await, dates("07-11", "07-25"));
+    assert!(state.gantt.move_failures.is_empty());
 }

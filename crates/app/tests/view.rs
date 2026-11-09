@@ -3732,8 +3732,8 @@ fn drag_preview_paints_what_the_cascade_leaves_and_counts_moves(cx: &mut gpui_ki
     let (view, cx) = clash_window(cx, clash_state(&dir));
     drag_bar_by(&view, cx, "gantt-bar-3", 3.0);
     assert!(
-        drag_chip(&view, cx).ends_with(" · moves 1"),
-        "{}",
+        drag_chip(&view, cx).ends_with(" · moves 2"),
+        "#4 follows and Epic #1 rolls up: {}",
         drag_chip(&view, cx)
     );
     assert!(
@@ -3757,7 +3757,11 @@ fn drag_preview_paints_what_the_cascade_leaves_and_counts_moves(cx: &mut gpui_ki
     });
     draw(cx);
     drag_bar_by(&view, cx, "gantt-bar-3", 3.0);
-    assert!(!drag_chip(&view, cx).contains("moves"));
+    assert!(
+        drag_chip(&view, cx).ends_with(" · moves 1"),
+        "No-action still rolls up Epic #1: {}",
+        drag_chip(&view, cx)
+    );
     assert!(has(cx, "gantt-arrow-3-4-clash"));
     view.update(cx, |view, _| {
         view.state.cancel_gesture();
@@ -7026,7 +7030,8 @@ fn wait_for(cx: &mut VisualTestContext, mut done: impl FnMut(&mut VisualTestCont
 }
 
 /// Drop Persist cart (#1003, Jul 6 → Jul 20) five days later, through the
-/// view's date save queue. Its successor #1012 (Jul 21 → Aug 4) follows.
+/// view's date save queue. Its successor #1012 (Jul 21 → Aug 4) follows, and
+/// its parents Cart (#1002) and Checkout rewrite (#1001) roll up.
 fn drop_persist_cart_later(
     fail_successor: bool,
     cx: &mut gpui_kit::TestAppContext,
@@ -7050,7 +7055,7 @@ fn drop_persist_cart_later(
     });
     draw(cx);
     drag_bar_by(&view, cx, "gantt-bar-1003", 5.0);
-    assert!(drag_chip(&view, cx).ends_with(" · moves 1"));
+    assert!(drag_chip(&view, cx).ends_with(" · moves 3"));
     let bar = cx.debug_bounds("gantt-bar-1003").expect("bar");
     cx.simulate_mouse_up(bar.center(), MouseButton::Left, Modifiers::default());
     draw(cx);
@@ -7066,11 +7071,22 @@ fn a_drop_cascades_through_the_save_queue_and_undoes_in_one_step(
         Some("2026-07-25".to_string()),
         Some("2026-08-08".to_string()),
     );
-    wait_for(cx, |_| mock_dates(&runtime, &mock, 1012) == pushed);
+    let rolled_up = (
+        Some("2026-07-11".to_string()),
+        Some("2026-07-25".to_string()),
+    );
+    wait_for(cx, |_| {
+        mock_dates(&runtime, &mock, 1012) == pushed
+            && mock_dates(&runtime, &mock, 1002) == rolled_up
+    });
     assert_eq!(mock_dates(&runtime, &mock, 1012), pushed);
+    assert_eq!(mock_dates(&runtime, &mock, 1002), rolled_up);
     view.update(cx, |view, _| {
         let message = view.state.toasts.last_message().unwrap_or_default();
-        assert!(message.ends_with(" · 1 successor moved"), "{message}");
+        assert!(
+            message.ends_with(" · 2 parents rolled up · 1 successor moved"),
+            "{message}"
+        );
         assert_eq!(view.state.history.undo.len(), 1, "one undo entry");
     });
     view.update(cx, |view, cx| {
@@ -7085,11 +7101,17 @@ fn a_drop_cascades_through_the_save_queue_and_undoes_in_one_step(
         Some("2026-07-21".to_string()),
         Some("2026-08-04".to_string()),
     );
+    let cart = (
+        Some("2026-07-06".to_string()),
+        Some("2026-08-14".to_string()),
+    );
     wait_for(cx, |_| {
         mock_dates(&runtime, &mock, 1012) == loaded
+            && mock_dates(&runtime, &mock, 1002) == cart
             && mock_dates(&runtime, &mock, 1003).1.as_deref() == Some("2026-07-20")
     });
     assert_eq!(mock_dates(&runtime, &mock, 1012), loaded);
+    assert_eq!(mock_dates(&runtime, &mock, 1002), cart);
     assert_eq!(
         mock_dates(&runtime, &mock, 1003).1.as_deref(),
         Some("2026-07-20")
