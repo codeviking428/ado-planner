@@ -546,6 +546,9 @@ Function RemoveElectronInstall
 FunctionEnd
 
 Section MigrateElectronInstall
+  ; The Electron app's executable is also ado-planner.exe, and a running copy
+  ; would make its uninstaller fail.
+  !insertmacro CheckIfAppIsRunning
   SetShellVarContext current
   Call RemoveElectronInstall
   SetShellVarContext all
