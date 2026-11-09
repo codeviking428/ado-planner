@@ -14,7 +14,7 @@ use ado_planner::gantt::{
 use ado_planner::paths::AppPaths;
 use ado_planner::state::{PlannerState, fake_ado_shaped_backlog, fake_hierarchy};
 use ado_planner::toasts::{HistoryEntry, ToastExtra, ToastKind, UndoAction};
-use ado_planner::ui::PlannerView;
+use ado_planner::ui::{EMPTY_FILTERED_MESSAGE, PlannerView};
 use ado_planner::ui::{
     date_field_text, dates_from_range_picker, dates_from_range_picker_in_years,
     format_picker_dates, looks_like_pat, pending_range_typed, range_picker_is_complete,
@@ -22,9 +22,10 @@ use ado_planner::ui::{
 };
 use ado_session::{EncryptedStore, MemoryStore, PlannerSession};
 use gpui_kit::component::calendar::Date as PickerDate;
+use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, ScrollDelta, ScrollEvent,
-    VisualTestContext, point, px,
+    Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, PinchEvent, ScrollDelta, ScrollEvent,
+    TouchPhase, VisualTestContext, point, px,
 };
 use jiff::ToSpan;
 use jiff::civil::Date;
@@ -4462,6 +4463,13 @@ fn filtered_empty_gantt_offers_show_all(cx: &mut gpui_kit::TestAppContext) {
         cx.debug_bounds("empty-show-all").is_some(),
         "filtered empty state should offer Show all"
     );
+    let message = cx.update(|window, _| {
+        window
+            .find("empty-gantt-message")
+            .label()
+            .map(str::to_owned)
+    });
+    assert_eq!(message.as_deref(), Some(EMPTY_FILTERED_MESSAGE));
     assert!(
         cx.debug_bounds("gantt-toolbar-more").is_some(),
         "less-used actions sit in the toolbar overflow"
@@ -4470,6 +4478,45 @@ fn filtered_empty_gantt_offers_show_all(cx: &mut gpui_kit::TestAppContext) {
     assert!(
         cx.debug_bounds("gantt-add-item").is_some(),
         "+ Add item must stay reachable from the overflow menu"
+    );
+}
+
+#[gpui_kit::test]
+fn show_all_clears_the_no_match_empty_state(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.hide_all_roots();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let show_all = cx.debug_bounds("empty-show-all").expect("Show all");
+    cx.simulate_click(show_all.center(), Modifiers::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("empty-gantt").is_none(),
+        "Show all must bring the Work Items back"
+    );
+    assert!(cx.debug_bounds("gantt-tree-row-1").is_some());
+}
+
+#[gpui_kit::test]
+fn team_with_no_work_items_does_not_say_filters_hide_them(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = idle_state(&dir);
+    state.nodes.clear();
+    let (_view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    draw(cx);
+    let message = cx.update(|window, _| {
+        window
+            .find("empty-gantt-message")
+            .label()
+            .map(str::to_owned)
+    });
+    assert_ne!(message.as_deref(), Some(EMPTY_FILTERED_MESSAGE));
+    assert!(
+        cx.debug_bounds("empty-show-all").is_none(),
+        "an empty Team has nothing for Show all to reveal"
     );
 }
 
@@ -4824,6 +4871,158 @@ fn zoom_buttons_and_ctrl_scroll_update_the_range_title(cx: &mut gpui_kit::TestAp
     assert!(
         cx.debug_bounds("gantt-range-title").is_some(),
         "range title should paint so Ctrl+scroll can update it"
+    );
+}
+
+fn pinch(
+    cx: &mut VisualTestContext,
+    position: gpui_kit::Point<gpui_kit::Pixels>,
+    phase: TouchPhase,
+    delta: f32,
+) {
+    cx.simulate_event(PinchEvent {
+        position,
+        delta,
+        modifiers: Modifiers::default(),
+        phase,
+    });
+    draw(cx);
+}
+
+/// Fractional day under a window-x on the timeline.
+fn day_under(view: &Entity<PlannerView>, cx: &mut VisualTestContext, window_x: f32) -> f32 {
+    view.update(cx, |view, _| {
+        let gantt = &view.state.gantt;
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        (gantt.scroll_x + window_x - gantt.timeline_origin_x) / ppd
+    })
+}
+
+fn month_pinch_view<'a>(
+    cx: &'a mut gpui_kit::TestAppContext,
+    dir: &tempfile::TempDir,
+) -> (Entity<PlannerView>, &'a mut VisualTestContext) {
+    cx.update(gpui_kit::init);
+    let mut state = idle_state(dir);
+    state.gantt.scale = GanttScale::Month;
+    state.gantt.zoom = 1.0;
+    let (view, cx) = cx.add_window_view(|window, cx| PlannerView::for_state(window, cx, state));
+    cx.simulate_resize(gpui_kit::Size {
+        width: px(1280.),
+        height: px(800.),
+    });
+    draw(cx);
+    (view, cx)
+}
+
+#[gpui_kit::test]
+fn pinch_zooms_the_timeline_around_the_pointer(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = month_pinch_view(cx, &dir);
+    let timeline = cx.debug_bounds("gantt-timeline").expect("timeline");
+    let anchor = point(
+        timeline.origin.x + timeline.size.width * 0.75,
+        timeline.center().y,
+    );
+    let anchor_x = f32::from(anchor.x);
+    let day_before = day_under(&view, cx, anchor_x);
+
+    pinch(cx, anchor, TouchPhase::Started, 0.0);
+    for _ in 0..3 {
+        pinch(cx, anchor, TouchPhase::Moved, 0.1);
+    }
+    pinch(cx, anchor, TouchPhase::Ended, 0.0);
+    let zoom_in = view.update(cx, |view, _| view.state.gantt.zoom);
+    assert!(
+        (zoom_in - 1.1f32.powi(3)).abs() < 1e-3,
+        "three 10% pinch steps must zoom to ~133%, got {zoom_in}"
+    );
+    let day_in = day_under(&view, cx, anchor_x);
+    assert!(
+        (day_in - day_before).abs() < 0.01,
+        "pinch must keep the date under the pointer still: {day_before} -> {day_in}"
+    );
+
+    pinch(cx, anchor, TouchPhase::Started, 0.0);
+    pinch(cx, anchor, TouchPhase::Moved, -0.2);
+    pinch(cx, anchor, TouchPhase::Ended, 0.0);
+    let zoom_out = view.update(cx, |view, _| view.state.gantt.zoom);
+    assert!(
+        (zoom_out - zoom_in * 0.8).abs() < 1e-3,
+        "a -20% pinch must zoom out, {zoom_in} -> {zoom_out}"
+    );
+    let day_out = day_under(&view, cx, anchor_x);
+    assert!(
+        (day_out - day_before).abs() < 0.01,
+        "pinch-out must keep the date under the pointer still: {day_before} -> {day_out}"
+    );
+}
+
+#[gpui_kit::test]
+fn pinch_zoom_stops_at_the_zoom_limits(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = month_pinch_view(cx, &dir);
+    let anchor = cx
+        .debug_bounds("gantt-timeline")
+        .expect("timeline")
+        .center();
+    pinch(cx, anchor, TouchPhase::Started, 0.0);
+    for _ in 0..20 {
+        pinch(cx, anchor, TouchPhase::Moved, 0.5);
+    }
+    assert_eq!(view.update(cx, |view, _| view.state.gantt.zoom), 4.0);
+    for _ in 0..20 {
+        pinch(cx, anchor, TouchPhase::Moved, -0.5);
+    }
+    pinch(cx, anchor, TouchPhase::Ended, 0.0);
+    assert_eq!(view.update(cx, |view, _| view.state.gantt.zoom), 0.4);
+}
+
+#[gpui_kit::test]
+fn cancelled_pinch_restores_the_camera(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = month_pinch_view(cx, &dir);
+    let anchor = cx
+        .debug_bounds("gantt-timeline")
+        .expect("timeline")
+        .center();
+    let before = view.update(cx, |view, _| {
+        (view.state.gantt.zoom, view.state.gantt.scroll_x)
+    });
+    pinch(cx, anchor, TouchPhase::Started, 0.0);
+    pinch(cx, anchor, TouchPhase::Moved, 0.3);
+    assert_ne!(
+        view.update(cx, |view, _| view.state.gantt.zoom),
+        before.0,
+        "a moving pinch must zoom live"
+    );
+    pinch(cx, anchor, TouchPhase::Cancelled, 0.0);
+    let after = view.update(cx, |view, _| {
+        (view.state.gantt.zoom, view.state.gantt.scroll_x)
+    });
+    assert_eq!(after, before, "a cancelled pinch must not keep its zoom");
+}
+
+#[gpui_kit::test]
+fn pinch_over_the_tree_zooms_around_the_timeline_center(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx) = month_pinch_view(cx, &dir);
+    let row = cx.debug_bounds("gantt-tree-row-1").expect("tree row");
+    let center_x = view.update(cx, |view, _| {
+        view.state.gantt.timeline_origin_x + view.state.gantt.timeline_width * 0.5
+    });
+    let day_before = day_under(&view, cx, center_x);
+    pinch(cx, row.center(), TouchPhase::Started, 0.0);
+    pinch(cx, row.center(), TouchPhase::Moved, 0.25);
+    pinch(cx, row.center(), TouchPhase::Ended, 0.0);
+    assert!(
+        (view.update(cx, |view, _| view.state.gantt.zoom) - 1.25).abs() < 1e-3,
+        "pinching over the tree must still zoom the timeline"
+    );
+    let day_after = day_under(&view, cx, center_x);
+    assert!(
+        (day_after - day_before).abs() < 0.01,
+        "off-timeline pinch anchors the timeline centre: {day_before} -> {day_after}"
     );
 }
 
@@ -14330,6 +14529,17 @@ fn shift_dragging_a_parent_moves_its_children(cx: &mut gpui_kit::TestAppContext)
         height: px(800.),
     });
     draw(cx);
+    view.update(cx, |view, _| {
+        let rows = view.state.gantt.flatten(&view.state.nodes);
+        let bars = view
+            .state
+            .gantt
+            .layout_bars(&view.state.nodes, &rows, &[], 720.0);
+        assert!(
+            bars.iter().any(|bar| bar.id == 1 && bar.summary),
+            "the parent must paint as a summary bar; summary bars stay draggable"
+        );
+    });
     let bar = cx.debug_bounds("gantt-bar-1").expect("parent bar");
     let start = bar.center();
     let shift = Modifiers {
