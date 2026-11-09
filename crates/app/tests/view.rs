@@ -16637,6 +16637,21 @@ fn rev_conflict_on_save_toasts_and_reloads_keeping_only_my_edits(
             "rebuilt date pickers must show my dates, not the pre-save Gantt dates"
         );
         assert!(view.form_save_is_enabled(cx), "my edit can be saved again");
+        assert_eq!(view.form_date_picker_count_for_test(), 1);
+        view.state
+            .form
+            .as_mut()
+            .expect("form")
+            .values
+            .insert(ado_core::START_DATE_FIELD.into(), serde_json::Value::Null);
+    });
+    draw(cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.form_date_picker_count_for_test(),
+            1,
+            "a target-only draft after the reload must not add a second date picker"
+        );
     });
     assert!(
         cx.debug_bounds("toast-title").is_some(),

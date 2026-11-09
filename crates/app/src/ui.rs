@@ -142,6 +142,8 @@ pub struct PlannerView {
     form_inputs_for: Option<i64>,
     /// `FormDraft::reloads` the inputs were built from; a rev-conflict reload rebuilds them.
     form_inputs_reloads: u32,
+    /// Date seed for widgets rebuilt after a rev-conflict reload.
+    form_reload_dates: Option<(Option<chrono::NaiveDate>, Option<chrono::NaiveDate>)>,
     identity_search_gen: u64,
     /// Tests block on Azure DevOps I/O instead of awaiting it in a GPUI task,
     /// so a reply from the ado-client thread never wakes the test scheduler.
@@ -533,6 +535,7 @@ impl PlannerView {
             form_dates_preview: None,
             form_inputs_for: None,
             form_inputs_reloads: 0,
+            form_reload_dates: None,
             identity_search_gen: 0,
             inline_io: false,
             form_title_focused_for: None,
@@ -895,6 +898,10 @@ impl PlannerView {
         }
         self.sync_form_inputs(cx);
         cx.notify();
+    }
+
+    pub fn form_date_picker_count_for_test(&self) -> usize {
+        self.form_dates.len()
     }
 
     /// Run Azure DevOps I/O to completion on the calling thread. GPUI tests use
@@ -10290,21 +10297,35 @@ impl PlannerView {
             self.form_calendar_open = false;
             self.form_inputs_for = Some(form.model.id);
             self.form_inputs_reloads = form.reloads;
-        }
-        // After a rev-conflict reload the draft carries the user's dates, and
-        // the Hierarchy row still holds the dates from before the save.
-        let node_dates = self
-            .state
-            .nodes
-            .iter()
-            .filter(|_| form.reloads == 0)
-            .find(|node| node.id == form.model.id)
-            .map(|node| {
+            // After a rev-conflict reload the draft carries the user's dates, and
+            // the Hierarchy row still holds the dates from before the save. Keep
+            // them fixed for the dialog so later edits cannot move the widgets.
+            self.form_reload_dates = (form.reloads > 0).then(|| {
+                let day = |field: &str| {
+                    form.values
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|text| parse_iso_date(Some(text)))
+                        .and_then(jiff_to_naive)
+                };
                 (
-                    parse_iso_date(node.start_date.as_deref()).and_then(jiff_to_naive),
-                    parse_iso_date(node.target_date.as_deref()).and_then(jiff_to_naive),
+                    day(ado_core::START_DATE_FIELD),
+                    day(ado_core::TARGET_DATE_FIELD),
                 )
             });
+        }
+        let node_dates = self.form_reload_dates.or_else(|| {
+            self.state
+                .nodes
+                .iter()
+                .find(|node| node.id == form.model.id)
+                .map(|node| {
+                    (
+                        parse_iso_date(node.start_date.as_deref()).and_then(jiff_to_naive),
+                        parse_iso_date(node.target_date.as_deref()).and_then(jiff_to_naive),
+                    )
+                })
+        });
         for control in crate::form::all_controls(&form.model) {
             if control.read_only
                 || matches!(
