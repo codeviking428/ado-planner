@@ -1327,13 +1327,15 @@ impl PlannerState {
                     ToastKind::Error,
                     "Work Item changed in Azure DevOps. Your edits are kept — review and save again.",
                 );
-                let draft = self.form.as_ref().map(|form| form.values.clone());
-                if let Some(form) = self.form.as_mut() {
-                    form.saving = false;
-                }
+                let stale = self.form.take();
                 let _ = self.open_form(id).await;
-                if let (Some(draft), Some(form)) = (draft, self.form.as_mut()) {
-                    form.values = draft;
+                match (stale, self.form.as_mut()) {
+                    (Some(stale), Some(form)) => form.carry_edits_from(&stale),
+                    (Some(mut stale), None) => {
+                        stale.saving = false;
+                        self.form = Some(stale);
+                    }
+                    _ => {}
                 }
                 Err(err.into())
             }

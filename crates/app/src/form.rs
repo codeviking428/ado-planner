@@ -20,6 +20,8 @@ pub struct FormDraft {
     pub active_page: usize,
     pub saving: bool,
     pub show_empty: bool,
+    /// Bumped when a rev conflict reloads the form, so the view rebuilds its inputs.
+    pub reloads: u32,
 }
 
 impl FormDraft {
@@ -54,7 +56,29 @@ impl FormDraft {
             active_page: 0,
             saving: false,
             show_empty: false,
+            reloads: 0,
         }
+    }
+
+    /// Re-apply the fields `stale` changed onto this freshly loaded draft.
+    /// Fields the user left alone keep the server's new values.
+    pub fn carry_edits_from(&mut self, stale: &FormDraft) {
+        for op in stale.patch_ops() {
+            let Some(reference) = op.path.strip_prefix("/fields/") else {
+                continue;
+            };
+            let value = stale.values.get(reference).cloned().unwrap_or(Value::Null);
+            self.values.insert(reference.to_string(), value);
+            if let Some(markdown) = stale.html_markdown.get(reference) {
+                self.html_markdown
+                    .insert(reference.to_string(), markdown.clone());
+            }
+        }
+        self.identity_query = stale.identity_query.clone();
+        self.identity_results = stale.identity_results.clone();
+        self.active_page = stale.active_page;
+        self.show_empty = stale.show_empty;
+        self.reloads = stale.reloads + 1;
     }
 
     pub fn is_dirty(&self) -> bool {
