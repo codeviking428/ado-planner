@@ -121,6 +121,36 @@ jobs:
       - name: Deny
         run: cargo deny check
 
+  speed:
+    name: Speed budgets
+    runs-on: ubuntu-latest
+    # Calibration: collect runner numbers before the budgets are set.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: speed-release
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Linux GPUI, software Vulkan and keyring deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev \
+            libvulkan-dev cmake pkg-config libfontconfig1-dev libfreetype6-dev clang xvfb \
+            mesa-vulkan-drivers gnome-keyring dbus-x11
+
+      - name: Build
+        run: cargo test --release --locked -p ado-planner --test speed --test launch --no-run
+
+      - name: Budgets
+        run: dbus-run-session -- .github/scripts/speed-budgets.sh 3
+
   workflows:
     name: Workflows and release scripts
     runs-on: ubuntu-latest
