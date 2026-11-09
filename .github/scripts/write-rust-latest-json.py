@@ -28,26 +28,6 @@ def signature_for(path: Path) -> str | None:
     return sig.read_text(encoding="utf-8").strip() or None
 
 
-def darwin_arch(name: str) -> str:
-    """Arch for a macOS artifact name.
-
-    cargo-packager often omits arch from `.app.tar.gz` names. This workflow
-    only packs macOS on `macos-latest` (Apple Silicon), so unlabeled Darwin
-    artifacts are aarch64. Explicit x86_64 tokens still map to Intel.
-    """
-    if any(token in name for token in ("aarch64", "arm64")):
-        return "aarch64"
-    if any(token in name for token in ("x86_64", "amd64", "x64", "intel")):
-        return "x86_64"
-    return "aarch64"
-
-
-def mac_platform_keys(arch: str) -> list[str]:
-    # cargo-packager-updater 0.2 README examples use `darwin-*`; the 0.2.3
-    # client looks up `macos-{arch}` via get_updater_target(). Emit both.
-    return [f"darwin-{arch}", f"macos-{arch}"]
-
-
 def platform_for(path: Path) -> tuple[list[str], str] | None:
     name = path.name.lower()
     if name.endswith(".sig"):
@@ -57,16 +37,12 @@ def platform_for(path: Path) -> tuple[list[str], str] | None:
         return ["windows-x86_64"], fmt
     if "appimage" in name:
         return ["linux-x86_64"], "appimage"
-    if name.endswith(".app.tar.gz") or name.endswith(".app.tar.gz.zip"):
-        return mac_platform_keys(darwin_arch(name)), "app"
-    # DMGs are GitHub-release downloads only. cargo-packager-updater's `app`
-    # format gunzips a .app tar; advertising a .dmg as `app` would fail install.
     return None
 
 
 def rank(path: Path) -> int:
     name = path.name.lower()
-    if name.endswith(".nsis.zip") or name.endswith(".app.tar.gz") or "appimage.tar.gz" in name:
+    if name.endswith(".nsis.zip") or "appimage.tar.gz" in name:
         return 0
     if name.endswith(".exe") or name.endswith(".appimage"):
         return 1

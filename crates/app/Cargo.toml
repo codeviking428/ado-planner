@@ -58,7 +58,7 @@ winresource = "0.1"
 product-name = "ADO Planner"
 identifier = "com.codeviking428.ado-planner"
 before-packaging-command = "cargo build --release -p ado-planner"
-formats = ["nsis", "appimage", "dmg"]
+formats = ["nsis", "appimage"]
 out-dir = "../../release/rust"
 binaries = [{ path = "ado-planner", main = true }]
 # Icons come from assets/icons/ado-planner.svg; regenerate with
