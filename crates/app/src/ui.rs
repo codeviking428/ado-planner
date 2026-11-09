@@ -158,6 +158,10 @@ pub struct PlannerView {
     inline_dates_error: Option<String>,
     pending_typed_preview: Option<String>,
     pending_delete: Option<(i64, String)>,
+    /// Add item / Add child dialog. Nothing is created until Create.
+    pending_create: Option<CreateDraft>,
+    create_title_input: Entity<InputState>,
+    create_enter_guard: Option<CreateEnterGuard>,
     /// True after Enter commits an inline editor so the same key does not
     /// also open the details dialog.
     inline_enter_guard: bool,
@@ -226,7 +230,7 @@ pub struct PlannerView {
     /// True while a non-date toast Undo spawn is in flight, so a second
     /// click (mouse-down + click) cannot dismiss the toast as a no-op.
     toast_undo_inflight: bool,
-    /// After Add item I/O, Render opens inline rename on this id.
+    /// After Edit title, Render opens inline rename on this id.
     pending_inline_title: Option<i64>,
     /// After Add/Undo I/O, Render blurs leftover title-button focus ticks.
     pending_focus_planner: bool,
@@ -314,6 +318,23 @@ pub struct BarHitDebug {
     pub kind: GestureKind,
 }
 
+#[derive(Clone, Debug)]
+struct CreateDraft {
+    parents: Vec<Option<i64>>,
+    parent_id: Option<i64>,
+    work_item_type: String,
+    error: Option<String>,
+    focus_title: bool,
+}
+
+/// GPUI still dispatches the Enter that submitted the create dialog, and a
+/// held Enter keeps repeating; neither may open details on the new row.
+#[derive(Clone, Copy, Debug)]
+enum CreateEnterGuard {
+    SameKey,
+    Repeats,
+}
+
 struct CameraAnim {
     from: SavedGanttView,
     to: SavedGanttView,
@@ -376,8 +397,10 @@ impl PlannerView {
                     || this.state.gantt.context_menu.is_some()
                     || this.popup_open()
                     || this.inline_edit.is_some()
-                    || this.pending_delete.is_some();
+                    || this.pending_delete.is_some()
+                    || this.pending_create.is_some();
                 if key == "f2"
+                    && this.pending_create.is_none()
                     && !this.details_overlay()
                     && this.inline_edit.is_none()
                     && let Some(id) = this.state.gantt.selected_id
@@ -405,6 +428,15 @@ impl PlannerView {
                         cx,
                     );
                     cx.stop_propagation();
+                    return;
+                }
+                if this.pending_create.is_some() {
+                    if key == "enter" {
+                        if this.submit_create(cx) {
+                            this.create_enter_guard = Some(CreateEnterGuard::SameKey);
+                        }
+                        cx.stop_propagation();
+                    }
                     return;
                 }
                 if key == "enter" && this.inline_edit.is_some() {
@@ -438,6 +470,7 @@ impl PlannerView {
                 let confirm_delete = this.pending_delete.is_some()
                     && matches!(key, "enter" | "escape" | "delete" | "backspace");
                 let open_details = key == "enter"
+                    && this.create_enter_guard.is_none()
                     && this.pending_delete.is_none()
                     && !this.io_busy
                     && !this.details_overlay()
@@ -477,6 +510,7 @@ impl PlannerView {
                 cx.stop_propagation();
             });
         });
+        let create_title_input = cx.new(|cx| InputState::new(window, cx));
         let mut this = Self {
             state,
             org_input,
@@ -505,6 +539,9 @@ impl PlannerView {
             inline_dates_error: None,
             pending_typed_preview: None,
             pending_delete: None,
+            pending_create: None,
+            create_title_input,
+            create_enter_guard: None,
             inline_enter_guard: false,
             dates_anchor: None,
             banner_dismissed: false,
@@ -564,8 +601,12 @@ impl PlannerView {
         this.filter_query.update(cx, |input, cx| {
             input.set_placeholder("Search", window, cx);
         });
+        this.create_title_input.update(cx, |input, cx| {
+            input.set_placeholder("Title", window, cx);
+        });
         this.bind_sign_in_events(window, cx);
         this.bind_inline_input(cx);
+        this.bind_create_title_input(cx);
         this
     }
 
@@ -726,7 +767,7 @@ impl PlannerView {
     }
 
     fn focus_planner(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.inline_edit.is_none() {
+        if self.inline_edit.is_none() && self.pending_create.is_none() {
             window.focus(&self.form_focus, cx);
         }
     }
@@ -955,6 +996,12 @@ impl PlannerView {
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(window)
+            || (self.pending_create.is_some()
+                && self
+                    .create_title_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window))
     }
 
     fn bind_sign_in_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -993,6 +1040,21 @@ impl PlannerView {
         });
         self._subscriptions.push(filter);
         self._subscriptions.push(scope);
+    }
+
+    fn bind_create_title_input(&mut self, cx: &mut Context<Self>) {
+        let events = cx.subscribe(
+            &self.create_title_input,
+            |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(draft) = this.pending_create.as_mut()
+                    && draft.error.take().is_some()
+                {
+                    cx.notify();
+                }
+            },
+        );
+        self._subscriptions.push(events);
     }
 
     fn bind_inline_input(&mut self, cx: &mut Context<Self>) {
@@ -1139,18 +1201,8 @@ impl PlannerView {
             let rows = self.state.gantt.flatten(&self.state.nodes);
             self.state.gantt.select_relative(&rows, 0);
         }
-        if let Some(id) = self.state.gantt.selected_id
-            && matches!(
-                self.state.history.undo.last(),
-                Some(HistoryEntry::Created { id: created, .. }) if *created == id
-            )
-        {
-            self.pending_inline_title = Some(id);
-            self.pending_focus_planner = false;
-        } else {
-            self.pending_inline_title = None;
-            self.pending_focus_planner = true;
-        }
+        self.pending_inline_title = None;
+        self.pending_focus_planner = true;
     }
 
     fn drop_stale_inline_edit(&mut self) {
@@ -1174,6 +1226,10 @@ impl PlannerView {
 
     pub fn after_io_selection_change_for_test(&mut self, prev_selected: Option<i64>) {
         self.after_io_selection_change(prev_selected);
+    }
+
+    pub fn focus_planner_for_test(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_planner(window, cx);
     }
 
     fn spawn_unbounded<F, Fut>(&mut self, cx: &mut Context<Self>, work: F)
@@ -1328,6 +1384,7 @@ impl PlannerView {
         self.pending_typed_preview = None;
         self.dates_anchor = None;
         self.pending_delete = None;
+        self.pending_create = None;
         self.state.gantt.context_menu = None;
         self.state.gantt.selected_link = None;
         self.dismiss_empty_timeline_hint();
@@ -3771,10 +3828,7 @@ impl PlannerView {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.toolbar_more_open = false;
                                         this.state.gantt.clear_hover();
-                                        this.spawn_state(cx, |mut state| async move {
-                                            let result = state.add_item().await;
-                                            (state, result)
-                                        });
+                                        this.open_create(this.state.gantt.selected_id, cx);
                                     })),
                             ),
                     )
@@ -4058,7 +4112,8 @@ impl PlannerView {
                                 let editing_title = self.inline_edit == Some(InlineEdit::Title(id));
                                 let hovered = hovered_id == Some(id);
                                 let dim_selection = self.details_overlay()
-                                    || self.pending_delete.is_some();
+                                    || self.pending_delete.is_some()
+                                    || self.pending_create.is_some();
                                 let row_selector = format!("gantt-tree-row-{id}");
                                 div()
                                     .id(("work-item", id as u64))
@@ -4968,7 +5023,8 @@ impl PlannerView {
                                 let selected = selected_id == Some(id);
                                 let hovered = hovered_id == Some(id);
                                 let dim_selection = self.details_overlay()
-                                    || self.pending_delete.is_some();
+                                    || self.pending_delete.is_some()
+                                    || self.pending_create.is_some();
                                 let striped = (first_row + offset) % 2 == 1;
                                 let bar = bars.iter().find(|bar| bar.id == id).cloned();
                                 let hit_bar = bar.clone();
@@ -7744,6 +7800,245 @@ impl PlannerView {
             .into_any_element()
     }
 
+    pub fn open_create(&mut self, parent_id: Option<i64>, cx: &mut Context<Self>) {
+        self.dismiss_overlays();
+        self.pending_inline_title = None;
+        let parents = self.state.new_item_parents(parent_id);
+        let parent_id = parents.first().copied().flatten();
+        self.pending_create = Some(CreateDraft {
+            work_item_type: self.state.new_item_default_type(parent_id),
+            parents,
+            parent_id,
+            error: None,
+            focus_title: true,
+        });
+        cx.notify();
+    }
+
+    pub fn create_dialog_open(&self) -> bool {
+        self.pending_create.is_some()
+    }
+
+    pub fn create_draft(&self) -> Option<(Option<i64>, String)> {
+        self.pending_create
+            .as_ref()
+            .map(|draft| (draft.parent_id, draft.work_item_type.clone()))
+    }
+
+    pub fn set_create_title(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_title_input.update(cx, |input, cx| {
+            input.set_value(title, window, cx);
+        });
+    }
+
+    fn set_create_parent(&mut self, parent_id: Option<i64>, cx: &mut Context<Self>) {
+        let types = self.state.new_item_types(parent_id);
+        let Some(draft) = self.pending_create.as_mut() else {
+            return;
+        };
+        draft.parent_id = parent_id;
+        if !types.contains(&draft.work_item_type) {
+            draft.work_item_type = types
+                .first()
+                .cloned()
+                .unwrap_or_else(|| draft.work_item_type.clone());
+        }
+        cx.notify();
+    }
+
+    /// Returns true once the create request is on its way.
+    pub fn submit_create(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(draft) = self.pending_create.clone() else {
+            return false;
+        };
+        let title = self.create_title_input.read(cx).value().trim().to_string();
+        if title.is_empty() {
+            if let Some(draft) = self.pending_create.as_mut() {
+                draft.error = Some("Enter a title.".into());
+            }
+            cx.notify();
+            return false;
+        }
+        let CreateDraft {
+            parent_id,
+            work_item_type,
+            ..
+        } = draft;
+        if !self.spawn_state(cx, move |mut state| async move {
+            let result = state.create_item(parent_id, &work_item_type, &title).await;
+            (state, result)
+        }) {
+            return false;
+        }
+        self.pending_create = None;
+        self.pending_focus_planner = true;
+        cx.notify();
+        true
+    }
+
+    fn create_parent_label(&self, parent_id: Option<i64>) -> String {
+        match parent_id.and_then(|id| self.state.nodes.iter().find(|node| node.id == id)) {
+            Some(node) => format!("{} #{} {}", node.work_item_type, node.id, node.title),
+            None => "None (root)".into(),
+        }
+    }
+
+    fn render_create_dialog(&self, cx: &Context<Self>) -> impl IntoElement {
+        let Some(draft) = self.pending_create.as_ref() else {
+            return div().into_any_element();
+        };
+        let types = self.state.new_item_types(draft.parent_id);
+        let close = |this: &mut Self, cx: &mut Context<Self>| {
+            this.pending_create = None;
+            this.pending_focus_planner = true;
+            cx.notify();
+        };
+        v_flex()
+            .id("gantt-create-overlay")
+            .debug_selector(|| "gantt-create-overlay".into())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(cx.theme().overlay)
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| close(this, cx)),
+            )
+            .child(
+                v_flex()
+                    .id("gantt-create-dialog")
+                    .debug_selector(|| "gantt-create-dialog".into())
+                    .w(px(480.))
+                    .gap_3()
+                    .p_4()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Label::new("New work item")
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        div()
+                            .id("gantt-create-title")
+                            .debug_selector(|| "gantt-create-title".into())
+                            .child(Input::new(&self.create_title_input)),
+                    )
+                    .child(
+                        Label::new("Type")
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .children(types.into_iter().map(|ty| {
+                                let selected = ty == draft.work_item_type;
+                                let selector = format!("gantt-create-type-{ty}");
+                                let value = ty.clone();
+                                div()
+                                    .id(SharedString::from(selector.clone()))
+                                    .debug_selector(move || selector.clone())
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "create-type-{ty}"
+                                        )))
+                                        .label(ty)
+                                        .compact()
+                                        .selected(selected)
+                                        .when(selected, |btn| btn.primary())
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if let Some(draft) = this.pending_create.as_mut() {
+                                                    draft.work_item_type = value.clone();
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                            })),
+                    )
+                    .child(
+                        Label::new("Parent")
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .children(draft.parents.iter().map(|parent| {
+                                let parent = *parent;
+                                let selected = parent == draft.parent_id;
+                                let key =
+                                    parent.map_or_else(|| "root".to_string(), |id| id.to_string());
+                                let selector = format!("gantt-create-parent-{key}");
+                                div()
+                                    .id(SharedString::from(selector.clone()))
+                                    .debug_selector(move || selector.clone())
+                                    .w_full()
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "create-parent-{key}"
+                                        )))
+                                        .label(self.create_parent_label(parent))
+                                        .compact()
+                                        .w_full()
+                                        .selected(selected)
+                                        .when(selected, |btn| btn.primary())
+                                        .when(!selected, |btn| btn.ghost())
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.set_create_parent(parent, cx);
+                                            }),
+                                        ),
+                                    )
+                            })),
+                    )
+                    .when_some(draft.error.clone(), |el, error| {
+                        el.child(
+                            div()
+                                .id("gantt-create-error")
+                                .debug_selector(|| "gantt-create-error".into())
+                                .child(Label::new(error).text_xs().text_color(cx.theme().danger)),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                div()
+                                    .id("gantt-create-cancel")
+                                    .debug_selector(|| "gantt-create-cancel".into())
+                                    .child(Button::new("cancel-create").label("Cancel").on_click(
+                                        cx.listener(move |this, _, _, cx| close(this, cx)),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("gantt-create-confirm")
+                                    .debug_selector(|| "gantt-create-confirm".into())
+                                    .child(
+                                        Button::new("confirm-create")
+                                            .primary()
+                                            .label("Create")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit_create(cx);
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn remove_link(&mut self, from_id: i64, to_id: i64, cx: &mut Context<Self>) {
         self.state.gantt.context_menu = None;
         self.state.gantt.selected_link = None;
@@ -7984,10 +8279,7 @@ impl PlannerView {
             }))
             .child(self.menu_item("Add child", cx, move |this, cx| {
                 this.state.gantt.select_row(id);
-                this.spawn_state(cx, move |mut state| async move {
-                    let result = state.add_item_under(Some(id)).await;
-                    (state, result)
-                });
+                this.open_create(Some(id), cx);
             }))
             .child(self.menu_item("Delete", cx, move |this, cx| {
                 this.request_delete(id, cx);
@@ -10255,6 +10547,9 @@ impl PlannerView {
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        if key != "enter" {
+            self.create_enter_guard = None;
+        }
         if event.is_held
             && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
             && (key == "z" || key == "y")
@@ -10262,7 +10557,8 @@ impl PlannerView {
             return;
         }
         if key == "escape" {
-            if self.pending_delete.take().is_some() {
+            if self.pending_delete.take().is_some() || self.pending_create.take().is_some() {
+                self.pending_focus_planner = true;
                 cx.notify();
                 return;
             }
@@ -10279,6 +10575,21 @@ impl PlannerView {
                 self.confirm_delete(cx);
             }
             return;
+        }
+        if self.pending_create.is_some() {
+            return;
+        }
+        if key == "enter"
+            && let Some(guard) = self.create_enter_guard
+        {
+            match guard {
+                CreateEnterGuard::SameKey => {
+                    self.create_enter_guard = Some(CreateEnterGuard::Repeats);
+                    return;
+                }
+                CreateEnterGuard::Repeats if event.is_held => return,
+                CreateEnterGuard::Repeats => self.create_enter_guard = None,
+            }
         }
         if key == "enter" && self.inline_edit.is_some() {
             self.commit_inline(cx);
@@ -11618,6 +11929,15 @@ impl Focusable for PlannerView {
 
 impl Render for PlannerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(draft) = self.pending_create.as_mut()
+            && std::mem::take(&mut draft.focus_title)
+        {
+            self.create_title_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+            Self::focus_input(&self.create_title_input, window, cx);
+            self.pending_focus_planner = false;
+        }
         if let Some(id) = self.pending_inline_title.take()
             && self.state.nodes.iter().any(|node| node.id == id)
         {
@@ -11813,6 +12133,9 @@ impl Render for PlannerView {
                     cx.stop_propagation();
                     return;
                 }
+                if this.pending_create.is_some() {
+                    return;
+                }
                 if key == "f2"
                     && !this.details_overlay()
                     && this.inline_edit.is_none()
@@ -11893,6 +12216,7 @@ impl Render for PlannerView {
                             .child(self.render_dates_popover(cx))
                             .child(self.render_form(cx))
                             .child(self.render_delete_confirm(cx))
+                            .child(self.render_create_dialog(cx))
                             .child(self.render_toasts(cx)),
                     )
                 },

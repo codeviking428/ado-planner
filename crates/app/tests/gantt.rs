@@ -2034,6 +2034,64 @@ async fn add_item_on_an_epic_creates_a_child_feature() {
 }
 
 #[tokio::test]
+async fn new_item_parents_offer_the_row_its_ancestors_and_the_root() {
+    let (_mock, state, _dir) = signed_in().await;
+    assert_eq!(
+        state.new_item_parents(Some(1005)),
+        vec![Some(1005), Some(1003), Some(1002), Some(1001), None]
+    );
+    assert_eq!(state.new_item_parents(None), vec![None]);
+    let feature_types = state.new_item_types(Some(1002));
+    assert_eq!(
+        feature_types.first().map(String::as_str),
+        Some("User Story"),
+        "a Feature child should default to User Story, got {feature_types:?}"
+    );
+    assert!(
+        feature_types.iter().any(|ty| ty == "Task"),
+        "a Feature child should also offer Task, got {feature_types:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_item_uses_the_chosen_title_type_and_parent() {
+    let (mock, mut state, _dir) = signed_in().await;
+    state.gantt.selected_id = Some(1005);
+    state
+        .create_item(Some(1002), "Task", "  Write the spec  ")
+        .await
+        .expect("create");
+    let created = created_item(&state);
+    assert_eq!(created.title, "Write the spec");
+    assert_eq!(created.work_item_type, "Task");
+    assert_eq!(created.parent_id, Some(1002));
+    let stored = mock
+        .work_item(created.id)
+        .await
+        .expect("stored on the mock");
+    assert_eq!(
+        stored["fields"]["System.Title"].as_str(),
+        Some("Write the spec"),
+        "the POST must carry the typed title, got {stored}"
+    );
+    let message = state.toasts.last_message().unwrap_or_default();
+    assert!(
+        message.contains("Created Task \"Write the spec\" under Feature"),
+        "create toast must name the chosen type, title, and parent, got {message}"
+    );
+}
+
+#[tokio::test]
+async fn create_item_rejects_an_empty_title_without_creating() {
+    let (_mock, mut state, _dir) = signed_in().await;
+    let before = state.nodes.len();
+    let result = state.create_item(None, "Epic", "   ").await;
+    assert!(result.is_err(), "an empty title must not create");
+    assert_eq!(state.nodes.len(), before);
+    assert!(state.history.undo.is_empty());
+}
+
+#[tokio::test]
 async fn add_item_under_nests_even_when_another_row_is_selected() {
     let (_mock, mut state, _dir) = signed_in().await;
     state.gantt.selected_id = Some(1012);
