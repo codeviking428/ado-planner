@@ -23,6 +23,10 @@ _Avoid_: board (when meaning the Kanban board)
 **Gantt bar**:
 The timeline representation of a Work Item's Start Date and Target Date.
 
+**Summary bar**:
+The Gantt bar of a Work Item that has children, drawn over the span of its Rollup. Its body drags like any Gantt bar; Shift-drag also moves every descendant by the same number of days, as one undo.
+_Avoid_: rollup bar, read-only parent bar
+
 **Dependency**:
 A Predecessor/Successor link between two Work Items that constrains schedule. Finish-to-start only.
 _Avoid_: Hierarchy, parent/child, related (bare)
