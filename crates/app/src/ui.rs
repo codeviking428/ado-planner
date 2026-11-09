@@ -13,7 +13,7 @@ use ado_core::{
 use ado_session::PlannerSession;
 use chrono::Datelike;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{ElementExt as _, Popup, Selectable};
+use gpui_kit::base::{ElementExt as _, Popup, Selectable, TestSupportExt as _};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::Sizable;
@@ -35,9 +35,9 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     Animation, AnimationExt, AnyElement, App, ClipboardItem, Context, CursorStyle, Entity,
     FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, Role,
-    ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions,
-    div, px, rgb,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent, Render,
+    Role, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, TouchPhase,
+    Window, actions, div, px, rgb,
 };
 use jiff::ToSpan;
 
@@ -80,6 +80,7 @@ const PROGRESS_ROLLUP_TIP: &str =
 const DATES_ROLLUP_TIP: &str = "Dates roll up from children";
 const DRAG_DATE_PILL_GAP: f32 = 4.0;
 const EMPTY_GANTT_MAX_W: f32 = 480.0;
+pub const EMPTY_FILTERED_MESSAGE: &str = "No Work Items match this Team and the current filters.";
 
 fn drag_date_pill_text_width(text: &str) -> f32 {
     (text.chars().count() as f32 * 7.0 + 16.0).max(36.0)
@@ -195,6 +196,9 @@ pub struct PlannerView {
     camera_anim_gen: u64,
     pending_camera_from: Option<SavedGanttView>,
     skip_camera_anim: bool,
+    /// Camera when the current trackpad pinch started. A cancelled pinch
+    /// restores it.
+    pinch_origin: Option<SavedGanttView>,
     /// True after a drag move with the left button down. A later move with
     /// the button up then commits, covering mouse-up outside the window.
     saw_pressed_drag: bool,
@@ -566,6 +570,7 @@ impl PlannerView {
             camera_anim_gen: 0,
             pending_camera_from: None,
             skip_camera_anim: false,
+            pinch_origin: None,
             saw_pressed_drag: false,
             schedule_origin_x: None,
             pill_press_window_x: None,
@@ -2578,6 +2583,48 @@ impl PlannerView {
         cx.notify();
     }
 
+    /// Trackpad pinch zooms continuously around the pointer, without the
+    /// camera ease: a pinch sends dozens of small deltas a second. Backends
+    /// that report a pinch as Ctrl+wheel reach [`Self::apply_scroll`].
+    fn apply_pinch(&mut self, event: &PinchEvent, cx: &mut Context<Self>) {
+        self.empty_timeline_hint_dismissed = true;
+        match event.phase {
+            TouchPhase::Started => {
+                self.cancel_camera_anim();
+                self.pinch_origin = Some(self.state.gantt.snapshot());
+            }
+            TouchPhase::Cancelled => {
+                if let Some(pose) = self.pinch_origin.take() {
+                    self.state.gantt.restore(pose);
+                }
+                cx.notify();
+                return;
+            }
+            TouchPhase::Ended => self.pinch_origin = None,
+            TouchPhase::Moved => {}
+        }
+        if !event.delta.is_finite() || event.delta == 0.0 {
+            return;
+        }
+        self.cancel_camera_anim();
+        self.state.gantt.clear_hover();
+        let factor = (1.0 + event.delta).clamp(0.5, 2.0);
+        let pointer = self.timeline_local_x(f32::from(event.position.x));
+        let rows = self.state.visible_rows().len();
+        let viewport_h = self.state.gantt.viewport_h;
+        let gantt = &mut self.state.gantt;
+        let timeline_width = gantt.timeline_width;
+        gantt.retarget_year_gutter(|gantt| {
+            if pointer >= 0.0 && pointer <= timeline_width {
+                gantt.zoom_at(factor, pointer, 0.0);
+            } else {
+                gantt.zoom_at_center(factor);
+            }
+            gantt.clamp_scroll(rows, viewport_h);
+        });
+        cx.notify();
+    }
+
     fn clear_canvas_hover(&mut self, cx: &mut Context<Self>) {
         if self
             .state
@@ -3461,8 +3508,7 @@ impl PlannerView {
         let message = if let Some(error) = self.state.team_settings_error.as_ref() {
             error.clone()
         } else if filtered {
-            let noun = if hidden == 1 { "item" } else { "items" };
-            format!("{hidden} {noun} hidden by filters")
+            EMPTY_FILTERED_MESSAGE.to_string()
         } else if team.is_empty() {
             "Choose a team to load work items.".into()
         } else {
@@ -3479,7 +3525,22 @@ impl PlannerView {
             .text_center()
             .px_8()
             .gap_2()
-            .child(Label::new(message))
+            .child(
+                div()
+                    .id("empty-gantt-message")
+                    .role(Role::Status)
+                    .aria_label(message.clone())
+                    .child(Label::new(message))
+                    .test_support(),
+            )
+            .when(filtered && hidden > 0, |el| {
+                let noun = if hidden == 1 { "item" } else { "items" };
+                el.child(
+                    Label::new(format!("{hidden} {noun} hidden by filters"))
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                )
+            })
             .when(filtered, |el| {
                 el.child(
                     div()
@@ -4079,6 +4140,9 @@ impl PlannerView {
                     .overflow_hidden()
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         this.apply_scroll(event, cx);
+                    }))
+                    .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                        this.apply_pinch(event, cx);
                     }))
                     .child(
                         v_flex()
@@ -4960,6 +5024,9 @@ impl PlannerView {
             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                 this.apply_scroll(event, cx);
             }))
+            .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                this.apply_pinch(event, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -5422,6 +5489,9 @@ impl PlannerView {
                                             this.dismiss_empty_timeline_hint();
                                             this.apply_scroll(event, cx);
                                         }))
+                                        .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                                            this.apply_pinch(event, cx);
+                                        }))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
@@ -5694,6 +5764,9 @@ impl PlannerView {
                             .cursor(CursorStyle::DragLink)
                             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                                 this.apply_scroll(event, cx);
+                            }))
+                            .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                                this.apply_pinch(event, cx);
                             }))
                             .on_mouse_move(cx.listener(
                                 |this, event: &MouseMoveEvent, window, cx| {
@@ -6347,6 +6420,9 @@ impl PlannerView {
                 .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                     this.apply_scroll(event, cx);
                 }))
+                .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                    this.apply_pinch(event, cx);
+                }))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.set_bar_hovered(Some(id), cx);
@@ -6467,6 +6543,9 @@ impl PlannerView {
                     .cursor(CursorStyle::ResizeLeftRight)
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         this.apply_scroll(event, cx);
+                    }))
+                    .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                        this.apply_pinch(event, cx);
                     }))
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
@@ -6739,6 +6818,9 @@ impl PlannerView {
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         this.apply_scroll(event, cx);
                     }))
+                    .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                        this.apply_pinch(event, cx);
+                    }))
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.set_bar_hovered(Some(id), cx);
@@ -6857,6 +6939,9 @@ impl PlannerView {
                 .occlude()
                 .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                     this.apply_scroll(event, cx);
+                }))
+                .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                    this.apply_pinch(event, cx);
                 }))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
@@ -7471,6 +7556,9 @@ impl PlannerView {
                 .child(bar_title_chip(label, muted_fg, truncate))
                 .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                     this.apply_scroll(event, cx);
+                }))
+                .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                    this.apply_pinch(event, cx);
                 }))
                 .on_click(
                     cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
