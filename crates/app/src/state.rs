@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use ado_client::{AdoClient, AdoRuntime, TokenSource};
 use ado_core::{
-    AssigneeFilter, Flavor, HierarchyIndex, HierarchyResult, IdentityValue, IterationNode,
-    Organization, OverlayFilter, Project, ScopeSelection, SessionInfo, Team, WorkItemNode,
-    apply_overlays, build_clear_dates_patch, build_dates_patch, build_field_patch,
+    AssigneeFilter, DependencyLink, Flavor, HierarchyIndex, HierarchyResult, IdentityValue,
+    IterationNode, Organization, OverlayFilter, Project, ScopeSelection, SessionInfo, Team,
+    WorkItemNode, apply_overlays, build_clear_dates_patch, build_dates_patch, build_field_patch,
     build_replace_dates_patch, choose_available, compact_date, identity_from_field,
     is_assignee_special, iso_date_only, parent_relation_op, parse_iso_date, resolve_root_types,
     schedule_from_iteration,
@@ -21,8 +21,8 @@ use crate::cache::{CacheFreshness, QueryCache};
 use crate::error::AppError;
 use crate::form::FormDraft;
 use crate::gantt::{
-    BarLayout, GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView, VisibleRow,
-    insert_index_for_child,
+    BarLayout, ClashMarks, GanttView, GestureKind, NudgeAxis, PendingNudge, SavedGanttView,
+    VisibleRow, insert_index_for_child,
 };
 use crate::paths::AppPaths;
 use crate::prefs::AppPrefs;
@@ -100,6 +100,7 @@ struct VisibleEntry {
     username: Option<String>,
     nodes: Arc<Vec<WorkItemNode>>,
     index: Arc<HierarchyIndex>,
+    clashes: Arc<HashSet<DependencyLink>>,
     rows: Option<(HashSet<i64>, Arc<Vec<VisibleRow>>)>,
 }
 
@@ -117,6 +118,8 @@ fn sorted_distinct<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
 pub struct Visible {
     pub nodes: Arc<Vec<WorkItemNode>>,
     pub index: Arc<HierarchyIndex>,
+    /// Clashes on the loaded dates, before any live gesture.
+    pub clashes: Arc<HashSet<DependencyLink>>,
     pub rows: Arc<Vec<VisibleRow>>,
 }
 
@@ -129,6 +132,14 @@ impl Visible {
             &state.iterations,
             viewport_h,
         )
+    }
+
+    /// Clashes as a drop now would leave them, with a badge per clashing
+    /// successor among `bars`.
+    pub fn clash_marks(&self, state: &PlannerState, bars: &[BarLayout]) -> ClashMarks {
+        state
+            .gantt
+            .clash_marks(&self.clashes, &self.nodes, &self.index, bars)
     }
 }
 
@@ -321,6 +332,15 @@ impl PlannerState {
         self.persist_prefs();
     }
 
+    pub fn show_arrows(&self) -> bool {
+        self.prefs.planner.show_arrows
+    }
+
+    pub fn set_show_arrows(&mut self, show: bool) {
+        self.prefs.planner.show_arrows = show;
+        self.persist_prefs();
+    }
+
     pub fn initials(&self) -> String {
         let name = self
             .session_info
@@ -422,6 +442,7 @@ impl PlannerState {
             Visible {
                 nodes: entry.nodes.clone(),
                 index: entry.index.clone(),
+                clashes: entry.clashes.clone(),
                 rows,
             }
         })
@@ -453,6 +474,7 @@ impl PlannerState {
                 planner: self.prefs.planner.clone(),
                 username: self.session_info.username.clone(),
                 index: Arc::new(HierarchyIndex::new(&nodes)),
+                clashes: Arc::new(ado_core::clashes(&nodes)),
                 nodes: Arc::new(nodes),
                 rows: None,
             });

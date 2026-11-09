@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use ado_core::{
-    DEFAULT_BAR_DAYS, GanttBarKind, HierarchyIndex, IterationHint, IterationNode, WorkItemNode,
-    compact_date, dates_column_text, dates_column_text_indexed, format_date_range,
-    from_gantt_exclusive_end, gantt_bar_display, gantt_bar_display_indexed,
-    iteration_hint_for_path, parse_iso_date,
+    ClashEnds, DEFAULT_BAR_DAYS, DependencyLink, GanttBarKind, HierarchyIndex, IterationHint,
+    IterationNode, WorkItemNode, clash_ends, compact_date, dates_column_text,
+    dates_column_text_indexed, format_date_range, from_gantt_exclusive_end, gantt_bar_display,
+    gantt_bar_display_indexed, iteration_hint_for_path, parse_iso_date, retest_clashes,
 };
 use jiff::civil::Date;
 use jiff::{ToSpan, Unit};
@@ -74,6 +74,8 @@ pub const PARALLEL_VERT_MIN: f32 = 16.0;
 /// Parent-overflow `!` on the bar. The circle is larger than the glyph so a
 /// 20px font still reads as a true 14px bang instead of a 10px mark.
 pub const OVERFLOW_BADGE: f32 = 22.0;
+/// Clash `!` centred on the successor's top-left corner.
+pub const CLASH_BADGE: f32 = 14.0;
 /// Gap after the link-handle hit box before the overflow badge.
 pub const OVERFLOW_BADGE_GAP: f32 = 4.0;
 /// Handles + `!` + slack in front of an outside title, matching the painted
@@ -431,6 +433,9 @@ pub struct Gesture {
     /// Pressed the inbound (start) connector. Preview drops from that
     /// handle; drop treats this bar as the successor (still FS).
     pub link_from_start: bool,
+    /// Dependencies into and out of this bar, found once at press so each
+    /// frame re-judges only these Clashes.
+    pub links: Vec<DependencyLink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1934,6 +1939,7 @@ impl GanttView {
                 had_start,
                 had_target,
                 link_from_start: bar.link_from_start_handle(origin_x),
+                links: Vec::new(),
             });
             return Ok(());
         }
@@ -1971,6 +1977,7 @@ impl GanttView {
             had_start,
             had_target,
             link_from_start: false,
+            links: ado_core::links_touching(nodes, bar.id),
         });
         Ok(())
     }
@@ -2138,6 +2145,74 @@ impl GanttView {
             ),
             GestureKind::Link => (None, None),
         }
+    }
+
+    /// Dates the Clash rule reads for `node`: its own fields, or what a drop
+    /// of the live drag or resize would write.
+    pub fn clash_ends_for(&self, node: &WorkItemNode) -> Option<ClashEnds> {
+        let moved = self.gesture.as_ref().filter(|gesture| {
+            gesture.id == node.id
+                && gesture.kind != GestureKind::Link
+                && (gesture.live_start != gesture.start || gesture.live_target != gesture.target)
+        });
+        match moved {
+            Some(gesture) if node.has_date_fields => {
+                let (start, target) = Self::gesture_patch_dates(gesture);
+                ClashEnds::from_dates(
+                    start.or_else(|| parse_iso_date(node.start_date.as_deref())),
+                    target.or_else(|| parse_iso_date(node.target_date.as_deref())),
+                )
+            }
+            _ => clash_ends(node),
+        }
+    }
+
+    /// `loaded` with the live gesture's links re-judged on its tentative
+    /// dates, plus a badge for each clashing successor among `bars`.
+    pub fn clash_marks(
+        &self,
+        loaded: &HashSet<DependencyLink>,
+        nodes: &[WorkItemNode],
+        index: &HierarchyIndex,
+        bars: &[BarLayout],
+    ) -> ClashMarks {
+        let ends = |id: i64| {
+            index
+                .get(nodes, id)
+                .and_then(|node| self.clash_ends_for(node))
+        };
+        let mut links = loaded.clone();
+        if let Some(gesture) = &self.gesture {
+            retest_clashes(&mut links, &gesture.links, ends);
+        }
+        let mut badges = HashMap::new();
+        for bar in bars {
+            let Some(successor) = ends(bar.id) else {
+                continue;
+            };
+            let clashes: Vec<ClashLine> = bar
+                .predecessors
+                .iter()
+                .filter(|from| links.contains(&(**from, bar.id)))
+                .filter_map(|&from| {
+                    Some(ClashLine {
+                        predecessor_id: from,
+                        starts: successor.start,
+                        predecessor_finishes: ends(from)?.target?,
+                    })
+                })
+                .collect();
+            if !clashes.is_empty() {
+                badges.insert(
+                    bar.id,
+                    ScheduleBadge {
+                        clashes,
+                        failures: Vec::new(),
+                    },
+                );
+            }
+        }
+        ClashMarks { links, badges }
     }
 
     pub fn gridline_xs(&self, width: f32) -> Vec<f32> {
@@ -5045,6 +5120,129 @@ pub fn critical_path(nodes: &[WorkItemNode]) -> CriticalPath {
         }
     }
     CriticalPath { ids, links }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrowTone {
+    /// The Flavor's `warning` token.
+    Clash,
+    Critical,
+    Emphasis,
+    /// Off the Critical path while the highlight is on.
+    Dimmed,
+    Plain,
+}
+
+impl ArrowTone {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clash => "clash",
+            Self::Critical => "critical",
+            Self::Emphasis => "emphasis",
+            Self::Dimmed => "dimmed",
+            Self::Plain => "plain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArrowState {
+    pub clash: bool,
+    pub on_critical: bool,
+    /// Selected or hovered.
+    pub focused: bool,
+    /// On the hovered bar's Dependency chain.
+    pub related: bool,
+    pub critical_path_on: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArrowPaint {
+    pub tone: ArrowTone,
+    pub stroke: f32,
+}
+
+/// A Clash takes the warning colour over every other state; a clashing
+/// Critical path arrow keeps the path's width.
+pub fn dependency_arrow_paint(state: ArrowState) -> ArrowPaint {
+    let tone = if state.clash {
+        ArrowTone::Clash
+    } else if state.on_critical {
+        ArrowTone::Critical
+    } else if state.focused || state.related {
+        ArrowTone::Emphasis
+    } else if state.critical_path_on {
+        ArrowTone::Dimmed
+    } else {
+        ArrowTone::Plain
+    };
+    let stroke = if state.focused || state.on_critical {
+        3.0
+    } else {
+        2.0
+    };
+    ArrowPaint { tone, stroke }
+}
+
+/// One `Starts Jul 9 · #12 finishes Jul 10` line on a Clash badge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClashLine {
+    pub predecessor_id: i64,
+    pub starts: Date,
+    pub predecessor_finishes: Date,
+}
+
+impl ClashLine {
+    pub fn text(&self) -> String {
+        format!(
+            "Starts {} · #{} finishes {}",
+            compact_date(self.starts),
+            self.predecessor_id,
+            compact_date(self.predecessor_finishes)
+        )
+    }
+}
+
+/// The warning `!` at a bar's start edge. One badge per bar: a line per
+/// clashing predecessor, then a line per failed Date cascade write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduleBadge {
+    pub clashes: Vec<ClashLine>,
+    /// Reasons a Date cascade write to this bar failed for good.
+    pub failures: Vec<String>,
+}
+
+impl ScheduleBadge {
+    pub fn is_empty(&self) -> bool {
+        self.clashes.is_empty() && self.failures.is_empty()
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        self.clashes
+            .iter()
+            .map(ClashLine::text)
+            .chain(
+                self.failures
+                    .iter()
+                    .map(|reason| format!("Couldn't move: {reason}")),
+            )
+            .collect()
+    }
+
+    pub fn tooltip(&self) -> String {
+        self.lines().join("\n")
+    }
+
+    pub fn accessibility_label(&self) -> String {
+        format!("Schedule warning: {}", self.lines().join("; "))
+    }
+}
+
+/// Clashing Dependencies and the badges they put on successor bars.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClashMarks {
+    pub links: HashSet<DependencyLink>,
+    pub badges: HashMap<i64, ScheduleBadge>,
 }
 
 /// Work items connected to `id` by finish-to-start links in either direction
@@ -14384,6 +14582,180 @@ mod tests {
             finished.1,
             Date::new(2026, 7, 10).unwrap(),
             "a 4-day flick with no intermediate updates must still move the bar"
+        );
+    }
+
+    fn dated(id: i64, start: &str, target: &str, preds: &[i64]) -> WorkItemNode {
+        WorkItemNode {
+            start_date: Some(format!("{start}T00:00:00Z")),
+            target_date: Some(format!("{target}T00:00:00Z")),
+            predecessors: preds.to_vec(),
+            ..node(id, None)
+        }
+    }
+
+    fn marks_for(gantt: &GanttView, nodes: &[WorkItemNode]) -> ClashMarks {
+        let rows = gantt.flatten(nodes);
+        let bars = gantt.layout_bars(nodes, &rows, &[], 720.0);
+        let loaded = ado_core::clashes(nodes);
+        gantt.clash_marks(&loaded, nodes, &HierarchyIndex::new(nodes), &bars)
+    }
+
+    #[test]
+    fn clash_takes_the_warning_tone_and_keeps_the_critical_width() {
+        let plain = dependency_arrow_paint(ArrowState::default());
+        assert_eq!(plain.tone, ArrowTone::Plain);
+        assert_eq!(plain.stroke, 2.0);
+        let clash = dependency_arrow_paint(ArrowState {
+            clash: true,
+            critical_path_on: true,
+            ..ArrowState::default()
+        });
+        assert_eq!(clash.tone, ArrowTone::Clash);
+        assert_eq!(clash.stroke, 2.0);
+        let critical = dependency_arrow_paint(ArrowState {
+            on_critical: true,
+            critical_path_on: true,
+            ..ArrowState::default()
+        });
+        let critical_clash = dependency_arrow_paint(ArrowState {
+            clash: true,
+            on_critical: true,
+            critical_path_on: true,
+            ..ArrowState::default()
+        });
+        assert_eq!(critical.tone, ArrowTone::Critical);
+        assert_eq!(critical_clash.tone, ArrowTone::Clash);
+        assert_eq!(critical_clash.stroke, critical.stroke);
+        let hovered_clash = dependency_arrow_paint(ArrowState {
+            clash: true,
+            focused: true,
+            ..ArrowState::default()
+        });
+        assert_eq!(hovered_clash.tone, ArrowTone::Clash);
+    }
+
+    #[test]
+    fn schedule_badge_lists_clashes_then_move_failures() {
+        let badge = ScheduleBadge {
+            clashes: vec![
+                ClashLine {
+                    predecessor_id: 12,
+                    starts: Date::new(2026, 7, 9).unwrap(),
+                    predecessor_finishes: Date::new(2026, 7, 10).unwrap(),
+                },
+                ClashLine {
+                    predecessor_id: 14,
+                    starts: Date::new(2026, 7, 9).unwrap(),
+                    predecessor_finishes: Date::new(2026, 7, 15).unwrap(),
+                },
+            ],
+            failures: vec!["The Work Item was changed by someone else.".into()],
+        };
+        assert_eq!(
+            badge.tooltip(),
+            "Starts Jul 9 · #12 finishes Jul 10\n\
+             Starts Jul 9 · #14 finishes Jul 15\n\
+             Couldn't move: The Work Item was changed by someone else."
+        );
+        assert!(
+            badge
+                .accessibility_label()
+                .starts_with("Schedule warning: Starts Jul 9 · #12 finishes Jul 10; ")
+        );
+        assert!(ScheduleBadge::default().is_empty());
+    }
+
+    #[test]
+    fn clash_marks_badge_the_successor_with_one_line_per_predecessor() {
+        let nodes = vec![
+            dated(12, "2026-07-01", "2026-07-10", &[]),
+            dated(14, "2026-07-01", "2026-07-15", &[]),
+            dated(16, "2026-07-01", "2026-07-05", &[]),
+            dated(34, "2026-07-09", "2026-07-20", &[12, 14, 16]),
+        ];
+        let gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            ..Default::default()
+        };
+        let marks = marks_for(&gantt, &nodes);
+        assert_eq!(marks.links, HashSet::from([(12, 34), (14, 34)]));
+        assert_eq!(
+            marks.badges[&34].lines(),
+            vec![
+                "Starts Jul 9 · #12 finishes Jul 10".to_string(),
+                "Starts Jul 9 · #14 finishes Jul 15".to_string(),
+            ]
+        );
+        assert_eq!(marks.badges.len(), 1);
+    }
+
+    #[test]
+    fn live_drag_rejudges_its_links_and_cancel_restores_them() {
+        let nodes = vec![
+            dated(1, "2026-07-01", "2026-07-10", &[]),
+            dated(2, "2026-07-11", "2026-07-20", &[1]),
+            dated(3, "2026-07-21", "2026-07-30", &[2]),
+        ];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            ..Default::default()
+        };
+        assert!(marks_for(&gantt, &nodes).links.is_empty());
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 2).unwrap().clone();
+        let origin = bar.x + bar.width / 2.0;
+        gantt
+            .begin_gesture(&bar, GestureKind::Move, origin, &nodes, &[])
+            .expect("move");
+        assert_eq!(
+            gantt.gesture.as_ref().unwrap().links.len(),
+            2,
+            "the press finds the bar's in and out links once"
+        );
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        gantt.update_gesture(origin - ppd * 3.0);
+        let marks = marks_for(&gantt, &nodes);
+        assert_eq!(marks.links, HashSet::from([(1, 2)]));
+        assert_eq!(
+            marks.badges[&2].lines(),
+            vec!["Starts Jul 8 · #1 finishes Jul 10".to_string()]
+        );
+        gantt.update_gesture(origin + ppd * 3.0);
+        let marks = marks_for(&gantt, &nodes);
+        assert_eq!(marks.links, HashSet::from([(2, 3)]));
+        assert!(marks.badges.contains_key(&3));
+        gantt.cancel_gesture();
+        assert_eq!(marks_for(&gantt, &nodes), ClashMarks::default());
+    }
+
+    #[test]
+    fn resize_end_clashes_only_the_outgoing_link() {
+        let nodes = vec![
+            dated(1, "2026-07-01", "2026-07-10", &[]),
+            dated(2, "2026-07-11", "2026-07-20", &[1]),
+            dated(3, "2026-07-21", "2026-07-30", &[2]),
+        ];
+        let mut gantt = GanttView {
+            origin: Date::new(2026, 7, 1).unwrap(),
+            scale: GanttScale::Month,
+            ..Default::default()
+        };
+        let rows = gantt.flatten(&nodes);
+        let bars = gantt.layout_bars(&nodes, &rows, &[], 720.0);
+        let bar = bars.iter().find(|bar| bar.id == 2).unwrap().clone();
+        let origin = bar.x + bar.width;
+        gantt
+            .begin_gesture(&bar, GestureKind::ResizeEnd, origin, &nodes, &[])
+            .expect("resize");
+        let ppd = gantt.scale.pixels_per_day(gantt.zoom);
+        gantt.update_gesture(origin + ppd * 2.0);
+        assert_eq!(
+            marks_for(&gantt, &nodes).links,
+            HashSet::from([(2, 3)]),
+            "Target Jul 22 runs past #3's Jul 21 start"
         );
     }
 }
